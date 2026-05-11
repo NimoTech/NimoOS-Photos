@@ -5,6 +5,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/NimoTech/NimoOS-Photos/common"
 	"github.com/spf13/viper"
 )
 
@@ -62,10 +63,10 @@ func Init(configFile, confSample string) error {
 		Cfg.DataPath = "/DATA/.system_data/photos"
 	}
 	if Cfg.MLEndpoint == "" {
-		Cfg.MLEndpoint = "http://127.0.0.1:3003"
+		Cfg.MLEndpoint = common.DefaultMLEndpoint
 	}
 	if Cfg.Workers == 0 {
-		Cfg.Workers = 3
+		Cfg.Workers = common.DefaultWorkers
 	}
 	return nil
 }

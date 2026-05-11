@@ -52,14 +52,12 @@ func main() {
 		os.Exit(1)
 	}
 
-	cfg := config.Cfg
-
 	// Create required data directories
 	for _, dir := range []string{
-		cfg.DataPath,
-		filepath.Join(cfg.DataPath, "thumbs"),
-		filepath.Join(cfg.DataPath, "live"),
-		filepath.Join(cfg.DataPath, "ml-cache"),
+		config.Cfg.DataPath,
+		filepath.Join(config.Cfg.DataPath, "thumbs"),
+		filepath.Join(config.Cfg.DataPath, "live"),
+		filepath.Join(config.Cfg.DataPath, "ml-cache"),
 	} {
 		if err := os.MkdirAll(dir, 0755); err != nil {
 			fmt.Fprintf(os.Stderr, "failed to create directory %s: %v\n", dir, err)
@@ -67,9 +65,9 @@ func main() {
 		}
 	}
 
-	logger.LogInit(cfg.LogPath, "nimoos-photos", "log")
+	logger.LogInit(config.Cfg.LogPath, "nimoos-photos", "log")
 
-	svc := service.NewService(cfg)
+	svc := service.NewService(config.Cfg)
 
 	// Start background workers
 	go svc.Watcher().Start(ctx)
@@ -82,14 +80,14 @@ func main() {
 	}
 
 	// Write URL file for service discovery
-	urlFilePath := filepath.Join(cfg.RuntimePath, common.URLFileName)
+	urlFilePath := filepath.Join(config.Cfg.RuntimePath, common.URLFileName)
 	if err := file.CreateFileAndWriteContent(urlFilePath, "http://"+listener.Addr().String()); err != nil {
 		logger.Error("failed to write URL file", zap.Error(err))
 		// Non-fatal: Gateway registration uses the address directly.
 	}
 
 	// Register routes at Gateway
-	gw, err := external.NewManagementService(cfg.RuntimePath)
+	gw, err := external.NewManagementService(config.Cfg.RuntimePath)
 	if err != nil {
 		panic("failed to connect to Gateway: " + err.Error())
 	}
@@ -102,7 +100,7 @@ func main() {
 		}
 	}
 
-	handler := route.InitRouter(svc, cfg.RuntimePath)
+	handler := route.InitRouter(svc, config.Cfg.RuntimePath)
 
 	// Notify systemd
 	if supported, err := daemon.SdNotify(false, daemon.SdNotifyReady); err != nil {
