@@ -20,14 +20,10 @@ type AssetsHandler struct {
 
 // NewAssetsHandler constructs an AssetsHandler.
 // thumbDir is the filesystem directory that contains <id>/small.jpg and <id>/large.jpg.
-func NewAssetsHandler(svc service.Services) *AssetsHandler {
-	// Derive thumbDir from the same convention used in service/service.go:
-	// DataPath/thumbs — inferred via the indexer's thumbDir field via StatusCounts is not
-	// directly accessible, so we use the same hardcoded DataPath default.
-	// A cleaner option is to pass thumbDir explicitly; left as a follow-up.
+func NewAssetsHandler(svc service.Services, thumbDir string) *AssetsHandler {
 	return &AssetsHandler{
 		svc:      svc,
-		thumbDir: "/DATA/.system_data/photos/thumbs",
+		thumbDir: thumbDir,
 	}
 }
 

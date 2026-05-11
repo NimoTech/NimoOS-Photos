@@ -16,7 +16,7 @@ import (
 )
 
 // InitRouter sets up the Echo router with JWT middleware and all v1 routes.
-func InitRouter(svc service.Services, runtimePath string) http.Handler {
+func InitRouter(svc service.Services, runtimePath string, thumbDir string) http.Handler {
 	e := echo.New()
 	e.HideBanner = true
 
@@ -59,7 +59,7 @@ func InitRouter(svc service.Services, runtimePath string) http.Handler {
 
 	g := e.Group(common.V1APIPath)
 
-	assets := v1.NewAssetsHandler(svc)
+	assets := v1.NewAssetsHandler(svc, thumbDir)
 	search := v1.NewSearchHandler(svc)
 	tl := v1.NewTimelineHandler(svc)
 	albums := v1.NewAlbumsHandler(svc)

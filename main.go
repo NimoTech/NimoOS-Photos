@@ -100,7 +100,7 @@ func main() {
 		}
 	}
 
-	handler := route.InitRouter(svc, config.Cfg.RuntimePath)
+	handler := route.InitRouter(svc, config.Cfg.RuntimePath, filepath.Join(config.Cfg.DataPath, "thumbs"))
 
 	// Notify systemd
 	if supported, err := daemon.SdNotify(false, daemon.SdNotifyReady); err != nil {
