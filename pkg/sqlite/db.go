@@ -157,10 +157,3 @@ func migrate(db *sql.DB) error {
 	return nil
 }
 
-// min returns the smaller of two ints (backport for go < 1.21 builtin).
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}

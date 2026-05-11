@@ -192,5 +192,6 @@ func (c *MLClient) IsReady() bool {
 		return false
 	}
 	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body) //nolint:errcheck // best-effort drain for keep-alive reuse
 	return resp.StatusCode == http.StatusOK
 }

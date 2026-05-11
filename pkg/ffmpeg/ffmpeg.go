@@ -44,8 +44,8 @@ func runExtract(videoPath, outPath, seekSec string) error {
 		"-i", videoPath,
 		"-vframes", "1",
 		"-q:v", "2",
-		outPath,
 		"-y",
+		outPath,
 	)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -104,8 +104,8 @@ func ExtractEmbeddedVideo(jpegPath, outPath string) error {
 	cmd := exec.Command("ffmpeg",
 		"-i", jpegPath,
 		"-map", "0:v:1",
-		outPath,
 		"-y",
+		outPath,
 	)
 	out, err := cmd.CombinedOutput()
 	if err != nil {

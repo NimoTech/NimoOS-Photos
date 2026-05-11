@@ -18,10 +18,12 @@ func makeTestJPEG(t *testing.T, w, h int) string {
 	t.Helper()
 	img := image.NewRGBA(image.Rect(0, 0, w, h))
 	var buf bytes.Buffer
-	jpeg.Encode(&buf, img, nil)
-	f, _ := os.CreateTemp(t.TempDir(), "*.jpg")
-	f.Write(buf.Bytes())
-	f.Close()
+	require.NoError(t, jpeg.Encode(&buf, img, nil))
+	f, err := os.CreateTemp(t.TempDir(), "*.jpg")
+	require.NoError(t, err)
+	_, err = f.Write(buf.Bytes())
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
 	return f.Name()
 }
 
