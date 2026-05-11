@@ -101,7 +101,7 @@ func parseEmbeddingString(s string) ([]float32, error) {
 
 // CLIPImageEmbed returns a 512-dim CLIP embedding for the given JPEG image bytes.
 func (c *MLClient) CLIPImageEmbed(imageData []byte) ([]float32, error) {
-	entries := `{"clip":{"visual":{"modelName":"clip-vit-b-32__openai"}}}`
+	entries := `{"clip":{"visual":{"modelName":"ViT-B-32__openai"}}}`
 	body, ct := buildImageForm(entries, imageData)
 
 	data, err := c.post(body, ct)
@@ -122,7 +122,7 @@ func (c *MLClient) CLIPImageEmbed(imageData []byte) ([]float32, error) {
 
 // CLIPTextEmbed returns a 512-dim CLIP embedding for the given text string.
 func (c *MLClient) CLIPTextEmbed(text string) ([]float32, error) {
-	entries := `{"clip":{"textual":{"modelName":"clip-vit-b-32__openai"}}}`
+	entries := `{"clip":{"textual":{"modelName":"ViT-B-32__openai"}}}`
 	body, ct := buildTextForm(entries, text)
 
 	data, err := c.post(body, ct)

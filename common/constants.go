@@ -13,6 +13,6 @@ const (
 	ThumbSmallSize = 250
 	ThumbLargeSize = 1280
 
-	CLIPModelName = "clip-vit-b-32__openai"
+	CLIPModelName = "ViT-B-32__openai"
 	FaceModelName = "buffalo_l"
 )
