@@ -12,7 +12,7 @@ import (
 
 // InitRouter sets up the Echo router and returns an http.Handler.
 // The runtimePath parameter is reserved for future middleware use.
-func InitRouter(svc *service.Service, runtimePath string) http.Handler {
+func InitRouter(svc service.Services, runtimePath string) http.Handler {
 	e := echo.New()
 	e.HideBanner = true
 	e.Use(middleware.Recover())
