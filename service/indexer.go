@@ -21,6 +21,7 @@ import (
 	"github.com/NimoTech/NimoOS-Photos/pkg/sqlite"
 	"github.com/NimoTech/NimoOS-Photos/pkg/thumb"
 	"github.com/google/uuid"
+	"go.uber.org/zap"
 )
 
 // MLProvider is the interface the Indexer uses for ML inference.
@@ -133,11 +134,13 @@ func (ix *Indexer) processFile(path string) {
 	// 2. Compute SHA-256 checksum.
 	checksum := sha256File(data)
 
-	// 3. Skip if checksum already exists in DB.
+	// 3. Skip if checksum already exists in DB with status='indexed'.
+	// Records with status='pending' (e.g. left by a crash) are intentionally
+	// re-processed so they can reach 'indexed' status.
 	var existingID string
-	err = ix.db.QueryRow(`SELECT id FROM assets WHERE checksum=?`, checksum).Scan(&existingID)
+	err = ix.db.QueryRow(`SELECT id FROM assets WHERE checksum=? AND status='indexed'`, checksum).Scan(&existingID)
 	if err == nil {
-		// already indexed — nothing to do
+		// already fully indexed — nothing to do
 		return
 	}
 
@@ -247,21 +250,27 @@ func (ix *Indexer) processFile(path string) {
 					bboxJSON, _ := json.Marshal(face.BBox)
 					faceID := uuid.NewString()
 					embBlob := sqlite.SerializeFloat32(embedding)
-					ix.db.Exec(`
+					if _, err := ix.db.Exec(`
 						INSERT INTO face_detections(id, asset_id, bbox, embedding)
 						VALUES(?,?,?,?)`,
 						faceID, assetID, string(bboxJSON), embBlob,
-					)
+					); err != nil {
+						zap.L().Error("indexer: failed to insert face_detections",
+							zap.String("assetID", assetID), zap.Error(err))
+					}
 				}
 			}
 		}
 	}
 
 	// 10. Mark as indexed.
-	ix.db.Exec(`
+	if _, err := ix.db.Exec(`
 		UPDATE assets SET status='indexed', indexed_at=? WHERE id=?`,
 		time.Now(), assetID,
-	)
+	); err != nil {
+		zap.L().Error("indexer: failed to mark asset as indexed",
+			zap.String("assetID", assetID), zap.Error(err))
+	}
 }
 
 // writeClipEmbedding upserts the CLIP embedding for the given asset.
@@ -276,7 +285,10 @@ func (ix *Indexer) writeClipEmbedding(assetID string, vec []float32) {
 	}
 	if rowid > 0 {
 		blob := sqlite.SerializeFloat32(vec)
-		ix.db.Exec(`INSERT OR REPLACE INTO clip_embeddings(rowid, embedding) VALUES(?,?)`, rowid, blob) //nolint:errcheck
+		if _, err := ix.db.Exec(`INSERT OR REPLACE INTO clip_embeddings(rowid, embedding) VALUES(?,?)`, rowid, blob); err != nil {
+			zap.L().Error("indexer: failed to upsert clip_embeddings",
+				zap.String("assetID", assetID), zap.Error(err))
+		}
 	}
 }
 

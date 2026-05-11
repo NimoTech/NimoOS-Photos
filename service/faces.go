@@ -100,7 +100,11 @@ func DBSCAN(vecs [][]float32, epsilon float64, minPoints int) []int {
 				visited[s] = true
 				sNeighbors := regionQuery(vecs, s, epsilon)
 				if len(sNeighbors) >= minPoints {
-					seeds = append(seeds, sNeighbors...)
+					for _, s2 := range sNeighbors {
+						if !visited[s2] {
+							seeds = append(seeds, s2)
+						}
+					}
 				}
 			}
 			if labels[s] == -1 {
