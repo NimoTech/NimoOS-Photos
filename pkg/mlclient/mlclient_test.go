@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/NimoTech/NimoOS-Photos/pkg/mlclient"
@@ -12,43 +13,63 @@ import (
 func mockMLServer(t *testing.T) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/health" {
-			w.WriteHeader(http.StatusOK)
+		// Health check
+		if r.Method == http.MethodGet && r.URL.Path == "/ping" {
+			w.Header().Set("Content-Type", "text/plain")
+			_, _ = w.Write([]byte("pong"))
 			return
 		}
 
-		var req map[string]interface{}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "bad request", http.StatusBadRequest)
+		// Parse multipart form
+		if err := r.ParseMultipartForm(32 << 20); err != nil {
+			http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
 			return
 		}
+		entries := r.FormValue("entries")
 
-		modelType, _ := req["modelType"].(string)
-		switch modelType {
-		case "clip":
-			embedding := make([]float64, 512)
-			embedding[0] = 0.9
-			json.NewEncoder(w).Encode(map[string]interface{}{
-				"imageEmbedding": embedding,
-				"textEmbedding":  embedding,
+		// Build a 512-dim embedding with a known first value
+		embedding := make([]float64, 512)
+		embedding[0] = 0.9
+		embJSON, _ := json.Marshal(embedding)
+		embStr := string(embJSON) // "[0.9,0,0,...]"
+
+		w.Header().Set("Content-Type", "application/json")
+
+		if strings.Contains(entries, `"clip"`) {
+			_ = json.NewEncoder(w).Encode(map[string]string{"clip": embStr})
+		} else if strings.Contains(entries, `"facial-recognition"`) {
+			face := map[string]interface{}{
+				"boundingBox": map[string]float64{"x1": 0.1, "y1": 0.1, "x2": 0.5, "y2": 0.9},
+				"embedding":   embStr,
+				"score":       0.99,
+			}
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"facial-recognition": []interface{}{face},
+				"imageHeight":        100,
+				"imageWidth":         100,
 			})
-		case "detection":
-			json.NewEncoder(w).Encode(map[string]interface{}{
-				"results": []map[string]interface{}{
-					{
-						"boundingBox": map[string]float64{"x1": 0.1, "y1": 0.1, "x2": 0.5, "y2": 0.9},
-						"score":       0.99,
-					},
-				},
-			})
-		case "recognition":
-			embedding := make([]float64, 512)
-			embedding[1] = 0.8
-			json.NewEncoder(w).Encode(map[string]interface{}{"embedding": embedding})
-		default:
-			http.Error(w, "unknown modelType", http.StatusBadRequest)
+		} else {
+			http.Error(w, "unknown entries", http.StatusBadRequest)
 		}
 	}))
+}
+
+func TestCLIPTextEmbed(t *testing.T) {
+	srv := mockMLServer(t)
+	defer srv.Close()
+
+	client := mlclient.New(srv.URL)
+
+	vec, err := client.CLIPTextEmbed("a cat")
+	if err != nil {
+		t.Fatalf("CLIPTextEmbed error: %v", err)
+	}
+	if len(vec) != 512 {
+		t.Fatalf("expected 512 dims, got %d", len(vec))
+	}
+	if vec[0] < 0.89 || vec[0] > 0.91 {
+		t.Fatalf("expected vec[0] ≈ 0.9, got %f", vec[0])
+	}
 }
 
 func TestCLIPImageEmbed(t *testing.T) {
@@ -70,31 +91,16 @@ func TestCLIPImageEmbed(t *testing.T) {
 	}
 }
 
-func TestCLIPTextEmbed(t *testing.T) {
-	srv := mockMLServer(t)
-	defer srv.Close()
-
-	client := mlclient.New(srv.URL)
-
-	vec, err := client.CLIPTextEmbed("a cat")
-	if err != nil {
-		t.Fatalf("CLIPTextEmbed error: %v", err)
-	}
-	if len(vec) != 512 {
-		t.Fatalf("expected 512 dims, got %d", len(vec))
-	}
-}
-
-func TestDetectFaces(t *testing.T) {
+func TestDetectAndRecognizeFaces(t *testing.T) {
 	srv := mockMLServer(t)
 	defer srv.Close()
 
 	client := mlclient.New(srv.URL)
 	imageData := []byte("fake-jpeg-bytes")
 
-	faces, err := client.DetectFaces(imageData)
+	faces, err := client.DetectAndRecognizeFaces(imageData)
 	if err != nil {
-		t.Fatalf("DetectFaces error: %v", err)
+		t.Fatalf("DetectAndRecognizeFaces error: %v", err)
 	}
 	if len(faces) != 1 {
 		t.Fatalf("expected 1 face, got %d", len(faces))
@@ -102,22 +108,8 @@ func TestDetectFaces(t *testing.T) {
 	if faces[0].BBox.X1 < 0.09 || faces[0].BBox.X1 > 0.11 {
 		t.Fatalf("expected BBox.X1 ≈ 0.1, got %f", faces[0].BBox.X1)
 	}
-}
-
-func TestRecognizeFace(t *testing.T) {
-	srv := mockMLServer(t)
-	defer srv.Close()
-
-	client := mlclient.New(srv.URL)
-	imageData := []byte("fake-jpeg-bytes")
-	bbox := mlclient.BoundingBox{X1: 0.1, Y1: 0.1, X2: 0.5, Y2: 0.9}
-
-	vec, err := client.RecognizeFace(imageData, bbox)
-	if err != nil {
-		t.Fatalf("RecognizeFace error: %v", err)
-	}
-	if len(vec) != 512 {
-		t.Fatalf("expected 512 dims, got %d", len(vec))
+	if len(faces[0].Embedding) != 512 {
+		t.Fatalf("expected Embedding length 512, got %d", len(faces[0].Embedding))
 	}
 }
 

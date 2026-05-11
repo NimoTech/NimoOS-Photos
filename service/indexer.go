@@ -29,8 +29,7 @@ import (
 type MLProvider interface {
 	CLIPImageEmbed(imageData []byte) ([]float32, error)
 	CLIPTextEmbed(text string) ([]float32, error)
-	DetectFaces(imageData []byte) ([]mlclient.FaceResult, error)
-	RecognizeFace(imageData []byte, bbox mlclient.BoundingBox) ([]float32, error)
+	DetectAndRecognizeFaces(imageData []byte) ([]mlclient.FaceResult, error)
 	IsReady() bool
 }
 
@@ -240,22 +239,19 @@ func (ix *Indexer) processFile(path string) {
 				ix.writeClipEmbedding(assetID, vec)
 			}
 
-			// Face detection + recognition.
-			if faces, faceErr := ix.ml.DetectFaces(mlData); faceErr == nil {
+			// Face detection + recognition in a single request.
+			if faces, faceErr := ix.ml.DetectAndRecognizeFaces(mlData); faceErr == nil {
 				for _, face := range faces {
-					embedding, recErr := ix.ml.RecognizeFace(mlData, face.BBox)
-					if recErr != nil {
+					if len(face.Embedding) != 512 {
 						continue
 					}
 					bboxJSON, _ := json.Marshal(face.BBox)
 					faceID := uuid.NewString()
-					embBlob := sqlite.SerializeFloat32(embedding)
-					if _, err := ix.db.Exec(`
-						INSERT INTO face_detections(id, asset_id, bbox, embedding)
-						VALUES(?,?,?,?)`,
-						faceID, assetID, string(bboxJSON), embBlob,
+					if _, err := ix.db.Exec(
+						`INSERT INTO face_detections(id, asset_id, bbox, embedding) VALUES(?,?,?,?)`,
+						faceID, assetID, string(bboxJSON), sqlite.SerializeFloat32(face.Embedding),
 					); err != nil {
-						zap.L().Error("indexer: failed to insert face_detections",
+						zap.L().Error("indexer: failed to insert face_detection",
 							zap.String("assetID", assetID), zap.Error(err))
 					}
 				}

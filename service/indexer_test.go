@@ -25,11 +25,8 @@ func (m *mockML) CLIPImageEmbed(_ []byte) ([]float32, error) {
 func (m *mockML) CLIPTextEmbed(_ string) ([]float32, error) {
 	return make([]float32, 512), nil
 }
-func (m *mockML) DetectFaces(_ []byte) ([]mlclient.FaceResult, error) {
+func (m *mockML) DetectAndRecognizeFaces(_ []byte) ([]mlclient.FaceResult, error) {
 	return nil, nil
-}
-func (m *mockML) RecognizeFace(_ []byte, _ mlclient.BoundingBox) ([]float32, error) {
-	return make([]float32, 512), nil
 }
 func (m *mockML) IsReady() bool { return true }
 
