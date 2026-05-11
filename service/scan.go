@@ -13,13 +13,16 @@ func scanAssets(rows *sql.Rows) ([]Asset, error) {
 	for rows.Next() {
 		var a Asset
 		var takenAt, indexedAt sql.NullTime
-		var durationMs sql.NullInt64
+		var fileSize, durationMs sql.NullInt64
 		if err := rows.Scan(
-			&a.ID, &a.FilePath, &a.FileSize, &a.MimeType, &a.OriginalName,
+			&a.ID, &a.FilePath, &fileSize, &a.MimeType, &a.OriginalName,
 			&takenAt, &durationMs, &a.LivePhotoVideoID, &a.IsLivePhotoVideo,
 			&indexedAt, &a.Status,
 		); err != nil {
 			return nil, err
+		}
+		if fileSize.Valid {
+			a.FileSize = fileSize.Int64
 		}
 		if takenAt.Valid {
 			t := takenAt.Time
