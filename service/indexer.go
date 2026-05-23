@@ -172,7 +172,7 @@ func (ix *Indexer) processFile(path string) {
 				takenAt = mi.TakenAt
 			}
 		} else {
-			// Fall back to legacy duration-only probe.
+			fmt.Fprintf(os.Stderr, "[indexer] ffmpeg.Probe failed for %s: %v — falling back to duration-only probe\n", path, perr)
 			durationMs, _ = ffmpeg.GetDurationMs(path)
 		}
 	} else {
