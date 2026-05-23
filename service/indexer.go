@@ -151,11 +151,11 @@ func (ix *Indexer) processFile(path string) {
 	var takenAt time.Time
 	var durationMs int64
 	var exifResult *exif.Result
+	var mediaInfo *ffmpeg.MediaInfo
 	var keyframePath string
 	var keyframeTmpDir string
 
 	if isVideo {
-		// Extract keyframe to a temp dir (cleaned up after processing).
 		keyframeTmpDir, err = os.MkdirTemp("", "nimoos-kf-*")
 		if err == nil {
 			keyframePath, err = ffmpeg.ExtractKeyframe(path, keyframeTmpDir)
@@ -163,9 +163,19 @@ func (ix *Indexer) processFile(path string) {
 				keyframePath = ""
 			}
 		}
-		durationMs, _ = ffmpeg.GetDurationMs(path)
+		// One ffprobe call gives us everything: duration, dimensions, codecs,
+		// frame rate, bit rate, rotation, creation_time, GPS.
+		if mi, perr := ffmpeg.Probe(path); perr == nil {
+			mediaInfo = mi
+			durationMs = mi.DurationMs
+			if !mi.TakenAt.IsZero() {
+				takenAt = mi.TakenAt
+			}
+		} else {
+			// Fall back to legacy duration-only probe.
+			durationMs, _ = ffmpeg.GetDurationMs(path)
+		}
 	} else {
-		// Parse EXIF metadata.
 		f, openErr := os.Open(path)
 		if openErr == nil {
 			exifResult = exif.Parse(f)
@@ -207,16 +217,67 @@ func (ix *Indexer) processFile(path string) {
 		return
 	}
 
-	// 7. INSERT EXIF metadata (images only).
-	if !isVideo && exifResult != nil {
-		ix.db.Exec(`
-			INSERT OR IGNORE INTO asset_exif(asset_id, width, height, latitude, longitude, make, model)
-			VALUES(?,?,?,?,?,?,?)`,
+	// 7. INSERT/UPDATE asset_exif — images and videos both write their metadata.
+	if isVideo && mediaInfo != nil {
+		var lat, lon sql.NullFloat64
+		if mediaInfo.HasLocation {
+			lat = sql.NullFloat64{Float64: mediaInfo.Latitude, Valid: true}
+			lon = sql.NullFloat64{Float64: mediaInfo.Longitude, Valid: true}
+		}
+		if _, err := ix.db.Exec(`
+			INSERT INTO asset_exif(asset_id, width, height, latitude, longitude,
+			                       video_codec, audio_codec, frame_rate, bit_rate, rotation)
+			VALUES(?,?,?,?,?,?,?,?,?,?)
+			ON CONFLICT(asset_id) DO UPDATE SET
+			  width        = excluded.width,
+			  height       = excluded.height,
+			  latitude     = excluded.latitude,
+			  longitude    = excluded.longitude,
+			  video_codec  = excluded.video_codec,
+			  audio_codec  = excluded.audio_codec,
+			  frame_rate   = excluded.frame_rate,
+			  bit_rate     = excluded.bit_rate,
+			  rotation     = excluded.rotation`,
+			assetID,
+			mediaInfo.Width, mediaInfo.Height,
+			lat, lon,
+			mediaInfo.VideoCodec, mediaInfo.AudioCodec,
+			mediaInfo.FrameRate, mediaInfo.BitRate, mediaInfo.Rotation,
+		); err != nil {
+			fmt.Fprintf(os.Stderr, "[indexer] asset_exif video upsert %s: %v\n", assetID, err)
+		}
+	} else if !isVideo && exifResult != nil {
+		var lat, lon sql.NullFloat64
+		if exifResult.Latitude != 0 || exifResult.Longitude != 0 {
+			lat = sql.NullFloat64{Float64: exifResult.Latitude, Valid: true}
+			lon = sql.NullFloat64{Float64: exifResult.Longitude, Valid: true}
+		}
+		if _, err := ix.db.Exec(`
+			INSERT INTO asset_exif(asset_id, width, height, latitude, longitude, make, model,
+			                       iso, shutter_speed, aperture, focal_length, orientation)
+			VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+			ON CONFLICT(asset_id) DO UPDATE SET
+			  width         = excluded.width,
+			  height        = excluded.height,
+			  latitude      = excluded.latitude,
+			  longitude     = excluded.longitude,
+			  make          = excluded.make,
+			  model         = excluded.model,
+			  iso           = excluded.iso,
+			  shutter_speed = excluded.shutter_speed,
+			  aperture      = excluded.aperture,
+			  focal_length  = excluded.focal_length,
+			  orientation   = excluded.orientation`,
 			assetID,
 			exifResult.Width, exifResult.Height,
-			exifResult.Latitude, exifResult.Longitude,
+			lat, lon,
 			exifResult.Make, exifResult.Model,
-		)
+			exifResult.ISO, exifResult.ShutterSpeed,
+			exifResult.Aperture, exifResult.FocalLength,
+			exifResult.Orientation,
+		); err != nil {
+			fmt.Fprintf(os.Stderr, "[indexer] asset_exif image upsert %s: %v\n", assetID, err)
+		}
 	}
 
 	// 8. Generate thumbnails.
