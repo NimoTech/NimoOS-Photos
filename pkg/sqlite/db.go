@@ -154,6 +154,51 @@ func migrate(db *sql.DB) error {
 		}
 	}
 
+	// Idempotent column expansion: extend asset_exif to hold full EXIF + video metadata.
+	newCols := []struct {
+		name string
+		decl string
+	}{
+		{"iso", "INTEGER"},
+		{"shutter_speed", "TEXT"},
+		{"aperture", "REAL"},
+		{"focal_length", "REAL"},
+		{"orientation", "INTEGER"},
+		{"video_codec", "TEXT"},
+		{"audio_codec", "TEXT"},
+		{"frame_rate", "REAL"},
+		{"bit_rate", "INTEGER"},
+		{"rotation", "INTEGER"},
+	}
+
+	existing := map[string]bool{}
+	rows, err := db.Query(`PRAGMA table_info(asset_exif)`)
+	if err != nil {
+		return fmt.Errorf("migrate pragma asset_exif: %w", err)
+	}
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notnull, pk int
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			rows.Close()
+			return fmt.Errorf("migrate pragma scan: %w", err)
+		}
+		existing[name] = true
+	}
+	rows.Close()
+
+	for _, col := range newCols {
+		if existing[col.name] {
+			continue
+		}
+		stmt := fmt.Sprintf("ALTER TABLE asset_exif ADD COLUMN %s %s", col.name, col.decl)
+		if _, err := db.Exec(stmt); err != nil {
+			return fmt.Errorf("migrate add column %s: %w", col.name, err)
+		}
+	}
+
 	return nil
 }
 

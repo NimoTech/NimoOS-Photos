@@ -1,11 +1,14 @@
 package sqlite_test
 
 import (
+	"database/sql"
 	"math"
 	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/NimoTech/NimoOS-Photos/pkg/sqlite"
+	"github.com/stretchr/testify/require"
 )
 
 // TestOpenDB verifies that Open creates all required tables.
@@ -123,5 +126,40 @@ func TestSerializeDeserialize(t *testing.T) {
 		if result[i] != v {
 			t.Errorf("index %d: got %v want %v", i, result[i], v)
 		}
+	}
+}
+
+func TestMigrateAddsNewColumns(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "test.db")
+
+	db, err := sqlite.Open(dbPath)
+	require.NoError(t, err)
+	db.Close()
+
+	// Second open must be idempotent (no error, no duplicate column attempts).
+	db2, err := sqlite.Open(dbPath)
+	require.NoError(t, err)
+	defer db2.Close()
+
+	rows, err := db2.Query(`PRAGMA table_info(asset_exif)`)
+	require.NoError(t, err)
+	defer rows.Close()
+
+	cols := map[string]bool{}
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notnull, pk int
+		var dflt sql.NullString
+		require.NoError(t, rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk))
+		cols[name] = true
+	}
+
+	for _, c := range []string{
+		"iso", "shutter_speed", "aperture", "focal_length", "orientation",
+		"video_codec", "audio_codec", "frame_rate", "bit_rate", "rotation",
+	} {
+		require.True(t, cols[c], "expected column %s to exist", c)
 	}
 }
