@@ -1,6 +1,7 @@
 package v1
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/tus/tusd/v2/pkg/handler"
@@ -24,7 +25,7 @@ func TestValidateMetadata(t *testing.T) {
 			info := handler.HookEvent{
 				Upload: handler.FileInfo{MetaData: tc.meta, Size: 1000},
 			}
-			_, err := validateMetadata(info)
+			_, err := validateMetadataWithQuota(info, func() (uint64, error) { return 1 << 40, nil })
 			if (err != nil) != tc.wantErr {
 				t.Fatalf("wantErr=%v got err=%v", tc.wantErr, err)
 			}
@@ -39,7 +40,7 @@ func TestValidateMetadata_SizeLimit(t *testing.T) {
 			Size:     21 * 1024 * 1024 * 1024, // 21 GB
 		},
 	}
-	_, err := validateMetadata(info)
+	_, err := validateMetadataWithQuota(info, func() (uint64, error) { return 1 << 40, nil })
 	if err == nil {
 		t.Fatal("expected error for oversized upload, got nil")
 	}
@@ -55,5 +56,29 @@ func TestValidateMetadata_ZeroSize(t *testing.T) {
 	_, err := validateMetadata(info)
 	if err == nil {
 		t.Fatal("expected error for zero-size upload, got nil")
+	}
+}
+
+func TestCheckQuota_Sufficient(t *testing.T) {
+	err := checkQuota(1000, func() (uint64, error) { return 1_000_000, nil })
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+}
+
+func TestCheckQuota_Insufficient(t *testing.T) {
+	// uploadLength * 1.05 > available
+	err := checkQuota(1000, func() (uint64, error) { return 1000, nil })
+	if err == nil {
+		t.Fatal("expected quota error, got nil")
+	}
+}
+
+func TestCheckQuota_StatFails(t *testing.T) {
+	err := checkQuota(1000, func() (uint64, error) {
+		return 0, fmt.Errorf("statfs failed")
+	})
+	if err == nil {
+		t.Fatal("expected error when statfs fails")
 	}
 }
