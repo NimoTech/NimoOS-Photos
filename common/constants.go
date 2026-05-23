@@ -16,3 +16,10 @@ const (
 	CLIPModelName = "ViT-B-32__openai"
 	FaceModelName = "buffalo_l"
 )
+
+// TUS upload staging
+const (
+	StagingDir    = "/DATA/.system_data/photos-tus-staging"
+	MaxUploadSize = int64(20 * 1024 * 1024 * 1024) // 20 GB
+	StagingMaxAge = 7 * 24                          // hours
+)
