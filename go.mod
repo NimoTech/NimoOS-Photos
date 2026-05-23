@@ -16,6 +16,7 @@ require (
 	github.com/rwcarlsen/goexif v0.0.0-20190401172101-9e8deecbddbd
 	github.com/spf13/viper v1.18.0
 	github.com/stretchr/testify v1.11.1
+	github.com/tus/tusd/v2 v2.8.0
 	go.uber.org/zap v1.27.1
 	golang.org/x/image v0.0.0-20191009234506-e7c1f5e7dbb8
 )
@@ -53,7 +54,6 @@ require (
 	github.com/tidwall/gjson v1.17.0 // indirect
 	github.com/tidwall/match v1.1.1 // indirect
 	github.com/tidwall/pretty v1.2.0 // indirect
-	github.com/tus/tusd/v2 v2.8.0 // indirect
 	github.com/ulikunitz/xz v0.5.11 // indirect
 	github.com/valyala/bytebufferpool v1.0.0 // indirect
 	github.com/valyala/fasttemplate v1.2.2 // indirect
