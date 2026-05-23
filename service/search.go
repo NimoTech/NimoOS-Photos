@@ -85,21 +85,27 @@ WHERE vec.embedding MATCH ? AND k = ?
 
 // Timeline returns all non-live-photo-video assets grouped by year/month in
 // descending chronological order. Assets without taken_at go into year=0, month=0.
+// The LEFT JOIN on asset_exif lets the frontend aggregate filter facets
+// (camera, location) without an extra fetch per asset.
 func (s *SearchService) Timeline() ([]TimelineGroup, error) {
 	rows, err := s.db.Query(`
-SELECT id, file_path, file_size, COALESCE(mime_type,''),
-       COALESCE(original_name,''), taken_at, duration_ms,
-       COALESCE(live_photo_video_id,''), is_live_photo_video,
-       indexed_at, status
-FROM assets
-WHERE is_live_photo_video = 0
-ORDER BY COALESCE(taken_at, indexed_at) DESC`)
+SELECT a.id, a.file_path, a.file_size, COALESCE(a.mime_type,''),
+       COALESCE(a.original_name,''), a.taken_at, a.duration_ms,
+       COALESCE(a.live_photo_video_id,''), a.is_live_photo_video,
+       a.indexed_at, a.status,
+       e.width, e.height, e.latitude, e.longitude, e.make, e.model,
+       e.iso, e.shutter_speed, e.aperture, e.focal_length, e.orientation,
+       e.video_codec, e.audio_codec, e.frame_rate, e.bit_rate, e.rotation
+FROM assets a
+LEFT JOIN asset_exif e ON e.asset_id = a.id
+WHERE a.is_live_photo_video = 0
+ORDER BY COALESCE(a.taken_at, a.indexed_at) DESC`)
 	if err != nil {
 		return nil, fmt.Errorf("Timeline query: %w", err)
 	}
 	defer rows.Close()
 
-	assets, err := scanAssets(rows)
+	assets, err := scanAssetsDetailed(rows)
 	if err != nil {
 		return nil, err
 	}
