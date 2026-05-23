@@ -131,6 +131,7 @@ type MediaInfo struct {
 	TakenAt    time.Time
 	Latitude   float64
 	Longitude  float64
+	HasLocation bool // true when Latitude/Longitude were actually parsed (distinguishes "no GPS" from Null Island)
 }
 
 type ffprobeFull struct {
@@ -234,13 +235,16 @@ func Probe(videoPath string) (*MediaInfo, error) {
 		if lat, lon, ok := ParseISO6709(loc); ok {
 			info.Latitude = lat
 			info.Longitude = lon
+			info.HasLocation = true
 		}
-	} else {
+	}
+	if !info.HasLocation {
 		for _, s := range p.Streams {
 			if loc := findLocationTag(s.Tags); loc != "" {
 				if lat, lon, ok := ParseISO6709(loc); ok {
 					info.Latitude = lat
 					info.Longitude = lon
+					info.HasLocation = true
 					break
 				}
 			}
