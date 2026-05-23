@@ -1,12 +1,17 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"image"
+	_ "image/gif"
+	_ "image/jpeg"
+	_ "image/png"
 	"io/fs"
 	"net/http"
 	"os"
@@ -14,6 +19,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	_ "golang.org/x/image/webp"
 
 	"github.com/NimoTech/NimoOS-Photos/pkg/exif"
 	"github.com/NimoTech/NimoOS-Photos/pkg/ffmpeg"
@@ -182,6 +189,14 @@ func (ix *Indexer) processFile(path string) {
 			f.Close()
 			if exifResult != nil && !exifResult.TakenAt.IsZero() {
 				takenAt = exifResult.TakenAt
+			}
+		}
+		// Most JPEGs put dimensions in the SOF marker rather than EXIF.
+		// Fall back to image.DecodeConfig (header-only decode) when EXIF lacks them.
+		if exifResult != nil && (exifResult.Width == 0 || exifResult.Height == 0) {
+			if cfg, _, derr := image.DecodeConfig(bytes.NewReader(data)); derr == nil {
+				exifResult.Width = cfg.Width
+				exifResult.Height = cfg.Height
 			}
 		}
 	}
