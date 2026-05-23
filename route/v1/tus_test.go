@@ -2,6 +2,8 @@ package v1
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/tus/tusd/v2/pkg/handler"
@@ -80,5 +82,47 @@ func TestCheckQuota_StatFails(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected error when statfs fails")
+	}
+}
+
+func TestIngestStagedFile_Success(t *testing.T) {
+	stagingDir := t.TempDir()
+	galleryDir := t.TempDir()
+
+	// Create a fake staged file
+	stagedID := "abc123"
+	stagedPath := filepath.Join(stagingDir, stagedID)
+	stagedInfo := stagedPath + ".info"
+	if err := os.WriteFile(stagedPath, []byte("imagedata"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(stagedInfo, []byte("{}"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	var enqueued []string
+	enqueue := func(p string) { enqueued = append(enqueued, p) }
+
+	err := ingestStagedFile(stagedPath, "IMG_001.jpg", "", enqueue, galleryDir)
+	if err != nil {
+		t.Fatalf("ingest failed: %v", err)
+	}
+
+	// Original moved out of staging
+	if _, e := os.Stat(stagedPath); !os.IsNotExist(e) {
+		t.Error("staged file should be removed")
+	}
+	if _, e := os.Stat(stagedInfo); !os.IsNotExist(e) {
+		t.Error(".info file should be removed")
+	}
+
+	// Should be in gallery
+	expectedDest := filepath.Join(galleryDir, "IMG_001.jpg")
+	if _, e := os.Stat(expectedDest); e != nil {
+		t.Errorf("expected file at %s: %v", expectedDest, e)
+	}
+
+	if len(enqueued) != 1 || enqueued[0] != expectedDest {
+		t.Errorf("expected indexer enqueue %s, got %v", expectedDest, enqueued)
 	}
 }

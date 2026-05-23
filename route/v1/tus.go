@@ -2,6 +2,9 @@ package v1
 
 import (
 	"fmt"
+	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"syscall"
 
@@ -61,4 +64,51 @@ func validateMetadataWithQuota(hook handler.HookEvent, quota freeBytesFn) (handl
 // validateMetadata is the production entry point used by tusd.
 func validateMetadata(hook handler.HookEvent) (handler.HTTPResponse, error) {
 	return validateMetadataWithQuota(hook, statfsDATA)
+}
+
+// ingestStagedFile moves a completed TUS upload from staging to the gallery
+// and enqueues it for indexing. albumID may be empty.
+// enqueue is injected (svc.Indexer().Enqueue in prod, fake in tests).
+func ingestStagedFile(
+	stagedPath string,
+	filename string,
+	albumID string,
+	enqueue func(path string),
+	galleryDir string,
+) error {
+	dest := filepath.Join(galleryDir, filename)
+	// Try atomic rename first (same filesystem).
+	if err := os.Rename(stagedPath, dest); err != nil {
+		// Fallback: copy + delete (cross-fs case)
+		if cerr := copyFile(stagedPath, dest); cerr != nil {
+			return fmt.Errorf("rename and copy both failed: %w / %v", err, cerr)
+		}
+		os.Remove(stagedPath) //nolint:errcheck
+	}
+	// Remove .info sidecar
+	os.Remove(stagedPath + ".info") //nolint:errcheck
+
+	enqueue(dest)
+	// albumID handling — current Indexer doesn't carry album metadata;
+	// album assignment happens via a separate call after asset record exists.
+	// Deferred to wiring task (Task 6).
+	_ = albumID
+	return nil
+}
+
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+	if _, err := io.Copy(out, in); err != nil {
+		return err
+	}
+	return nil
 }
