@@ -208,6 +208,12 @@ func (ix *Indexer) processFile(path string) {
 	if fi != nil {
 		fileSize = fi.Size()
 	}
+	// Fall back to file mtime when no embedded capture time was found.
+	// Without this, files lacking EXIF DateTime or video creation_time would
+	// all collapse to indexed_at and bunch together on the timeline.
+	if takenAt.IsZero() && fi != nil {
+		takenAt = fi.ModTime()
+	}
 	originalName := filepath.Base(path)
 
 	_, err = ix.db.Exec(`
