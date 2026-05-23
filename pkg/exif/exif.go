@@ -105,7 +105,7 @@ func Parse(r io.Reader) *Result {
 	}
 	// Shutter speed (ExposureTime, stored as Rational)
 	if tag, err := x.Get(goexif.ExposureTime); err == nil {
-		if num, den, err := tag.Rat2(0); err == nil && den != 0 {
+		if num, den, err := tag.Rat2(0); err == nil && den != 0 && num > 0 {
 			if num == 1 || num < den {
 				res.ShutterSpeed = fmt.Sprintf("%d/%d", num, den)
 			} else {
