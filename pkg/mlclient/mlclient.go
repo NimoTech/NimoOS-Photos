@@ -99,46 +99,53 @@ func parseEmbeddingString(s string) ([]float32, error) {
 	return nil, fmt.Errorf("failed to parse embedding")
 }
 
+// parseClipField extracts a []float32 from the raw JSON value of the "clip" field.
+// Immich ML may return either a JSON array [0.1, ...] or a JSON-encoded string "[0.1, ...]".
+func parseClipField(raw json.RawMessage) ([]float32, error) {
+	var vec []float32
+	if err := json.Unmarshal(raw, &vec); err == nil {
+		return vec, nil
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		return parseEmbeddingString(s)
+	}
+	return nil, fmt.Errorf("mlclient: cannot parse clip embedding")
+}
+
+// extractClip unmarshals the /predict response and returns the clip embedding.
+func extractClip(data []byte) ([]float32, error) {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return nil, fmt.Errorf("mlclient: unmarshal CLIP response: %w", err)
+	}
+	clipRaw, ok := raw["clip"]
+	if !ok {
+		return nil, fmt.Errorf("mlclient: missing clip in response")
+	}
+	return parseClipField(clipRaw)
+}
+
 // CLIPImageEmbed returns a 512-dim CLIP embedding for the given JPEG image bytes.
 func (c *MLClient) CLIPImageEmbed(imageData []byte) ([]float32, error) {
 	entries := `{"clip":{"visual":{"modelName":"ViT-B-32__openai"}}}`
 	body, ct := buildImageForm(entries, imageData)
-
 	data, err := c.post(body, ct)
 	if err != nil {
 		return nil, err
 	}
-
-	var resp map[string]string
-	if err := json.Unmarshal(data, &resp); err != nil {
-		return nil, fmt.Errorf("mlclient: unmarshal CLIP image response: %w", err)
-	}
-	embStr, ok := resp["clip"]
-	if !ok {
-		return nil, fmt.Errorf("mlclient: missing clip in response")
-	}
-	return parseEmbeddingString(embStr)
+	return extractClip(data)
 }
 
 // CLIPTextEmbed returns a 512-dim CLIP embedding for the given text string.
 func (c *MLClient) CLIPTextEmbed(text string) ([]float32, error) {
 	entries := `{"clip":{"textual":{"modelName":"ViT-B-32__openai"}}}`
 	body, ct := buildTextForm(entries, text)
-
 	data, err := c.post(body, ct)
 	if err != nil {
 		return nil, err
 	}
-
-	var resp map[string]string
-	if err := json.Unmarshal(data, &resp); err != nil {
-		return nil, fmt.Errorf("mlclient: unmarshal CLIP text response: %w", err)
-	}
-	embStr, ok := resp["clip"]
-	if !ok {
-		return nil, fmt.Errorf("mlclient: missing clip in response")
-	}
-	return parseEmbeddingString(embStr)
+	return extractClip(data)
 }
 
 // DetectAndRecognizeFaces sends a single request that performs both face detection

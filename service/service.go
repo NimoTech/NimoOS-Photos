@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"database/sql"
 	"path/filepath"
 
@@ -18,16 +19,18 @@ type Services interface {
 	Albums() *AlbumService
 	Search() *SearchService
 	Faces() *FaceService
+	RestartWatcher(dirs []string)
 }
 
 // services is the unexported implementation of Services.
 type services struct {
-	db      *sql.DB
-	indexer *Indexer
-	watcher *Watcher
-	albums  *AlbumService
-	search  *SearchService
-	faces   *FaceService
+	db        *sql.DB
+	indexer   *Indexer
+	watcher   *Watcher
+	albums    *AlbumService
+	search    *SearchService
+	faces     *FaceService
+	parentCtx context.Context
 }
 
 func (s *services) DB() *sql.DB           { return s.db }
@@ -40,7 +43,7 @@ func (s *services) Faces() *FaceService   { return s.faces }
 // NewService wires all service-layer components together from cfg and returns a
 // ready-to-use Services handle. It panics if the database cannot be opened.
 // A goroutine is started immediately to scan all WatchDirs and pair live photos.
-func NewService(cfg *config.Config) Services {
+func NewService(parentCtx context.Context, cfg *config.Config) Services {
 	// 1. Open (or create) the SQLite database.
 	dbPath := filepath.Join(cfg.DataPath, "photos.db")
 	db, err := sqlite.Open(dbPath)
@@ -63,8 +66,10 @@ func NewService(cfg *config.Config) Services {
 	faces := NewFaceService(db)
 
 	// 5. Kick off the initial directory scan in the background so startup is
-	//    non-blocking. Live-photo pairing runs after all directories are queued.
+	//    non-blocking. ScanPending retries assets that failed in a prior run
+	//    (e.g. unsupported format that now has a fallback decoder).
 	go func() {
+		idx.ScanPending()
 		for _, dir := range cfg.WatchDirs {
 			idx.ScanDirectory(dir) //nolint:errcheck
 		}
@@ -72,11 +77,16 @@ func NewService(cfg *config.Config) Services {
 	}()
 
 	return &services{
-		db:      db,
-		indexer: idx,
-		watcher: watcher,
-		albums:  albums,
-		search:  search,
-		faces:   faces,
+		db:        db,
+		indexer:   idx,
+		watcher:   watcher,
+		albums:    albums,
+		search:    search,
+		faces:     faces,
+		parentCtx: parentCtx,
 	}
+}
+
+func (s *services) RestartWatcher(dirs []string) {
+	s.watcher.Restart(s.parentCtx, dirs)
 }

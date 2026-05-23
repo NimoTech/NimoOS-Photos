@@ -70,3 +70,20 @@ func Init(configFile, confSample string) error {
 	}
 	return nil
 }
+
+// Save writes watchDirs back to the config file and updates the in-memory Cfg.
+func Save(watchDirs []string) error {
+	if Cfg == nil {
+		return fmt.Errorf("config not initialized")
+	}
+	v := viper.New()
+	v.SetConfigFile("/etc/nimoos/photos.conf")
+	v.SetConfigType("ini")
+	_ = v.ReadInConfig()
+	v.Set("photos.WatchDirs", strings.Join(watchDirs, ","))
+	if err := v.WriteConfig(); err != nil {
+		return fmt.Errorf("config.Save: %w", err)
+	}
+	Cfg.WatchDirs = watchDirs
+	return nil
+}

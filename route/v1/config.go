@@ -1,0 +1,40 @@
+package v1
+
+import (
+	"net/http"
+
+	"github.com/NimoTech/NimoOS-Photos/pkg/config"
+	"github.com/NimoTech/NimoOS-Photos/service"
+	"github.com/labstack/echo/v4"
+)
+
+type ConfigHandler struct{ svc service.Services }
+
+func NewConfigHandler(svc service.Services) *ConfigHandler { return &ConfigHandler{svc} }
+
+// GET /v1/photos/config
+func (h *ConfigHandler) GetConfig(c echo.Context) error {
+	dirs := config.Cfg.WatchDirs
+	if dirs == nil {
+		dirs = []string{}
+	}
+	return c.JSON(http.StatusOK, map[string]interface{}{"watchDirs": dirs})
+}
+
+// PUT /v1/photos/config
+func (h *ConfigHandler) UpdateConfig(c echo.Context) error {
+	var req struct {
+		WatchDirs []string `json:"watchDirs"`
+	}
+	if err := c.Bind(&req); err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, "invalid request body")
+	}
+	if len(req.WatchDirs) == 0 {
+		return echo.NewHTTPError(http.StatusBadRequest, "watchDirs must not be empty")
+	}
+	if err := config.Save(req.WatchDirs); err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	}
+	h.svc.RestartWatcher(req.WatchDirs)
+	return c.JSON(http.StatusOK, map[string]interface{}{"watchDirs": req.WatchDirs})
+}

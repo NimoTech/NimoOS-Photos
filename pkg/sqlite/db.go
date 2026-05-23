@@ -44,7 +44,7 @@ func DeserializeFloat32(b []byte) []float32 {
 // Open opens (or creates) a SQLite database at the given path, enables
 // WAL mode and foreign keys, and runs the full schema migration.
 func Open(path string) (*sql.DB, error) {
-	dsn := fmt.Sprintf("file:%s?_journal_mode=WAL&_foreign_keys=on", path)
+	dsn := fmt.Sprintf("file:%s?_journal_mode=WAL&_foreign_keys=on&_busy_timeout=5000", path)
 	db, err := sql.Open("sqlite3", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("sqlite.Open: %w", err)

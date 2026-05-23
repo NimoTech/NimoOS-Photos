@@ -21,7 +21,6 @@ import (
 	"github.com/NimoTech/NimoOS-Photos/pkg/sqlite"
 	"github.com/NimoTech/NimoOS-Photos/pkg/thumb"
 	"github.com/google/uuid"
-	"go.uber.org/zap"
 )
 
 // MLProvider is the interface the Indexer uses for ML inference.
@@ -189,12 +188,22 @@ func (ix *Indexer) processFile(path string) {
 	_, err = ix.db.Exec(`
 		INSERT INTO assets(id, file_path, file_size, mime_type, original_name,
 		                   taken_at, duration_ms, is_live_photo_video, status, checksum)
-		VALUES(?,?,?,?,?,?,?,0,'pending',?)`,
+		VALUES(?,?,?,?,?,?,?,0,'pending',?)
+		ON CONFLICT(file_path) DO UPDATE SET
+		  checksum=excluded.checksum,
+		  file_size=excluded.file_size,
+		  mime_type=excluded.mime_type,
+		  status='pending'`,
 		assetID, path, fileSize, mime, originalName,
 		nullTime(takenAt), sqlNullInt64(durationMs),
 		checksum,
 	)
 	if err != nil {
+		return
+	}
+	// After upsert, look up the actual asset ID in case it was an existing record.
+	if scanErr := ix.db.QueryRow(`SELECT id FROM assets WHERE file_path=?`, path).Scan(&assetID); scanErr != nil {
+		fmt.Fprintf(os.Stderr, "[indexer] assetID lookup failed for %s: %v\n", path, scanErr)
 		return
 	}
 
@@ -251,8 +260,7 @@ func (ix *Indexer) processFile(path string) {
 						`INSERT INTO face_detections(id, asset_id, bbox, embedding) VALUES(?,?,?,?)`,
 						faceID, assetID, string(bboxJSON), sqlite.SerializeFloat32(face.Embedding),
 					); err != nil {
-						zap.L().Error("indexer: failed to insert face_detection",
-							zap.String("assetID", assetID), zap.Error(err))
+						fmt.Fprintf(os.Stderr, "[indexer] failed to insert face_detection %s: %v\n", assetID, err)
 					}
 				}
 			}
@@ -264,8 +272,7 @@ func (ix *Indexer) processFile(path string) {
 		UPDATE assets SET status='indexed', indexed_at=? WHERE id=?`,
 		time.Now(), assetID,
 	); err != nil {
-		zap.L().Error("indexer: failed to mark asset as indexed",
-			zap.String("assetID", assetID), zap.Error(err))
+		fmt.Fprintf(os.Stderr, "[indexer] failed to mark asset indexed %s: %v\n", assetID, err)
 	}
 }
 
@@ -282,8 +289,7 @@ func (ix *Indexer) writeClipEmbedding(assetID string, vec []float32) {
 	if rowid > 0 {
 		blob := sqlite.SerializeFloat32(vec)
 		if _, err := ix.db.Exec(`INSERT OR REPLACE INTO clip_embeddings(rowid, embedding) VALUES(?,?)`, rowid, blob); err != nil {
-			zap.L().Error("indexer: failed to upsert clip_embeddings",
-				zap.String("assetID", assetID), zap.Error(err))
+			fmt.Fprintf(os.Stderr, "[indexer] failed to upsert clip_embeddings %s: %v\n", assetID, err)
 		}
 	}
 }
@@ -294,9 +300,10 @@ func sha256File(data []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// ScanDirectory walks dir and enqueues all supported media files.
+// ScanDirectory walks dir, enqueues all supported media files found on disk,
+// and prunes asset rows under dir whose backing files no longer exist.
 func (ix *Indexer) ScanDirectory(dir string) error {
-	return filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+	if err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
 			return err
 		}
@@ -305,7 +312,69 @@ func (ix *Indexer) ScanDirectory(dir string) error {
 			ix.Enqueue(path)
 		}
 		return nil
-	})
+	}); err != nil {
+		return err
+	}
+	return ix.pruneMissingUnder(dir)
+}
+
+// RemoveByPath deletes the asset row for path (if any) and removes its
+// thumbnail directory from disk. Safe to call for paths that are not indexed.
+func (ix *Indexer) RemoveByPath(path string) {
+	var id string
+	err := ix.db.QueryRow(`SELECT id FROM assets WHERE file_path = ?`, path).Scan(&id)
+	if err == sql.ErrNoRows {
+		return
+	}
+	if err != nil {
+		return
+	}
+	if _, err := ix.db.Exec(`DELETE FROM assets WHERE id = ?`, id); err != nil {
+		return
+	}
+	if ix.thumbDir != "" && id != "" {
+		_ = os.RemoveAll(filepath.Join(ix.thumbDir, id))
+	}
+	ix.seen.Delete(path)
+}
+
+// pruneMissingUnder removes asset rows whose file_path is under dir but whose
+// file no longer exists on disk. Thumbnails for removed assets are deleted too.
+func (ix *Indexer) pruneMissingUnder(dir string) error {
+	prefix := strings.TrimRight(dir, string(filepath.Separator)) + string(filepath.Separator)
+	rows, err := ix.db.Query(
+		`SELECT id, file_path FROM assets WHERE file_path = ? OR file_path LIKE ?`,
+		dir, prefix+"%",
+	)
+	if err != nil {
+		return fmt.Errorf("pruneMissingUnder query: %w", err)
+	}
+	type row struct{ id, path string }
+	var gone []row
+	for rows.Next() {
+		var r row
+		if err := rows.Scan(&r.id, &r.path); err != nil {
+			rows.Close()
+			return err
+		}
+		if _, statErr := os.Stat(r.path); os.IsNotExist(statErr) {
+			gone = append(gone, r)
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, r := range gone {
+		if _, err := ix.db.Exec(`DELETE FROM assets WHERE id = ?`, r.id); err != nil {
+			continue
+		}
+		if ix.thumbDir != "" {
+			_ = os.RemoveAll(filepath.Join(ix.thumbDir, r.id))
+		}
+		ix.seen.Delete(r.path)
+	}
+	return nil
 }
 
 // ScanPending enqueues all assets currently in 'pending' status.

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/fsnotify/fsnotify"
 	"go.uber.org/zap"
@@ -17,6 +18,8 @@ type Watcher struct {
 	watchDirs []string
 	indexer   *Indexer
 	liveDir   string
+	cancel    context.CancelFunc
+	mu        sync.Mutex
 }
 
 // NewWatcher creates a new Watcher.
@@ -31,8 +34,18 @@ func NewWatcher(db *sql.DB, watchDirs []string, indexer *Indexer, liveDir string
 
 // Start begins watching all configured directories. Directories that cannot be
 // watched are logged as warnings but do not abort startup. The function blocks
-// until ctx is cancelled.
-func (w *Watcher) Start(ctx context.Context) {
+// until the internal context (derived from parentCtx) is cancelled. Calling
+// Restart cancels the previous Start goroutine and spawns a new one.
+func (w *Watcher) Start(parentCtx context.Context) {
+	w.mu.Lock()
+	ctx, cancel := context.WithCancel(parentCtx)
+	if w.cancel != nil {
+		w.cancel()
+	}
+	w.cancel = cancel
+	dirs := append([]string(nil), w.watchDirs...)
+	w.mu.Unlock()
+
 	fw, err := fsnotify.NewWatcher()
 	if err != nil {
 		zap.L().Error("watcher: failed to create fsnotify watcher", zap.Error(err))
@@ -40,7 +53,7 @@ func (w *Watcher) Start(ctx context.Context) {
 	}
 	defer fw.Close()
 
-	for _, dir := range w.watchDirs {
+	for _, dir := range dirs {
 		if addErr := fw.Add(dir); addErr != nil {
 			zap.L().Warn("watcher: failed to watch directory",
 				zap.String("dir", dir), zap.Error(addErr))
@@ -60,6 +73,11 @@ func (w *Watcher) Start(ctx context.Context) {
 					w.indexer.Enqueue(event.Name)
 				}
 			}
+			if event.Has(fsnotify.Remove) || event.Has(fsnotify.Rename) {
+				if isSupportedMedia(event.Name) {
+					w.indexer.RemoveByPath(event.Name)
+				}
+			}
 		case watchErr, ok := <-fw.Errors:
 			if !ok {
 				return
@@ -67,6 +85,14 @@ func (w *Watcher) Start(ctx context.Context) {
 			zap.L().Warn("watcher: fsnotify error", zap.Error(watchErr))
 		}
 	}
+}
+
+// Restart updates the watched directories and restarts the watcher goroutine.
+func (w *Watcher) Restart(parentCtx context.Context, dirs []string) {
+	w.mu.Lock()
+	w.watchDirs = dirs
+	w.mu.Unlock()
+	go w.Start(parentCtx)
 }
 
 // PairLivePhotos scans all un-paired MOV files and attempts to match them with

@@ -29,9 +29,17 @@ func InitRouter(svc service.Services, runtimePath string, thumbDir string) http.
 
 	e.Use(echo_middleware.JWTWithConfig(echo_middleware.JWTConfig{
 		Skipper: func(c echo.Context) bool {
+			// Media serving endpoints: thumbnail/original/live are already
+			// protected by the Gateway; <img> tags can't send Authorization headers.
+			p := c.Path()
+			if strings.HasSuffix(p, "/thumbnail") ||
+				strings.HasSuffix(p, "/original") ||
+				strings.HasSuffix(p, "/live") {
+				return true
+			}
 			// Allow internal service calls from localhost (e.g. NimoOS-AI agent)
 			// to POST /search/smart without a JWT.
-			return strings.HasSuffix(c.Path(), "/search/smart") &&
+			return strings.HasSuffix(p, "/search/smart") &&
 				strings.HasPrefix(c.RealIP(), "127.")
 		},
 		ParseTokenFunc: func(token string, c echo.Context) (interface{}, error) {
@@ -99,6 +107,10 @@ func InitRouter(svc service.Services, runtimePath string, thumbDir string) http.
 	// Indexer status/control
 	g.GET("/status", index.Status)
 	g.POST("/scan", index.Scan)
+
+	cfg := v1.NewConfigHandler(svc)
+	g.GET("/config", cfg.GetConfig)
+	g.PUT("/config", cfg.UpdateConfig)
 
 	return e
 }
