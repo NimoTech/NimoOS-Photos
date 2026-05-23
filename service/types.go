@@ -15,6 +15,24 @@ type Asset struct {
 	IndexedAt        *time.Time `json:"indexedAt,omitempty"`
 	Status           string     `json:"status"`
 	Checksum         string     `json:"checksum,omitempty"`
+
+	// Joined from asset_exif (populated by GetAsset; absent in ListAssets/SmartSearch).
+	Width        int     `json:"width,omitempty"`
+	Height       int     `json:"height,omitempty"`
+	Latitude     float64 `json:"latitude,omitempty"`
+	Longitude    float64 `json:"longitude,omitempty"`
+	Make         string  `json:"make,omitempty"`
+	Model        string  `json:"model,omitempty"`
+	ISO          int     `json:"iso,omitempty"`
+	ShutterSpeed string  `json:"shutterSpeed,omitempty"`
+	Aperture     float64 `json:"aperture,omitempty"`
+	FocalLength  float64 `json:"focalLength,omitempty"`
+	Orientation  int     `json:"orientation,omitempty"`
+	VideoCodec   string  `json:"videoCodec,omitempty"`
+	AudioCodec   string  `json:"audioCodec,omitempty"`
+	FrameRate    float64 `json:"frameRate,omitempty"`
+	BitRate      int64   `json:"bitRate,omitempty"`
+	Rotation     int     `json:"rotation,omitempty"`
 }
 
 type AssetExif struct {

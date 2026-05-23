@@ -78,3 +78,66 @@ func TestListAssets(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, assets, 3)
 }
+
+func TestGetAssetReturnsImageMetadata(t *testing.T) {
+	db, err := sqlite.Open(filepath.Join(t.TempDir(), "img.db"))
+	require.NoError(t, err)
+	defer db.Close()
+
+	_, err = db.Exec(`INSERT INTO assets(id, file_path, status, mime_type) VALUES('img1','/tmp/x.jpg','indexed','image/jpeg')`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO asset_exif(asset_id, width, height, iso, aperture, make, focal_length, orientation)
+		VALUES('img1', 4000, 3000, 800, 1.8, 'Apple', 35.0, 1)`)
+	require.NoError(t, err)
+
+	svc := service.NewSearchService(db, nil)
+	a, err := svc.GetAsset("img1")
+	require.NoError(t, err)
+	require.Equal(t, 4000, a.Width)
+	require.Equal(t, 3000, a.Height)
+	require.Equal(t, 800, a.ISO)
+	require.InDelta(t, 1.8, a.Aperture, 1e-6)
+	require.Equal(t, "Apple", a.Make)
+	require.InDelta(t, 35.0, a.FocalLength, 1e-6)
+	require.Equal(t, 1, a.Orientation)
+}
+
+func TestGetAssetReturnsVideoMetadata(t *testing.T) {
+	db, err := sqlite.Open(filepath.Join(t.TempDir(), "vid.db"))
+	require.NoError(t, err)
+	defer db.Close()
+
+	_, err = db.Exec(`INSERT INTO assets(id, file_path, status, mime_type) VALUES('vid1','/tmp/x.mp4','indexed','video/mp4')`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO asset_exif(asset_id, width, height, video_codec, audio_codec, frame_rate, bit_rate, rotation, latitude, longitude)
+		VALUES('vid1', 1920, 1080, 'h264', 'aac', 29.97, 12000000, 90, 39.9, 116.4)`)
+	require.NoError(t, err)
+
+	svc := service.NewSearchService(db, nil)
+	a, err := svc.GetAsset("vid1")
+	require.NoError(t, err)
+	require.Equal(t, 1920, a.Width)
+	require.Equal(t, 1080, a.Height)
+	require.Equal(t, "h264", a.VideoCodec)
+	require.Equal(t, "aac", a.AudioCodec)
+	require.InDelta(t, 29.97, a.FrameRate, 1e-3)
+	require.Equal(t, int64(12000000), a.BitRate)
+	require.Equal(t, 90, a.Rotation)
+	require.InDelta(t, 39.9, a.Latitude, 1e-6)
+	require.InDelta(t, 116.4, a.Longitude, 1e-6)
+}
+
+func TestGetAssetWithoutExifRow(t *testing.T) {
+	db, err := sqlite.Open(filepath.Join(t.TempDir(), "bare.db"))
+	require.NoError(t, err)
+	defer db.Close()
+
+	_, err = db.Exec(`INSERT INTO assets(id, file_path, status) VALUES('bare','/tmp/y.jpg','indexed')`)
+	require.NoError(t, err)
+
+	svc := service.NewSearchService(db, nil)
+	a, err := svc.GetAsset("bare")
+	require.NoError(t, err)
+	require.Equal(t, "bare", a.ID)
+	require.Equal(t, 0, a.Width)
+}

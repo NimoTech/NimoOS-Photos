@@ -231,17 +231,22 @@ LIMIT ? OFFSET ?`, limit, offset)
 // GetAsset returns a single asset by ID; returns ErrNotFound when absent.
 func (s *SearchService) GetAsset(id string) (*Asset, error) {
 	rows, err := s.db.Query(`
-SELECT id, file_path, file_size, COALESCE(mime_type,''),
-       COALESCE(original_name,''), taken_at, duration_ms,
-       COALESCE(live_photo_video_id,''), is_live_photo_video,
-       indexed_at, status
-FROM assets WHERE id=?`, id)
+SELECT a.id, a.file_path, a.file_size, COALESCE(a.mime_type,''),
+       COALESCE(a.original_name,''), a.taken_at, a.duration_ms,
+       COALESCE(a.live_photo_video_id,''), a.is_live_photo_video,
+       a.indexed_at, a.status,
+       e.width, e.height, e.latitude, e.longitude, e.make, e.model,
+       e.iso, e.shutter_speed, e.aperture, e.focal_length, e.orientation,
+       e.video_codec, e.audio_codec, e.frame_rate, e.bit_rate, e.rotation
+FROM assets a
+LEFT JOIN asset_exif e ON e.asset_id = a.id
+WHERE a.id = ?`, id)
 	if err != nil {
 		return nil, fmt.Errorf("GetAsset query: %w", err)
 	}
 	defer rows.Close()
 
-	assets, err := scanAssets(rows)
+	assets, err := scanAssetsDetailed(rows)
 	if err != nil {
 		return nil, err
 	}
