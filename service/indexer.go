@@ -221,10 +221,13 @@ func (ix *Indexer) processFile(path string) {
 		                   taken_at, duration_ms, is_live_photo_video, status, checksum)
 		VALUES(?,?,?,?,?,?,?,0,'pending',?)
 		ON CONFLICT(file_path) DO UPDATE SET
-		  checksum=excluded.checksum,
-		  file_size=excluded.file_size,
-		  mime_type=excluded.mime_type,
-		  status='pending'`,
+		  checksum      = excluded.checksum,
+		  file_size     = excluded.file_size,
+		  mime_type     = excluded.mime_type,
+		  original_name = excluded.original_name,
+		  taken_at      = excluded.taken_at,
+		  duration_ms   = excluded.duration_ms,
+		  status        = 'pending'`,
 		assetID, path, fileSize, mime, originalName,
 		nullTime(takenAt), sqlNullInt64(durationMs),
 		checksum,
