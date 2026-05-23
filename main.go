@@ -73,6 +73,22 @@ func main() {
 	go svc.Watcher().Start(ctx)
 	go svc.Indexer().Start(ctx)
 
+	// Prune orphaned TUS staging files at startup (one-shot) and then daily.
+	go func() {
+		if n, err := service.PruneStaging(common.StagingDir, time.Duration(common.StagingMaxAge)*time.Hour); err != nil {
+			zap.L().Warn("PruneStaging failed", zap.Error(err))
+		} else if n > 0 {
+			zap.L().Info("PruneStaging removed orphans", zap.Int("count", n))
+		}
+	}()
+	go func() {
+		ticker := time.NewTicker(24 * time.Hour)
+		defer ticker.Stop()
+		for range ticker.C {
+			service.PruneStaging(common.StagingDir, time.Duration(common.StagingMaxAge)*time.Hour) //nolint:errcheck
+		}
+	}()
+
 	// Bind to a random port on localhost
 	listener, err := net.Listen("tcp", net.JoinHostPort(common.Localhost, "0"))
 	if err != nil {

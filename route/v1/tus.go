@@ -3,13 +3,17 @@ package v1
 import (
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"syscall"
 
 	"github.com/NimoTech/NimoOS-Photos/common"
+	"github.com/NimoTech/NimoOS-Photos/service"
+	"github.com/tus/tusd/v2/pkg/filestore"
 	"github.com/tus/tusd/v2/pkg/handler"
+	"go.uber.org/zap"
 )
 
 // freeBytesFn returns available bytes on /DATA. Injectable for tests.
@@ -40,29 +44,29 @@ func checkQuota(uploadLength int64, available freeBytesFn) error {
 }
 
 // validateMetadataWithQuota checks metadata and quota with an injectable free-bytes provider.
-func validateMetadataWithQuota(hook handler.HookEvent, quota freeBytesFn) (handler.HTTPResponse, error) {
+func validateMetadataWithQuota(hook handler.HookEvent, quota freeBytesFn) (handler.HTTPResponse, handler.FileInfoChanges, error) {
 	meta := hook.Upload.MetaData
 	name := strings.TrimSpace(meta["filename"])
 	if name == "" {
-		return handler.HTTPResponse{}, fmt.Errorf("filename metadata required")
+		return handler.HTTPResponse{}, handler.FileInfoChanges{}, fmt.Errorf("filename metadata required")
 	}
 	if strings.ContainsAny(name, "/\\") || strings.Contains(name, "..") {
-		return handler.HTTPResponse{}, fmt.Errorf("filename contains illegal characters")
+		return handler.HTTPResponse{}, handler.FileInfoChanges{}, fmt.Errorf("filename contains illegal characters")
 	}
 	if hook.Upload.Size <= 0 {
-		return handler.HTTPResponse{}, fmt.Errorf("empty file rejected")
+		return handler.HTTPResponse{}, handler.FileInfoChanges{}, fmt.Errorf("empty file rejected")
 	}
 	if hook.Upload.Size > common.MaxUploadSize {
-		return handler.HTTPResponse{}, fmt.Errorf("file exceeds %d byte limit", common.MaxUploadSize)
+		return handler.HTTPResponse{}, handler.FileInfoChanges{}, fmt.Errorf("file exceeds %d byte limit", common.MaxUploadSize)
 	}
 	if err := checkQuota(hook.Upload.Size, quota); err != nil {
-		return handler.HTTPResponse{StatusCode: 413}, err
+		return handler.HTTPResponse{StatusCode: 413}, handler.FileInfoChanges{}, err
 	}
-	return handler.HTTPResponse{}, nil
+	return handler.HTTPResponse{}, handler.FileInfoChanges{}, nil
 }
 
 // validateMetadata is the production entry point used by tusd.
-func validateMetadata(hook handler.HookEvent) (handler.HTTPResponse, error) {
+func validateMetadata(hook handler.HookEvent) (handler.HTTPResponse, handler.FileInfoChanges, error) {
 	return validateMetadataWithQuota(hook, statfsDATA)
 }
 
@@ -111,4 +115,46 @@ func copyFile(src, dst string) error {
 		return err
 	}
 	return nil
+}
+
+// NewTUSHandler creates the tusd handler wired to the staging dir,
+// metadata validator, and complete-hook → Indexer.
+// Returns an http.Handler that Echo can wrap via echo.WrapHandler.
+func NewTUSHandler(svc service.Services, galleryDir string) (http.Handler, error) {
+	if err := os.MkdirAll(common.StagingDir, 0700); err != nil {
+		return nil, fmt.Errorf("mkdir staging: %w", err)
+	}
+	store := filestore.New(common.StagingDir)
+	composer := handler.NewStoreComposer()
+	store.UseIn(composer)
+
+	tusH, err := handler.NewHandler(handler.Config{
+		BasePath:                "/v1/upload-tus/",
+		StoreComposer:           composer,
+		NotifyCompleteUploads:   true,
+		MaxSize:                 common.MaxUploadSize,
+		PreUploadCreateCallback: validateMetadata,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	// Run complete-hook drain in a goroutine.
+	go func() {
+		for event := range tusH.CompleteUploads {
+			stagedPath := filepath.Join(common.StagingDir, event.Upload.ID)
+			filename := event.Upload.MetaData["filename"]
+			albumID := event.Upload.MetaData["albumId"]
+			if err := ingestStagedFile(
+				stagedPath, filename, albumID,
+				svc.Indexer().Enqueue, galleryDir,
+			); err != nil {
+				zap.L().Error("ingestStagedFile failed",
+					zap.String("id", event.Upload.ID),
+					zap.Error(err))
+			}
+		}
+	}()
+
+	return tusH, nil
 }

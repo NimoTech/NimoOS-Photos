@@ -10,6 +10,7 @@ import (
 
 	"github.com/NimoTech/NimoOS-Photos/service"
 	"github.com/labstack/echo/v4"
+	"go.uber.org/zap"
 )
 
 // AssetsHandler handles media asset CRUD and file serving endpoints.
@@ -57,6 +58,9 @@ func (h *AssetsHandler) Get(c echo.Context) error {
 // Upload accepts a multipart file upload, writes it to /DATA/Gallery, and
 // enqueues the file for indexing.
 func (h *AssetsHandler) Upload(c echo.Context) error {
+	zap.L().Warn("deprecated endpoint /v1/assets/upload used, prefer /v1/upload-tus/",
+		zap.String("ip", c.RealIP()),
+	)
 	file, err := c.FormFile("file")
 	if err != nil {
 		return echo.NewHTTPError(http.StatusBadRequest, "file field required")

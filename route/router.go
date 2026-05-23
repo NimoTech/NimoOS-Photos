@@ -13,6 +13,7 @@ import (
 	"github.com/NimoTech/NimoOS-Photos/service"
 	"github.com/labstack/echo/v4"
 	echo_middleware "github.com/labstack/echo/v4/middleware"
+	"go.uber.org/zap"
 )
 
 // InitRouter sets up the Echo router with JWT middleware and all v1 routes.
@@ -29,6 +30,10 @@ func InitRouter(svc service.Services, runtimePath string, thumbDir string) http.
 
 	e.Use(echo_middleware.JWTWithConfig(echo_middleware.JWTConfig{
 		Skipper: func(c echo.Context) bool {
+			// Allow CORS preflight — TUS client sends OPTIONS before every request.
+			if c.Request().Method == http.MethodOptions {
+				return true
+			}
 			// Media serving endpoints: thumbnail/original/live are already
 			// protected by the Gateway; <img> tags can't send Authorization headers.
 			p := c.Path()
@@ -111,6 +116,16 @@ func InitRouter(svc service.Services, runtimePath string, thumbDir string) http.
 	cfg := v1.NewConfigHandler(svc)
 	g.GET("/config", cfg.GetConfig)
 	g.PUT("/config", cfg.UpdateConfig)
+
+	// TUS resumable upload endpoints — register outside the v1 group so the
+	// path is exactly /v1/upload-tus (matching the frontend tusClient base URL).
+	tusH, err := v1.NewTUSHandler(svc, "/DATA/Gallery")
+	if err != nil {
+		zap.L().Fatal("failed to init TUS handler", zap.Error(err))
+	}
+	// TUS protocol uses POST/PATCH/HEAD/OPTIONS on the base path and child paths.
+	e.Any("/v1/upload-tus", echo.WrapHandler(tusH))
+	e.Any("/v1/upload-tus/*", echo.WrapHandler(tusH))
 
 	return e
 }

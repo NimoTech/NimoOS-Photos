@@ -27,7 +27,7 @@ func TestValidateMetadata(t *testing.T) {
 			info := handler.HookEvent{
 				Upload: handler.FileInfo{MetaData: tc.meta, Size: 1000},
 			}
-			_, err := validateMetadataWithQuota(info, func() (uint64, error) { return 1 << 40, nil })
+			_, _, err := validateMetadataWithQuota(info, func() (uint64, error) { return 1 << 40, nil })
 			if (err != nil) != tc.wantErr {
 				t.Fatalf("wantErr=%v got err=%v", tc.wantErr, err)
 			}
@@ -42,7 +42,7 @@ func TestValidateMetadata_SizeLimit(t *testing.T) {
 			Size:     21 * 1024 * 1024 * 1024, // 21 GB
 		},
 	}
-	_, err := validateMetadataWithQuota(info, func() (uint64, error) { return 1 << 40, nil })
+	_, _, err := validateMetadataWithQuota(info, func() (uint64, error) { return 1 << 40, nil })
 	if err == nil {
 		t.Fatal("expected error for oversized upload, got nil")
 	}
@@ -55,7 +55,7 @@ func TestValidateMetadata_ZeroSize(t *testing.T) {
 			Size:     0,
 		},
 	}
-	_, err := validateMetadata(info)
+	_, _, err := validateMetadata(info)
 	if err == nil {
 		t.Fatal("expected error for zero-size upload, got nil")
 	}
