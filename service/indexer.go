@@ -353,6 +353,10 @@ func (ix *Indexer) processFile(path string) {
 }
 
 // writeClipEmbedding upserts the CLIP embedding for the given asset.
+// clip_embeddings is a sqlite-vec vec0 virtual table that does NOT support
+// INSERT OR REPLACE, so we try UPDATE first and fall back to INSERT when no row
+// is affected. That also self-heals partial state (asset_clip_idx row exists
+// but clip_embeddings row was never written).
 func (ix *Indexer) writeClipEmbedding(assetID string, vec []float32) {
 	var rowid int64
 	err := ix.db.QueryRow(`SELECT rowid FROM asset_clip_idx WHERE asset_id=?`, assetID).Scan(&rowid)
@@ -362,11 +366,20 @@ func (ix *Indexer) writeClipEmbedding(assetID string, vec []float32) {
 			rowid, _ = res.LastInsertId()
 		}
 	}
-	if rowid > 0 {
-		blob := sqlite.SerializeFloat32(vec)
-		if _, err := ix.db.Exec(`INSERT OR REPLACE INTO clip_embeddings(rowid, embedding) VALUES(?,?)`, rowid, blob); err != nil {
-			fmt.Fprintf(os.Stderr, "[indexer] failed to upsert clip_embeddings %s: %v\n", assetID, err)
-		}
+	if rowid <= 0 {
+		return
+	}
+	blob := sqlite.SerializeFloat32(vec)
+	res, err := ix.db.Exec(`UPDATE clip_embeddings SET embedding=? WHERE rowid=?`, blob, rowid)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[indexer] update clip_embeddings %s: %v\n", assetID, err)
+		return
+	}
+	if n, _ := res.RowsAffected(); n > 0 {
+		return
+	}
+	if _, err := ix.db.Exec(`INSERT INTO clip_embeddings(rowid, embedding) VALUES(?,?)`, rowid, blob); err != nil {
+		fmt.Fprintf(os.Stderr, "[indexer] insert clip_embeddings %s: %v\n", assetID, err)
 	}
 }
 
