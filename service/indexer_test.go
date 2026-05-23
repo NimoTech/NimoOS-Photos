@@ -124,3 +124,79 @@ func TestIndexerDeduplicates(t *testing.T) {
 	).Scan(&count))
 	require.Equal(t, 1, count, "duplicate enqueue must not create duplicate DB rows")
 }
+
+// TestAssetExifUpsertReplacesOnConflict drives the asset_exif upsert SQL
+// directly to confirm that ON CONFLICT(asset_id) DO UPDATE replaces only the
+// columns listed in the DO UPDATE clause, leaving previously-written columns
+// untouched. This guards the indexer's image→video sequential write path.
+func TestAssetExifUpsertReplacesOnConflict(t *testing.T) {
+	dir := t.TempDir()
+	db, err := sqlite.Open(filepath.Join(dir, "test.db"))
+	require.NoError(t, err)
+	defer db.Close()
+
+	// Seed an asset row so the FK is satisfied.
+	_, err = db.Exec(`INSERT INTO assets(id, file_path, status) VALUES('a1','/tmp/a.jpg','pending')`)
+	require.NoError(t, err)
+
+	// First write (image-style: with iso).
+	_, err = db.Exec(`
+		INSERT INTO asset_exif(asset_id, width, height, iso, aperture, make)
+		VALUES('a1', 100, 200, 800, 1.8, 'Apple')
+		ON CONFLICT(asset_id) DO UPDATE SET
+		  width = excluded.width,
+		  height = excluded.height,
+		  iso = excluded.iso,
+		  aperture = excluded.aperture,
+		  make = excluded.make`)
+	require.NoError(t, err)
+
+	var width, iso int
+	var aperture float64
+	var make string
+	require.NoError(t, db.QueryRow(
+		`SELECT width, iso, aperture, make FROM asset_exif WHERE asset_id='a1'`,
+	).Scan(&width, &iso, &aperture, &make))
+	require.Equal(t, 100, width)
+	require.Equal(t, 800, iso)
+	require.InDelta(t, 1.8, aperture, 1e-6)
+	require.Equal(t, "Apple", make)
+
+	// Second write (video-style: different columns; conflicts on asset_id).
+	_, err = db.Exec(`
+		INSERT INTO asset_exif(asset_id, width, height, video_codec, frame_rate, bit_rate, rotation)
+		VALUES('a1', 1920, 1080, 'h264', 29.97, 12000000, 90)
+		ON CONFLICT(asset_id) DO UPDATE SET
+		  width = excluded.width,
+		  height = excluded.height,
+		  video_codec = excluded.video_codec,
+		  frame_rate = excluded.frame_rate,
+		  bit_rate = excluded.bit_rate,
+		  rotation = excluded.rotation`)
+	require.NoError(t, err)
+
+	var w2, h2, br, rot int
+	var codec string
+	var fps float64
+	require.NoError(t, db.QueryRow(
+		`SELECT width, height, video_codec, frame_rate, bit_rate, rotation FROM asset_exif WHERE asset_id='a1'`,
+	).Scan(&w2, &h2, &codec, &fps, &br, &rot))
+	require.Equal(t, 1920, w2)
+	require.Equal(t, 1080, h2)
+	require.Equal(t, "h264", codec)
+	require.InDelta(t, 29.97, fps, 1e-3)
+	require.Equal(t, 12000000, br)
+	require.Equal(t, 90, rot)
+
+	// Image-side columns from the first write should still be there (they were
+	// NOT listed in the second upsert's DO UPDATE clause).
+	var oldIso int
+	var oldAp float64
+	var oldMake string
+	require.NoError(t, db.QueryRow(
+		`SELECT iso, aperture, make FROM asset_exif WHERE asset_id='a1'`,
+	).Scan(&oldIso, &oldAp, &oldMake))
+	require.Equal(t, 800, oldIso)
+	require.InDelta(t, 1.8, oldAp, 1e-6)
+	require.Equal(t, "Apple", oldMake)
+}
