@@ -38,3 +38,33 @@ func TestGetDurationNonexistent(t *testing.T) {
 	_, err := ffmpeg.GetDurationMs("/nonexistent/path/video.mp4")
 	require.Error(t, err)
 }
+
+func TestProbeNonexistent(t *testing.T) {
+	if _, err := exec.LookPath("ffprobe"); err != nil {
+		t.Skip("ffprobe not found in PATH")
+	}
+	_, err := ffmpeg.Probe("/nonexistent/path/video.mp4")
+	require.Error(t, err)
+}
+
+func TestParseISO6709(t *testing.T) {
+	cases := []struct {
+		in       string
+		lat, lon float64
+		ok       bool
+	}{
+		{"+39.9042+116.4074/", 39.9042, 116.4074, true},
+		{"-33.8568+151.2153+010.500/", -33.8568, 151.2153, true},
+		{"+00.0000-000.0000/", 0, 0, true},
+		{"garbage", 0, 0, false},
+		{"", 0, 0, false},
+	}
+	for _, c := range cases {
+		lat, lon, ok := ffmpeg.ParseISO6709(c.in)
+		require.Equal(t, c.ok, ok, "case %q", c.in)
+		if c.ok {
+			require.InDelta(t, c.lat, lat, 1e-6, "lat %q", c.in)
+			require.InDelta(t, c.lon, lon, 1e-6, "lon %q", c.in)
+		}
+	}
+}

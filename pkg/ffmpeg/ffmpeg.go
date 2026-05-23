@@ -9,7 +9,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
+	"strings"
+	"time"
 )
 
 // ExtractKeyframe extracts a single representative frame from videoPath and
@@ -112,4 +115,197 @@ func ExtractEmbeddedVideo(jpegPath, outPath string) error {
 		return fmt.Errorf("ffmpeg ExtractEmbeddedVideo: %w — %s", err, string(out))
 	}
 	return nil
+}
+
+// MediaInfo carries all metadata that one ffprobe call extracts from a video file.
+// Every field is best-effort: zero value means "not present" or "couldn't parse".
+type MediaInfo struct {
+	DurationMs int64
+	Width      int
+	Height     int
+	VideoCodec string
+	AudioCodec string
+	FrameRate  float64
+	BitRate    int64 // bps
+	Rotation   int   // 0, 90, 180, 270
+	TakenAt    time.Time
+	Latitude   float64
+	Longitude  float64
+}
+
+type ffprobeFull struct {
+	Format struct {
+		Duration string            `json:"duration"`
+		BitRate  string            `json:"bit_rate"`
+		Tags     map[string]string `json:"tags"`
+	} `json:"format"`
+	Streams []struct {
+		CodecType    string            `json:"codec_type"`
+		CodecName    string            `json:"codec_name"`
+		Width        int               `json:"width"`
+		Height       int               `json:"height"`
+		RFrameRate   string            `json:"r_frame_rate"`
+		AvgFrameRate string            `json:"avg_frame_rate"`
+		BitRate      string            `json:"bit_rate"`
+		Tags         map[string]string `json:"tags"`
+		SideData     []struct {
+			SideDataType string  `json:"side_data_type"`
+			Rotation     float64 `json:"rotation"`
+		} `json:"side_data_list"`
+	} `json:"streams"`
+}
+
+// Probe runs `ffprobe -show_format -show_streams` on videoPath and parses the
+// JSON output into a MediaInfo. Returns an error only when ffprobe itself fails
+// or its output cannot be parsed; partial fields are tolerated and left zero.
+func Probe(videoPath string) (*MediaInfo, error) {
+	cmd := exec.Command("ffprobe",
+		"-v", "quiet",
+		"-print_format", "json",
+		"-show_format",
+		"-show_streams",
+		videoPath,
+	)
+	raw, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("ffprobe Probe: %w", err)
+	}
+	var p ffprobeFull
+	if err := json.Unmarshal(raw, &p); err != nil {
+		return nil, fmt.Errorf("ffprobe Probe: parse JSON: %w", err)
+	}
+
+	info := &MediaInfo{}
+	if p.Format.Duration != "" {
+		if secs, err := strconv.ParseFloat(p.Format.Duration, 64); err == nil {
+			info.DurationMs = int64(math.Round(secs * 1000))
+		}
+	}
+	if p.Format.BitRate != "" {
+		if br, err := strconv.ParseInt(p.Format.BitRate, 10, 64); err == nil {
+			info.BitRate = br
+		}
+	}
+
+	for _, s := range p.Streams {
+		switch s.CodecType {
+		case "video":
+			if info.VideoCodec != "" {
+				continue
+			}
+			info.VideoCodec = s.CodecName
+			info.Width = s.Width
+			info.Height = s.Height
+			info.FrameRate = parseFraction(s.RFrameRate)
+			if info.FrameRate == 0 {
+				info.FrameRate = parseFraction(s.AvgFrameRate)
+			}
+			// Rotation source 1: legacy "rotate" tag
+			if v, ok := s.Tags["rotate"]; ok {
+				if r, err := strconv.Atoi(v); err == nil {
+					info.Rotation = ((r % 360) + 360) % 360
+				}
+			}
+			// Rotation source 2 (newer ffprobe): Display Matrix side data
+			// gives a negative angle; flip sign and normalize to 0..359.
+			for _, sd := range s.SideData {
+				if sd.SideDataType == "Display Matrix" {
+					r := int(math.Round(-sd.Rotation))
+					info.Rotation = ((r % 360) + 360) % 360
+				}
+			}
+		case "audio":
+			if info.AudioCodec == "" {
+				info.AudioCodec = s.CodecName
+			}
+		}
+	}
+
+	// creation_time lives in format.tags (case varies across muxers)
+	if tagsLower := lowerKeys(p.Format.Tags); tagsLower["creation_time"] != "" {
+		if t, err := time.Parse(time.RFC3339, tagsLower["creation_time"]); err == nil {
+			info.TakenAt = t
+		}
+	}
+
+	// GPS: iPhone/Android videos put it in format.tags."com.apple.quicktime.location.ISO6709"
+	// or in a stream's tags as "location".
+	if loc := findLocationTag(p.Format.Tags); loc != "" {
+		if lat, lon, ok := ParseISO6709(loc); ok {
+			info.Latitude = lat
+			info.Longitude = lon
+		}
+	} else {
+		for _, s := range p.Streams {
+			if loc := findLocationTag(s.Tags); loc != "" {
+				if lat, lon, ok := ParseISO6709(loc); ok {
+					info.Latitude = lat
+					info.Longitude = lon
+					break
+				}
+			}
+		}
+	}
+
+	return info, nil
+}
+
+func lowerKeys(in map[string]string) map[string]string {
+	out := make(map[string]string, len(in))
+	for k, v := range in {
+		out[strings.ToLower(k)] = v
+	}
+	return out
+}
+
+func findLocationTag(tags map[string]string) string {
+	for k, v := range tags {
+		kl := strings.ToLower(k)
+		if kl == "location" ||
+			kl == "com.apple.quicktime.location.iso6709" ||
+			strings.HasSuffix(kl, "iso6709") {
+			return v
+		}
+	}
+	return ""
+}
+
+func parseFraction(s string) float64 {
+	if s == "" || s == "0/0" {
+		return 0
+	}
+	parts := strings.Split(s, "/")
+	if len(parts) != 2 {
+		if f, err := strconv.ParseFloat(s, 64); err == nil {
+			return f
+		}
+		return 0
+	}
+	num, err1 := strconv.ParseFloat(parts[0], 64)
+	den, err2 := strconv.ParseFloat(parts[1], 64)
+	if err1 != nil || err2 != nil || den == 0 {
+		return 0
+	}
+	return num / den
+}
+
+// iso6709Re matches a signed lat/lon pair at the start of an ISO 6709 short
+// string. The optional altitude segment is intentionally ignored.
+var iso6709Re = regexp.MustCompile(`^([+-]\d+(?:\.\d+)?)([+-]\d+(?:\.\d+)?)`)
+
+// ParseISO6709 parses an ISO 6709 short-form coordinate string (e.g.
+// "+39.9042+116.4074/" or "-33.8568+151.2153+010.500/") and returns latitude,
+// longitude, true on success. Altitude is ignored. The function is exported so
+// it can be unit-tested.
+func ParseISO6709(s string) (float64, float64, bool) {
+	m := iso6709Re.FindStringSubmatch(strings.TrimSpace(s))
+	if len(m) != 3 {
+		return 0, 0, false
+	}
+	lat, err1 := strconv.ParseFloat(m[1], 64)
+	lon, err2 := strconv.ParseFloat(m[2], 64)
+	if err1 != nil || err2 != nil {
+		return 0, 0, false
+	}
+	return lat, lon, true
 }
