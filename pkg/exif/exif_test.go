@@ -33,3 +33,14 @@ func TestParseEmptyReader(t *testing.T) {
 	require.NotNil(t, result)
 	require.True(t, result.TakenAt.IsZero())
 }
+
+func TestResultHasExtendedFields(t *testing.T) {
+	// Even when the input has no EXIF, the new fields must be addressable
+	// and zero-valued (this also acts as a compile-time check).
+	result := exif.Parse(bytes.NewReader([]byte{}))
+	require.Equal(t, 0, result.ISO)
+	require.Equal(t, "", result.ShutterSpeed)
+	require.Equal(t, 0.0, result.Aperture)
+	require.Equal(t, 0.0, result.FocalLength)
+	require.Equal(t, 0, result.Orientation)
+}

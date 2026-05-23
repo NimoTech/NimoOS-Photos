@@ -4,6 +4,7 @@
 package exif
 
 import (
+	"fmt"
 	"io"
 	"time"
 
@@ -29,6 +30,13 @@ type Result struct {
 	Width     int
 	Height    int
 	ContentID string // Apple/Google Live Photo UUID
+
+	// Extended EXIF (best-effort; zero value means absent)
+	ISO          int
+	ShutterSpeed string  // e.g. "1/250"
+	Aperture     float64 // f-number
+	FocalLength  float64 // mm
+	Orientation  int     // 1..8
 }
 
 // Parse reads EXIF metadata from r. It never returns an error; if the data
@@ -88,6 +96,41 @@ func Parse(r io.Reader) *Result {
 		}
 		return nil
 	}))
+
+	// ISO speed
+	if tag, err := x.Get(goexif.ISOSpeedRatings); err == nil {
+		if n, err := tag.Int(0); err == nil {
+			res.ISO = n
+		}
+	}
+	// Shutter speed (ExposureTime, stored as Rational)
+	if tag, err := x.Get(goexif.ExposureTime); err == nil {
+		if num, den, err := tag.Rat2(0); err == nil && den != 0 {
+			if num == 1 || num < den {
+				res.ShutterSpeed = fmt.Sprintf("%d/%d", num, den)
+			} else {
+				res.ShutterSpeed = fmt.Sprintf("%.1fs", float64(num)/float64(den))
+			}
+		}
+	}
+	// Aperture (FNumber, Rational)
+	if tag, err := x.Get(goexif.FNumber); err == nil {
+		if num, den, err := tag.Rat2(0); err == nil && den != 0 {
+			res.Aperture = float64(num) / float64(den)
+		}
+	}
+	// Focal length (mm, Rational)
+	if tag, err := x.Get(goexif.FocalLength); err == nil {
+		if num, den, err := tag.Rat2(0); err == nil && den != 0 {
+			res.FocalLength = float64(num) / float64(den)
+		}
+	}
+	// Orientation
+	if tag, err := x.Get(goexif.Orientation); err == nil {
+		if n, err := tag.Int(0); err == nil {
+			res.Orientation = n
+		}
+	}
 
 	return res
 }
