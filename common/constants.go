@@ -21,5 +21,9 @@ const (
 const (
 	StagingDir    = "/DATA/.system_data/photos-tus-staging"
 	MaxUploadSize = int64(20 * 1024 * 1024 * 1024) // 20 GB
-	StagingMaxAge = 7 * 24                          // hours
+	StagingMaxAge = 7 * 24                         // hours
+
+	// V1TUSPath is the Gateway prefix that must be registered so the resumable
+	// upload endpoint at /v1/upload-tus reaches this service.
+	V1TUSPath = "/v1/upload-tus"
 )

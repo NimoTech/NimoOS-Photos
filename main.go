@@ -107,7 +107,7 @@ func main() {
 	if err != nil {
 		panic("failed to connect to Gateway: " + err.Error())
 	}
-	for _, path := range []string{common.V1APIPath, common.V1DocPath} {
+	for _, path := range []string{common.V1APIPath, common.V1DocPath, common.V1TUSPath} {
 		if err := gw.CreateRoute(&model.Route{
 			Path:   path,
 			Target: "http://" + listener.Addr().String(),
