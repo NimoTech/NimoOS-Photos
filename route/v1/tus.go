@@ -156,5 +156,10 @@ func NewTUSHandler(svc service.Services, galleryDir string) (http.Handler, error
 		}
 	}()
 
-	return tusH, nil
+	// tusd v2.8 internally does `strings.Trim(r.URL.Path, "/")` to route. It
+	// expects the prefix to be stripped before it sees the request, otherwise
+	// the leftover path is interpreted as an upload ID and POST falls through
+	// to the "upload resource" branch which only allows GET/HEAD/PATCH/DELETE.
+	// Strip /v1/upload-tus before delegating.
+	return http.StripPrefix("/v1/upload-tus", tusH), nil
 }
