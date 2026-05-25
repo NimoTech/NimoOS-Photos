@@ -56,3 +56,29 @@ func TestTaskRegistry_ThrottlePublish(t *testing.T) {
 		t.Fatalf("expected 3 publishes after status change, got %d", calls)
 	}
 }
+
+func TestTaskRegistry_500msThrottleExpiry(t *testing.T) {
+	calls := 0
+	pub := func(_ Task) { calls++ }
+	r := NewTaskRegistry(pub)
+
+	// First upsert publishes immediately.
+	r.Upsert(Task{ID: "a", Type: "index", Progress: 0.50, Status: "running"})
+	if calls != 1 {
+		t.Fatalf("expected 1 publish on first upsert, got %d", calls)
+	}
+
+	// Sub-bucket update within 500ms should be throttled out.
+	r.Upsert(Task{ID: "a", Type: "index", Progress: 0.505, Status: "running"})
+	if calls != 1 {
+		t.Fatalf("expected throttle within 500ms, got %d publishes", calls)
+	}
+
+	// Wait past the throttle window. Same progress / same status —
+	// only the time gap should trigger a re-publish.
+	time.Sleep(550 * time.Millisecond)
+	r.Upsert(Task{ID: "a", Type: "index", Progress: 0.505, Status: "running"})
+	if calls != 2 {
+		t.Fatalf("expected publish after 500ms expiry, got %d", calls)
+	}
+}

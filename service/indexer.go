@@ -466,9 +466,17 @@ func (ix *Indexer) ScanDirectory(dir string) error {
 	for _, path := range paths {
 		ix.processFile(path)
 		processed++
-		if ix.taskReg != nil {
-			progress := float64(processed) / float64(total)
-			ix.taskReg.Upsert(Task{
+		if reg := ix.taskReg; reg != nil {
+			progress := 0.0
+			if total > 0 {
+				progress = float64(processed) / float64(total)
+			} else {
+				progress = float64(processed) * 0.005
+				if progress > 0.99 {
+					progress = 0.99
+				}
+			}
+			reg.Upsert(Task{
 				ID:        taskID,
 				Type:      "index",
 				Label:     "索引照片",
