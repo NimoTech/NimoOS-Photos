@@ -71,6 +71,7 @@ type Indexer struct {
 	workers  int
 	queue    chan string
 	seen     sync.Map // in-flight dedup: path -> struct{}
+	taskReg  *TaskRegistry
 }
 
 // NewIndexer creates a new Indexer. The queue channel is buffered to 1024 entries.
@@ -82,6 +83,12 @@ func NewIndexer(db *sql.DB, ml MLProvider, thumbDir string, workers int) *Indexe
 		workers:  workers,
 		queue:    make(chan string, 1024),
 	}
+}
+
+// SetTaskRegistry injects a TaskRegistry so ScanDirectory can report progress.
+// Call this after construction (e.g. from NewService) before any scans begin.
+func (ix *Indexer) SetTaskRegistry(reg *TaskRegistry) {
+	ix.taskReg = reg
 }
 
 // Enqueue adds path to the processing queue.
@@ -398,21 +405,82 @@ func sha256File(data []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// ScanDirectory walks dir, enqueues all supported media files found on disk,
+// ScanDirectory walks dir, processes all supported media files found on disk,
 // and prunes asset rows under dir whose backing files no longer exist.
+// If a TaskRegistry has been injected via SetTaskRegistry, scan progress is
+// reported as a running "index" task and cleared 6 seconds after completion.
 func (ix *Indexer) ScanDirectory(dir string) error {
+	// First pass: collect all supported file paths to know the total.
+	var paths []string
 	if err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
 			return err
 		}
-		ext := strings.ToLower(filepath.Ext(path))
-		if supportedExts[ext] {
-			ix.Enqueue(path)
+		if supportedExts[strings.ToLower(filepath.Ext(path))] {
+			paths = append(paths, path)
 		}
 		return nil
 	}); err != nil {
 		return err
 	}
+
+	total := int64(len(paths))
+	scanStart := time.Now()
+	taskID := fmt.Sprintf("idx_%d", scanStart.UnixNano())
+	var processed int64
+
+	if ix.taskReg != nil && total > 0 {
+		ix.taskReg.Upsert(Task{
+			ID:        taskID,
+			Type:      "index",
+			Label:     "索引照片",
+			Current:   0,
+			Total:     total,
+			Progress:  0,
+			Status:    "running",
+			StartedAt: scanStart,
+		})
+	}
+
+	defer func() {
+		if ix.taskReg == nil || total == 0 {
+			return
+		}
+		ix.taskReg.Upsert(Task{
+			ID:        taskID,
+			Type:      "index",
+			Label:     "索引照片",
+			Current:   processed,
+			Total:     total,
+			Progress:  1,
+			Status:    "done",
+			StartedAt: scanStart,
+		})
+		go func() {
+			time.Sleep(6 * time.Second)
+			ix.taskReg.Remove(taskID)
+		}()
+	}()
+
+	// Second pass: process each file and report progress.
+	for _, path := range paths {
+		ix.processFile(path)
+		processed++
+		if ix.taskReg != nil {
+			progress := float64(processed) / float64(total)
+			ix.taskReg.Upsert(Task{
+				ID:        taskID,
+				Type:      "index",
+				Label:     "索引照片",
+				Current:   processed,
+				Total:     total,
+				Progress:  progress,
+				Status:    "running",
+				StartedAt: scanStart,
+			})
+		}
+	}
+
 	return ix.pruneMissingUnder(dir)
 }
 

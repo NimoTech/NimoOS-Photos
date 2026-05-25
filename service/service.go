@@ -62,7 +62,9 @@ func NewService(parentCtx context.Context, cfg *config.Config) Services {
 	liveDir := filepath.Join(cfg.DataPath, "live")
 
 	// 4. Assemble individual services.
+	taskReg := NewTaskRegistry(nil)
 	idx := NewIndexer(db, ml, thumbDir, cfg.Workers)
+	idx.SetTaskRegistry(taskReg)
 	watcher := NewWatcher(db, cfg.WatchDirs, idx, liveDir)
 	albums := NewAlbumService(db)
 	search := NewSearchService(db, ml)
@@ -86,7 +88,7 @@ func NewService(parentCtx context.Context, cfg *config.Config) Services {
 		albums:    albums,
 		search:    search,
 		faces:     faces,
-		tasks:     NewTaskRegistry(nil),
+		tasks:     taskReg,
 		parentCtx: parentCtx,
 	}
 }
