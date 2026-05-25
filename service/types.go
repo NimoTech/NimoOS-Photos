@@ -73,9 +73,12 @@ type TimelineGroup struct {
 }
 
 type IndexStatus struct {
-	Pending    int   `json:"pending"`
-	Indexed    int   `json:"indexed"`
-	Error      int   `json:"error"`
-	QueueLen   int   `json:"queueLen"`
-	TotalBytes int64 `json:"totalBytes"`
+	Pending    int    `json:"pending"`
+	Indexed    int    `json:"indexed"`
+	Error      int    `json:"error"`
+	QueueLen   int    `json:"queueLen"`
+	TotalBytes int64  `json:"totalBytes"`
+	GalleryDir string `json:"galleryDir,omitempty"`
+	DiskTotal  int64  `json:"diskTotal,omitempty"`
+	DiskAvail  int64  `json:"diskAvail,omitempty"`
 }
