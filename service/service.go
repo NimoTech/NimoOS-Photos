@@ -19,6 +19,7 @@ type Services interface {
 	Albums() *AlbumService
 	Search() *SearchService
 	Faces() *FaceService
+	Tasks() *TaskRegistry
 	RestartWatcher(dirs []string)
 }
 
@@ -30,15 +31,17 @@ type services struct {
 	albums    *AlbumService
 	search    *SearchService
 	faces     *FaceService
+	tasks     *TaskRegistry
 	parentCtx context.Context
 }
 
-func (s *services) DB() *sql.DB           { return s.db }
-func (s *services) Indexer() *Indexer     { return s.indexer }
-func (s *services) Watcher() *Watcher     { return s.watcher }
-func (s *services) Albums() *AlbumService { return s.albums }
+func (s *services) DB() *sql.DB            { return s.db }
+func (s *services) Indexer() *Indexer      { return s.indexer }
+func (s *services) Watcher() *Watcher      { return s.watcher }
+func (s *services) Albums() *AlbumService  { return s.albums }
 func (s *services) Search() *SearchService { return s.search }
-func (s *services) Faces() *FaceService   { return s.faces }
+func (s *services) Faces() *FaceService    { return s.faces }
+func (s *services) Tasks() *TaskRegistry   { return s.tasks }
 
 // NewService wires all service-layer components together from cfg and returns a
 // ready-to-use Services handle. It panics if the database cannot be opened.
@@ -83,6 +86,7 @@ func NewService(parentCtx context.Context, cfg *config.Config) Services {
 		albums:    albums,
 		search:    search,
 		faces:     faces,
+		tasks:     NewTaskRegistry(nil),
 		parentCtx: parentCtx,
 	}
 }

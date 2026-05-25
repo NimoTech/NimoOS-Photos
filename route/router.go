@@ -77,7 +77,7 @@ func InitRouter(svc service.Services, runtimePath string, thumbDir string) http.
 	tl := v1.NewTimelineHandler(svc)
 	albums := v1.NewAlbumsHandler(svc)
 	persons := v1.NewPersonsHandler(svc)
-	index := v1.NewIndexHandler(svc)
+	index := v1.NewIndexHandler(svc, "/DATA/Gallery")
 
 	// Asset endpoints
 	g.GET("/assets", assets.List)
@@ -112,6 +112,9 @@ func InitRouter(svc service.Services, runtimePath string, thumbDir string) http.
 	// Indexer status/control
 	g.GET("/status", index.Status)
 	g.POST("/scan", index.Scan)
+
+	tasks := v1.NewTasksHandler(svc)
+	g.GET("/tasks", tasks.List)
 
 	cfg := v1.NewConfigHandler(svc)
 	g.GET("/config", cfg.GetConfig)
