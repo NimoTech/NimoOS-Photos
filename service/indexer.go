@@ -405,6 +405,13 @@ func sha256File(data []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// ScanDirectory walks dir, then synchronously processes each file. This is
+// intentionally serial (vs. the Enqueue/worker-pool path used by watcher) so
+// that we can report deterministic per-scan progress via TaskRegistry —
+// async workers can't easily associate per-file completion with a single
+// scan task ID. Throughput trade-off is acceptable because scans run in a
+// background goroutine and are not user-blocking.
+//
 // ScanDirectory walks dir, processes all supported media files found on disk,
 // and prunes asset rows under dir whose backing files no longer exist.
 // If a TaskRegistry has been injected via SetTaskRegistry, scan progress is
@@ -465,6 +472,10 @@ func (ix *Indexer) ScanDirectory(dir string) error {
 	// Second pass: process each file and report progress.
 	for _, path := range paths {
 		ix.processFile(path)
+		// Mirror the async worker path (Start): clear the in-flight marker so
+		// that watcher-triggered Enqueue calls for the same file after the scan
+		// are not silently dropped by seen.LoadOrStore.
+		ix.seen.Delete(path)
 		processed++
 		if reg := ix.taskReg; reg != nil {
 			progress := 0.0
