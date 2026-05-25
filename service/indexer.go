@@ -516,6 +516,12 @@ func (ix *Indexer) StatusCounts() IndexStatus {
 		}
 	}
 	s.QueueLen = ix.QueueLen()
+
+	// Total bytes of all indexed assets — used by the UI to display real
+	// gallery footprint independent of filesystem-level disk usage.
+	_ = ix.db.QueryRow(
+		`SELECT COALESCE(SUM(file_size), 0) FROM assets WHERE status = 'indexed'`,
+	).Scan(&s.TotalBytes)
 	return s
 }
 
