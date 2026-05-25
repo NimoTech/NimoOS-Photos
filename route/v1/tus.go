@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,6 +16,46 @@ import (
 	"github.com/tus/tusd/v2/pkg/handler"
 	"go.uber.org/zap"
 )
+
+// relativeLocationWriter wraps http.ResponseWriter to rewrite tusd's
+// absolute Location header into a relative path. tusd constructs Location
+// from the Host header of the request it sees, which after Gateway → Photos
+// proxying is "127.0.0.1" (the internal hop). The browser-facing URL is
+// different. TUS 1.0 allows the Location header to be a path-only URL, which
+// the client resolves against the original endpoint origin.
+type relativeLocationWriter struct {
+	http.ResponseWriter
+	wrote bool
+}
+
+func (w *relativeLocationWriter) WriteHeader(status int) {
+	if !w.wrote {
+		w.wrote = true
+		if loc := w.Header().Get("Location"); loc != "" {
+			if u, err := url.Parse(loc); err == nil && u.Path != "" {
+				w.Header().Set("Location", u.Path)
+			}
+		}
+	}
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *relativeLocationWriter) Write(b []byte) (int, error) {
+	// Some handlers write body before explicitly calling WriteHeader; ensure
+	// our header rewrite still runs.
+	if !w.wrote {
+		w.WriteHeader(http.StatusOK)
+	}
+	return w.ResponseWriter.Write(b)
+}
+
+// withRelativeLocation wraps an http.Handler so that any absolute Location
+// header it sets is rewritten to a path-only URL.
+func withRelativeLocation(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h.ServeHTTP(&relativeLocationWriter{ResponseWriter: w}, r)
+	})
+}
 
 // freeBytesFn returns available bytes on /DATA. Injectable for tests.
 type freeBytesFn func() (uint64, error)
@@ -161,5 +202,5 @@ func NewTUSHandler(svc service.Services, galleryDir string) (http.Handler, error
 	// the leftover path is interpreted as an upload ID and POST falls through
 	// to the "upload resource" branch which only allows GET/HEAD/PATCH/DELETE.
 	// Strip /v1/upload-tus before delegating.
-	return http.StripPrefix("/v1/upload-tus", tusH), nil
+	return withRelativeLocation(http.StripPrefix("/v1/upload-tus", tusH)), nil
 }
