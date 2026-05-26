@@ -214,9 +214,9 @@ func NewTUSHandler(svc service.Services, galleryDir string) (http.Handler, error
 			stagedPath := filepath.Join(common.StagingDir, event.Upload.ID)
 			filename := event.Upload.MetaData["filename"]
 			albumID := event.Upload.MetaData["albumId"]
-			batchID := event.Upload.MetaData["batchId"]
+			batchID := event.Upload.MetaData["batch_id"]
 			var batchTotal int64
-			if bt := event.Upload.MetaData["batchTotal"]; bt != "" {
+			if bt := event.Upload.MetaData["batch_total"]; bt != "" {
 				if n, perr := strconv.ParseInt(bt, 10, 64); perr == nil {
 					batchTotal = n
 				}
