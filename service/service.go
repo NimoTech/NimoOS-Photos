@@ -8,6 +8,7 @@ import (
 	"github.com/NimoTech/NimoOS-Photos/pkg/config"
 	"github.com/NimoTech/NimoOS-Photos/pkg/mlclient"
 	"github.com/NimoTech/NimoOS-Photos/pkg/sqlite"
+	"go.uber.org/zap"
 )
 
 // Services is the top-level dependency container used by the HTTP layer and
@@ -78,6 +79,16 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 	faces := NewFaceService(db)
 	faces.SetTaskRegistry(taskReg)
 	embedder := NewEmbedder(db, ml, idx, taskReg)
+
+	// batch 上传完成后主动触发人脸聚类，让前端能看到从 0% 涨到 100% 的"识别人物" task。
+	// faces.RunClustering 内部用 CAS 防重入，多个 batch 同时 done 也只会跑一次。
+	idx.SetOnBatchDone(func() {
+		go func() {
+			if err := faces.RunClustering(parentCtx); err != nil {
+				zap.L().Warn("post-batch face clustering failed", zap.Error(err))
+			}
+		}()
+	})
 
 	// 5. Kick off the initial directory scan in the background so startup is
 	//    non-blocking. ScanPending retries assets that failed in a prior run
