@@ -146,6 +146,16 @@ func migrate(db *sql.DB) error {
 		`CREATE VIRTUAL TABLE IF NOT EXISTS clip_embeddings USING vec0(
 			embedding float[512]
 		)`,
+
+		// ── Favorites (per-user, time-indexed) ────────────────────────────
+		`CREATE TABLE IF NOT EXISTS asset_favorites (
+			user_id      TEXT NOT NULL DEFAULT 'default',
+			asset_id     TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+			favorited_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			PRIMARY KEY (user_id, asset_id)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_fav_user_time ON asset_favorites(user_id, favorited_at DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_fav_asset     ON asset_favorites(asset_id)`,
 	}
 
 	for _, stmt := range statements {

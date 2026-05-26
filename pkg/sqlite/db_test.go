@@ -129,6 +129,48 @@ func TestSerializeDeserialize(t *testing.T) {
 	}
 }
 
+func TestMigrateAssetFavoritesTable(t *testing.T) {
+	db, err := sqlite.Open(filepath.Join(t.TempDir(), "test.db"))
+	require.NoError(t, err)
+	defer db.Close()
+
+	var name string
+	err = db.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name='asset_favorites'`).Scan(&name)
+	require.NoError(t, err)
+	require.Equal(t, "asset_favorites", name)
+
+	rows, err := db.Query(`SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='asset_favorites' ORDER BY name`)
+	require.NoError(t, err)
+	defer rows.Close()
+	var indices []string
+	for rows.Next() {
+		var n string
+		require.NoError(t, rows.Scan(&n))
+		indices = append(indices, n)
+	}
+	require.Contains(t, indices, "idx_fav_asset")
+	require.Contains(t, indices, "idx_fav_user_time")
+}
+
+func TestAssetFavoritesCascadeOnAssetDelete(t *testing.T) {
+	db, err := sqlite.Open(filepath.Join(t.TempDir(), "test.db"))
+	require.NoError(t, err)
+	defer db.Close()
+
+	_, err = db.Exec(`INSERT INTO assets(id, file_path, status) VALUES('a1','/x.jpg','indexed')`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO asset_favorites(user_id, asset_id) VALUES('default','a1')`)
+	require.NoError(t, err)
+
+	_, err = db.Exec(`DELETE FROM assets WHERE id='a1'`)
+	require.NoError(t, err)
+
+	var cnt int
+	err = db.QueryRow(`SELECT COUNT(*) FROM asset_favorites WHERE asset_id='a1'`).Scan(&cnt)
+	require.NoError(t, err)
+	require.Equal(t, 0, cnt, "expected cascade delete to clear favorite row")
+}
+
 func TestMigrateAddsNewColumns(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "test.db")
