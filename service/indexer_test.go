@@ -125,6 +125,55 @@ func TestIndexerDeduplicates(t *testing.T) {
 	require.Equal(t, 1, count, "duplicate enqueue must not create duplicate DB rows")
 }
 
+// TestIndexer_ForceReprocess_BypassesChecksumShortcut 断言 ForceReprocess
+// 在 asset 已经 indexed 时仍能再跑一次 ML，写入缺失的 clip_embeddings。
+func TestIndexer_ForceReprocess_BypassesChecksumShortcut(t *testing.T) {
+	db := makeTestDB(t)
+	thumbDir := t.TempDir()
+	imgDir := t.TempDir()
+	imgPath := makeTestJPEG(t, imgDir)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// 第一遍：用一个 ML "不就绪" 的 mock 跑索引，模拟"asset 被标 indexed 但没向量"的真实场景。
+	notReady := &mockMLNotReady{}
+	idx := NewIndexer(db, notReady, thumbDir, 1)
+	go idx.Start(ctx)
+	idx.Enqueue(imgPath)
+
+	var assetID string
+	require.Eventually(t, func() bool {
+		return db.QueryRow(`SELECT id FROM assets WHERE file_path=? AND status='indexed'`, imgPath).Scan(&assetID) == nil
+	}, 4*time.Second, 50*time.Millisecond)
+
+	var hasIdx int
+	_ = db.QueryRow(`SELECT COUNT(*) FROM asset_clip_idx WHERE asset_id=?`, assetID).Scan(&hasIdx)
+	require.Equal(t, 0, hasIdx, "precondition: asset 应该没有 clip embedding")
+
+	// 第二遍：替换 ML 为 ready 的 mock，调 ForceReprocess。
+	cancel() // 关掉旧 worker
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	defer cancel2()
+	ready := &mockML{}
+	idx2 := NewIndexer(db, ready, thumbDir, 1)
+	go idx2.Start(ctx2)
+
+	ok := idx2.ForceReprocess(imgPath, processOpts{force: true, skipExif: true, skipThumb: true})
+	require.True(t, ok, "ForceReprocess 应返回 true")
+
+	require.Eventually(t, func() bool {
+		var n int
+		_ = db.QueryRow(`SELECT COUNT(*) FROM asset_clip_idx WHERE asset_id=?`, assetID).Scan(&n)
+		return n == 1
+	}, 2*time.Second, 50*time.Millisecond)
+}
+
+// mockMLNotReady 永远返回 IsReady=false，强制 processFile 跳过 ML 段。
+type mockMLNotReady struct{ mockML }
+
+func (m *mockMLNotReady) IsReady() bool { return false }
+
 // TestAssetExifUpsertReplacesOnConflict drives the asset_exif upsert SQL
 // directly to confirm that ON CONFLICT(asset_id) DO UPDATE replaces only the
 // columns listed in the DO UPDATE clause, leaving previously-written columns

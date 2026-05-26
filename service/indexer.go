@@ -121,7 +121,7 @@ func (ix *Indexer) Start(ctx context.Context) {
 					if !ok {
 						return
 					}
-					ix.processFile(path)
+					_ = ix.processFile(path)
 					ix.seen.Delete(path)
 				}
 			}
@@ -135,12 +135,31 @@ func (ix *Indexer) QueueLen() int {
 	return len(ix.queue)
 }
 
-// processFile runs the full indexing pipeline for a single file.
-func (ix *Indexer) processFile(path string) {
+// processOpts controls which stages processFileInternal executes.
+type processOpts struct {
+	force     bool // skip checksum + status='indexed' short-circuit
+	skipExif  bool // skip asset_exif write
+	skipThumb bool // skip thumbnail generation
+}
+
+// processFile is the entry point from Enqueue → worker pool, with zero options.
+// Returns success: true means status='indexed' was written; false means any stage failed.
+func (ix *Indexer) processFile(path string) bool {
+	return ix.processFileInternal(path, processOpts{})
+}
+
+// ForceReprocess is used by the Embedder retry path to bypass the checksum
+// short-circuit and optionally skip EXIF / thumbnail stages.
+func (ix *Indexer) ForceReprocess(path string, opts processOpts) bool {
+	return ix.processFileInternal(path, opts)
+}
+
+// processFileInternal runs the full indexing pipeline for a single file.
+func (ix *Indexer) processFileInternal(path string, opts processOpts) (success bool) {
 	// 1. Read file content.
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return
+		return false
 	}
 
 	// 2. Compute SHA-256 checksum.
@@ -149,11 +168,14 @@ func (ix *Indexer) processFile(path string) {
 	// 3. Skip if checksum already exists in DB with status='indexed'.
 	// Records with status='pending' (e.g. left by a crash) are intentionally
 	// re-processed so they can reach 'indexed' status.
-	var existingID string
-	err = ix.db.QueryRow(`SELECT id FROM assets WHERE checksum=? AND status='indexed'`, checksum).Scan(&existingID)
-	if err == nil {
-		// already fully indexed — nothing to do
-		return
+	// When opts.force is set, bypass this short-circuit entirely.
+	if !opts.force {
+		var existingID string
+		err = ix.db.QueryRow(`SELECT id FROM assets WHERE checksum=? AND status='indexed'`, checksum).Scan(&existingID)
+		if err == nil {
+			// already fully indexed — nothing to do
+			return true
+		}
 	}
 
 	// 4. Detect MIME type and decide image vs. video.
@@ -240,78 +262,82 @@ func (ix *Indexer) processFile(path string) {
 		checksum,
 	)
 	if err != nil {
-		return
+		return false
 	}
 	// After upsert, look up the actual asset ID in case it was an existing record.
 	if scanErr := ix.db.QueryRow(`SELECT id FROM assets WHERE file_path=?`, path).Scan(&assetID); scanErr != nil {
 		fmt.Fprintf(os.Stderr, "[indexer] assetID lookup failed for %s: %v\n", path, scanErr)
-		return
+		return false
 	}
 
 	// 7. INSERT/UPDATE asset_exif — images and videos both write their metadata.
-	if isVideo && mediaInfo != nil {
-		var lat, lon sql.NullFloat64
-		if mediaInfo.HasLocation {
-			lat = sql.NullFloat64{Float64: mediaInfo.Latitude, Valid: true}
-			lon = sql.NullFloat64{Float64: mediaInfo.Longitude, Valid: true}
-		}
-		if _, err := ix.db.Exec(`
-			INSERT INTO asset_exif(asset_id, width, height, latitude, longitude,
-			                       video_codec, audio_codec, frame_rate, bit_rate, rotation)
-			VALUES(?,?,?,?,?,?,?,?,?,?)
-			ON CONFLICT(asset_id) DO UPDATE SET
-			  width        = excluded.width,
-			  height       = excluded.height,
-			  latitude     = excluded.latitude,
-			  longitude    = excluded.longitude,
-			  video_codec  = excluded.video_codec,
-			  audio_codec  = excluded.audio_codec,
-			  frame_rate   = excluded.frame_rate,
-			  bit_rate     = excluded.bit_rate,
-			  rotation     = excluded.rotation`,
-			assetID,
-			mediaInfo.Width, mediaInfo.Height,
-			lat, lon,
-			mediaInfo.VideoCodec, mediaInfo.AudioCodec,
-			mediaInfo.FrameRate, mediaInfo.BitRate, mediaInfo.Rotation,
-		); err != nil {
-			fmt.Fprintf(os.Stderr, "[indexer] asset_exif video upsert %s: %v\n", assetID, err)
-		}
-	} else if !isVideo && exifResult != nil {
-		var lat, lon sql.NullFloat64
-		if exifResult.Latitude != 0 || exifResult.Longitude != 0 {
-			lat = sql.NullFloat64{Float64: exifResult.Latitude, Valid: true}
-			lon = sql.NullFloat64{Float64: exifResult.Longitude, Valid: true}
-		}
-		if _, err := ix.db.Exec(`
-			INSERT INTO asset_exif(asset_id, width, height, latitude, longitude, make, model,
-			                       iso, shutter_speed, aperture, focal_length, orientation)
-			VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
-			ON CONFLICT(asset_id) DO UPDATE SET
-			  width         = excluded.width,
-			  height        = excluded.height,
-			  latitude      = excluded.latitude,
-			  longitude     = excluded.longitude,
-			  make          = excluded.make,
-			  model         = excluded.model,
-			  iso           = excluded.iso,
-			  shutter_speed = excluded.shutter_speed,
-			  aperture      = excluded.aperture,
-			  focal_length  = excluded.focal_length,
-			  orientation   = excluded.orientation`,
-			assetID,
-			exifResult.Width, exifResult.Height,
-			lat, lon,
-			exifResult.Make, exifResult.Model,
-			exifResult.ISO, exifResult.ShutterSpeed,
-			exifResult.Aperture, exifResult.FocalLength,
-			exifResult.Orientation,
-		); err != nil {
-			fmt.Fprintf(os.Stderr, "[indexer] asset_exif image upsert %s: %v\n", assetID, err)
+	// Skipped when opts.skipExif is set (e.g. Embedder retry path).
+	if !opts.skipExif {
+		if isVideo && mediaInfo != nil {
+			var lat, lon sql.NullFloat64
+			if mediaInfo.HasLocation {
+				lat = sql.NullFloat64{Float64: mediaInfo.Latitude, Valid: true}
+				lon = sql.NullFloat64{Float64: mediaInfo.Longitude, Valid: true}
+			}
+			if _, err := ix.db.Exec(`
+				INSERT INTO asset_exif(asset_id, width, height, latitude, longitude,
+				                       video_codec, audio_codec, frame_rate, bit_rate, rotation)
+				VALUES(?,?,?,?,?,?,?,?,?,?)
+				ON CONFLICT(asset_id) DO UPDATE SET
+				  width        = excluded.width,
+				  height       = excluded.height,
+				  latitude     = excluded.latitude,
+				  longitude    = excluded.longitude,
+				  video_codec  = excluded.video_codec,
+				  audio_codec  = excluded.audio_codec,
+				  frame_rate   = excluded.frame_rate,
+				  bit_rate     = excluded.bit_rate,
+				  rotation     = excluded.rotation`,
+				assetID,
+				mediaInfo.Width, mediaInfo.Height,
+				lat, lon,
+				mediaInfo.VideoCodec, mediaInfo.AudioCodec,
+				mediaInfo.FrameRate, mediaInfo.BitRate, mediaInfo.Rotation,
+			); err != nil {
+				fmt.Fprintf(os.Stderr, "[indexer] asset_exif video upsert %s: %v\n", assetID, err)
+			}
+		} else if !isVideo && exifResult != nil {
+			var lat, lon sql.NullFloat64
+			if exifResult.Latitude != 0 || exifResult.Longitude != 0 {
+				lat = sql.NullFloat64{Float64: exifResult.Latitude, Valid: true}
+				lon = sql.NullFloat64{Float64: exifResult.Longitude, Valid: true}
+			}
+			if _, err := ix.db.Exec(`
+				INSERT INTO asset_exif(asset_id, width, height, latitude, longitude, make, model,
+				                       iso, shutter_speed, aperture, focal_length, orientation)
+				VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+				ON CONFLICT(asset_id) DO UPDATE SET
+				  width         = excluded.width,
+				  height        = excluded.height,
+				  latitude      = excluded.latitude,
+				  longitude     = excluded.longitude,
+				  make          = excluded.make,
+				  model         = excluded.model,
+				  iso           = excluded.iso,
+				  shutter_speed = excluded.shutter_speed,
+				  aperture      = excluded.aperture,
+				  focal_length  = excluded.focal_length,
+				  orientation   = excluded.orientation`,
+				assetID,
+				exifResult.Width, exifResult.Height,
+				lat, lon,
+				exifResult.Make, exifResult.Model,
+				exifResult.ISO, exifResult.ShutterSpeed,
+				exifResult.Aperture, exifResult.FocalLength,
+				exifResult.Orientation,
+			); err != nil {
+				fmt.Fprintf(os.Stderr, "[indexer] asset_exif image upsert %s: %v\n", assetID, err)
+			}
 		}
 	}
 
 	// 8. Generate thumbnails.
+	// Skipped when opts.skipThumb is set (e.g. Embedder retry path).
 	imagePath := path
 	if isVideo && keyframePath != "" {
 		imagePath = keyframePath
@@ -320,7 +346,7 @@ func (ix *Indexer) processFile(path string) {
 		defer os.RemoveAll(keyframeTmpDir)
 	}
 
-	if imagePath != "" {
+	if !opts.skipThumb && imagePath != "" {
 		thumb.Generate(imagePath, assetID, ix.thumbDir) //nolint:errcheck
 	}
 
@@ -365,7 +391,9 @@ func (ix *Indexer) processFile(path string) {
 		time.Now(), assetID,
 	); err != nil {
 		fmt.Fprintf(os.Stderr, "[indexer] failed to mark asset indexed %s: %v\n", assetID, err)
+		return false
 	}
+	return true
 }
 
 // writeClipEmbedding upserts the CLIP embedding for the given asset.
@@ -471,7 +499,7 @@ func (ix *Indexer) ScanDirectory(dir string) error {
 
 	// Second pass: process each file and report progress.
 	for _, path := range paths {
-		ix.processFile(path)
+		_ = ix.processFile(path)
 		// Mirror the async worker path (Start): clear the in-flight marker so
 		// that watcher-triggered Enqueue calls for the same file after the scan
 		// are not silently dropped by seen.LoadOrStore.
