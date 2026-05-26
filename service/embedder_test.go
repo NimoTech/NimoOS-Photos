@@ -304,3 +304,88 @@ func TestEmbedder_Backfill_ConcurrencyGuard(t *testing.T) {
 	e2 := NewEmbedder(db2, &mockML{}, nil, NewTaskRegistry(nil))
 	require.NoError(t, e2.Backfill(context.Background()))
 }
+
+// togglingML：IsReady 返回值由外部 atomic 控制。
+type togglingML struct {
+	mockML
+	ready atomic.Bool
+}
+
+func (m *togglingML) IsReady() bool { return m.ready.Load() }
+
+// TestEmbedder_Run_TriggersOnReadyJump: ML ready false→true 跳变时触发一次 Backfill。
+func TestEmbedder_Run_TriggersOnReadyJump(t *testing.T) {
+	db := makeTestDB(t)
+	thumbDir := t.TempDir()
+	imgDir := t.TempDir()
+
+	notReady := &mockMLNotReady{}
+	idx := NewIndexer(db, notReady, thumbDir, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go idx.Start(ctx)
+	idx.Enqueue(makeUniqueJPEG(t, imgDir, 0))
+	require.Eventually(t, func() bool {
+		var n int
+		_ = db.QueryRow(`SELECT COUNT(*) FROM assets WHERE status='indexed'`).Scan(&n)
+		return n == 1
+	}, 5*time.Second, 50*time.Millisecond)
+
+	tog := &togglingML{}
+	var emitted []Task
+	var mu sync.Mutex
+	reg := NewTaskRegistry(func(t Task) { mu.Lock(); emitted = append(emitted, t); mu.Unlock() })
+	idx2 := NewIndexer(db, tog, thumbDir, 1)
+	go idx2.Start(ctx)
+	e := NewEmbedder(db, tog, idx2, reg)
+	e.SetPollInterval(50 * time.Millisecond)
+
+	go e.Run(ctx)
+	// 在 ready=false 时不应触发
+	time.Sleep(200 * time.Millisecond)
+	mu.Lock()
+	require.Empty(t, embeddingTasks(emitted), "ML 未就绪时不应触发 Backfill")
+	mu.Unlock()
+
+	// 翻转 ready=true
+	tog.ready.Store(true)
+	require.Eventually(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		for _, ev := range emitted {
+			if ev.Type == "embedding" && ev.Status == "done" {
+				return true
+			}
+		}
+		return false
+	}, 5*time.Second, 50*time.Millisecond)
+}
+
+func embeddingTasks(all []Task) []Task {
+	out := []Task{}
+	for _, t := range all {
+		if t.Type == "embedding" {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+// TestEmbedder_Run_DoesNotRetriggerOnSustainedReady:
+// ML 持续 ready 且无活可干时，不应反复发 task。
+func TestEmbedder_Run_DoesNotRetriggerOnSustainedReady(t *testing.T) {
+	db := makeTestDB(t)
+	// 没有缺向量的 asset → Backfill 应该 noop 但不应被多次调用造成 task spam
+	var emitted []Task
+	var mu sync.Mutex
+	reg := NewTaskRegistry(func(t Task) { mu.Lock(); emitted = append(emitted, t); mu.Unlock() })
+	e := NewEmbedder(db, &mockML{} /* ready */, nil, reg)
+	e.SetPollInterval(50 * time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go e.Run(ctx)
+	time.Sleep(300 * time.Millisecond)
+	mu.Lock()
+	defer mu.Unlock()
+	require.Empty(t, embeddingTasks(emitted), "ML 持续 ready 且无活可干时不应反复发 task")
+}

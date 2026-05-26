@@ -143,5 +143,32 @@ func (e *Embedder) Backfill(ctx context.Context) error {
 	return nil
 }
 
-// Run 占位：实际实现在 Task 9。
-func (e *Embedder) Run(ctx context.Context) {}
+// Run 主循环：每隔 pollInterval 检查 ML ready 状态，
+// 检测到 false→true 跳变时触发一次 Backfill（goroutine 异步执行）。
+// 服务启动时如果 ML 已经就绪，第一次 tick 的 prev=false 也会触发——符合 spec §5.2。
+func (e *Embedder) Run(ctx context.Context) {
+	interval := e.pollInterval
+	if interval <= 0 {
+		interval = defaultEmbedderPollInterval
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	e.tick(ctx)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			e.tick(ctx)
+		}
+	}
+}
+
+// tick 检测 ML ready 跳变，有跳变时异步触发 Backfill。
+func (e *Embedder) tick(ctx context.Context) {
+	ready := e.ml.IsReady()
+	prev := e.lastReady.Swap(ready)
+	if ready && !prev {
+		go func() { _ = e.Backfill(ctx) }()
+	}
+}
