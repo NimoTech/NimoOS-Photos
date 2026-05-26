@@ -72,6 +72,123 @@ type Indexer struct {
 	queue    chan string
 	seen     sync.Map // in-flight dedup: path -> struct{}
 	taskReg  *TaskRegistry
+	ingest   *ingestTracker // aggregates Enqueue/processFile into a single rolling task
+}
+
+// defaultIngestIdleTimeout is the quiet period after which ingestTracker
+// publishes the final "done" task and resets itself for the next batch.
+const defaultIngestIdleTimeout = 6 * time.Second
+
+// ingestTracker aggregates TUS/watcher-driven Enqueue calls into a single
+// type="index" rolling Task. It is reset after each idle period so that a new
+// wave of files starts a fresh Task ID.
+type ingestTracker struct {
+	mu        sync.Mutex
+	reg       *TaskRegistry
+	taskID    string
+	total     int64
+	current   int64
+	failed    int64
+	startedAt time.Time
+	idleTimer *time.Timer
+	idleAfter time.Duration
+}
+
+func newIngestTracker() *ingestTracker {
+	return &ingestTracker{idleAfter: defaultIngestIdleTimeout}
+}
+
+// noteEnqueue is called by Indexer.Enqueue immediately after a path is
+// successfully pushed onto the queue.
+func (t *ingestTracker) noteEnqueue() {
+	if t == nil || t.reg == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.taskID == "" {
+		t.taskID = fmt.Sprintf("ingest_%d", time.Now().UnixNano())
+		t.startedAt = time.Now()
+		t.total, t.current, t.failed = 0, 0, 0
+	}
+	t.total++
+	if t.idleTimer != nil {
+		t.idleTimer.Stop()
+		t.idleTimer = nil
+	}
+	t.publishRunningLocked()
+}
+
+// noteResult is called by the worker pool after each processFile returns.
+func (t *ingestTracker) noteResult(success bool) {
+	if t == nil || t.reg == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.taskID == "" {
+		return
+	}
+	t.current++
+	if !success {
+		t.failed++
+	}
+	t.publishRunningLocked()
+	if t.current >= t.total {
+		if t.idleTimer != nil {
+			t.idleTimer.Stop()
+		}
+		t.idleTimer = time.AfterFunc(t.idleAfter, t.onIdle)
+	}
+}
+
+func (t *ingestTracker) publishRunningLocked() {
+	progress := 0.0
+	if t.total > 0 {
+		progress = float64(t.current) / float64(t.total)
+	}
+	t.reg.Upsert(Task{
+		ID:        t.taskID,
+		Type:      "index",
+		Label:     "索引照片",
+		Current:   t.current,
+		Total:     t.total,
+		Progress:  progress,
+		Status:    "running",
+		StartedAt: t.startedAt,
+	})
+}
+
+func (t *ingestTracker) onIdle() {
+	t.mu.Lock()
+	if t.taskID == "" || t.current < t.total {
+		t.mu.Unlock()
+		return
+	}
+	label := "索引照片"
+	if t.failed > 0 {
+		label = fmt.Sprintf("索引照片（失败 %d 张）", t.failed)
+	}
+	id := t.taskID
+	final := Task{
+		ID:        id,
+		Type:      "index",
+		Label:     label,
+		Current:   t.current,
+		Total:     t.total,
+		Progress:  1,
+		Status:    "done",
+		StartedAt: t.startedAt,
+	}
+	t.taskID = ""
+	t.idleTimer = nil
+	reg := t.reg
+	t.mu.Unlock()
+	reg.Upsert(final)
+	go func() {
+		time.Sleep(6 * time.Second)
+		reg.Remove(id)
+	}()
 }
 
 // NewIndexer creates a new Indexer. The queue channel is buffered to 1024 entries.
@@ -82,13 +199,27 @@ func NewIndexer(db *sql.DB, ml MLProvider, thumbDir string, workers int) *Indexe
 		thumbDir: thumbDir,
 		workers:  workers,
 		queue:    make(chan string, 1024),
+		ingest:   newIngestTracker(),
 	}
 }
 
 // SetTaskRegistry injects a TaskRegistry so ScanDirectory can report progress.
 // Call this after construction (e.g. from NewService) before any scans begin.
+// It also wires the registry into the ingestTracker for Enqueue-driven tasks.
 func (ix *Indexer) SetTaskRegistry(reg *TaskRegistry) {
 	ix.taskReg = reg
+	if ix.ingest != nil {
+		ix.ingest.reg = reg
+	}
+}
+
+// SetIngestIdleTimeout overrides the quiet period after which ingestTracker
+// publishes the final "done" and resets. The default is 6 seconds.
+// Intended for tests; production code should not call this.
+func (ix *Indexer) SetIngestIdleTimeout(d time.Duration) {
+	if ix.ingest != nil {
+		ix.ingest.idleAfter = d
+	}
 }
 
 // Enqueue adds path to the processing queue.
@@ -100,6 +231,7 @@ func (ix *Indexer) Enqueue(path string) {
 	}
 	select {
 	case ix.queue <- path:
+		ix.ingest.noteEnqueue()
 	default:
 		// queue full — release the seen lock so it can be retried later
 		ix.seen.Delete(path)
@@ -121,7 +253,8 @@ func (ix *Indexer) Start(ctx context.Context) {
 					if !ok {
 						return
 					}
-					_ = ix.processFile(path)
+					success := ix.processFile(path)
+					ix.ingest.noteResult(success)
 					ix.seen.Delete(path)
 				}
 			}
