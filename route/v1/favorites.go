@@ -78,6 +78,13 @@ func (h *FavoritesHandler) List(c echo.Context) error {
 // Export — GET /v1/photos/favorites/export
 // 流式 ZIP 下载。单文件失败跳过、写日志。无收藏返回 400。
 func (h *FavoritesHandler) Export(c echo.Context) error {
+	// 手动 token 校验（因为绕过了 JWT middleware；与 thumbnail/original/live 同一模式）
+	token := c.QueryParam("token")
+	if token == "" {
+		return echo.NewHTTPError(http.StatusUnauthorized, "token required")
+	}
+	_ = token // 完整 JWT 校验由 Gateway 完成；本服务被直连时只确保非空
+
 	userID := JWTUserID(c)
 	assets, err := h.svc.Favorites().List(userID, service.ListFavoritesOpts{})
 	if err != nil {

@@ -146,7 +146,7 @@ func TestExportZipHandler(t *testing.T) {
 
 	h := v1.NewFavoritesHandler(svc, dir)
 
-	req := httptest.NewRequest(http.MethodGet, "/v1/photos/favorites/export", nil)
+	req := httptest.NewRequest(http.MethodGet, "/v1/photos/favorites/export?token=t", nil)
 	rec := httptest.NewRecorder()
 	c := echo.New().NewContext(req, rec)
 
@@ -178,7 +178,7 @@ func TestExportZipNoFavorites(t *testing.T) {
 	h, _, cleanup := newFavHarness(t)
 	defer cleanup()
 
-	req := httptest.NewRequest(http.MethodGet, "/v1/photos/favorites/export", nil)
+	req := httptest.NewRequest(http.MethodGet, "/v1/photos/favorites/export?token=t", nil)
 	rec := httptest.NewRecorder()
 	c := echo.New().NewContext(req, rec)
 
@@ -208,7 +208,7 @@ func TestExportZipDeduplicatesNames(t *testing.T) {
 	_, _ = svc.favs.Favorite("default", "a2")
 
 	h := v1.NewFavoritesHandler(svc, dir)
-	req := httptest.NewRequest(http.MethodGet, "/v1/photos/favorites/export", nil)
+	req := httptest.NewRequest(http.MethodGet, "/v1/photos/favorites/export?token=t", nil)
 	rec := httptest.NewRecorder()
 	c := echo.New().NewContext(req, rec)
 
@@ -220,4 +220,18 @@ func TestExportZipDeduplicatesNames(t *testing.T) {
 	names := []string{zr.File[0].Name, zr.File[1].Name}
 	require.Contains(t, names, "photo.jpg")
 	require.Contains(t, names, "photo-2.jpg")
+}
+
+func TestExportZipMissingToken(t *testing.T) {
+	h, _, cleanup := newFavHarness(t)
+	defer cleanup()
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/photos/favorites/export", nil)
+	rec := httptest.NewRecorder()
+	c := echo.New().NewContext(req, rec)
+
+	err := h.Export(c)
+	httpErr, ok := err.(*echo.HTTPError)
+	require.True(t, ok)
+	require.Equal(t, http.StatusUnauthorized, httpErr.Code)
 }

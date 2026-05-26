@@ -39,7 +39,8 @@ func InitRouter(svc service.Services, runtimePath string, thumbDir string) http.
 			p := c.Path()
 			if strings.HasSuffix(p, "/thumbnail") ||
 				strings.HasSuffix(p, "/original") ||
-				strings.HasSuffix(p, "/live") {
+				strings.HasSuffix(p, "/live") ||
+				strings.HasSuffix(p, "/favorites/export") {
 				return true
 			}
 			// Allow internal service calls from localhost (e.g. NimoOS-AI agent)
@@ -78,6 +79,7 @@ func InitRouter(svc service.Services, runtimePath string, thumbDir string) http.
 	albums := v1.NewAlbumsHandler(svc)
 	persons := v1.NewPersonsHandler(svc)
 	index := v1.NewIndexHandler(svc, "/DATA/Gallery")
+	favorites := v1.NewFavoritesHandler(svc, "/DATA/Gallery")
 
 	// Asset endpoints
 	g.GET("/assets", assets.List)
@@ -102,6 +104,16 @@ func InitRouter(svc service.Services, runtimePath string, thumbDir string) http.
 	g.DELETE("/albums/:id", albums.Delete)
 	g.POST("/albums/:id/assets", albums.AddAsset)
 	g.DELETE("/albums/:id/assets/:asset", albums.RemoveAsset)
+
+	// Album batch
+	g.POST("/albums/:id/assets/batch", albums.BatchAdd)
+
+	// Favorites
+	g.POST("/favorites/:asset_id",   favorites.Favorite)
+	g.DELETE("/favorites/:asset_id", favorites.Unfavorite)
+	g.GET("/favorites/ids",          favorites.ListIDs)
+	g.GET("/favorites",              favorites.List)
+	g.GET("/favorites/export",       favorites.Export)
 
 	// Person endpoints
 	g.GET("/persons", persons.List)
