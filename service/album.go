@@ -2,6 +2,8 @@ package service
 
 import (
 	"database/sql"
+	"errors"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -16,12 +18,26 @@ func NewAlbumService(db *sql.DB) *AlbumService {
 }
 
 func (s *AlbumService) Create(name string) (*Album, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return nil, ErrInvalidInput
+	}
+
+	var existing string
+	err := s.db.QueryRow(`SELECT id FROM albums WHERE name=? LIMIT 1`, name).Scan(&existing)
+	if err == nil {
+		return nil, ErrAlbumNameExists
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return nil, err
+	}
+
 	a := &Album{
 		ID:        uuid.NewString(),
 		Name:      name,
 		CreatedAt: time.Now(),
 	}
-	_, err := s.db.Exec(
+	_, err = s.db.Exec(
 		`INSERT INTO albums(id, name, created_at) VALUES(?,?,?)`,
 		a.ID, a.Name, a.CreatedAt,
 	)
@@ -85,6 +101,39 @@ func (s *AlbumService) AddAsset(albumID, assetID string) error {
 func (s *AlbumService) RemoveAsset(albumID, assetID string) error {
 	_, err := s.db.Exec(`DELETE FROM album_assets WHERE album_id=? AND asset_id=?`, albumID, assetID)
 	return err
+}
+
+// BatchAddAssets 在单 transaction 内一次添加多个 asset。
+// 幂等（INSERT OR IGNORE）。album 不存在返回 ErrNotFound。
+func (s *AlbumService) BatchAddAssets(albumID string, assetIDs []string) error {
+	var dummy string
+	err := s.db.QueryRow(`SELECT id FROM albums WHERE id=?`, albumID).Scan(&dummy)
+	if err == sql.ErrNoRows {
+		return ErrNotFound
+	}
+	if err != nil {
+		return err
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	stmt, err := tx.Prepare(`INSERT OR IGNORE INTO album_assets(album_id, asset_id, added_at) VALUES(?,?,?)`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
+	now := time.Now()
+	for _, id := range assetIDs {
+		if _, err := stmt.Exec(albumID, id, now); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 func (s *AlbumService) ListAssets(albumID string) ([]Asset, error) {

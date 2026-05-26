@@ -26,10 +26,6 @@ func (h *AlbumsHandler) List(c echo.Context) error {
 }
 
 // Create creates a new album.
-//
-// POST /v1/photos/albums
-//
-//	{ "name": "Summer 2024" }
 func (h *AlbumsHandler) Create(c echo.Context) error {
 	var req struct {
 		Name string `json:"name"`
@@ -38,6 +34,12 @@ func (h *AlbumsHandler) Create(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusBadRequest, "name is required")
 	}
 	album, err := h.svc.Albums().Create(req.Name)
+	if errors.Is(err, service.ErrInvalidInput) {
+		return echo.NewHTTPError(http.StatusBadRequest, "name is required")
+	}
+	if errors.Is(err, service.ErrAlbumNameExists) {
+		return echo.NewHTTPError(http.StatusConflict, "album name already exists")
+	}
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
 	}
@@ -99,6 +101,26 @@ func (h *AlbumsHandler) AddAsset(c echo.Context) error {
 // DELETE /v1/photos/albums/:id/assets/:asset
 func (h *AlbumsHandler) RemoveAsset(c echo.Context) error {
 	if err := h.svc.Albums().RemoveAsset(c.Param("id"), c.Param("asset")); err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	}
+	return c.NoContent(http.StatusNoContent)
+}
+
+// BatchAdd — POST /v1/photos/albums/:id/assets/batch
+//
+//	{ "assetIds": ["uuid1", "uuid2"] }
+func (h *AlbumsHandler) BatchAdd(c echo.Context) error {
+	var req struct {
+		AssetIDs []string `json:"assetIds"`
+	}
+	if err := c.Bind(&req); err != nil || len(req.AssetIDs) == 0 {
+		return echo.NewHTTPError(http.StatusBadRequest, "assetIds is required")
+	}
+	err := h.svc.Albums().BatchAddAssets(c.Param("id"), req.AssetIDs)
+	if errors.Is(err, service.ErrNotFound) {
+		return echo.NewHTTPError(http.StatusNotFound, "album not found")
+	}
+	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
 	}
 	return c.NoContent(http.StatusNoContent)

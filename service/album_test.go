@@ -78,3 +78,69 @@ func TestAlbumAddRemoveAsset(t *testing.T) {
 
 	require.NoError(t, svc.RemoveAsset(album.ID, "a1"))
 }
+
+func TestAlbumCreateDuplicateName(t *testing.T) {
+	svc, cleanup := openTestAlbumSvc(t)
+	defer cleanup()
+
+	_, err := svc.Create("MyAlbum")
+	require.NoError(t, err)
+
+	_, err = svc.Create("MyAlbum")
+	require.ErrorIs(t, err, service.ErrAlbumNameExists)
+}
+
+func TestAlbumCreateTrimsAndRejectsBlank(t *testing.T) {
+	svc, cleanup := openTestAlbumSvc(t)
+	defer cleanup()
+
+	_, err := svc.Create("   ")
+	require.ErrorIs(t, err, service.ErrInvalidInput)
+
+	a, err := svc.Create("  Trimmed  ")
+	require.NoError(t, err)
+	require.Equal(t, "Trimmed", a.Name)
+}
+
+func TestBatchAddAssetsToAlbum(t *testing.T) {
+	db, err := sqlite.Open(filepath.Join(t.TempDir(), "test.db"))
+	require.NoError(t, err)
+	defer db.Close()
+
+	for _, id := range []string{"a1", "a2", "a3"} {
+		_, err := db.Exec(`INSERT INTO assets(id, file_path, status) VALUES(?, ?, 'indexed')`, id, "/x/"+id+".jpg")
+		require.NoError(t, err)
+	}
+
+	svc := service.NewAlbumService(db)
+	album, err := svc.Create("Batch")
+	require.NoError(t, err)
+
+	require.NoError(t, svc.BatchAddAssets(album.ID, []string{"a1", "a2", "a3"}))
+
+	assets, err := svc.ListAssets(album.ID)
+	require.NoError(t, err)
+	require.Len(t, assets, 3)
+}
+
+func TestBatchAddAssetsIdempotent(t *testing.T) {
+	db, err := sqlite.Open(filepath.Join(t.TempDir(), "test.db"))
+	require.NoError(t, err)
+	defer db.Close()
+
+	_, _ = db.Exec(`INSERT INTO assets(id, file_path, status) VALUES('a1', '/x.jpg', 'indexed')`)
+	svc := service.NewAlbumService(db)
+	album, _ := svc.Create("X")
+
+	require.NoError(t, svc.BatchAddAssets(album.ID, []string{"a1", "a1", "a1"}))
+
+	assets, _ := svc.ListAssets(album.ID)
+	require.Len(t, assets, 1)
+}
+
+func TestBatchAddUnknownAlbum(t *testing.T) {
+	svc, cleanup := openTestAlbumSvc(t)
+	defer cleanup()
+	err := svc.BatchAddAssets("nonexistent-id", []string{"a1"})
+	require.ErrorIs(t, err, service.ErrNotFound)
+}
