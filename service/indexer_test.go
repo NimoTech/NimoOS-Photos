@@ -174,6 +174,70 @@ type mockMLNotReady struct{ mockML }
 
 func (m *mockMLNotReady) IsReady() bool { return false }
 
+// TestIndexer_ForceReprocess_SkipExif 断言 skipExif=true 时不动 asset_exif 行。
+func TestIndexer_ForceReprocess_SkipExif(t *testing.T) {
+	db := makeTestDB(t)
+	thumbDir := t.TempDir()
+	imgDir := t.TempDir()
+	imgPath := makeTestJPEG(t, imgDir)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	idx := NewIndexer(db, &mockML{}, thumbDir, 1)
+	go idx.Start(ctx)
+	idx.Enqueue(imgPath)
+
+	var assetID string
+	require.Eventually(t, func() bool {
+		return db.QueryRow(`SELECT id FROM assets WHERE file_path=? AND status='indexed'`, imgPath).Scan(&assetID) == nil
+	}, 4*time.Second, 50*time.Millisecond)
+
+	// 故意污染 asset_exif: 写一个明显错误的值
+	_, err := db.Exec(`UPDATE asset_exif SET width=99999 WHERE asset_id=?`, assetID)
+	require.NoError(t, err)
+
+	ok := idx.ForceReprocess(imgPath, processOpts{force: true, skipExif: true, skipThumb: true})
+	require.True(t, ok)
+
+	// skipExif 生效时，污染值仍然保留
+	var w int
+	require.NoError(t, db.QueryRow(`SELECT width FROM asset_exif WHERE asset_id=?`, assetID).Scan(&w))
+	require.Equal(t, 99999, w, "skipExif=true 时应保留原 asset_exif")
+}
+
+// TestIndexer_ForceReprocess_SkipThumb 断言 skipThumb=true 时不重生缩略图。
+func TestIndexer_ForceReprocess_SkipThumb(t *testing.T) {
+	db := makeTestDB(t)
+	thumbDir := t.TempDir()
+	imgDir := t.TempDir()
+	imgPath := makeTestJPEG(t, imgDir)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	idx := NewIndexer(db, &mockML{}, thumbDir, 1)
+	go idx.Start(ctx)
+	idx.Enqueue(imgPath)
+
+	var assetID string
+	require.Eventually(t, func() bool {
+		return db.QueryRow(`SELECT id FROM assets WHERE file_path=? AND status='indexed'`, imgPath).Scan(&assetID) == nil
+	}, 4*time.Second, 50*time.Millisecond)
+
+	// 替换缩略图目录里某个文件为 sentinel（取目录下任一已存在的图）
+	entries, err := os.ReadDir(filepath.Join(thumbDir, assetID))
+	require.NoError(t, err)
+	require.NotEmpty(t, entries, "precondition: 应已生成缩略图")
+	sentinel := filepath.Join(thumbDir, assetID, entries[0].Name())
+	require.NoError(t, os.WriteFile(sentinel, []byte{0}, 0644))
+
+	ok := idx.ForceReprocess(imgPath, processOpts{force: true, skipExif: true, skipThumb: true})
+	require.True(t, ok)
+
+	info, err := os.Stat(sentinel)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), info.Size(), "skipThumb=true 时应保留原缩略图（sentinel 仍是 1 字节）")
+}
+
 // TestAssetExifUpsertReplacesOnConflict drives the asset_exif upsert SQL
 // directly to confirm that ON CONFLICT(asset_id) DO UPDATE replaces only the
 // columns listed in the DO UPDATE clause, leaving previously-written columns
