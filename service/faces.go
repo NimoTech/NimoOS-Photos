@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"math"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -190,7 +191,14 @@ type FaceService struct {
 	db      *sql.DB
 	reg     *TaskRegistry
 	running atomic.Bool
+
+	// 失败 backoff：RunClustering 出错后短期内不再触发，避免每分钟重试风暴。
+	failMu   sync.Mutex
+	nextAttempt time.Time
 }
+
+// clusterFailBackoff 是 RunClustering 失败后的最短再次尝试间隔。
+const clusterFailBackoff = 30 * time.Minute
 
 // NewFaceService creates a new FaceService backed by the given database.
 func NewFaceService(db *sql.DB) *FaceService {
@@ -210,7 +218,10 @@ func (s *FaceService) RunClustering(ctx context.Context) error {
 	defer s.running.Store(false)
 
 	var total int64
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM face_detections`).Scan(&total); err != nil {
+	// 与 loadFacesWithProgress 一致：只算关联到现存 asset 的 face_detections。
+	if err := s.db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM face_detections fd
+		JOIN assets a ON a.id = fd.asset_id`).Scan(&total); err != nil {
 		return err
 	}
 	if total == 0 {
@@ -269,7 +280,7 @@ func (s *FaceService) RunClustering(ctx context.Context) error {
 
 	pub(1, "done", "")
 	go func() {
-		time.Sleep(6 * time.Second)
+		time.Sleep(taskCleanupDelay)
 		if s.reg != nil {
 			s.reg.Remove(taskID)
 		}
@@ -280,7 +291,13 @@ func (s *FaceService) RunClustering(ctx context.Context) error {
 func (s *FaceService) loadFacesWithProgress(ctx context.Context, total int64,
 	onProgress func(int64),
 ) ([]faceRow, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, asset_id, embedding FROM face_detections`)
+	// JOIN assets 过滤孤儿 face_detections（asset_id 指向已删除 asset 的行）。
+	// 不 JOIN 的话，rebuildPersons 拿着孤儿的 asset_id 做 cover 会触发
+	// persons.cover_asset_id REFERENCES assets(id) 的外键违反。
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT fd.id, fd.asset_id, fd.embedding
+		FROM face_detections fd
+		JOIN assets a ON a.id = fd.asset_id`)
 	if err != nil {
 		return nil, err
 	}
@@ -373,6 +390,14 @@ func (s *FaceService) StartScheduler(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			case t := <-ticker.C:
+				// 失败 backoff：上次失败后短期内不再尝试。
+				s.failMu.Lock()
+				nextOK := s.nextAttempt
+				s.failMu.Unlock()
+				if !nextOK.IsZero() && t.Before(nextOK) {
+					continue
+				}
+
 				shouldRun := false
 
 				if t.Hour() == 3 && t.Minute() < 5 {
@@ -394,6 +419,13 @@ func (s *FaceService) StartScheduler(ctx context.Context) {
 				if shouldRun {
 					if err := s.RunClustering(ctx); err != nil {
 						zap.L().Error("face clustering failed", zap.Error(err))
+						s.failMu.Lock()
+						s.nextAttempt = time.Now().Add(clusterFailBackoff)
+						s.failMu.Unlock()
+					} else {
+						s.failMu.Lock()
+						s.nextAttempt = time.Time{}
+						s.failMu.Unlock()
 					}
 				}
 			}
