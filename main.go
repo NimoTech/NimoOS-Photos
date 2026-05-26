@@ -67,11 +67,14 @@ func main() {
 
 	logger.LogInit(config.Cfg.LogPath, "nimoos-photos", "log")
 
-	svc := service.NewService(ctx, config.Cfg, nil)
+	pub := service.NewMessageBusPublisher(ctx)
+	svc := service.NewService(ctx, config.Cfg, pub)
 
 	// Start background workers
 	go svc.Watcher().Start(ctx)
 	go svc.Indexer().Start(ctx)
+	go svc.Faces().StartScheduler(ctx)
+	go svc.Embedder().Run(ctx)
 
 	// Prune orphaned TUS staging files at startup (one-shot) and then daily.
 	go func() {

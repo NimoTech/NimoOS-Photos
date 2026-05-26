@@ -20,6 +20,7 @@ type Services interface {
 	Search() *SearchService
 	Faces() *FaceService
 	Tasks() *TaskRegistry
+	Embedder() *Embedder
 	RestartWatcher(dirs []string)
 }
 
@@ -32,6 +33,7 @@ type services struct {
 	search    *SearchService
 	faces     *FaceService
 	tasks     *TaskRegistry
+	embedder  *Embedder
 	parentCtx context.Context
 }
 
@@ -42,6 +44,7 @@ func (s *services) Albums() *AlbumService  { return s.albums }
 func (s *services) Search() *SearchService { return s.search }
 func (s *services) Faces() *FaceService    { return s.faces }
 func (s *services) Tasks() *TaskRegistry   { return s.tasks }
+func (s *services) Embedder() *Embedder    { return s.embedder }
 
 // NewService wires all service-layer components together from cfg and returns a
 // ready-to-use Services handle. It panics if the database cannot be opened.
@@ -70,6 +73,7 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 	search := NewSearchService(db, ml)
 	faces := NewFaceService(db)
 	faces.SetTaskRegistry(taskReg)
+	embedder := NewEmbedder(db, ml, idx, taskReg)
 
 	// 5. Kick off the initial directory scan in the background so startup is
 	//    non-blocking. ScanPending retries assets that failed in a prior run
@@ -90,6 +94,7 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 		search:    search,
 		faces:     faces,
 		tasks:     taskReg,
+		embedder:  embedder,
 		parentCtx: parentCtx,
 	}
 }
