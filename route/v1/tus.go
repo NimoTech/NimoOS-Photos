@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 
@@ -121,16 +122,33 @@ func validateMetadata(hook handler.HookEvent) (handler.HTTPResponse, handler.Fil
 
 // ingestStagedFile moves a completed TUS upload from staging to the gallery
 // and enqueues it for indexing. albumID may be empty.
-// enqueue is injected (svc.Indexer().Enqueue in prod, fake in tests).
+//
+// reserve and submit are injected callbacks that implement a two-step enqueue
+// protocol:
+//  1. reserve(dest, batchID, batchTotal) — pre-occupies the indexer's seen map
+//     and records batch metadata BEFORE the rename. This prevents the fsnotify
+//     watcher from racing ahead with a plain Enqueue call (no batchID) the
+//     moment the file appears in the gallery directory.
+//  2. submit(dest, batchID) — pushes the item into the worker queue AFTER the
+//     rename has succeeded.
 func ingestStagedFile(
 	stagedPath string,
 	filename string,
 	albumID string,
-	enqueue func(path string),
+	batchID string,
+	batchTotal int64,
+	reserve func(path, batchID string, batchTotal int64) bool,
+	submit func(path, batchID string),
 	galleryDir string,
 ) error {
 	dest := filepath.Join(galleryDir, filename)
-	// Try atomic rename first (same filesystem).
+
+	// Step 1: pre-occupy seen + record batch metadata before rename.
+	if !reserve(dest, batchID, batchTotal) {
+		return fmt.Errorf("path already pending: %s", dest)
+	}
+
+	// Step 2: rename / copy into gallery.
 	if err := os.Rename(stagedPath, dest); err != nil {
 		// Fallback: copy + delete (cross-fs case)
 		if cerr := copyFile(stagedPath, dest); cerr != nil {
@@ -141,7 +159,9 @@ func ingestStagedFile(
 	// Remove .info sidecar
 	os.Remove(stagedPath + ".info") //nolint:errcheck
 
-	enqueue(dest)
+	// Step 3: push into worker queue.
+	submit(dest, batchID)
+
 	// albumID handling — current Indexer doesn't carry album metadata;
 	// album assignment happens via a separate call after asset record exists.
 	// Deferred to wiring task (Task 6).
@@ -194,9 +214,19 @@ func NewTUSHandler(svc service.Services, galleryDir string) (http.Handler, error
 			stagedPath := filepath.Join(common.StagingDir, event.Upload.ID)
 			filename := event.Upload.MetaData["filename"]
 			albumID := event.Upload.MetaData["albumId"]
+			batchID := event.Upload.MetaData["batchId"]
+			var batchTotal int64
+			if bt := event.Upload.MetaData["batchTotal"]; bt != "" {
+				if n, perr := strconv.ParseInt(bt, 10, 64); perr == nil {
+					batchTotal = n
+				}
+			}
 			if err := ingestStagedFile(
 				stagedPath, filename, albumID,
-				svc.Indexer().Enqueue, galleryDir,
+				batchID, batchTotal,
+				svc.Indexer().MarkAndReserve,
+				svc.Indexer().SubmitReserved,
+				galleryDir,
 			); err != nil {
 				zap.L().Error("ingestStagedFile failed",
 					zap.String("id", event.Upload.ID),

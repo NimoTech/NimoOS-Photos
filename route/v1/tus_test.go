@@ -100,10 +100,30 @@ func TestIngestStagedFile_Success(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var enqueued []string
-	enqueue := func(p string) { enqueued = append(enqueued, p) }
+	const wantBatchID = "batch-uuid-001"
+	const wantBatchTotal int64 = 5
 
-	err := ingestStagedFile(stagedPath, "IMG_001.jpg", "", enqueue, galleryDir)
+	var reservedPath, reservedBatchID string
+	var reservedBatchTotal int64
+	reserve := func(path, bid string, total int64) bool {
+		reservedPath = path
+		reservedBatchID = bid
+		reservedBatchTotal = total
+		return true
+	}
+
+	var submittedPath, submittedBatchID string
+	submit := func(path, bid string) {
+		submittedPath = path
+		submittedBatchID = bid
+	}
+
+	err := ingestStagedFile(
+		stagedPath, "IMG_001.jpg", "",
+		wantBatchID, wantBatchTotal,
+		reserve, submit,
+		galleryDir,
+	)
 	if err != nil {
 		t.Fatalf("ingest failed: %v", err)
 	}
@@ -122,7 +142,41 @@ func TestIngestStagedFile_Success(t *testing.T) {
 		t.Errorf("expected file at %s: %v", expectedDest, e)
 	}
 
-	if len(enqueued) != 1 || enqueued[0] != expectedDest {
-		t.Errorf("expected indexer enqueue %s, got %v", expectedDest, enqueued)
+	// reserve must have been called with correct args before rename
+	if reservedPath != expectedDest {
+		t.Errorf("reserve: expected path %s, got %s", expectedDest, reservedPath)
+	}
+	if reservedBatchID != wantBatchID {
+		t.Errorf("reserve: expected batchID %q, got %q", wantBatchID, reservedBatchID)
+	}
+	if reservedBatchTotal != wantBatchTotal {
+		t.Errorf("reserve: expected batchTotal %d, got %d", wantBatchTotal, reservedBatchTotal)
+	}
+
+	// submit must have been called with correct path + batchID
+	if submittedPath != expectedDest {
+		t.Errorf("submit: expected path %s, got %s", expectedDest, submittedPath)
+	}
+	if submittedBatchID != wantBatchID {
+		t.Errorf("submit: expected batchID %q, got %q", wantBatchID, submittedBatchID)
+	}
+}
+
+func TestIngestStagedFile_ReserveFailure(t *testing.T) {
+	stagingDir := t.TempDir()
+	galleryDir := t.TempDir()
+
+	stagedPath := filepath.Join(stagingDir, "xyz")
+	if err := os.WriteFile(stagedPath, []byte("data"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	// reserve returns false — simulates path already occupied
+	reserve := func(path, bid string, total int64) bool { return false }
+	submit := func(path, bid string) { t.Error("submit must not be called when reserve fails") }
+
+	err := ingestStagedFile(stagedPath, "photo.jpg", "", "bid", 1, reserve, submit, galleryDir)
+	if err == nil {
+		t.Fatal("expected error when reserve returns false, got nil")
 	}
 }

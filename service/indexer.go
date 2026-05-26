@@ -345,6 +345,35 @@ func (ix *Indexer) EnqueueWithBatch(path, batchID string, batchTotal int64) {
 	}
 }
 
+// MarkAndReserve pre-occupies the seen map and records batch metadata for path
+// before the file is moved into the gallery directory. This two-step API
+// (MarkAndReserve → rename → SubmitReserved) prevents a fsnotify race where
+// the watcher fires a Create event for the renamed file and calls Enqueue
+// before the TUS goroutine reaches EnqueueWithBatch — causing the file to land
+// in the default idle slot (batches[""]) instead of the named batch.
+//
+// Returns false when path is already occupied in seen (should not normally
+// happen); the caller must not proceed with the rename in that case.
+func (ix *Indexer) MarkAndReserve(path, batchID string, batchTotal int64) bool {
+	if _, loaded := ix.seen.LoadOrStore(path, struct{}{}); loaded {
+		return false
+	}
+	ix.ingest.noteEnqueueWithBatch(batchID, batchTotal)
+	return true
+}
+
+// SubmitReserved pushes a previously MarkAndReserve-d path into the worker
+// queue. If the queue is full the seen reservation is released (batch counter
+// already incremented; the idle timer will eventually fire on the remaining
+// files and not deadlock).
+func (ix *Indexer) SubmitReserved(path, batchID string) {
+	select {
+	case ix.queue <- ingestQueueItem{path: path, batchID: batchID}:
+	default:
+		ix.seen.Delete(path)
+	}
+}
+
 // SetOnBatchDone registers a callback that is called each time any batch
 // (including the anonymous "" batch) transitions to "done". Intended for
 // upper-layer hooks such as triggering RunClustering after an upload batch
