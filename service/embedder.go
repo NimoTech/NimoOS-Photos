@@ -109,6 +109,12 @@ func (e *Embedder) Backfill(ctx context.Context) error {
 		pubRunning(processed)
 	}
 
+	// 若 ctx 已取消（用户主动取消或服务关闭），不发 final task——
+	// 部分完成不等于完成，registry 里残留的 running task 会随服务关闭自然消失。
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+
 	final := Task{
 		ID:        taskID,
 		Type:      "embedding",

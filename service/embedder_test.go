@@ -223,6 +223,71 @@ func TestEmbedder_Backfill_AllFail(t *testing.T) {
 	require.Contains(t, errEv.Error, "ML")
 }
 
+// TestEmbedder_Backfill_CtxCancelMidwayDoesNotEmitDone:
+// ctx 在循环中途被取消时，不应发 "done" 状态的 final task，且应返回 context.Canceled。
+//
+// 策略：
+//   - 插 10 个真实 JPEG，让 Indexer 先把它们变成 status='indexed'（无 CLIP 向量）。
+//   - 用 slowML（每次 CLIPImageEmbed 延迟 50ms）使整个循环需要 ~500ms。
+//   - ctx 在 150ms 后超时，届时大约处理 2-3 个，break 触发。
+//   - 修复前：break 后直接落入 final 决策 → 发 done；修复后：检查 ctx.Err() → return，不发 done。
+func TestEmbedder_Backfill_CtxCancelMidwayDoesNotEmitDone(t *testing.T) {
+	db := makeTestDB(t)
+	thumbDir := t.TempDir()
+	imgDir := t.TempDir()
+
+	// 用 mockMLNotReady 先把图片 indexed（无 CLIP 向量）
+	notReady := &mockMLNotReady{}
+	idx0 := NewIndexer(db, notReady, thumbDir, 1)
+	bgCtx, bgCancel := context.WithCancel(context.Background())
+	defer bgCancel()
+	go idx0.Start(bgCtx)
+	for i := 0; i < 10; i++ {
+		idx0.Enqueue(makeUniqueJPEG(t, imgDir, i))
+	}
+	require.Eventually(t, func() bool {
+		var n int
+		_ = db.QueryRow(`SELECT COUNT(*) FROM assets WHERE status='indexed'`).Scan(&n)
+		return n == 10
+	}, 15*time.Second, 100*time.Millisecond, "等待 10 个 asset indexed")
+
+	var emitted []Task
+	var mu sync.Mutex
+	reg := NewTaskRegistry(func(tk Task) { mu.Lock(); emitted = append(emitted, tk); mu.Unlock() })
+
+	// slowML：每次 CLIPImageEmbed 延迟 50ms，10 个文件共需 ~500ms
+	slow := &slowML{delay: 50 * time.Millisecond}
+	idx2 := NewIndexer(db, slow, thumbDir, 1)
+	go idx2.Start(bgCtx)
+	e := NewEmbedder(db, slow, idx2, reg)
+
+	// 150ms 后取消，届时循环只跑了 2-3 轮，尚未完成全部 10 个
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+
+	err := e.Backfill(ctx)
+	require.ErrorIs(t, err, context.DeadlineExceeded, "ctx 超时后应返回 DeadlineExceeded")
+
+	mu.Lock()
+	defer mu.Unlock()
+	for _, ev := range emitted {
+		if ev.Type == "embedding" && ev.Status == "done" {
+			t.Fatalf("不应在 ctx 取消后发 done event：%+v", ev)
+		}
+	}
+}
+
+// slowML 包装 mockML 给 CLIPImageEmbed 加固定延迟。
+type slowML struct {
+	mockML
+	delay time.Duration
+}
+
+func (m *slowML) CLIPImageEmbed(d []byte) ([]float32, error) {
+	time.Sleep(m.delay)
+	return m.mockML.CLIPImageEmbed(d)
+}
+
 // TestEmbedder_Backfill_ConcurrencyGuard 同时调两次，第二个秒返回。
 func TestEmbedder_Backfill_ConcurrencyGuard(t *testing.T) {
 	db := makeTestDB(t)
