@@ -1,9 +1,13 @@
 package v1_test
 
 import (
+	"archive/zip"
+	"bytes"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -119,4 +123,101 @@ func TestListHandler(t *testing.T) {
 	require.Equal(t, http.StatusOK, rec.Code)
 	require.True(t, strings.Contains(rec.Body.String(), `"id":"a1"`))
 	require.True(t, strings.Contains(rec.Body.String(), `"favoritedAt"`))
+}
+
+func TestExportZipHandler(t *testing.T) {
+	dir := t.TempDir()
+	fileA := filepath.Join(dir, "alpha.jpg")
+	fileB := filepath.Join(dir, "beta.jpg")
+	require.NoError(t, os.WriteFile(fileA, []byte("AAAA"), 0o644))
+	require.NoError(t, os.WriteFile(fileB, []byte("BBBB"), 0o644))
+
+	db, err := sqlite.Open(filepath.Join(dir, "test.db"))
+	require.NoError(t, err)
+	defer db.Close()
+	_, err = db.Exec(`INSERT INTO assets(id, file_path, original_name, status) VALUES('a1', ?, 'alpha.jpg', 'indexed')`, fileA)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO assets(id, file_path, original_name, status) VALUES('a2', ?, 'beta.jpg', 'indexed')`, fileB)
+	require.NoError(t, err)
+
+	svc := &fakeServices{favs: service.NewFavoritesService(db)}
+	_, _ = svc.favs.Favorite("default", "a1")
+	_, _ = svc.favs.Favorite("default", "a2")
+
+	h := v1.NewFavoritesHandler(svc, dir)
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/photos/favorites/export", nil)
+	rec := httptest.NewRecorder()
+	c := echo.New().NewContext(req, rec)
+
+	require.NoError(t, h.Export(c))
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Equal(t, "application/zip", rec.Header().Get("Content-Type"))
+	require.Contains(t, rec.Header().Get("Content-Disposition"), "favorites-")
+
+	zr, err := zip.NewReader(bytes.NewReader(rec.Body.Bytes()), int64(rec.Body.Len()))
+	require.NoError(t, err)
+	require.Len(t, zr.File, 2)
+	names := []string{zr.File[0].Name, zr.File[1].Name}
+	require.ElementsMatch(t, []string{"alpha.jpg", "beta.jpg"}, names)
+
+	for _, zf := range zr.File {
+		rc, err := zf.Open()
+		require.NoError(t, err)
+		data, _ := io.ReadAll(rc)
+		rc.Close()
+		if zf.Name == "alpha.jpg" {
+			require.Equal(t, "AAAA", string(data))
+		} else {
+			require.Equal(t, "BBBB", string(data))
+		}
+	}
+}
+
+func TestExportZipNoFavorites(t *testing.T) {
+	h, _, cleanup := newFavHarness(t)
+	defer cleanup()
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/photos/favorites/export", nil)
+	rec := httptest.NewRecorder()
+	c := echo.New().NewContext(req, rec)
+
+	err := h.Export(c)
+	httpErr, ok := err.(*echo.HTTPError)
+	require.True(t, ok)
+	require.Equal(t, http.StatusBadRequest, httpErr.Code)
+}
+
+func TestExportZipDeduplicatesNames(t *testing.T) {
+	dir := t.TempDir()
+	fileA := filepath.Join(dir, "sub1", "photo.jpg")
+	fileB := filepath.Join(dir, "sub2", "photo.jpg")
+	require.NoError(t, os.MkdirAll(filepath.Dir(fileA), 0o755))
+	require.NoError(t, os.MkdirAll(filepath.Dir(fileB), 0o755))
+	require.NoError(t, os.WriteFile(fileA, []byte("X"), 0o644))
+	require.NoError(t, os.WriteFile(fileB, []byte("Y"), 0o644))
+
+	db, err := sqlite.Open(filepath.Join(dir, "test.db"))
+	require.NoError(t, err)
+	defer db.Close()
+	_, _ = db.Exec(`INSERT INTO assets(id, file_path, original_name, status) VALUES('a1', ?, 'photo.jpg', 'indexed')`, fileA)
+	_, _ = db.Exec(`INSERT INTO assets(id, file_path, original_name, status) VALUES('a2', ?, 'photo.jpg', 'indexed')`, fileB)
+
+	svc := &fakeServices{favs: service.NewFavoritesService(db)}
+	_, _ = svc.favs.Favorite("default", "a1")
+	_, _ = svc.favs.Favorite("default", "a2")
+
+	h := v1.NewFavoritesHandler(svc, dir)
+	req := httptest.NewRequest(http.MethodGet, "/v1/photos/favorites/export", nil)
+	rec := httptest.NewRecorder()
+	c := echo.New().NewContext(req, rec)
+
+	require.NoError(t, h.Export(c))
+
+	zr, err := zip.NewReader(bytes.NewReader(rec.Body.Bytes()), int64(rec.Body.Len()))
+	require.NoError(t, err)
+	require.Len(t, zr.File, 2)
+	names := []string{zr.File[0].Name, zr.File[1].Name}
+	require.Contains(t, names, "photo.jpg")
+	require.Contains(t, names, "photo-2.jpg")
 }

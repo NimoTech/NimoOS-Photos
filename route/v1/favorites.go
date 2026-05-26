@@ -1,12 +1,19 @@
 package v1
 
 import (
+	"archive/zip"
 	"errors"
+	"fmt"
+	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
+	"time"
 
 	"github.com/NimoTech/NimoOS-Photos/service"
 	"github.com/labstack/echo/v4"
+	"go.uber.org/zap"
 )
 
 type FavoritesHandler struct {
@@ -66,4 +73,76 @@ func (h *FavoritesHandler) List(c echo.Context) error {
 		assets = []service.Asset{}
 	}
 	return c.JSON(http.StatusOK, assets)
+}
+
+// Export — GET /v1/photos/favorites/export
+// 流式 ZIP 下载。单文件失败跳过、写日志。无收藏返回 400。
+func (h *FavoritesHandler) Export(c echo.Context) error {
+	userID := JWTUserID(c)
+	assets, err := h.svc.Favorites().List(userID, service.ListFavoritesOpts{})
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	}
+	if len(assets) == 0 {
+		return echo.NewHTTPError(http.StatusBadRequest, "no favorites")
+	}
+
+	filename := fmt.Sprintf("favorites-%s.zip", time.Now().Format("2006-01-02"))
+	c.Response().Header().Set("Content-Type", "application/zip")
+	c.Response().Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, filename))
+	c.Response().WriteHeader(http.StatusOK)
+
+	zw := zip.NewWriter(c.Response().Writer)
+	defer zw.Close()
+
+	usedNames := map[string]int{}
+	for _, a := range assets {
+		name := dedupZipEntryName(a.OriginalName, usedNames)
+		if name == "" {
+			name = a.ID + filepath.Ext(a.FilePath)
+		}
+
+		w, err := zw.Create(name)
+		if err != nil {
+			zap.L().Warn("zip create entry failed", zap.String("name", name), zap.Error(err))
+			continue
+		}
+		f, err := os.Open(a.FilePath)
+		if err != nil {
+			zap.L().Warn("zip skip missing file", zap.String("path", a.FilePath), zap.Error(err))
+			continue
+		}
+		_, copyErr := io.Copy(w, f)
+		f.Close()
+		if copyErr != nil {
+			zap.L().Warn("zip copy failed", zap.String("path", a.FilePath), zap.Error(copyErr))
+			continue
+		}
+		if flusher, ok := c.Response().Writer.(http.Flusher); ok {
+			flusher.Flush()
+		}
+	}
+	return nil
+}
+
+// dedupZipEntryName 返回不与 used 中已有名字冲突的文件名。
+// "photo.jpg" 第二次出现变成 "photo-2.jpg"。
+func dedupZipEntryName(name string, used map[string]int) string {
+	if name == "" {
+		return ""
+	}
+	if _, exists := used[name]; !exists {
+		used[name] = 1
+		return name
+	}
+	ext := filepath.Ext(name)
+	base := name[:len(name)-len(ext)]
+	for {
+		used[name]++
+		candidate := fmt.Sprintf("%s-%d%s", base, used[name], ext)
+		if _, exists := used[candidate]; !exists {
+			used[candidate] = 1
+			return candidate
+		}
+	}
 }
