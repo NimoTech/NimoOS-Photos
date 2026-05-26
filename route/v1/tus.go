@@ -49,6 +49,14 @@ func (w *relativeLocationWriter) Write(b []byte) (int, error) {
 	return w.ResponseWriter.Write(b)
 }
 
+// Unwrap 让 tusd v2 能通过 http.NewResponseController 拿到原始 ResponseWriter
+// 的 SetReadDeadline / SetWriteDeadline 等控制 API。否则日志里会刷
+// "NetworkControlError / feature not supported" warning（虽不影响上传成功，
+// 但用 fixed timeout 而不是 tusd 的动态超时）。
+func (w *relativeLocationWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
+}
+
 // withRelativeLocation wraps an http.Handler so that any absolute Location
 // header it sets is rewritten to a path-only URL.
 func withRelativeLocation(h http.Handler) http.Handler {
