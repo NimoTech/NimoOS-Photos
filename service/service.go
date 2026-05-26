@@ -69,6 +69,7 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 	albums := NewAlbumService(db)
 	search := NewSearchService(db, ml)
 	faces := NewFaceService(db)
+	faces.SetTaskRegistry(taskReg)
 
 	// 5. Kick off the initial directory scan in the background so startup is
 	//    non-blocking. ScanPending retries assets that failed in a prior run

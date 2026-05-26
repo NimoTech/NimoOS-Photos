@@ -3,7 +3,9 @@ package service
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"math"
+	"sync/atomic"
 	"time"
 
 	"github.com/NimoTech/NimoOS-Photos/pkg/sqlite"
@@ -176,9 +178,18 @@ func DBSCANWithProgress(vecs [][]float32, epsilon float64, minPoints int, onProg
 	return labels
 }
 
+// faceRow holds a single face detection record loaded from the database.
+type faceRow struct {
+	id      string
+	assetID string
+	vec     []float32
+}
+
 // FaceService handles face clustering and person management.
 type FaceService struct {
-	db *sql.DB
+	db      *sql.DB
+	reg     *TaskRegistry
+	running atomic.Bool
 }
 
 // NewFaceService creates a new FaceService backed by the given database.
@@ -186,51 +197,111 @@ func NewFaceService(db *sql.DB) *FaceService {
 	return &FaceService{db: db}
 }
 
+// SetTaskRegistry injects a TaskRegistry so RunClustering can report progress.
+func (s *FaceService) SetTaskRegistry(reg *TaskRegistry) { s.reg = reg }
+
 // RunClustering reads all face embeddings, runs DBSCAN, and rebuilds the
 // persons and face_person tables from scratch.
-func (s *FaceService) RunClustering() error {
-	// 1. Load all face detections.
-	rows, err := s.db.Query(`SELECT id, asset_id, embedding FROM face_detections`)
-	if err != nil {
+// Concurrent calls are safe: the second call returns nil immediately (CAS guard).
+func (s *FaceService) RunClustering(ctx context.Context) error {
+	if !s.running.CompareAndSwap(false, true) {
+		return nil
+	}
+	defer s.running.Store(false)
+
+	var total int64
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM face_detections`).Scan(&total); err != nil {
 		return err
 	}
-	defer rows.Close()
-
-	type faceRow struct {
-		id      string
-		assetID string
-		vec     []float32
-	}
-
-	var faces []faceRow
-	for rows.Next() {
-		var f faceRow
-		var blob []byte
-		if err := rows.Scan(&f.id, &f.assetID, &blob); err != nil {
-			return err
-		}
-		f.vec = sqlite.DeserializeFloat32(blob)
-		faces = append(faces, f)
-	}
-	if err := rows.Err(); err != nil {
-		return err
-	}
-
-	if len(faces) == 0 {
+	if total == 0 {
 		return nil
 	}
 
-	// 2. Build embedding matrix.
+	taskID := fmt.Sprintf("face_%d", time.Now().UnixNano())
+	started := time.Now()
+	pub := func(progress float64, status string, errMsg string) {
+		if s.reg == nil {
+			return
+		}
+		s.reg.Upsert(Task{
+			ID:        taskID,
+			Type:      "face",
+			Label:     "识别人物",
+			Progress:  progress,
+			Status:    status,
+			Error:     errMsg,
+			StartedAt: started,
+		})
+	}
+	pub(0, "running", "")
+
+	faces, err := s.loadFacesWithProgress(ctx, total, func(loaded int64) {
+		pub(0.10*float64(loaded)/float64(total), "running", "")
+	})
+	if err != nil {
+		pub(0, "error", fmt.Sprintf("人脸聚类失败：%s", err.Error()))
+		return err
+	}
+
 	vecs := make([][]float32, len(faces))
 	for i, f := range faces {
 		vecs[i] = f.vec
 	}
+	labels := DBSCANWithProgress(vecs, dbscanEpsilon, dbscanMinPoints,
+		func(done, n int) { pub(0.10+0.75*float64(done)/float64(n), "running", "") })
 
-	// 3. Run DBSCAN.
-	labels := DBSCAN(vecs, dbscanEpsilon, dbscanMinPoints)
+	if err := s.rebuildPersonsWithProgress(ctx, faces, labels,
+		func(done, n int) { pub(0.85+0.15*float64(done)/float64(n), "running", "") },
+	); err != nil {
+		pub(0, "error", fmt.Sprintf("人脸聚类失败：%s", err.Error()))
+		return err
+	}
 
-	// 4. Rebuild persons and face_person inside a transaction.
-	tx, err := s.db.Begin()
+	pub(1, "done", "")
+	go func() {
+		time.Sleep(6 * time.Second)
+		if s.reg != nil {
+			s.reg.Remove(taskID)
+		}
+	}()
+	return nil
+}
+
+func (s *FaceService) loadFacesWithProgress(ctx context.Context, total int64,
+	onProgress func(int64),
+) ([]faceRow, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, asset_id, embedding FROM face_detections`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]faceRow, 0, total)
+	var loaded int64
+	lastReport := -1
+	for rows.Next() {
+		var f faceRow
+		var blob []byte
+		if err := rows.Scan(&f.id, &f.assetID, &blob); err != nil {
+			return nil, err
+		}
+		f.vec = sqlite.DeserializeFloat32(blob)
+		out = append(out, f)
+		loaded++
+		if total > 0 {
+			if b := int(loaded * 100 / total); b != lastReport {
+				onProgress(loaded)
+				lastReport = b
+			}
+		}
+	}
+	onProgress(loaded)
+	return out, rows.Err()
+}
+
+func (s *FaceService) rebuildPersonsWithProgress(ctx context.Context, faces []faceRow, labels []int,
+	onProgress func(done, n int),
+) error {
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
@@ -247,37 +318,34 @@ func (s *FaceService) RunClustering() error {
 		return err
 	}
 
-	// Map cluster label → Person ID.
-	labelToPersonID := make(map[int]string)
-	// Map cluster label → cover asset ID (first face seen for that cluster).
-	labelToCover := make(map[int]string)
-
+	labelToPersonID := map[int]string{}
 	for i, f := range faces {
-		label := labels[i]
-		if _, exists := labelToPersonID[label]; !exists {
+		l := labels[i]
+		if _, ok := labelToPersonID[l]; !ok {
 			personID := uuid.NewString()
-			labelToPersonID[label] = personID
-			labelToCover[label] = f.assetID
-			if _, err = tx.Exec(
-				`INSERT INTO persons(id, name, cover_asset_id) VALUES(?, '', ?)`,
-				personID, f.assetID,
-			); err != nil {
+			labelToPersonID[l] = personID
+			if _, err = tx.Exec(`INSERT INTO persons(id, name, cover_asset_id) VALUES(?, '', ?)`,
+				personID, f.assetID); err != nil {
 				return err
 			}
 		}
 	}
 
+	n := len(faces)
+	lastReport := -1
 	for i, f := range faces {
-		label := labels[i]
-		personID := labelToPersonID[label]
-		if _, err = tx.Exec(
-			`INSERT INTO face_person(face_id, person_id) VALUES(?, ?)`,
-			f.id, personID,
-		); err != nil {
+		if _, err = tx.Exec(`INSERT INTO face_person(face_id, person_id) VALUES(?, ?)`,
+			f.id, labelToPersonID[labels[i]]); err != nil {
 			return err
 		}
+		if n > 0 {
+			if b := (i + 1) * 100 / n; b != lastReport {
+				onProgress(i+1, n)
+				lastReport = b
+			}
+		}
 	}
-
+	onProgress(n, n)
 	return tx.Commit()
 }
 
@@ -313,7 +381,7 @@ func (s *FaceService) StartScheduler(ctx context.Context) {
 				}
 
 				if shouldRun {
-					if err := s.RunClustering(); err != nil {
+					if err := s.RunClustering(ctx); err != nil {
 						zap.L().Error("face clustering failed", zap.Error(err))
 					}
 				}

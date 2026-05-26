@@ -1,14 +1,27 @@
 package service_test
 
 import (
+	"context"
+	"database/sql"
 	"math"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/NimoTech/NimoOS-Photos/pkg/sqlite"
 	"github.com/NimoTech/NimoOS-Photos/service"
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 )
+
+// makeTestFaceDB opens a fresh temp SQLite database for face tests.
+func makeTestFaceDB(t *testing.T) *sql.DB {
+	t.Helper()
+	db, err := sqlite.Open(filepath.Join(t.TempDir(), "fc.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { db.Close() })
+	return db
+}
 
 func normalize(v []float32) []float32 {
 	var sum float64
@@ -55,9 +68,7 @@ func TestDBSCAN_Empty(t *testing.T) {
 }
 
 func TestRunClustering(t *testing.T) {
-	db, err := sqlite.Open(filepath.Join(t.TempDir(), "fc.db"))
-	require.NoError(t, err)
-	defer db.Close()
+	db := makeTestFaceDB(t)
 
 	// 插入 2 个相似人脸（应聚成 1 个 person）+ 1 个不相似（单独 person）
 	// 人脸 1 和 2：v[0]=1，归一化后余弦距离 ≈ 0
@@ -82,7 +93,7 @@ func TestRunClustering(t *testing.T) {
 	insert("f3", "a2", face(1.0, 1))    // 正交
 
 	svc := service.NewFaceService(db)
-	require.NoError(t, svc.RunClustering())
+	require.NoError(t, svc.RunClustering(context.Background()))
 
 	var personCount int
 	db.QueryRow(`SELECT COUNT(*) FROM persons`).Scan(&personCount)
@@ -91,6 +102,93 @@ func TestRunClustering(t *testing.T) {
 	var fpCount int
 	db.QueryRow(`SELECT COUNT(*) FROM face_person`).Scan(&fpCount)
 	require.Equal(t, 3, fpCount, "所有 3 个 face 都应有 person 关联")
+}
+
+// TestRunClustering_ConcurrencyGuard 同时启两个 RunClustering，
+// 期待第二个秒返回 nil，且 persons / face_person 状态只被一次操作改写。
+func TestRunClustering_ConcurrencyGuard(t *testing.T) {
+	db := makeTestFaceDB(t)
+	_, err := db.Exec(`INSERT INTO assets(id,file_path,status) VALUES('a','/a.jpg','indexed')`)
+	require.NoError(t, err)
+	for i := 0; i < 60; i++ {
+		vec := make([]float32, 512)
+		vec[i%512] = 1
+		_, err := db.Exec(`
+            INSERT INTO face_detections(id, asset_id, bbox, embedding)
+            VALUES(?, 'a', '{}', ?)`,
+			uuid.NewString(), sqlite.SerializeFloat32(vec),
+		)
+		require.NoError(t, err)
+	}
+
+	s := service.NewFaceService(db)
+	var wg sync.WaitGroup
+	var errs [2]error
+	wg.Add(2)
+	go func() { defer wg.Done(); errs[0] = s.RunClustering(context.Background()) }()
+	go func() { defer wg.Done(); errs[1] = s.RunClustering(context.Background()) }()
+	wg.Wait()
+	require.NoError(t, errs[0])
+	require.NoError(t, errs[1])
+
+	var personCount int
+	_ = db.QueryRow(`SELECT COUNT(*) FROM persons`).Scan(&personCount)
+	require.Equal(t, 60, personCount, "60 face、minPts=1 应得 60 簇/60 persons")
+}
+
+// TestRunClustering_EmptyDoesNotPublish 0 人脸时不发任何 task。
+func TestRunClustering_EmptyDoesNotPublish(t *testing.T) {
+	db := makeTestFaceDB(t)
+	var emitted []service.Task
+	var mu sync.Mutex
+	s := service.NewFaceService(db)
+	reg := service.NewTaskRegistry(func(tk service.Task) { mu.Lock(); emitted = append(emitted, tk); mu.Unlock() })
+	s.SetTaskRegistry(reg)
+	require.NoError(t, s.RunClustering(context.Background()))
+	mu.Lock()
+	defer mu.Unlock()
+	require.Empty(t, emitted)
+}
+
+// TestRunClustering_StagesPublishProgress 断言三阶段都发出 progress。
+func TestRunClustering_StagesPublishProgress(t *testing.T) {
+	db := makeTestFaceDB(t)
+	_, _ = db.Exec(`INSERT INTO assets(id,file_path,status) VALUES('a','/a.jpg','indexed')`)
+	for i := 0; i < 5; i++ {
+		vec := make([]float32, 512)
+		vec[i] = 1
+		_, _ = db.Exec(`INSERT INTO face_detections(id, asset_id, bbox, embedding) VALUES(?, 'a', '{}', ?)`,
+			uuid.NewString(), sqlite.SerializeFloat32(vec))
+	}
+	var emitted []service.Task
+	var mu sync.Mutex
+	s := service.NewFaceService(db)
+	reg := service.NewTaskRegistry(func(tk service.Task) { mu.Lock(); emitted = append(emitted, tk); mu.Unlock() })
+	s.SetTaskRegistry(reg)
+	require.NoError(t, s.RunClustering(context.Background()))
+
+	mu.Lock()
+	defer mu.Unlock()
+	var sawLoading, sawClustering, sawPersisting, sawDone bool
+	for _, e := range emitted {
+		if e.Type != "face" {
+			continue
+		}
+		switch {
+		case e.Status == "done" && e.Progress == 1:
+			sawDone = true
+		case e.Progress > 0 && e.Progress < 0.10:
+			sawLoading = true
+		case e.Progress >= 0.10 && e.Progress < 0.85:
+			sawClustering = true
+		case e.Progress >= 0.85 && e.Progress < 1:
+			sawPersisting = true
+		}
+	}
+	require.True(t, sawLoading, "应有 loading 阶段 progress")
+	require.True(t, sawClustering, "应有 clustering 阶段 progress")
+	require.True(t, sawPersisting, "应有 persisting 阶段 progress")
+	require.True(t, sawDone, "应有 done event")
 }
 
 // TestDBSCANWithProgress 断言 onProgress 回调被调用，progress 单调递增，
