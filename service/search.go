@@ -87,7 +87,7 @@ WHERE vec.embedding MATCH ? AND k = ?
 // descending chronological order. Assets without taken_at go into year=0, month=0.
 // The LEFT JOIN on asset_exif lets the frontend aggregate filter facets
 // (camera, location) without an extra fetch per asset.
-func (s *SearchService) Timeline() ([]TimelineGroup, error) {
+func (s *SearchService) Timeline(userID string) ([]TimelineGroup, error) {
 	rows, err := s.db.Query(`
 SELECT a.id, a.file_path, a.file_size, COALESCE(a.mime_type,''),
        COALESCE(a.original_name,''), a.taken_at, a.duration_ms,
@@ -95,22 +95,23 @@ SELECT a.id, a.file_path, a.file_size, COALESCE(a.mime_type,''),
        a.indexed_at, a.status,
        e.width, e.height, e.latitude, e.longitude, e.make, e.model,
        e.iso, e.shutter_speed, e.aperture, e.focal_length, e.orientation,
-       e.video_codec, e.audio_codec, e.frame_rate, e.bit_rate, e.rotation
+       e.video_codec, e.audio_codec, e.frame_rate, e.bit_rate, e.rotation,
+       f.favorited_at
 FROM assets a
 LEFT JOIN asset_exif e ON e.asset_id = a.id
+LEFT JOIN asset_favorites f ON f.asset_id = a.id AND f.user_id = ?
 WHERE a.is_live_photo_video = 0
-ORDER BY COALESCE(a.taken_at, a.indexed_at) DESC`)
+ORDER BY COALESCE(a.taken_at, a.indexed_at) DESC`, userID)
 	if err != nil {
 		return nil, fmt.Errorf("Timeline query: %w", err)
 	}
 	defer rows.Close()
 
-	assets, err := scanAssetsDetailed(rows)
+	assets, err := scanAssetsDetailedWithFav(rows)
 	if err != nil {
 		return nil, err
 	}
 
-	// Group preserving descending order.
 	type key struct{ year, month int }
 	var order []key
 	groups := map[key]*TimelineGroup{}
@@ -122,7 +123,6 @@ ORDER BY COALESCE(a.taken_at, a.indexed_at) DESC`)
 		} else if a.IndexedAt != nil {
 			k = key{a.IndexedAt.Year(), int(a.IndexedAt.Month())}
 		}
-		// else zero group
 
 		if _, exists := groups[k]; !exists {
 			order = append(order, k)
@@ -217,25 +217,7 @@ func (s *SearchService) MergePersons(fromID, intoID string) error {
 
 // ListAssets returns paginated assets (non-live-photo-video) ordered by
 // descending taken_at / indexed_at.
-func (s *SearchService) ListAssets(limit, offset int) ([]Asset, error) {
-	rows, err := s.db.Query(`
-SELECT id, file_path, file_size, COALESCE(mime_type,''),
-       COALESCE(original_name,''), taken_at, duration_ms,
-       COALESCE(live_photo_video_id,''), is_live_photo_video,
-       indexed_at, status
-FROM assets
-WHERE is_live_photo_video = 0
-ORDER BY COALESCE(taken_at, indexed_at) DESC
-LIMIT ? OFFSET ?`, limit, offset)
-	if err != nil {
-		return nil, fmt.Errorf("ListAssets query: %w", err)
-	}
-	defer rows.Close()
-	return scanAssets(rows)
-}
-
-// GetAsset returns a single asset by ID; returns ErrNotFound when absent.
-func (s *SearchService) GetAsset(id string) (*Asset, error) {
+func (s *SearchService) ListAssets(userID string, limit, offset int) ([]Asset, error) {
 	rows, err := s.db.Query(`
 SELECT a.id, a.file_path, a.file_size, COALESCE(a.mime_type,''),
        COALESCE(a.original_name,''), a.taken_at, a.duration_ms,
@@ -243,16 +225,42 @@ SELECT a.id, a.file_path, a.file_size, COALESCE(a.mime_type,''),
        a.indexed_at, a.status,
        e.width, e.height, e.latitude, e.longitude, e.make, e.model,
        e.iso, e.shutter_speed, e.aperture, e.focal_length, e.orientation,
-       e.video_codec, e.audio_codec, e.frame_rate, e.bit_rate, e.rotation
+       e.video_codec, e.audio_codec, e.frame_rate, e.bit_rate, e.rotation,
+       f.favorited_at
 FROM assets a
 LEFT JOIN asset_exif e ON e.asset_id = a.id
-WHERE a.id = ?`, id)
+LEFT JOIN asset_favorites f ON f.asset_id = a.id AND f.user_id = ?
+WHERE a.is_live_photo_video = 0
+ORDER BY COALESCE(a.taken_at, a.indexed_at) DESC
+LIMIT ? OFFSET ?`, userID, limit, offset)
+	if err != nil {
+		return nil, fmt.Errorf("ListAssets query: %w", err)
+	}
+	defer rows.Close()
+	return scanAssetsDetailedWithFav(rows)
+}
+
+// GetAsset returns a single asset by ID; returns ErrNotFound when absent.
+func (s *SearchService) GetAsset(userID, id string) (*Asset, error) {
+	rows, err := s.db.Query(`
+SELECT a.id, a.file_path, a.file_size, COALESCE(a.mime_type,''),
+       COALESCE(a.original_name,''), a.taken_at, a.duration_ms,
+       COALESCE(a.live_photo_video_id,''), a.is_live_photo_video,
+       a.indexed_at, a.status,
+       e.width, e.height, e.latitude, e.longitude, e.make, e.model,
+       e.iso, e.shutter_speed, e.aperture, e.focal_length, e.orientation,
+       e.video_codec, e.audio_codec, e.frame_rate, e.bit_rate, e.rotation,
+       f.favorited_at
+FROM assets a
+LEFT JOIN asset_exif e ON e.asset_id = a.id
+LEFT JOIN asset_favorites f ON f.asset_id = a.id AND f.user_id = ?
+WHERE a.id = ?`, userID, id)
 	if err != nil {
 		return nil, fmt.Errorf("GetAsset query: %w", err)
 	}
 	defer rows.Close()
 
-	assets, err := scanAssetsDetailed(rows)
+	assets, err := scanAssetsDetailedWithFav(rows)
 	if err != nil {
 		return nil, err
 	}

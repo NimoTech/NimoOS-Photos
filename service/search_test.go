@@ -56,7 +56,7 @@ func TestTimeline(t *testing.T) {
 	db.Exec(`INSERT INTO assets(id,file_path,status,taken_at,is_live_photo_video) VALUES('v1','/p1.mov','indexed','2025-07-15 10:00:00',1)`)
 
 	svc := service.NewSearchService(db, nil)
-	groups, err := svc.Timeline()
+	groups, err := svc.Timeline("default")
 	require.NoError(t, err)
 	require.Len(t, groups, 1)
 	require.Equal(t, 2025, groups[0].Year)
@@ -74,7 +74,7 @@ func TestListAssets(t *testing.T) {
 	}
 
 	svc := service.NewSearchService(db, nil)
-	assets, err := svc.ListAssets(10, 0)
+	assets, err := svc.ListAssets("default", 10, 0)
 	require.NoError(t, err)
 	require.Len(t, assets, 3)
 }
@@ -91,7 +91,7 @@ func TestGetAssetReturnsImageMetadata(t *testing.T) {
 	require.NoError(t, err)
 
 	svc := service.NewSearchService(db, nil)
-	a, err := svc.GetAsset("img1")
+	a, err := svc.GetAsset("default", "img1")
 	require.NoError(t, err)
 	require.Equal(t, 4000, a.Width)
 	require.Equal(t, 3000, a.Height)
@@ -114,7 +114,7 @@ func TestGetAssetReturnsVideoMetadata(t *testing.T) {
 	require.NoError(t, err)
 
 	svc := service.NewSearchService(db, nil)
-	a, err := svc.GetAsset("vid1")
+	a, err := svc.GetAsset("default", "vid1")
 	require.NoError(t, err)
 	require.Equal(t, 1920, a.Width)
 	require.Equal(t, 1080, a.Height)
@@ -136,7 +136,7 @@ func TestGetAssetWithoutExifRow(t *testing.T) {
 	require.NoError(t, err)
 
 	svc := service.NewSearchService(db, nil)
-	a, err := svc.GetAsset("bare")
+	a, err := svc.GetAsset("default", "bare")
 	require.NoError(t, err)
 	require.Equal(t, "bare", a.ID)
 	require.Equal(t, 0, a.Width)

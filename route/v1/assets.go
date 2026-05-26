@@ -36,7 +36,7 @@ func (h *AssetsHandler) List(c echo.Context) error {
 	if limit <= 0 || limit > 200 {
 		limit = 50
 	}
-	assets, err := h.svc.Search().ListAssets(limit, offset)
+	assets, err := h.svc.Search().ListAssets(JWTUserID(c), limit, offset)
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
 	}
@@ -45,7 +45,7 @@ func (h *AssetsHandler) List(c echo.Context) error {
 
 // Get returns a single asset by ID.
 func (h *AssetsHandler) Get(c echo.Context) error {
-	asset, err := h.svc.Search().GetAsset(c.Param("id"))
+	asset, err := h.svc.Search().GetAsset(JWTUserID(c), c.Param("id"))
 	if errors.Is(err, service.ErrNotFound) {
 		return echo.NewHTTPError(http.StatusNotFound)
 	}
@@ -93,7 +93,7 @@ func (h *AssetsHandler) Upload(c echo.Context) error {
 // live-photo video partner, if any).
 func (h *AssetsHandler) Delete(c echo.Context) error {
 	id := c.Param("id")
-	asset, err := h.svc.Search().GetAsset(id)
+	asset, err := h.svc.Search().GetAsset(JWTUserID(c), id)
 	if errors.Is(err, service.ErrNotFound) {
 		return echo.NewHTTPError(http.StatusNotFound)
 	}
@@ -106,7 +106,7 @@ func (h *AssetsHandler) Delete(c echo.Context) error {
 
 	// Remove live-photo video partner if present.
 	if asset.LivePhotoVideoID != "" {
-		if liveAsset, lerr := h.svc.Search().GetAsset(asset.LivePhotoVideoID); lerr == nil {
+		if liveAsset, lerr := h.svc.Search().GetAsset(JWTUserID(c), asset.LivePhotoVideoID); lerr == nil {
 			os.Remove(liveAsset.FilePath) //nolint:errcheck
 		}
 		h.svc.DB().Exec(`DELETE FROM assets WHERE id=?`, asset.LivePhotoVideoID) //nolint:errcheck
@@ -135,7 +135,7 @@ func (h *AssetsHandler) Thumbnail(c echo.Context) error {
 
 // Original streams the full-resolution original file.
 func (h *AssetsHandler) Original(c echo.Context) error {
-	asset, err := h.svc.Search().GetAsset(c.Param("id"))
+	asset, err := h.svc.Search().GetAsset(JWTUserID(c), c.Param("id"))
 	if errors.Is(err, service.ErrNotFound) {
 		return echo.NewHTTPError(http.StatusNotFound)
 	}
@@ -147,7 +147,7 @@ func (h *AssetsHandler) Original(c echo.Context) error {
 
 // Live streams the video component of a live photo.
 func (h *AssetsHandler) Live(c echo.Context) error {
-	asset, err := h.svc.Search().GetAsset(c.Param("id"))
+	asset, err := h.svc.Search().GetAsset(JWTUserID(c), c.Param("id"))
 	if errors.Is(err, service.ErrNotFound) {
 		return echo.NewHTTPError(http.StatusNotFound)
 	}
@@ -157,7 +157,7 @@ func (h *AssetsHandler) Live(c echo.Context) error {
 	if asset.LivePhotoVideoID == "" {
 		return echo.NewHTTPError(http.StatusNotFound, "no live photo video")
 	}
-	liveAsset, err := h.svc.Search().GetAsset(asset.LivePhotoVideoID)
+	liveAsset, err := h.svc.Search().GetAsset(JWTUserID(c), asset.LivePhotoVideoID)
 	if err != nil {
 		return echo.NewHTTPError(http.StatusNotFound)
 	}

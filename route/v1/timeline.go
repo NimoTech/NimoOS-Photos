@@ -18,7 +18,7 @@ func NewTimelineHandler(svc service.Services) *TimelineHandler { return &Timelin
 //
 // GET /v1/photos/timeline
 func (h *TimelineHandler) List(c echo.Context) error {
-	groups, err := h.svc.Search().Timeline()
+	groups, err := h.svc.Search().Timeline(JWTUserID(c))
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
 	}
