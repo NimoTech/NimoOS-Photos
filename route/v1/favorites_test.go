@@ -1,0 +1,122 @@
+package v1_test
+
+import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/NimoTech/NimoOS-Photos/pkg/sqlite"
+	v1 "github.com/NimoTech/NimoOS-Photos/route/v1"
+	"github.com/NimoTech/NimoOS-Photos/service"
+	"github.com/labstack/echo/v4"
+	"github.com/stretchr/testify/require"
+)
+
+type fakeServices struct {
+	service.Services
+	favs *service.FavoritesService
+}
+
+func (f *fakeServices) Favorites() *service.FavoritesService { return f.favs }
+
+func newFavHarness(t *testing.T) (*v1.FavoritesHandler, *fakeServices, func()) {
+	t.Helper()
+	db, err := sqlite.Open(filepath.Join(t.TempDir(), "test.db"))
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO assets(id, file_path, status) VALUES('a1','/x/a1.jpg','indexed')`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO assets(id, file_path, status) VALUES('a2','/x/a2.jpg','indexed')`)
+	require.NoError(t, err)
+
+	svc := &fakeServices{favs: service.NewFavoritesService(db)}
+	h := v1.NewFavoritesHandler(svc, "/tmp/gallery")
+	return h, svc, func() { db.Close() }
+}
+
+func TestFavoriteHandlerSuccess(t *testing.T) {
+	h, _, cleanup := newFavHarness(t)
+	defer cleanup()
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/photos/favorites/a1", nil)
+	rec := httptest.NewRecorder()
+	c := echo.New().NewContext(req, rec)
+	c.SetParamNames("asset_id")
+	c.SetParamValues("a1")
+
+	require.NoError(t, h.Favorite(c))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	var resp struct {
+		FavoritedAt string `json:"favoritedAt"`
+	}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+	require.NotEmpty(t, resp.FavoritedAt)
+}
+
+func TestFavoriteHandlerAssetNotFound(t *testing.T) {
+	h, _, cleanup := newFavHarness(t)
+	defer cleanup()
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/photos/favorites/nope", nil)
+	rec := httptest.NewRecorder()
+	c := echo.New().NewContext(req, rec)
+	c.SetParamNames("asset_id")
+	c.SetParamValues("nope")
+
+	err := h.Favorite(c)
+	httpErr, ok := err.(*echo.HTTPError)
+	require.True(t, ok)
+	require.Equal(t, http.StatusNotFound, httpErr.Code)
+}
+
+func TestUnfavoriteHandlerIdempotent(t *testing.T) {
+	h, _, cleanup := newFavHarness(t)
+	defer cleanup()
+
+	req := httptest.NewRequest(http.MethodDelete, "/v1/photos/favorites/nope", nil)
+	rec := httptest.NewRecorder()
+	c := echo.New().NewContext(req, rec)
+	c.SetParamNames("asset_id")
+	c.SetParamValues("nope")
+
+	require.NoError(t, h.Unfavorite(c))
+	require.Equal(t, http.StatusNoContent, rec.Code)
+}
+
+func TestListIDsHandler(t *testing.T) {
+	h, svcs, cleanup := newFavHarness(t)
+	defer cleanup()
+
+	_, _ = svcs.Favorites().Favorite("default", "a1")
+	_, _ = svcs.Favorites().Favorite("default", "a2")
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/photos/favorites/ids", nil)
+	rec := httptest.NewRecorder()
+	c := echo.New().NewContext(req, rec)
+
+	require.NoError(t, h.ListIDs(c))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	var ids []string
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &ids))
+	require.ElementsMatch(t, []string{"a1", "a2"}, ids)
+}
+
+func TestListHandler(t *testing.T) {
+	h, svcs, cleanup := newFavHarness(t)
+	defer cleanup()
+
+	_, _ = svcs.Favorites().Favorite("default", "a1")
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/photos/favorites?limit=10", nil)
+	rec := httptest.NewRecorder()
+	c := echo.New().NewContext(req, rec)
+
+	require.NoError(t, h.List(c))
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.True(t, strings.Contains(rec.Body.String(), `"id":"a1"`))
+	require.True(t, strings.Contains(rec.Body.String(), `"favoritedAt"`))
+}
