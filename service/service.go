@@ -8,6 +8,7 @@ import (
 	"github.com/NimoTech/NimoOS-Photos/pkg/config"
 	"github.com/NimoTech/NimoOS-Photos/pkg/mlclient"
 	"github.com/NimoTech/NimoOS-Photos/pkg/sqlite"
+	"go.uber.org/zap"
 )
 
 // Services is the top-level dependency container used by the HTTP layer and
@@ -21,7 +22,6 @@ type Services interface {
 	Faces() *FaceService
 	Tasks() *TaskRegistry
 	Embedder() *Embedder
-	Favorites() *FavoritesService
 	RestartWatcher(dirs []string)
 }
 
@@ -35,7 +35,6 @@ type services struct {
 	faces     *FaceService
 	tasks     *TaskRegistry
 	embedder  *Embedder
-	favorites *FavoritesService
 	parentCtx context.Context
 }
 
@@ -46,8 +45,7 @@ func (s *services) Albums() *AlbumService  { return s.albums }
 func (s *services) Search() *SearchService { return s.search }
 func (s *services) Faces() *FaceService    { return s.faces }
 func (s *services) Tasks() *TaskRegistry   { return s.tasks }
-func (s *services) Embedder() *Embedder          { return s.embedder }
-func (s *services) Favorites() *FavoritesService { return s.favorites }
+func (s *services) Embedder() *Embedder    { return s.embedder }
 
 // NewService wires all service-layer components together from cfg and returns a
 // ready-to-use Services handle. It panics if the database cannot be opened.
@@ -73,11 +71,20 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 	idx.SetTaskRegistry(taskReg)
 	watcher := NewWatcher(db, cfg.WatchDirs, idx, liveDir)
 	albums := NewAlbumService(db)
-	favorites := NewFavoritesService(db)
 	search := NewSearchService(db, ml)
 	faces := NewFaceService(db)
 	faces.SetTaskRegistry(taskReg)
 	embedder := NewEmbedder(db, ml, idx, taskReg)
+
+	// batch 上传完成后主动触发人脸聚类，让前端能看到从 0% 涨到 100% 的"识别人物" task。
+	// faces.RunClustering 内部用 CAS 防重入，多个 batch 同时 done 也只会跑一次。
+	idx.SetOnBatchDone(func() {
+		go func() {
+			if err := faces.RunClustering(parentCtx); err != nil {
+				zap.L().Warn("post-batch face clustering failed", zap.Error(err))
+			}
+		}()
+	})
 
 	// 5. Kick off the initial directory scan in the background so startup is
 	//    non-blocking. ScanPending retries assets that failed in a prior run
@@ -99,7 +106,6 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 		faces:     faces,
 		tasks:     taskReg,
 		embedder:  embedder,
-		favorites: favorites,
 		parentCtx: parentCtx,
 	}
 }
