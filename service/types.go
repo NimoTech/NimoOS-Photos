@@ -33,6 +33,10 @@ type Asset struct {
 	FrameRate    float64 `json:"frameRate,omitempty"`
 	BitRate      int64   `json:"bitRate,omitempty"`
 	Rotation     int     `json:"rotation,omitempty"`
+
+	// Joined from asset_favorites (populated by List/Timeline/GetAsset when caller
+	// supplies a user_id; nil = not favorited by this user).
+	FavoritedAt *time.Time `json:"favoritedAt,omitempty"`
 }
 
 type AssetExif struct {
