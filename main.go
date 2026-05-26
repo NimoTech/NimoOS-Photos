@@ -67,7 +67,7 @@ func main() {
 
 	logger.LogInit(config.Cfg.LogPath, "nimoos-photos", "log")
 
-	svc := service.NewService(ctx, config.Cfg)
+	svc := service.NewService(ctx, config.Cfg, nil)
 
 	// Start background workers
 	go svc.Watcher().Start(ctx)

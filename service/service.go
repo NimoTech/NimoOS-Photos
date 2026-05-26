@@ -46,7 +46,7 @@ func (s *services) Tasks() *TaskRegistry   { return s.tasks }
 // NewService wires all service-layer components together from cfg and returns a
 // ready-to-use Services handle. It panics if the database cannot be opened.
 // A goroutine is started immediately to scan all WatchDirs and pair live photos.
-func NewService(parentCtx context.Context, cfg *config.Config) Services {
+func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher) Services {
 	// 1. Open (or create) the SQLite database.
 	dbPath := filepath.Join(cfg.DataPath, "photos.db")
 	db, err := sqlite.Open(dbPath)
@@ -62,7 +62,7 @@ func NewService(parentCtx context.Context, cfg *config.Config) Services {
 	liveDir := filepath.Join(cfg.DataPath, "live")
 
 	// 4. Assemble individual services.
-	taskReg := NewTaskRegistry(nil)
+	taskReg := NewTaskRegistry(pub)
 	idx := NewIndexer(db, ml, thumbDir, cfg.Workers)
 	idx.SetTaskRegistry(taskReg)
 	watcher := NewWatcher(db, cfg.WatchDirs, idx, liveDir)
