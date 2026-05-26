@@ -63,13 +63,21 @@ var videoExts = map[string]bool{
 	".avi": true,
 }
 
+// ingestQueueItem carries a file path and its optional batch association
+// through the worker queue so that noteResultWithBatch can update the correct
+// batch slot.
+type ingestQueueItem struct {
+	path    string
+	batchID string // "" for watcher / ScanDirectory paths
+}
+
 // Indexer processes media files into the database with a worker pool.
 type Indexer struct {
 	db       *sql.DB
 	ml       MLProvider
 	thumbDir string
 	workers  int
-	queue    chan string
+	queue    chan ingestQueueItem
 	seen     sync.Map // in-flight dedup: path -> struct{}
 	taskReg  *TaskRegistry
 	ingest   *ingestTracker // aggregates Enqueue/processFile into a single rolling task
@@ -79,115 +87,192 @@ type Indexer struct {
 // publishes the final "done" task and resets itself for the next batch.
 const defaultIngestIdleTimeout = 6 * time.Second
 
-// ingestTracker aggregates TUS/watcher-driven Enqueue calls into a single
-// type="index" rolling Task. It is reset after each idle period so that a new
-// wave of files starts a fresh Task ID.
+// taskCleanupDelay is how long a completed task stays in the registry before
+// being removed. Shared by ingestTracker, ScanDirectory, and FaceService so
+// the UI has a consistent window to display the done state.
+const taskCleanupDelay = 6 * time.Second
+
+// ingestBatch tracks the progress of a single logical batch of files.
+// The empty-string batchID ("") is the legacy singleton slot used by watcher
+// and ScanDirectory; named batches come from multi-select TUS uploads.
+type ingestBatch struct {
+	id         string // = batchID (map key); taskID is a separate auto-generated ID
+	taskID     string // "ingest_<unixnano>"
+	fixedTotal bool   // true: total was set by caller (batchTotal > 0), not incremented per-enqueue
+	enqueued   int64  // total number of noteEnqueueWithBatch calls for this batch (overrun detection)
+	total      int64
+	current    int64
+	failed     int64
+	startedAt  time.Time
+	idleTimer  *time.Timer
+}
+
+// ingestTracker aggregates TUS/watcher-driven Enqueue calls into rolling
+// type="index" Tasks, one per batchID. The empty batchID ("") maintains the
+// original idle-based singleton behaviour; named batches are independent and
+// each own their own task ID and timer.
 type ingestTracker struct {
-	mu        sync.Mutex
-	reg       *TaskRegistry
-	taskID    string
-	total     int64
-	current   int64
-	failed    int64
-	startedAt time.Time
-	idleTimer *time.Timer
-	idleAfter time.Duration
+	mu          sync.Mutex
+	reg         *TaskRegistry
+	batches     map[string]*ingestBatch
+	idleAfter   time.Duration
+	onBatchDone func() // optional callback invoked when any batch reaches done
 }
 
 func newIngestTracker() *ingestTracker {
-	return &ingestTracker{idleAfter: defaultIngestIdleTimeout}
+	return &ingestTracker{
+		idleAfter: defaultIngestIdleTimeout,
+		batches:   make(map[string]*ingestBatch),
+	}
 }
 
-// noteEnqueue is called by Indexer.Enqueue immediately after a path is
-// successfully pushed onto the queue.
+// noteEnqueue is the legacy entry point (batchID="", batchTotal=0).
 func (t *ingestTracker) noteEnqueue() {
-	if t == nil || t.reg == nil {
-		return
-	}
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if t.taskID == "" {
-		t.taskID = fmt.Sprintf("ingest_%d", time.Now().UnixNano())
-		t.startedAt = time.Now()
-		t.total, t.current, t.failed = 0, 0, 0
-	}
-	t.total++
-	if t.idleTimer != nil {
-		t.idleTimer.Stop()
-		t.idleTimer = nil
-	}
-	t.publishRunningLocked()
+	t.noteEnqueueWithBatch("", 0)
 }
 
-// noteResult is called by the worker pool after each processFile returns.
-func (t *ingestTracker) noteResult(success bool) {
+// noteEnqueueWithBatch registers one new file entering the queue for the given
+// batch. If batchTotal > 0 the task total is fixed from the start (only the
+// first call establishes the declared size). Subsequent calls for the same
+// fixedTotal batch do not change total unless enqueued count exceeds the
+// declared total (front-end over-send tolerance: total is extended by 1 per
+// extra file and a warning is printed).
+func (t *ingestTracker) noteEnqueueWithBatch(batchID string, batchTotal int64) {
 	if t == nil || t.reg == nil {
 		return
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if t.taskID == "" {
-		return
-	}
-	t.current++
-	if !success {
-		t.failed++
-	}
-	t.publishRunningLocked()
-	if t.current >= t.total {
-		if t.idleTimer != nil {
-			t.idleTimer.Stop()
+
+	b, exists := t.batches[batchID]
+	if !exists {
+		b = &ingestBatch{
+			id:        batchID,
+			taskID:    fmt.Sprintf("ingest_%d", time.Now().UnixNano()),
+			startedAt: time.Now(),
 		}
-		t.idleTimer = time.AfterFunc(t.idleAfter, t.onIdle)
+		if batchTotal > 0 {
+			b.fixedTotal = true
+			b.total = batchTotal
+		} else {
+			// batchTotal == 0: accumulate mode (legacy "" slot behaviour).
+			b.total = 1
+		}
+		b.enqueued = 1
+		t.batches[batchID] = b
+	} else {
+		b.enqueued++
+		if b.fixedTotal {
+			// Total is fixed. Only extend it when more files are enqueued than declared.
+			if b.enqueued > b.total {
+				fmt.Fprintf(os.Stderr,
+					"[ingestTracker] batch %q: received extra enqueue beyond declared total %d; extending\n",
+					batchID, b.total)
+				b.total++
+			}
+			// Within the declared total: do not modify total.
+		} else {
+			// Accumulate mode: each enqueue increments the total.
+			b.total++
+		}
+	}
+
+	// Cancel any pending idle timer so a new arrival keeps the task alive.
+	if b.idleTimer != nil {
+		b.idleTimer.Stop()
+		b.idleTimer = nil
+	}
+	t.publishRunningLocked(b)
+}
+
+// noteResult is the legacy entry point (batchID="").
+func (t *ingestTracker) noteResult(success bool) {
+	t.noteResultWithBatch("", success)
+}
+
+// noteResultWithBatch records one completed file for the given batch.
+func (t *ingestTracker) noteResultWithBatch(batchID string, success bool) {
+	if t == nil || t.reg == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	b, exists := t.batches[batchID]
+	if !exists {
+		return
+	}
+	b.current++
+	if !success {
+		b.failed++
+	}
+	t.publishRunningLocked(b)
+	if b.current >= b.total {
+		if b.idleTimer != nil {
+			b.idleTimer.Stop()
+		}
+		b.idleTimer = time.AfterFunc(t.idleAfter, func() { t.onIdle(batchID) })
 	}
 }
 
-func (t *ingestTracker) publishRunningLocked() {
+// publishRunningLocked publishes a running task update for b. Must be called
+// with t.mu held.
+func (t *ingestTracker) publishRunningLocked(b *ingestBatch) {
 	progress := 0.0
-	if t.total > 0 {
-		progress = float64(t.current) / float64(t.total)
+	if b.total > 0 {
+		progress = float64(b.current) / float64(b.total)
 	}
 	t.reg.Upsert(Task{
-		ID:        t.taskID,
+		ID:        b.taskID,
 		Type:      "index",
 		Label:     "索引照片",
-		Current:   t.current,
-		Total:     t.total,
+		Current:   b.current,
+		Total:     b.total,
 		Progress:  progress,
 		Status:    "running",
-		StartedAt: t.startedAt,
+		StartedAt: b.startedAt,
 	})
 }
 
-func (t *ingestTracker) onIdle() {
+// onIdle fires after the per-batch idle timer expires; publishes the final
+// "done" task event and schedules cleanup of the batch slot.
+func (t *ingestTracker) onIdle(batchID string) {
 	t.mu.Lock()
-	if t.taskID == "" || t.current < t.total {
+	b, exists := t.batches[batchID]
+	if !exists || b.current < b.total {
 		t.mu.Unlock()
 		return
 	}
 	label := "索引照片"
-	if t.failed > 0 {
-		label = fmt.Sprintf("索引照片（失败 %d 张）", t.failed)
+	if b.failed > 0 {
+		label = fmt.Sprintf("索引照片（失败 %d 张）", b.failed)
 	}
-	id := t.taskID
+	taskID := b.taskID
 	final := Task{
-		ID:        id,
+		ID:        taskID,
 		Type:      "index",
 		Label:     label,
-		Current:   t.current,
-		Total:     t.total,
+		Current:   b.current,
+		Total:     b.total,
 		Progress:  1,
 		Status:    "done",
-		StartedAt: t.startedAt,
+		StartedAt: b.startedAt,
 	}
-	t.taskID = ""
-	t.idleTimer = nil
+	b.idleTimer = nil
 	reg := t.reg
+	cb := t.onBatchDone
 	t.mu.Unlock()
+
 	reg.Upsert(final)
+	if cb != nil {
+		cb()
+	}
 	go func() {
-		time.Sleep(6 * time.Second)
-		reg.Remove(id)
+		time.Sleep(taskCleanupDelay)
+		t.mu.Lock()
+		delete(t.batches, batchID)
+		t.mu.Unlock()
+		reg.Remove(taskID)
 	}()
 }
 
@@ -198,7 +283,7 @@ func NewIndexer(db *sql.DB, ml MLProvider, thumbDir string, workers int) *Indexe
 		ml:       ml,
 		thumbDir: thumbDir,
 		workers:  workers,
-		queue:    make(chan string, 1024),
+		queue:    make(chan ingestQueueItem, 1024),
 		ingest:   newIngestTracker(),
 	}
 }
@@ -222,7 +307,7 @@ func (ix *Indexer) SetIngestIdleTimeout(d time.Duration) {
 	}
 }
 
-// Enqueue adds path to the processing queue.
+// Enqueue adds path to the processing queue with no batch association.
 // Duplicate in-flight paths are silently dropped (only one copy processed at a time).
 func (ix *Indexer) Enqueue(path string) {
 	// LoadOrStore: if already in flight, skip.
@@ -230,11 +315,43 @@ func (ix *Indexer) Enqueue(path string) {
 		return
 	}
 	select {
-	case ix.queue <- path:
+	case ix.queue <- ingestQueueItem{path: path}:
 		ix.ingest.noteEnqueue()
 	default:
 		// queue full — release the seen lock so it can be retried later
 		ix.seen.Delete(path)
+	}
+}
+
+// EnqueueWithBatch is like Enqueue but associates the file with a named batch.
+// batchID identifies a logical group of files (e.g. a single multi-select upload
+// session generated by the front end). batchTotal is the total number of files
+// expected in the batch; when > 0 the task starts with Progress=0/batchTotal
+// rather than growing the total one file at a time.
+// If batchID is empty, behaviour is identical to Enqueue.
+func (ix *Indexer) EnqueueWithBatch(path, batchID string, batchTotal int64) {
+	if batchID == "" {
+		ix.Enqueue(path)
+		return
+	}
+	if _, loaded := ix.seen.LoadOrStore(path, struct{}{}); loaded {
+		return
+	}
+	select {
+	case ix.queue <- ingestQueueItem{path: path, batchID: batchID}:
+		ix.ingest.noteEnqueueWithBatch(batchID, batchTotal)
+	default:
+		ix.seen.Delete(path)
+	}
+}
+
+// SetOnBatchDone registers a callback that is called each time any batch
+// (including the anonymous "" batch) transitions to "done". Intended for
+// upper-layer hooks such as triggering RunClustering after an upload batch
+// completes. Safe to call before or after Start.
+func (ix *Indexer) SetOnBatchDone(fn func()) {
+	if ix.ingest != nil {
+		ix.ingest.onBatchDone = fn
 	}
 }
 
@@ -249,13 +366,13 @@ func (ix *Indexer) Start(ctx context.Context) {
 				select {
 				case <-ctx.Done():
 					return
-				case path, ok := <-ix.queue:
+				case item, ok := <-ix.queue:
 					if !ok {
 						return
 					}
-					success := ix.processFile(path)
-					ix.ingest.noteResult(success)
-					ix.seen.Delete(path)
+					success := ix.processFile(item.path)
+					ix.ingest.noteResultWithBatch(item.batchID, success)
+					ix.seen.Delete(item.path)
 				}
 			}
 		}()
@@ -625,7 +742,7 @@ func (ix *Indexer) ScanDirectory(dir string) error {
 			StartedAt: scanStart,
 		})
 		go func() {
-			time.Sleep(6 * time.Second)
+			time.Sleep(taskCleanupDelay)
 			ix.taskReg.Remove(taskID)
 		}()
 	}()
