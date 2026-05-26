@@ -248,10 +248,20 @@ func (s *FaceService) RunClustering(ctx context.Context) error {
 		vecs[i] = f.vec
 	}
 	labels := DBSCANWithProgress(vecs, dbscanEpsilon, dbscanMinPoints,
-		func(done, n int) { pub(0.10+0.75*float64(done)/float64(n), "running", "") })
+		func(done, n int) {
+			if n == 0 {
+				return
+			}
+			pub(0.10+0.75*float64(done)/float64(n), "running", "")
+		})
 
 	if err := s.rebuildPersonsWithProgress(ctx, faces, labels,
-		func(done, n int) { pub(0.85+0.15*float64(done)/float64(n), "running", "") },
+		func(done, n int) {
+			if n == 0 {
+				return
+			}
+			pub(0.85+0.15*float64(done)/float64(n), "running", "")
+		},
 	); err != nil {
 		pub(0, "error", fmt.Sprintf("人脸聚类失败：%s", err.Error()))
 		return err
@@ -346,7 +356,8 @@ func (s *FaceService) rebuildPersonsWithProgress(ctx context.Context, faces []fa
 		}
 	}
 	onProgress(n, n)
-	return tx.Commit()
+	err = tx.Commit()
+	return err
 }
 
 // StartScheduler runs a background goroutine that triggers RunClustering:
