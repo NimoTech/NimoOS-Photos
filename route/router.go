@@ -79,7 +79,7 @@ func InitRouter(svc service.Services, runtimePath string, thumbDir string) http.
 	albums := v1.NewAlbumsHandler(svc)
 	persons := v1.NewPersonsHandler(svc)
 	index := v1.NewIndexHandler(svc, "/DATA/Gallery")
-	favorites := v1.NewFavoritesHandler(svc, "/DATA/Gallery")
+	favorites := v1.NewFavoritesHandler(svc, "/DATA/Gallery", runtimePath)
 
 	// Asset endpoints
 	g.GET("/assets", assets.List)

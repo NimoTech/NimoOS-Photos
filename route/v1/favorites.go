@@ -2,6 +2,7 @@ package v1
 
 import (
 	"archive/zip"
+	"crypto/ecdsa"
 	"errors"
 	"fmt"
 	"io"
@@ -11,18 +12,21 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/NimoTech/NimoOS-Common/external"
+	"github.com/NimoTech/NimoOS-Common/utils/jwt"
 	"github.com/NimoTech/NimoOS-Photos/service"
 	"github.com/labstack/echo/v4"
 	"go.uber.org/zap"
 )
 
 type FavoritesHandler struct {
-	svc        service.Services
-	galleryDir string
+	svc         service.Services
+	galleryDir  string
+	runtimePath string
 }
 
-func NewFavoritesHandler(svc service.Services, galleryDir string) *FavoritesHandler {
-	return &FavoritesHandler{svc: svc, galleryDir: galleryDir}
+func NewFavoritesHandler(svc service.Services, galleryDir, runtimePath string) *FavoritesHandler {
+	return &FavoritesHandler{svc: svc, galleryDir: galleryDir, runtimePath: runtimePath}
 }
 
 func (h *FavoritesHandler) Favorite(c echo.Context) error {
@@ -78,14 +82,26 @@ func (h *FavoritesHandler) List(c echo.Context) error {
 // Export — GET /v1/photos/favorites/export
 // 流式 ZIP 下载。单文件失败跳过、写日志。无收藏返回 400。
 func (h *FavoritesHandler) Export(c echo.Context) error {
-	// 手动 token 校验（因为绕过了 JWT middleware；与 thumbnail/original/live 同一模式）
+	// 走 query token，绕过了 JWT middleware（router Skipper），所以这里得自己
+	// 解析 JWT 拿 user_id；不然 fallback 到 "default"，和 Favorite 写入的真实
+	// user_id 不一致就会读空、返回 "no favorites"。
 	token := c.QueryParam("token")
 	if token == "" {
 		return echo.NewHTTPError(http.StatusUnauthorized, "token required")
 	}
-	_ = token // 完整 JWT 校验由 Gateway 完成；本服务被直连时只确保非空
-
-	userID := JWTUserID(c)
+	var userID string
+	if h.runtimePath == "" {
+		// 测试 / 单机直连场景：runtimePath 没配，跳过 JWT 校验，回退 "default"。
+		userID = JWTUserID(c)
+	} else {
+		valid, claims, err := jwt.Validate(token, func() (*ecdsa.PublicKey, error) {
+			return external.GetPublicKey(h.runtimePath)
+		})
+		if err != nil || !valid {
+			return echo.NewHTTPError(http.StatusUnauthorized, "invalid token")
+		}
+		userID = strconv.Itoa(claims.ID)
+	}
 	assets, err := h.svc.Favorites().List(userID, service.ListFavoritesOpts{})
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())

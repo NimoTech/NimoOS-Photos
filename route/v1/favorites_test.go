@@ -36,7 +36,7 @@ func newFavHarness(t *testing.T) (*v1.FavoritesHandler, *fakeServices, func()) {
 	require.NoError(t, err)
 
 	svc := &fakeServices{favs: service.NewFavoritesService(db)}
-	h := v1.NewFavoritesHandler(svc, "/tmp/gallery")
+	h := v1.NewFavoritesHandler(svc, "/tmp/gallery", "")
 	return h, svc, func() { db.Close() }
 }
 
@@ -144,7 +144,7 @@ func TestExportZipHandler(t *testing.T) {
 	_, _ = svc.favs.Favorite("default", "a1")
 	_, _ = svc.favs.Favorite("default", "a2")
 
-	h := v1.NewFavoritesHandler(svc, dir)
+	h := v1.NewFavoritesHandler(svc, dir, "")
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/photos/favorites/export?token=t", nil)
 	rec := httptest.NewRecorder()
@@ -207,7 +207,7 @@ func TestExportZipDeduplicatesNames(t *testing.T) {
 	_, _ = svc.favs.Favorite("default", "a1")
 	_, _ = svc.favs.Favorite("default", "a2")
 
-	h := v1.NewFavoritesHandler(svc, dir)
+	h := v1.NewFavoritesHandler(svc, dir, "")
 	req := httptest.NewRequest(http.MethodGet, "/v1/photos/favorites/export?token=t", nil)
 	rec := httptest.NewRecorder()
 	c := echo.New().NewContext(req, rec)
