@@ -3,7 +3,16 @@ package service
 import (
 	"context"
 	"database/sql"
+	"fmt"
+	"image"
+	"image/color"
+	"image/jpeg"
+	"os"
+	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
@@ -53,4 +62,180 @@ func TestEmbedder_HasEmbeddingForPath(t *testing.T) {
 	require.True(t, e.hasEmbeddingForPath("/x.jpg"))
 	require.False(t, e.hasEmbeddingForPath("/y.jpg"))
 	require.False(t, e.hasEmbeddingForPath("/nope.jpg"))
+}
+
+// flakyML：第 N 次 CLIPImageEmbed 返回 error，其余返回正常向量。
+type flakyML struct {
+	mockML
+	failOnCalls map[int]bool
+	calls       atomic.Int64
+}
+
+func (m *flakyML) CLIPImageEmbed(d []byte) ([]float32, error) {
+	n := int(m.calls.Add(1))
+	if m.failOnCalls[n] {
+		return nil, fmt.Errorf("simulated ml failure")
+	}
+	return m.mockML.CLIPImageEmbed(d)
+}
+
+// makeUniqueJPEG 生成内容唯一的 JPEG（不同序号 → 不同 checksum），供 Backfill 测试使用。
+// 与 makeTestJPEGNamed 的区别：填充 idx 颜色避免所有文件 checksum 相同。
+func makeUniqueJPEG(t *testing.T, dir string, idx int) string {
+	t.Helper()
+	img := image.NewRGBA(image.Rect(0, 0, 50, 50))
+	c := color.RGBA{R: uint8(idx * 50 % 256), G: uint8(idx * 30 % 256), B: uint8(idx * 70 % 256), A: 255}
+	for y := 0; y < 50; y++ {
+		for x := 0; x < 50; x++ {
+			img.Set(x, y, c)
+		}
+	}
+	path := filepath.Join(dir, fmt.Sprintf("u%d.jpg", idx))
+	f, err := os.Create(path)
+	require.NoError(t, err)
+	defer f.Close()
+	require.NoError(t, jpeg.Encode(f, img, nil))
+	return path
+}
+
+// TestEmbedder_Backfill_AllSuccess 5 个缺向量 → done, current=5
+func TestEmbedder_Backfill_AllSuccess(t *testing.T) {
+	db := makeTestDB(t)
+	thumbDir := t.TempDir()
+	imgDir := t.TempDir()
+
+	// 用 indexer 先把图片 indexed-without-embedding：ML 不就绪跑一次
+	idx := NewIndexer(db, &mockMLNotReady{}, thumbDir, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go idx.Start(ctx)
+	var paths []string
+	for i := 0; i < 5; i++ {
+		p := makeUniqueJPEG(t, imgDir, i)
+		paths = append(paths, p)
+		idx.Enqueue(p)
+	}
+	require.Eventually(t, func() bool {
+		var n int
+		_ = db.QueryRow(`SELECT COUNT(*) FROM assets WHERE status='indexed'`).Scan(&n)
+		return n == 5
+	}, 10*time.Second, 100*time.Millisecond)
+
+	// 现在用 ready ML 起 embedder
+	var emitted []Task
+	var mu sync.Mutex
+	reg := NewTaskRegistry(func(t Task) { mu.Lock(); emitted = append(emitted, t); mu.Unlock() })
+	idx2 := NewIndexer(db, &mockML{}, thumbDir, 1)
+	go idx2.Start(ctx)
+	e := NewEmbedder(db, &mockML{}, idx2, reg)
+	require.NoError(t, e.Backfill(ctx))
+
+	mu.Lock()
+	defer mu.Unlock()
+	var doneEv *Task
+	for i := range emitted {
+		if emitted[i].Type == "embedding" && emitted[i].Status == "done" {
+			doneEv = &emitted[i]
+		}
+	}
+	require.NotNil(t, doneEv, "应有 done event")
+	require.Equal(t, int64(5), doneEv.Current)
+	require.Equal(t, "生成 AI 索引", doneEv.Label)
+}
+
+// TestEmbedder_Backfill_PartialFail 3 成功 + 2 失败 → done, label 含"失败 2 张"
+func TestEmbedder_Backfill_PartialFail(t *testing.T) {
+	db := makeTestDB(t)
+	thumbDir := t.TempDir()
+	imgDir := t.TempDir()
+	notReady := &mockMLNotReady{}
+	idx := NewIndexer(db, notReady, thumbDir, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go idx.Start(ctx)
+	for i := 0; i < 5; i++ {
+		idx.Enqueue(makeUniqueJPEG(t, imgDir, i))
+	}
+	require.Eventually(t, func() bool {
+		var n int
+		_ = db.QueryRow(`SELECT COUNT(*) FROM assets WHERE status='indexed'`).Scan(&n)
+		return n == 5
+	}, 10*time.Second, 100*time.Millisecond)
+
+	flaky := &flakyML{failOnCalls: map[int]bool{2: true, 4: true}}
+	var emitted []Task
+	var mu sync.Mutex
+	reg := NewTaskRegistry(func(t Task) { mu.Lock(); emitted = append(emitted, t); mu.Unlock() })
+	idx2 := NewIndexer(db, flaky, thumbDir, 1)
+	go idx2.Start(ctx)
+	e := NewEmbedder(db, flaky, idx2, reg)
+	require.NoError(t, e.Backfill(ctx))
+
+	mu.Lock()
+	defer mu.Unlock()
+	var doneEv *Task
+	for i := range emitted {
+		if emitted[i].Type == "embedding" && emitted[i].Status == "done" {
+			doneEv = &emitted[i]
+		}
+	}
+	require.NotNil(t, doneEv)
+	require.Contains(t, doneEv.Label, "失败 2 张")
+}
+
+// TestEmbedder_Backfill_AllFail 0 成功 + N 失败 → error
+func TestEmbedder_Backfill_AllFail(t *testing.T) {
+	db := makeTestDB(t)
+	thumbDir := t.TempDir()
+	imgDir := t.TempDir()
+	notReady := &mockMLNotReady{}
+	idx := NewIndexer(db, notReady, thumbDir, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go idx.Start(ctx)
+	for i := 0; i < 3; i++ {
+		idx.Enqueue(makeUniqueJPEG(t, imgDir, i))
+	}
+	require.Eventually(t, func() bool {
+		var n int
+		_ = db.QueryRow(`SELECT COUNT(*) FROM assets WHERE status='indexed'`).Scan(&n)
+		return n == 3
+	}, 10*time.Second, 100*time.Millisecond)
+
+	allFail := &flakyML{failOnCalls: map[int]bool{1: true, 2: true, 3: true}}
+	var emitted []Task
+	var mu sync.Mutex
+	reg := NewTaskRegistry(func(t Task) { mu.Lock(); emitted = append(emitted, t); mu.Unlock() })
+	idx2 := NewIndexer(db, allFail, thumbDir, 1)
+	go idx2.Start(ctx)
+	e := NewEmbedder(db, allFail, idx2, reg)
+	require.NoError(t, e.Backfill(ctx))
+
+	mu.Lock()
+	defer mu.Unlock()
+	var errEv *Task
+	for i := range emitted {
+		if emitted[i].Type == "embedding" && emitted[i].Status == "error" {
+			errEv = &emitted[i]
+		}
+	}
+	require.NotNil(t, errEv, "全失败应发 error event")
+	require.Contains(t, errEv.Error, "ML")
+}
+
+// TestEmbedder_Backfill_ConcurrencyGuard 同时调两次，第二个秒返回。
+func TestEmbedder_Backfill_ConcurrencyGuard(t *testing.T) {
+	db := makeTestDB(t)
+	_ = insertAsset(t, db, "/a.jpg", "indexed") // 1 个缺向量
+
+	e := NewEmbedder(db, &mockML{}, nil /* indexer 此用例不被调用 */, NewTaskRegistry(nil))
+
+	e.running.Store(true)
+	err := e.Backfill(context.Background())
+	require.NoError(t, err, "已 running 时应秒返回 nil")
+	e.running.Store(false)
+
+	db2 := makeTestDB(t)
+	e2 := NewEmbedder(db2, &mockML{}, nil, NewTaskRegistry(nil))
+	require.NoError(t, e2.Backfill(context.Background()))
 }

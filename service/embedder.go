@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"sync/atomic"
 	"time"
 )
@@ -60,8 +61,81 @@ func (e *Embedder) hasEmbeddingForPath(path string) bool {
 	return n == 1
 }
 
-// Backfill 占位：实际实现在 Task 8。
-func (e *Embedder) Backfill(ctx context.Context) error { return nil }
+// Backfill 对所有 status='indexed' 但缺 CLIP 向量的 asset 补跑 ML。
+// 并发调用安全：第二次调用会立即返回 nil。
+func (e *Embedder) Backfill(ctx context.Context) error {
+	if !e.running.CompareAndSwap(false, true) {
+		return nil
+	}
+	defer e.running.Store(false)
+
+	paths, err := e.queryMissing(ctx)
+	if err != nil {
+		return err
+	}
+	if len(paths) == 0 {
+		return nil
+	}
+
+	taskID := fmt.Sprintf("embedding_%d", time.Now().UnixNano())
+	started := time.Now()
+	total := int64(len(paths))
+	pubRunning := func(processed int64) {
+		e.reg.Upsert(Task{
+			ID:        taskID,
+			Type:      "embedding",
+			Label:     "生成 AI 索引",
+			Total:     total,
+			Current:   processed,
+			Progress:  float64(processed) / float64(total),
+			Status:    "running",
+			StartedAt: started,
+		})
+	}
+	pubRunning(0)
+
+	var processed, success, failed int64
+	for _, p := range paths {
+		if ctx.Err() != nil {
+			break
+		}
+		e.indexer.ForceReprocess(p, processOpts{force: true, skipExif: true, skipThumb: true})
+		processed++
+		if e.hasEmbeddingForPath(p) {
+			success++
+		} else {
+			failed++
+		}
+		pubRunning(processed)
+	}
+
+	final := Task{
+		ID:        taskID,
+		Type:      "embedding",
+		Label:     "生成 AI 索引",
+		Total:     total,
+		Current:   success,
+		StartedAt: started,
+	}
+	if success == 0 && failed > 0 {
+		final.Status = "error"
+		final.Error = "ML 服务在补跑过程中失联，请检查服务状态"
+	} else {
+		final.Status = "done"
+		final.Progress = 1
+		if failed > 0 {
+			final.Label = fmt.Sprintf("生成 AI 索引（失败 %d 张）", failed)
+		}
+	}
+	e.reg.Upsert(final)
+	go func() {
+		time.Sleep(6 * time.Second)
+		if e.reg != nil {
+			e.reg.Remove(taskID)
+		}
+	}()
+	return nil
+}
 
 // Run 占位：实际实现在 Task 9。
 func (e *Embedder) Run(ctx context.Context) {}
