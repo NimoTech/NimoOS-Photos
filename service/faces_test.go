@@ -92,3 +92,29 @@ func TestRunClustering(t *testing.T) {
 	db.QueryRow(`SELECT COUNT(*) FROM face_person`).Scan(&fpCount)
 	require.Equal(t, 3, fpCount, "所有 3 个 face 都应有 person 关联")
 }
+
+// TestDBSCANWithProgress 断言 onProgress 回调被调用，progress 单调递增，
+// 最后一次回调 done == n。
+func TestDBSCANWithProgress(t *testing.T) {
+	// 50 个完全分离的点，每个独立成簇（minPts=1）。
+	vecs := make([][]float32, 50)
+	for i := range vecs {
+		v := make([]float32, 512)
+		v[i] = 1
+		vecs[i] = v
+	}
+
+	var calls [][2]int
+	labels := service.DBSCANWithProgress(vecs, 0.6, 1, func(done, n int) {
+		calls = append(calls, [2]int{done, n})
+	})
+
+	require.Equal(t, 50, len(labels))
+	require.NotEmpty(t, calls, "应至少触发一次回调")
+	require.Equal(t, [2]int{50, 50}, calls[len(calls)-1], "最后一次回调应是 done==n")
+
+	// 单调递增
+	for i := 1; i < len(calls); i++ {
+		require.GreaterOrEqual(t, calls[i][0], calls[i-1][0], "done 应单调递增")
+	}
+}

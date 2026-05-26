@@ -117,6 +117,65 @@ func DBSCAN(vecs [][]float32, epsilon float64, minPoints int) []int {
 	return labels
 }
 
+// DBSCANWithProgress 行为同 DBSCAN，但每跨 1% 进度调一次 onProgress。
+// onProgress 必非 nil；终止前保证最后一次回调 done==n。
+func DBSCANWithProgress(vecs [][]float32, epsilon float64, minPoints int, onProgress func(done, n int)) []int {
+	n := len(vecs)
+	labels := make([]int, n)
+	for i := range labels {
+		labels[i] = -1
+	}
+	visited := make([]bool, n)
+	clusterID := 0
+	lastReport := -1
+	bucket := func(i int) int {
+		if n == 0 {
+			return 0
+		}
+		return (i * 100) / n
+	}
+
+	for i := 0; i < n; i++ {
+		if b := bucket(i); b != lastReport {
+			onProgress(i, n)
+			lastReport = b
+		}
+		if visited[i] {
+			continue
+		}
+		visited[i] = true
+		neighbors := regionQuery(vecs, i, epsilon)
+		if len(neighbors) < minPoints {
+			labels[i] = clusterID
+			clusterID++
+			continue
+		}
+		labels[i] = clusterID
+		seeds := make([]int, len(neighbors))
+		copy(seeds, neighbors)
+		for j := 0; j < len(seeds); j++ {
+			s := seeds[j]
+			if !visited[s] {
+				visited[s] = true
+				sNeighbors := regionQuery(vecs, s, epsilon)
+				if len(sNeighbors) >= minPoints {
+					for _, s2 := range sNeighbors {
+						if !visited[s2] {
+							seeds = append(seeds, s2)
+						}
+					}
+				}
+			}
+			if labels[s] == -1 {
+				labels[s] = clusterID
+			}
+		}
+		clusterID++
+	}
+	onProgress(n, n) // 保证终态 done==n
+	return labels
+}
+
 // FaceService handles face clustering and person management.
 type FaceService struct {
 	db *sql.DB
