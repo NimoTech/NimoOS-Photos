@@ -234,7 +234,7 @@ func (s *FaceService) RunClustering(ctx context.Context) error {
 		if s.reg == nil {
 			return
 		}
-		s.reg.Upsert(Task{
+		t := Task{
 			ID:        taskID,
 			Type:      "face",
 			Label:     "识别人物",
@@ -242,7 +242,14 @@ func (s *FaceService) RunClustering(ctx context.Context) error {
 			Status:    status,
 			Error:     errMsg,
 			StartedAt: started,
-		})
+		}
+		// 终态填入 current/total，前端 done 时拼 "已识别 N 个人脸" toast 文案需要。
+		// running 中间态不填，避免节流 publish 把 0 错带到前端造成数字闪。
+		if status == "done" || status == "error" {
+			t.Current = total
+			t.Total = total
+		}
+		s.reg.Upsert(t)
 	}
 	pub(0, "running", "")
 
