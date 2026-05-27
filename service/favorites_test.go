@@ -111,3 +111,60 @@ func TestListFavoritesLimitOffset(t *testing.T) {
 	require.Len(t, page2, 1)
 	require.Equal(t, "a1", page2[0].ID)
 }
+
+func TestTopOrdersByViewCountThenFavoritedAt(t *testing.T) {
+	// 该用例需要同库的 ViewsService 播种浏览次数，openTestFavSvc 不暴露 db，故自建 db。
+	db, err := sqlite.Open(filepath.Join(t.TempDir(), "test.db"))
+	require.NoError(t, err)
+	defer db.Close()
+	for _, id := range []string{"a1", "a2", "a3"} {
+		_, e := db.Exec(`INSERT INTO assets(id, file_path, status) VALUES(?, ?, 'indexed')`, id, "/x/"+id+".jpg")
+		require.NoError(t, e)
+	}
+	svc := service.NewFavoritesService(db)
+	views := service.NewViewsService(db)
+
+	// 三张都收藏（a1 最早、a3 最晚）。
+	_, err = svc.Favorite("default", "a1")
+	require.NoError(t, err)
+	_, err = svc.Favorite("default", "a2")
+	require.NoError(t, err)
+	_, err = svc.Favorite("default", "a3")
+	require.NoError(t, err)
+
+	// a2 看 3 次、a1 看 1 次、a3 看 0 次。
+	require.NoError(t, views.Record("default", "a2"))
+	require.NoError(t, views.Record("default", "a2"))
+	require.NoError(t, views.Record("default", "a2"))
+	require.NoError(t, views.Record("default", "a1"))
+
+	top, err := svc.Top("default", 5)
+	require.NoError(t, err)
+	require.Len(t, top, 3)
+	require.Equal(t, "a2", top[0].ID, "看得最多的排第一")
+	require.Equal(t, "a1", top[1].ID, "看过 1 次排第二")
+	require.Equal(t, "a3", top[2].ID, "0 次的按收藏时间兜底排最后")
+}
+
+func TestTopRespectsLimit(t *testing.T) {
+	svc, cleanup := openTestFavSvc(t)
+	defer cleanup()
+
+	for _, id := range []string{"a1", "a2", "a3"} {
+		_, err := svc.Favorite("default", id)
+		require.NoError(t, err)
+	}
+
+	top, err := svc.Top("default", 2)
+	require.NoError(t, err)
+	require.Len(t, top, 2)
+}
+
+func TestTopEmptyWhenNoFavorites(t *testing.T) {
+	svc, cleanup := openTestFavSvc(t)
+	defer cleanup()
+
+	top, err := svc.Top("default", 5)
+	require.NoError(t, err)
+	require.Len(t, top, 0)
+}

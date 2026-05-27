@@ -124,3 +124,36 @@ func (s *FavoritesService) IsFavorited(userID, assetID string) (bool, error) {
 	}
 	return true, nil
 }
+
+// Top returns up to limit favorited assets for userID, ordered by view count
+// (desc) with favorited_at (desc) as tie-breaker / fallback for never-viewed
+// favorites. The SELECT column list MUST match scanAssetsDetailedWithFav's
+// expectations (detailed columns + trailing favorited_at).
+func (s *FavoritesService) Top(userID string, limit int) ([]Asset, error) {
+	if limit <= 0 {
+		limit = 5
+	}
+	q := `
+SELECT a.id, a.file_path, a.file_size, COALESCE(a.mime_type,''),
+       COALESCE(a.original_name,''), a.taken_at, a.duration_ms,
+       COALESCE(a.live_photo_video_id,''), a.is_live_photo_video,
+       a.indexed_at, a.status,
+       e.width, e.height, e.latitude, e.longitude, e.make, e.model,
+       e.iso, e.shutter_speed, e.aperture, e.focal_length, e.orientation,
+       e.video_codec, e.audio_codec, e.frame_rate, e.bit_rate, e.rotation,
+       f.favorited_at
+FROM asset_favorites f
+JOIN assets a ON a.id = f.asset_id
+LEFT JOIN asset_exif e ON e.asset_id = a.id
+LEFT JOIN asset_views v ON v.user_id = f.user_id AND v.asset_id = f.asset_id
+WHERE f.user_id = ?
+ORDER BY COALESCE(v.view_count, 0) DESC, f.favorited_at DESC
+LIMIT ?`
+
+	rows, err := s.db.Query(q, userID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("Top query: %w", err)
+	}
+	defer rows.Close()
+	return scanAssetsDetailedWithFav(rows)
+}
