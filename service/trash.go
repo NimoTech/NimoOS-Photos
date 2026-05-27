@@ -140,7 +140,7 @@ func dedupePath(p string) string {
 func (s *TrashService) PurgeAsset(id string) error {
 	var curPath, liveID string
 	err := s.db.QueryRow(
-		`SELECT file_path, COALESCE(live_photo_video_id,'') FROM assets WHERE id=?`, id,
+		`SELECT file_path, COALESCE(live_photo_video_id,'') FROM assets WHERE id=? AND deleted_at IS NOT NULL`, id,
 	).Scan(&curPath, &liveID)
 	if err == sql.ErrNoRows {
 		return ErrNotFound
