@@ -56,14 +56,19 @@ func (s *TrashService) moveToTrash(id, filePath string) error {
 		return fmt.Errorf("moveToTrash mkdir: %w", err)
 	}
 	dst := filepath.Join(dstDir, filepath.Base(filePath))
-	if err := os.Rename(filePath, dst); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("moveToTrash rename: %w", err)
-	}
-	_, err := s.db.Exec(
+	// Update DB BEFORE moving the file. The fsnotify watcher fires a Rename/Remove
+	// event for the old path and calls Indexer.RemoveByPath, which matches on
+	// file_path. By flipping file_path to the .trash path first, that async handler
+	// no longer matches the old path and cannot hard-delete this row (race fix).
+	if _, err := s.db.Exec(
 		`UPDATE assets SET original_path=?, file_path=?, deleted_at=CURRENT_TIMESTAMP WHERE id=?`,
-		filePath, dst, id)
-	if err != nil {
+		filePath, dst, id); err != nil {
 		return fmt.Errorf("moveToTrash update: %w", err)
+	}
+	if err := os.Rename(filePath, dst); err != nil && !os.IsNotExist(err) {
+		// Roll back so the row keeps pointing at the still-present original file.
+		s.db.Exec(`UPDATE assets SET original_path=NULL, file_path=?, deleted_at=NULL WHERE id=?`, filePath, id) //nolint:errcheck
+		return fmt.Errorf("moveToTrash rename: %w", err)
 	}
 	return nil
 }

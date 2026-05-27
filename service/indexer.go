@@ -827,7 +827,9 @@ func (ix *Indexer) ScanDirectory(dir string) error {
 // thumbnail directory from disk. Safe to call for paths that are not indexed.
 func (ix *Indexer) RemoveByPath(path string) {
 	var id string
-	err := ix.db.QueryRow(`SELECT id FROM assets WHERE file_path = ?`, path).Scan(&id)
+	// Never remove a soft-deleted (trashed) asset: its file legitimately lives
+	// under .trash and the watcher must not treat the move as a real deletion.
+	err := ix.db.QueryRow(`SELECT id FROM assets WHERE file_path = ? AND deleted_at IS NULL`, path).Scan(&id)
 	if err == sql.ErrNoRows {
 		return
 	}

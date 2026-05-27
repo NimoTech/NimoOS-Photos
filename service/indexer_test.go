@@ -342,3 +342,21 @@ func TestScanDirectorySkipsHiddenDirs(t *testing.T) {
 		t.Fatalf("collected %d files, want 1", len(collected))
 	}
 }
+
+// TestRemoveByPathSkipsTrashedAsset is a regression test for the watcher race:
+// soft-deleting moves the file, which fires an fsnotify Rename on the old path;
+// the watcher calls RemoveByPath, which must NOT hard-delete a trashed asset.
+func TestRemoveByPathSkipsTrashedAsset(t *testing.T) {
+	db := makeTestDB(t)
+	idx := NewIndexer(db, &mockML{}, t.TempDir(), 1)
+
+	_, err := db.Exec(`INSERT INTO assets(id, file_path, status, deleted_at, original_path)
+		VALUES('t1', '/DATA/Gallery/foo.jpg', 'indexed', CURRENT_TIMESTAMP, '/DATA/Gallery/foo.jpg')`)
+	require.NoError(t, err)
+
+	idx.RemoveByPath("/DATA/Gallery/foo.jpg")
+
+	var n int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM assets WHERE id='t1'`).Scan(&n))
+	require.Equal(t, 1, n, "RemoveByPath must not delete a soft-deleted asset")
+}
