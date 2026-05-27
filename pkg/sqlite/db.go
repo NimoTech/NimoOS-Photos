@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math"
+	"strings"
 
 	sqlite_vec "github.com/asg017/sqlite-vec-go-bindings/cgo"
 	_ "github.com/mattn/go-sqlite3" // CGO SQLite3 driver
@@ -216,6 +217,22 @@ func migrate(db *sql.DB) error {
 		if _, err := db.Exec(stmt); err != nil {
 			return fmt.Errorf("migrate add column %s: %w", col.name, err)
 		}
+	}
+
+	// ── 幂等列迁移：旧库用 CREATE TABLE IF NOT EXISTS 不会获得新列，
+	//    用 ALTER TABLE ADD COLUMN 补齐；列已存在时 SQLite 报 "duplicate column"，忽略之。
+	alters := []string{
+		`ALTER TABLE assets ADD COLUMN deleted_at DATETIME`,
+		`ALTER TABLE assets ADD COLUMN original_path TEXT`,
+	}
+	for _, stmt := range alters {
+		if _, err := db.Exec(stmt); err != nil &&
+			!strings.Contains(err.Error(), "duplicate column") {
+			return fmt.Errorf("migrate alter: %w", err)
+		}
+	}
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_assets_deleted_at ON assets(deleted_at)`); err != nil {
+		return fmt.Errorf("migrate index deleted_at: %w", err)
 	}
 
 	return nil

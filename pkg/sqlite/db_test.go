@@ -171,6 +171,29 @@ func TestAssetFavoritesCascadeOnAssetDelete(t *testing.T) {
 	require.Equal(t, 0, cnt, "expected cascade delete to clear favorite row")
 }
 
+func TestMigrateAddsTrashColumns(t *testing.T) {
+	dir := t.TempDir()
+	db, err := sqlite.Open(filepath.Join(dir, "t.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	// 应能写入并读回 deleted_at / original_path
+	_, err = db.Exec(`INSERT INTO assets (id, file_path, status, deleted_at, original_path)
+		VALUES ('x1', '/DATA/Gallery/.trash/x1/a.jpg', 'indexed', CURRENT_TIMESTAMP, '/DATA/Gallery/a.jpg')`)
+	if err != nil {
+		t.Fatalf("insert with trash cols: %v", err)
+	}
+	var op string
+	if err := db.QueryRow(`SELECT original_path FROM assets WHERE id='x1'`).Scan(&op); err != nil {
+		t.Fatalf("select original_path: %v", err)
+	}
+	if op != "/DATA/Gallery/a.jpg" {
+		t.Fatalf("original_path = %q, want /DATA/Gallery/a.jpg", op)
+	}
+}
+
 func TestMigrateAddsNewColumns(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "test.db")
