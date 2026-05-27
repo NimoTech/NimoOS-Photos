@@ -24,7 +24,8 @@ func (h *ConfigHandler) GetConfig(c echo.Context) error {
 // PUT /v1/photos/config
 func (h *ConfigHandler) UpdateConfig(c echo.Context) error {
 	var req struct {
-		WatchDirs []string `json:"watchDirs"`
+		WatchDirs     []string `json:"watchDirs"`
+		RetentionDays int      `json:"retentionDays"`
 	}
 	if err := c.Bind(&req); err != nil {
 		return echo.NewHTTPError(http.StatusBadRequest, "invalid request body")
@@ -32,9 +33,12 @@ func (h *ConfigHandler) UpdateConfig(c echo.Context) error {
 	if len(req.WatchDirs) == 0 {
 		return echo.NewHTTPError(http.StatusBadRequest, "watchDirs must not be empty")
 	}
-	if err := config.Save(req.WatchDirs); err != nil {
+	if err := config.Save(req.WatchDirs, req.RetentionDays); err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
 	}
 	h.svc.RestartWatcher(req.WatchDirs)
-	return c.JSON(http.StatusOK, map[string]interface{}{"watchDirs": req.WatchDirs})
+	return c.JSON(http.StatusOK, map[string]interface{}{
+		"watchDirs":     req.WatchDirs,
+		"retentionDays": config.Cfg.RetentionDays,
+	})
 }
