@@ -18,7 +18,14 @@ func (h *ConfigHandler) GetConfig(c echo.Context) error {
 	if dirs == nil {
 		dirs = []string{}
 	}
-	return c.JSON(http.StatusOK, map[string]interface{}{"watchDirs": dirs})
+	retention := config.Cfg.RetentionDays
+	if retention <= 0 {
+		retention = 30
+	}
+	return c.JSON(http.StatusOK, map[string]interface{}{
+		"watchDirs":     dirs,
+		"retentionDays": retention,
+	})
 }
 
 // PUT /v1/photos/config
@@ -32,6 +39,9 @@ func (h *ConfigHandler) UpdateConfig(c echo.Context) error {
 	}
 	if len(req.WatchDirs) == 0 {
 		return echo.NewHTTPError(http.StatusBadRequest, "watchDirs must not be empty")
+	}
+	if req.RetentionDays != 0 && (req.RetentionDays < 1 || req.RetentionDays > 365) {
+		return echo.NewHTTPError(http.StatusBadRequest, "retentionDays must be between 1 and 365")
 	}
 	if err := config.Save(req.WatchDirs, req.RetentionDays); err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
