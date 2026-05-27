@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"path/filepath"
+	"time"
 
 	"github.com/NimoTech/NimoOS-Photos/pkg/config"
 	"github.com/NimoTech/NimoOS-Photos/pkg/mlclient"
@@ -23,6 +24,7 @@ type Services interface {
 	Tasks() *TaskRegistry
 	Embedder() *Embedder
 	Favorites() *FavoritesService
+	Trash() *TrashService
 	Views() *ViewsService
 	RestartWatcher(dirs []string)
 }
@@ -38,6 +40,7 @@ type services struct {
 	tasks     *TaskRegistry
 	embedder  *Embedder
 	favorites *FavoritesService
+	trash     *TrashService
 	views     *ViewsService
 	parentCtx context.Context
 }
@@ -51,6 +54,7 @@ func (s *services) Faces() *FaceService    { return s.faces }
 func (s *services) Tasks() *TaskRegistry   { return s.tasks }
 func (s *services) Embedder() *Embedder          { return s.embedder }
 func (s *services) Favorites() *FavoritesService { return s.favorites }
+func (s *services) Trash() *TrashService          { return s.trash }
 func (s *services) Views() *ViewsService           { return s.views }
 
 // NewService wires all service-layer components together from cfg and returns a
@@ -78,6 +82,7 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 	watcher := NewWatcher(db, cfg.WatchDirs, idx, liveDir)
 	albums := NewAlbumService(db)
 	favorites := NewFavoritesService(db)
+	trash := NewTrashService(db, "/DATA/Gallery", thumbDir)
 	views := NewViewsService(db)
 	search := NewSearchService(db, ml)
 	faces := NewFaceService(db)
@@ -105,6 +110,30 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 		watcher.PairLivePhotos() //nolint:errcheck
 	}()
 
+	// 回收站自动清理：启动时跑一次，之后每 24 小时跑一次，到期项永久删除。
+	go func() {
+		runPurge := func() {
+			days := 30
+			if config.Cfg != nil && config.Cfg.RetentionDays > 0 {
+				days = config.Cfg.RetentionDays
+			}
+			if err := trash.PurgeExpired(days); err != nil {
+				zap.L().Warn("trash auto-purge failed", zap.Error(err))
+			}
+		}
+		runPurge()
+		ticker := time.NewTicker(24 * time.Hour)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-parentCtx.Done():
+				return
+			case <-ticker.C:
+				runPurge()
+			}
+		}
+	}()
+
 	return &services{
 		db:        db,
 		indexer:   idx,
@@ -115,6 +144,7 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 		tasks:     taskReg,
 		embedder:  embedder,
 		favorites: favorites,
+		trash:     trash,
 		views:     views,
 		parentCtx: parentCtx,
 	}
