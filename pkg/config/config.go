@@ -12,12 +12,13 @@ import (
 var Cfg *Config
 
 type Config struct {
-	RuntimePath string
-	LogPath     string
-	DataPath    string
-	MLEndpoint  string
-	Workers     int
-	WatchDirs   []string
+	RuntimePath   string
+	LogPath       string
+	DataPath      string
+	MLEndpoint    string
+	Workers       int
+	WatchDirs     []string
+	RetentionDays int
 }
 
 func Init(configFile, confSample string) error {
@@ -46,12 +47,13 @@ func Init(configFile, confSample string) error {
 		watchDirs = []string{"/DATA/Gallery", "/DATA/Documents", "/DATA/Downloads"}
 	}
 	Cfg = &Config{
-		RuntimePath: v.GetString("common.RuntimePath"),
-		LogPath:     v.GetString("common.LogPath"),
-		DataPath:    v.GetString("photos.DataPath"),
-		MLEndpoint:  v.GetString("photos.MLEndpoint"),
-		Workers:     v.GetInt("photos.Workers"),
-		WatchDirs:   watchDirs,
+		RuntimePath:   v.GetString("common.RuntimePath"),
+		LogPath:       v.GetString("common.LogPath"),
+		DataPath:      v.GetString("photos.DataPath"),
+		MLEndpoint:    v.GetString("photos.MLEndpoint"),
+		Workers:       v.GetInt("photos.Workers"),
+		WatchDirs:     watchDirs,
+		RetentionDays: v.GetInt("photos.RetentionDays"),
 	}
 	if Cfg.RuntimePath == "" {
 		Cfg.RuntimePath = "/var/run/nimoos"
@@ -68,11 +70,14 @@ func Init(configFile, confSample string) error {
 	if Cfg.Workers == 0 {
 		Cfg.Workers = common.DefaultWorkers
 	}
+	if Cfg.RetentionDays <= 0 {
+		Cfg.RetentionDays = 30
+	}
 	return nil
 }
 
-// Save writes watchDirs back to the config file and updates the in-memory Cfg.
-func Save(watchDirs []string) error {
+// Save writes watchDirs and retentionDays back to the config file and updates Cfg.
+func Save(watchDirs []string, retentionDays int) error {
 	if Cfg == nil {
 		return fmt.Errorf("config not initialized")
 	}
@@ -81,9 +86,15 @@ func Save(watchDirs []string) error {
 	v.SetConfigType("ini")
 	_ = v.ReadInConfig()
 	v.Set("photos.WatchDirs", strings.Join(watchDirs, ","))
+	if retentionDays > 0 {
+		v.Set("photos.RetentionDays", retentionDays)
+	}
 	if err := v.WriteConfig(); err != nil {
 		return fmt.Errorf("config.Save: %w", err)
 	}
 	Cfg.WatchDirs = watchDirs
+	if retentionDays > 0 {
+		Cfg.RetentionDays = retentionDays
+	}
 	return nil
 }
