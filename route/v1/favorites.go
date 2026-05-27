@@ -148,6 +148,22 @@ func (h *FavoritesHandler) Export(c echo.Context) error {
 	return nil
 }
 
+// Top — GET /v1/photos/favorites/top?limit=5
+func (h *FavoritesHandler) Top(c echo.Context) error {
+	limit, _ := strconv.Atoi(c.QueryParam("limit"))
+	if limit <= 0 || limit > 50 {
+		limit = 5
+	}
+	assets, err := h.svc.Favorites().Top(JWTUserID(c), limit)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	}
+	if assets == nil {
+		assets = []service.Asset{}
+	}
+	return c.JSON(http.StatusOK, assets)
+}
+
 // dedupZipEntryName 返回不与 used 中已有名字冲突的文件名。
 // "photo.jpg" 第二次出现变成 "photo-2.jpg"。
 func dedupZipEntryName(name string, used map[string]int) string {

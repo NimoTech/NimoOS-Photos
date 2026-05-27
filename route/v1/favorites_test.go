@@ -235,3 +235,29 @@ func TestExportZipMissingToken(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, http.StatusUnauthorized, httpErr.Code)
 }
+
+func TestTopHandlerReturnsJSON(t *testing.T) {
+	h, _, cleanup := newFavHarness(t)
+	defer cleanup()
+
+	// 先收藏 a1/a2，再请求 top。
+	for _, id := range []string{"a1", "a2"} {
+		req := httptest.NewRequest(http.MethodPost, "/v1/photos/favorites/"+id, nil)
+		rec := httptest.NewRecorder()
+		c := echo.New().NewContext(req, rec)
+		c.SetParamNames("asset_id")
+		c.SetParamValues(id)
+		require.NoError(t, h.Favorite(c))
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/photos/favorites/top?limit=5", nil)
+	rec := httptest.NewRecorder()
+	c := echo.New().NewContext(req, rec)
+
+	require.NoError(t, h.Top(c))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	var assets []map[string]interface{}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &assets))
+	require.Len(t, assets, 2)
+}

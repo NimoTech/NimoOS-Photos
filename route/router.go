@@ -80,6 +80,7 @@ func InitRouter(svc service.Services, runtimePath string, thumbDir string) http.
 	persons := v1.NewPersonsHandler(svc)
 	index := v1.NewIndexHandler(svc, "/DATA/Gallery")
 	favorites := v1.NewFavoritesHandler(svc, "/DATA/Gallery", runtimePath)
+	views := v1.NewViewsHandler(svc)
 
 	// Asset endpoints
 	g.GET("/assets", assets.List)
@@ -114,6 +115,10 @@ func InitRouter(svc service.Services, runtimePath string, thumbDir string) http.
 	g.GET("/favorites/ids",          favorites.ListIDs)
 	g.GET("/favorites",              favorites.List)
 	g.GET("/favorites/export",       favorites.Export)
+	g.GET("/favorites/top",          favorites.Top)
+
+	// Asset views (open counter)
+	g.POST("/views/:asset_id", views.Record)
 
 	// Person endpoints
 	g.GET("/persons", persons.List)

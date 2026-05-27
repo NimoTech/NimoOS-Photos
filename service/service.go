@@ -23,6 +23,7 @@ type Services interface {
 	Tasks() *TaskRegistry
 	Embedder() *Embedder
 	Favorites() *FavoritesService
+	Views() *ViewsService
 	RestartWatcher(dirs []string)
 }
 
@@ -37,6 +38,7 @@ type services struct {
 	tasks     *TaskRegistry
 	embedder  *Embedder
 	favorites *FavoritesService
+	views     *ViewsService
 	parentCtx context.Context
 }
 
@@ -49,6 +51,7 @@ func (s *services) Faces() *FaceService    { return s.faces }
 func (s *services) Tasks() *TaskRegistry   { return s.tasks }
 func (s *services) Embedder() *Embedder          { return s.embedder }
 func (s *services) Favorites() *FavoritesService { return s.favorites }
+func (s *services) Views() *ViewsService           { return s.views }
 
 // NewService wires all service-layer components together from cfg and returns a
 // ready-to-use Services handle. It panics if the database cannot be opened.
@@ -75,6 +78,7 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 	watcher := NewWatcher(db, cfg.WatchDirs, idx, liveDir)
 	albums := NewAlbumService(db)
 	favorites := NewFavoritesService(db)
+	views := NewViewsService(db)
 	search := NewSearchService(db, ml)
 	faces := NewFaceService(db)
 	faces.SetTaskRegistry(taskReg)
@@ -111,6 +115,7 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 		tasks:     taskReg,
 		embedder:  embedder,
 		favorites: favorites,
+		views:     views,
 		parentCtx: parentCtx,
 	}
 }
