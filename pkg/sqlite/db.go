@@ -156,6 +156,15 @@ func migrate(db *sql.DB) error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_fav_user_time ON asset_favorites(user_id, favorited_at DESC)`,
 		`CREATE INDEX IF NOT EXISTS idx_fav_asset     ON asset_favorites(asset_id)`,
+
+		// ── Asset views (per-user open counter) ───────────────────────────
+		`CREATE TABLE IF NOT EXISTS asset_views (
+			user_id        TEXT NOT NULL DEFAULT 'default',
+			asset_id       TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+			view_count     INTEGER NOT NULL DEFAULT 0,
+			last_viewed_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			PRIMARY KEY (user_id, asset_id)
+		)`,
 	}
 
 	for _, stmt := range statements {
