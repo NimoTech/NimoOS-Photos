@@ -37,6 +37,11 @@ type Asset struct {
 	// Joined from asset_favorites (populated by List/Timeline/GetAsset when caller
 	// supplies a user_id; nil = not favorited by this user).
 	FavoritedAt *time.Time `json:"favoritedAt,omitempty"`
+
+	// 软删除（回收站）相关：DeletedAt 非 nil 表示在回收站；
+	// OriginalPath 为软删除前的原始 file_path，用于恢复与来源文件夹名展示。
+	DeletedAt    *time.Time `json:"deletedAt,omitempty"`
+	OriginalPath string     `json:"originalPath,omitempty"`
 }
 
 type AssetExif struct {
