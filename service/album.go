@@ -144,7 +144,7 @@ func (s *AlbumService) ListAssets(albumID string) ([]Asset, error) {
 		       a.indexed_at, a.status
 		FROM assets a
 		JOIN album_assets aa ON aa.asset_id = a.id
-		WHERE aa.album_id = ? AND a.is_live_photo_video = 0
+		WHERE aa.album_id = ? AND a.is_live_photo_video = 0 AND a.deleted_at IS NULL
 		ORDER BY COALESCE(a.taken_at, a.indexed_at) DESC
 	`, albumID)
 	if err != nil {
