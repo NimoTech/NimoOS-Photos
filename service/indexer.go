@@ -712,6 +712,27 @@ func sha256File(data []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// walkSupported recursively walks dir, calling fn for each supported media file.
+// Directories whose names begin with "." (e.g. .trash) are skipped entirely so
+// that soft-deleted files are never re-indexed.
+func walkSupported(dir string, fn func(path string)) error {
+	return filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			if path != dir && strings.HasPrefix(d.Name(), ".") {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if supportedExts[strings.ToLower(filepath.Ext(path))] {
+			fn(path)
+		}
+		return nil
+	})
+}
+
 // ScanDirectory walks dir, then synchronously processes each file. This is
 // intentionally serial (vs. the Enqueue/worker-pool path used by watcher) so
 // that we can report deterministic per-scan progress via TaskRegistry —
@@ -726,15 +747,7 @@ func sha256File(data []byte) string {
 func (ix *Indexer) ScanDirectory(dir string) error {
 	// First pass: collect all supported file paths to know the total.
 	var paths []string
-	if err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
-		if err != nil || d.IsDir() {
-			return err
-		}
-		if supportedExts[strings.ToLower(filepath.Ext(path))] {
-			paths = append(paths, path)
-		}
-		return nil
-	}); err != nil {
+	if err := walkSupported(dir, func(p string) { paths = append(paths, p) }); err != nil {
 		return err
 	}
 

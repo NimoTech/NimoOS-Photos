@@ -8,6 +8,7 @@ import (
 	"image/jpeg"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -312,4 +313,32 @@ func TestAssetExifUpsertReplacesOnConflict(t *testing.T) {
 	require.Equal(t, 800, oldIso)
 	require.InDelta(t, 1.8, oldAp, 1e-6)
 	require.Equal(t, "Apple", oldMake)
+}
+
+func TestScanDirectorySkipsHiddenDirs(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "a.jpg"), []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	trashDir := filepath.Join(root, ".trash", "id1")
+	if err := os.MkdirAll(trashDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(trashDir, "b.jpg"), []byte("y"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	var collected []string
+	err := walkSupported(root, func(p string) { collected = append(collected, p) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range collected {
+		if strings.Contains(p, ".trash") {
+			t.Fatalf("scan should skip .trash, but collected %q", p)
+		}
+	}
+	if len(collected) != 1 {
+		t.Fatalf("collected %d files, want 1", len(collected))
+	}
 }
