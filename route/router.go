@@ -80,6 +80,7 @@ func InitRouter(svc service.Services, runtimePath string, thumbDir string) http.
 	persons := v1.NewPersonsHandler(svc)
 	index := v1.NewIndexHandler(svc, "/DATA/Gallery")
 	favorites := v1.NewFavoritesHandler(svc, "/DATA/Gallery", runtimePath)
+	trash := v1.NewTrashHandler(svc)
 	views := v1.NewViewsHandler(svc)
 
 	// Asset endpoints
@@ -116,6 +117,13 @@ func InitRouter(svc service.Services, runtimePath string, thumbDir string) http.
 	g.GET("/favorites",              favorites.List)
 	g.GET("/favorites/export",       favorites.Export)
 	g.GET("/favorites/top",          favorites.Top)
+
+	// Trash（回收站）
+	g.GET("/trash", trash.List)
+	g.POST("/trash/restore", trash.RestoreBatch)
+	g.POST("/trash/empty", trash.Empty)
+	g.POST("/trash/:id/restore", trash.Restore)
+	g.DELETE("/trash/:id", trash.Purge)
 
 	// Asset views (open counter)
 	g.POST("/views/:asset_id", views.Record)

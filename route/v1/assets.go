@@ -89,31 +89,15 @@ func (h *AssetsHandler) Upload(c echo.Context) error {
 	})
 }
 
-// Delete removes an asset's database record and its original file (plus its
-// live-photo video partner, if any).
+// Delete moves an asset to the trash (soft delete). The original file is moved
+// to <gallery>/.trash/<id>/ and the row is flagged with deleted_at. Permanent
+// deletion happens only from the Recently Deleted view (see TrashHandler.Purge).
 func (h *AssetsHandler) Delete(c echo.Context) error {
 	id := c.Param("id")
-	asset, err := h.svc.Search().GetAsset(JWTUserID(c), id)
-	if errors.Is(err, service.ErrNotFound) {
+	if err := h.svc.Trash().TrashAsset(id); errors.Is(err, service.ErrNotFound) {
 		return echo.NewHTTPError(http.StatusNotFound)
-	}
-	if err != nil {
+	} else if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
-	}
-
-	// Remove original file from disk.
-	os.Remove(asset.FilePath) //nolint:errcheck
-
-	// Remove live-photo video partner if present.
-	if asset.LivePhotoVideoID != "" {
-		if liveAsset, lerr := h.svc.Search().GetAsset(JWTUserID(c), asset.LivePhotoVideoID); lerr == nil {
-			os.Remove(liveAsset.FilePath) //nolint:errcheck
-		}
-		h.svc.DB().Exec(`DELETE FROM assets WHERE id=?`, asset.LivePhotoVideoID) //nolint:errcheck
-	}
-
-	if err := h.svc.Search().DeleteAsset(id); errors.Is(err, service.ErrNotFound) {
-		return echo.NewHTTPError(http.StatusNotFound)
 	}
 	return c.NoContent(http.StatusNoContent)
 }
