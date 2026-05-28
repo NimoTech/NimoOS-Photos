@@ -391,6 +391,50 @@ func suggestionReason(name string, conf float64) string {
 	return fmt.Sprintf("两个集群的人脸高度相似（%.0f%%），可能是同一个人。", conf*100)
 }
 
+// recomputeOneCentroidTx 在事务内重算单个 person 的 centroid/confidence/cover_face_id。
+func recomputeOneCentroidTx(tx *sql.Tx, personID string) error {
+	rows, err := tx.Query(`
+SELECT fd.id, fd.asset_id, fd.embedding
+FROM face_person fp JOIN face_detections fd ON fd.id=fp.face_id
+WHERE fp.person_id=?`, personID)
+	if err != nil {
+		return err
+	}
+	var faceIDs, assetIDs []string
+	var vecs [][]float32
+	for rows.Next() {
+		var fid, aid string
+		var blob []byte
+		if err := rows.Scan(&fid, &aid, &blob); err != nil {
+			rows.Close()
+			return err
+		}
+		faceIDs = append(faceIDs, fid)
+		assetIDs = append(assetIDs, aid)
+		vecs = append(vecs, sqlite.DeserializeFloat32(blob))
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+	if len(vecs) == 0 {
+		return nil
+	}
+	centroid := ComputeCentroid(vecs)
+	conf := ClusterConfidence(vecs, centroid)
+	best, bestDist := 0, 2.0
+	for i, v := range vecs {
+		if d := cosDist(v, centroid); d < bestDist {
+			bestDist = d
+			best = i
+		}
+	}
+	_, err = tx.Exec(`UPDATE persons SET centroid=?, confidence=?, cover_face_id=?, cover_asset_id=?, updated_at=CURRENT_TIMESTAMP WHERE id=?`,
+		sqlite.SerializeFloat32(centroid), conf, faceIDs[best], assetIDs[best], personID)
+	return err
+}
+
 // FaceThumbnail 按 cover_face 的 bbox 从原图裁出方形人脸缓存到 cacheDir，返回文件路径。
 // 已缓存则直接返回。person 无 cover_face 或不存在返回 ErrNotFound。
 func (s *PersonService) FaceThumbnail(personID, cacheDir string) (string, error) {

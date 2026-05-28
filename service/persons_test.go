@@ -339,3 +339,30 @@ func TestMergeSuggestions_RespectRejections(t *testing.T) {
 			"被拒绝的配对不应再出现")
 	}
 }
+
+func TestMergePersons_RecomputesCentroid(t *testing.T) {
+	db := makeTestFaceDB(t)
+	dim := 512
+	a := make([]float32, dim); a[0] = 1.0
+	b := make([]float32, dim); b[1] = 1.0
+	insertAssetFace(t, db, "mp-a", normalize(a))
+	insertAssetFace(t, db, "mp-b", normalize(b))
+	require.NoError(t, service.NewFaceService(db).RunClustering(context.Background()))
+	list, _ := service.NewPersonService(db).ListPersons()
+	require.Len(t, list, 2)
+
+	from, into := list[0].ID, list[1].ID
+	require.NoError(t, service.NewSearchService(db, nil).MergePersons(from, into))
+
+	// into 名下应有 2 张脸，且 confidence 已重算。
+	// 合并前每个 person 各有 1 张脸，单脸 confidence=1.0。
+	// 合并后两个正交向量的质心余弦相似度 ≈ 0.707，必然 < 1.0。
+	// 若未重算则 confidence 仍为旧值 1.0，断言失败。
+	var cnt int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM face_person WHERE person_id=?`, into).Scan(&cnt))
+	require.Equal(t, 2, cnt)
+	var conf float64
+	require.NoError(t, db.QueryRow(`SELECT confidence FROM persons WHERE id=?`, into).Scan(&conf))
+	require.Greater(t, conf, 0.0)
+	require.Less(t, conf, 1.0, "confidence 应已重算（两个正交脸合并后 <1.0），若仍为 1.0 说明未重算")
+}

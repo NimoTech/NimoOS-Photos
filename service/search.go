@@ -197,7 +197,8 @@ func (s *SearchService) UpdatePersonName(id, name string) error {
 }
 
 // MergePersons reassigns all face_person rows from fromID to intoID, then
-// deletes the source person — all within a single transaction.
+// deletes the source person and recomputes the centroid/confidence/cover of
+// intoID — all within a single transaction.
 func (s *SearchService) MergePersons(fromID, intoID string) error {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -210,6 +211,9 @@ func (s *SearchService) MergePersons(fromID, intoID string) error {
 	}
 	if _, err = tx.Exec(`DELETE FROM persons WHERE id=?`, fromID); err != nil {
 		return fmt.Errorf("MergePersons delete: %w", err)
+	}
+	if err = recomputeOneCentroidTx(tx, intoID); err != nil {
+		return fmt.Errorf("MergePersons recompute: %w", err)
 	}
 	return tx.Commit()
 }

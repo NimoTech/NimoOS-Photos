@@ -22,6 +22,7 @@ import (
 
 	_ "golang.org/x/image/webp"
 
+	"github.com/NimoTech/NimoOS-Photos/pkg/config"
 	"github.com/NimoTech/NimoOS-Photos/pkg/exif"
 	"github.com/NimoTech/NimoOS-Photos/pkg/ffmpeg"
 	"github.com/NimoTech/NimoOS-Photos/pkg/mlclient"
@@ -645,19 +646,21 @@ func (ix *Indexer) processFileInternal(path string, opts processOpts) (success b
 				ix.writeClipEmbedding(assetID, vec)
 			}
 
-			// Face detection + recognition in a single request.
-			if faces, faceErr := ix.ml.DetectAndRecognizeFaces(mlData); faceErr == nil {
-				for _, face := range faces {
-					if len(face.Embedding) != 512 {
-						continue
-					}
-					bboxJSON, _ := json.Marshal(face.BBox)
-					faceID := uuid.NewString()
-					if _, err := ix.db.Exec(
-						`INSERT INTO face_detections(id, asset_id, bbox, embedding) VALUES(?,?,?,?)`,
-						faceID, assetID, string(bboxJSON), sqlite.SerializeFloat32(face.Embedding),
-					); err != nil {
-						fmt.Fprintf(os.Stderr, "[indexer] failed to insert face_detection %s: %v\n", assetID, err)
+			// Face detection + recognition（FacesEnabled 关闭时跳过）。
+			if config.Cfg == nil || config.Cfg.FacesEnabled {
+				if faces, faceErr := ix.ml.DetectAndRecognizeFaces(mlData); faceErr == nil {
+					for _, face := range faces {
+						if len(face.Embedding) != 512 {
+							continue
+						}
+						bboxJSON, _ := json.Marshal(face.BBox)
+						faceID := uuid.NewString()
+						if _, err := ix.db.Exec(
+							`INSERT INTO face_detections(id, asset_id, bbox, embedding) VALUES(?,?,?,?)`,
+							faceID, assetID, string(bboxJSON), sqlite.SerializeFloat32(face.Embedding),
+						); err != nil {
+							fmt.Fprintf(os.Stderr, "[indexer] failed to insert face_detection %s: %v\n", assetID, err)
+						}
 					}
 				}
 			}

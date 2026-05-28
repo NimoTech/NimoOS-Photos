@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/NimoTech/NimoOS-Photos/pkg/config"
 	"github.com/NimoTech/NimoOS-Photos/pkg/sqlite"
 	"github.com/google/uuid"
 	"go.uber.org/zap"
@@ -659,6 +660,10 @@ func (s *FaceService) StartScheduler(ctx context.Context) {
 				nextOK := s.nextAttempt
 				s.failMu.Unlock()
 				if !nextOK.IsZero() && t.Before(nextOK) {
+					continue
+				}
+
+				if config.Cfg != nil && !config.Cfg.FacesEnabled {
 					continue
 				}
 
