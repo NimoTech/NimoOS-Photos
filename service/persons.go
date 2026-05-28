@@ -3,7 +3,10 @@ package service
 import (
 	"database/sql"
 	"fmt"
+	"sort"
 	"strings"
+
+	"github.com/NimoTech/NimoOS-Photos/pkg/sqlite"
 )
 
 // PersonService provides People list/detail/edit/relations/places/merge suggestions.
@@ -229,4 +232,153 @@ SELECT MAX(a.indexed_at) FROM face_detections fd JOIN assets a ON a.id=fd.asset_
 	}
 	v := ts.String
 	return &v, nil
+}
+
+// PersonPlaces 返回该 person 照片的 GPS 点（前端做国家/城市级聚合）。
+func (s *PersonService) PersonPlaces(id string) ([]PersonPlace, error) {
+	rows, err := s.db.Query(`
+SELECT e.latitude, e.longitude, a.taken_at
+FROM face_person fp
+JOIN face_detections fd ON fd.id=fp.face_id
+JOIN assets a ON a.id=fd.asset_id AND a.deleted_at IS NULL AND a.is_live_photo_video=0
+JOIN asset_exif e ON e.asset_id=a.id
+WHERE fp.person_id=? AND e.latitude IS NOT NULL AND e.longitude IS NOT NULL
+  AND NOT (e.latitude=0 AND e.longitude=0)`, id)
+	if err != nil {
+		return nil, fmt.Errorf("PersonPlaces: %w", err)
+	}
+	defer rows.Close()
+	var out []PersonPlace
+	for rows.Next() {
+		var pl PersonPlace
+		var taken sql.NullTime
+		if err := rows.Scan(&pl.Latitude, &pl.Longitude, &taken); err != nil {
+			return nil, fmt.Errorf("PersonPlaces scan: %w", err)
+		}
+		if taken.Valid {
+			tt := taken.Time
+			pl.TakenAt = &tt
+		}
+		out = append(out, pl)
+	}
+	return out, rows.Err()
+}
+
+type personCentroid struct {
+	id       string
+	name     string
+	faceID   string
+	centroid []float32
+}
+
+// MergeSuggestions 返回质心距离落在 (dbscanEpsilon, suggestEpsilon) 带内、
+// 且未被拒绝的 person 配对，confidence=1-dist，按 confidence 降序。
+func (s *PersonService) MergeSuggestions() ([]MergeSuggestion, error) {
+	rows, err := s.db.Query(`
+SELECT id, COALESCE(name,''), COALESCE(cover_face_id,''), centroid
+FROM persons WHERE hidden=0 AND centroid IS NOT NULL`)
+	if err != nil {
+		return nil, fmt.Errorf("MergeSuggestions load: %w", err)
+	}
+	var ps []personCentroid
+	for rows.Next() {
+		var pc personCentroid
+		var blob []byte
+		if err := rows.Scan(&pc.id, &pc.name, &pc.faceID, &blob); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("MergeSuggestions scan: %w", err)
+		}
+		pc.centroid = sqlite.DeserializeFloat32(blob)
+		if len(pc.centroid) > 0 {
+			ps = append(ps, pc)
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("MergeSuggestions iter: %w", err)
+	}
+
+	rejected, err := s.loadRejections()
+	if err != nil {
+		return nil, err
+	}
+
+	var out []MergeSuggestion
+	for i := 0; i < len(ps); i++ {
+		for j := i + 1; j < len(ps); j++ {
+			d := cosDist(ps[i].centroid, ps[j].centroid)
+			if d <= dbscanEpsilon || d >= suggestEpsilon {
+				continue
+			}
+			a, b := ps[i], ps[j]
+			if rejected[pairKey(a.id, b.id)] {
+				continue
+			}
+			// 目标取有名的一方；都无名/都同有名则按 id 稳定。
+			from, into := a, b
+			if a.name != "" && b.name == "" {
+				from, into = b, a
+			} else if a.name == "" && b.name == "" && a.id > b.id {
+				from, into = b, a
+			}
+			conf := 1.0 - d
+			out = append(out, MergeSuggestion{
+				ID:         pairKey(a.id, b.id),
+				FromID:     from.id,
+				IntoID:     into.id,
+				FromFaceID: from.faceID,
+				IntoFaceID: into.faceID,
+				IntoName:   into.name,
+				Confidence: conf,
+				Reason:     suggestionReason(into.name, conf),
+			})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Confidence > out[j].Confidence })
+	return out, nil
+}
+
+// RejectMerge 记住被拒绝的配对（方向无关）。
+func (s *PersonService) RejectMerge(a, b string) error {
+	pa, pb := orderPair(a, b)
+	_, err := s.db.Exec(`INSERT OR IGNORE INTO merge_rejections(person_a, person_b) VALUES(?,?)`, pa, pb)
+	if err != nil {
+		return fmt.Errorf("RejectMerge: %w", err)
+	}
+	return nil
+}
+
+func (s *PersonService) loadRejections() (map[string]bool, error) {
+	rows, err := s.db.Query(`SELECT person_a, person_b FROM merge_rejections`)
+	if err != nil {
+		return nil, fmt.Errorf("loadRejections: %w", err)
+	}
+	defer rows.Close()
+	m := map[string]bool{}
+	for rows.Next() {
+		var a, b string
+		if err := rows.Scan(&a, &b); err != nil {
+			return nil, fmt.Errorf("loadRejections scan: %w", err)
+		}
+		m[pairKey(a, b)] = true
+	}
+	return m, rows.Err()
+}
+
+func orderPair(a, b string) (string, string) {
+	if a <= b {
+		return a, b
+	}
+	return b, a
+}
+func pairKey(a, b string) string {
+	x, y := orderPair(a, b)
+	return x + "|" + y
+}
+
+func suggestionReason(name string, conf float64) string {
+	if name != "" {
+		return fmt.Sprintf("两个集群的人脸高度相似（%.0f%%），可能都是 %s。", conf*100, name)
+	}
+	return fmt.Sprintf("两个集群的人脸高度相似（%.0f%%），可能是同一个人。", conf*100)
 }

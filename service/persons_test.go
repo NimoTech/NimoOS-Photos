@@ -182,3 +182,50 @@ func TestPersonRelations(t *testing.T) {
 	require.Len(t, rels2, 1)
 	require.Equal(t, 1, rels2[0].Count)
 }
+
+func TestPersonPlaces(t *testing.T) {
+	db := makeTestFaceDB(t)
+	dim := 512
+	a := make([]float32, dim); a[0] = 1.0
+	insertAssetFace(t, db, "pp-a1", normalize(a))
+	insertAssetFace(t, db, "pp-a2", normalize(a))
+	_, err := db.Exec(`INSERT INTO asset_exif(asset_id, latitude, longitude) VALUES('pp-a1', 35.6, 139.6)`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO asset_exif(asset_id, latitude, longitude) VALUES('pp-a2', 37.7, -122.4)`)
+	require.NoError(t, err)
+	_, err = db.Exec(`UPDATE assets SET taken_at='2026-01-15 12:00:00' WHERE id='pp-a1'`)
+	require.NoError(t, err)
+	require.NoError(t, service.NewFaceService(db).RunClustering(context.Background()))
+
+	ps := service.NewPersonService(db)
+	id := mustFirstPersonID(t, db)
+	pts, err := ps.PersonPlaces(id)
+	require.NoError(t, err)
+	require.Len(t, pts, 2)
+}
+
+func TestMergeSuggestions_RespectRejections(t *testing.T) {
+	db := makeTestFaceDB(t)
+	dim := 512
+	// 两个簇质心 cosine 距离落在 (dbscanEpsilon=0.6, suggestEpsilon=0.75) 带内
+	a := make([]float32, dim); a[0] = 1.0
+	c := make([]float32, dim); c[0] = 0.3; c[1] = 0.954 // cos≈0.3 → dist≈0.7
+	insertAssetFace(t, db, "ms-a", normalize(a))
+	insertAssetFace(t, db, "ms-c", normalize(c))
+	require.NoError(t, service.NewFaceService(db).RunClustering(context.Background()))
+
+	ps := service.NewPersonService(db)
+	sugs, err := ps.MergeSuggestions()
+	require.NoError(t, err)
+	require.NotEmpty(t, sugs, "应至少一个建议落在距离带内")
+
+	require.NoError(t, ps.RejectMerge(sugs[0].FromID, sugs[0].IntoID))
+	sugs2, err := ps.MergeSuggestions()
+	require.NoError(t, err)
+	for _, s := range sugs2 {
+		require.False(t,
+			(s.FromID == sugs[0].FromID && s.IntoID == sugs[0].IntoID) ||
+				(s.FromID == sugs[0].IntoID && s.IntoID == sugs[0].FromID),
+			"被拒绝的配对不应再出现")
+	}
+}
