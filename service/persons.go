@@ -193,7 +193,7 @@ FROM face_person fp1
 JOIN face_detections fd1 ON fd1.id=fp1.face_id
 JOIN face_detections fd2 ON fd2.asset_id=fd1.asset_id AND fd2.id!=fd1.id
 JOIN face_person fp2 ON fp2.face_id=fd2.id
-JOIN assets a ON a.id=fd1.asset_id AND a.deleted_at IS NULL
+JOIN assets a ON a.id=fd1.asset_id AND a.deleted_at IS NULL AND a.is_live_photo_video=0
 JOIN persons p ON p.id=fp2.person_id AND p.hidden=0
 WHERE fp1.person_id=? AND fp2.person_id!=fp1.person_id
 GROUP BY fp2.person_id

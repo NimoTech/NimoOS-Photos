@@ -176,4 +176,9 @@ func TestPersonRelations(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, rels, 1)
 	require.Equal(t, 1, rels[0].Count)
+
+	rels2, err := ps.PersonRelations(list[1].ID)
+	require.NoError(t, err)
+	require.Len(t, rels2, 1)
+	require.Equal(t, 1, rels2[0].Count)
 }
