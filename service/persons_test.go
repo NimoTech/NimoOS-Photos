@@ -32,6 +32,33 @@ func TestListPersons_ExcludesHiddenAndCounts(t *testing.T) {
 	require.Len(t, list2, 0)
 }
 
+func TestListPersons_PlacesCount(t *testing.T) {
+	db := makeTestFaceDB(t)
+	dim := 512
+	a := make([]float32, dim); a[0] = 1.0
+	insertAssetFace(t, db, "pl-a1", normalize(a))
+	insertAssetFace(t, db, "pl-a2", normalize(a))
+	// 给两张 asset 不同 GPS（粗粒度 cell 不同），asset_exif 行
+	_, err := db.Exec(`INSERT INTO asset_exif(asset_id, latitude, longitude) VALUES('pl-a1', 35.6, 139.6)`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO asset_exif(asset_id, latitude, longitude) VALUES('pl-a2', 37.7, -122.4)`)
+	require.NoError(t, err)
+
+	require.NoError(t, service.NewFaceService(db).RunClustering(context.Background()))
+	list, err := service.NewPersonService(db).ListPersons()
+	require.NoError(t, err)
+	require.Len(t, list, 1)
+	require.Equal(t, 2, list[0].PlacesCount)
+
+	// 软删 a2 后 places 应减为 1
+	_, err = db.Exec(`UPDATE assets SET deleted_at='2026-05-01 00:00:00' WHERE id='pl-a2'`)
+	require.NoError(t, err)
+	list2, err := service.NewPersonService(db).ListPersons()
+	require.NoError(t, err)
+	require.Len(t, list2, 1)
+	require.Equal(t, 1, list2[0].PlacesCount)
+}
+
 func TestFacesIndexedUpTo(t *testing.T) {
 	db := makeTestFaceDB(t)
 	// 空库

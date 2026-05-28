@@ -31,8 +31,10 @@ SELECT p.id, p.name, COALESCE(p.cover_asset_id,''), COALESCE(p.cover_face_id,'')
           WHERE fp.person_id=p.id AND a.deleted_at IS NULL AND a.is_live_photo_video=0) AS last_seen,
        (SELECT COUNT(DISTINCT (CAST(e.latitude*2 AS INT) || ',' || CAST(e.longitude*2 AS INT)))
           FROM face_person fp JOIN face_detections fd ON fd.id=fp.face_id
+          JOIN assets a ON a.id=fd.asset_id
           JOIN asset_exif e ON e.asset_id=fd.asset_id
-          WHERE fp.person_id=p.id AND e.latitude IS NOT NULL AND e.longitude IS NOT NULL
+          WHERE fp.person_id=p.id AND a.deleted_at IS NULL AND a.is_live_photo_video=0
+            AND e.latitude IS NOT NULL AND e.longitude IS NOT NULL
             AND NOT (e.latitude=0 AND e.longitude=0)) AS places
 FROM persons p
 WHERE p.hidden=0
