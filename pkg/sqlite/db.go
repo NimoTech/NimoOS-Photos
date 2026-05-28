@@ -258,8 +258,13 @@ func migrate(db *sql.DB) error {
 		return fmt.Errorf("migrate index album_assets_position: %w", err)
 	}
 
-	// 回填 position：只有当某 album 内所有行 position == 0 且行数 >= 2 时执行
-	// （区分"全新空表"与"旧库未回填"两种状态）。多次执行幂等。
+	// Backfill position: only runs when an album has >=2 rows all at position=0,
+	// which distinguishes legacy unbackfilled rows from a freshly-created album.
+	// Idempotent: after backfill MAX(position) > 0, so HAVING never fires again.
+	// NOTE (follow-up): once AddAsset/ReorderAssets land (Tasks 5,7), an album
+	// whose positions are all reset to 0 by buggy callers would falsely re-trigger
+	// this. Acceptable for now; revisit if a metadata-backed migration guard
+	// becomes warranted.
 	if _, err := db.Exec(`
 		WITH targets AS (
 			SELECT album_id FROM album_assets

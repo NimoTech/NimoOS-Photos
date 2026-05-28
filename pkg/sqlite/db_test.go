@@ -297,27 +297,35 @@ func TestMigrateAlbumAssetsHasPositionColumn(t *testing.T) {
 	require.True(t, ok, "album_assets.position column should exist")
 	require.Equal(t, "INTEGER", pos.ctype)
 	require.Equal(t, 1, pos.notnull)
+
+	var idxName string
+	err = db.QueryRow(`SELECT name FROM sqlite_master WHERE type='index' AND name='idx_album_assets_position'`).Scan(&idxName)
+	require.NoError(t, err, "idx_album_assets_position index should exist")
+	require.Equal(t, "idx_album_assets_position", idxName)
 }
 
 func TestMigrateAlbumAssetsBackfillsPosition(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "test.db")
+
+	// Phase 1: seed DB to simulate legacy (all position=0) state.
+	func() {
+		db, err := sqlite.Open(dbPath)
+		require.NoError(t, err)
+		defer db.Close()
+
+		_, err = db.Exec(`INSERT INTO assets(id, file_path, status) VALUES('a1','/g/1.jpg','indexed'),('a2','/g/2.jpg','indexed'),('a3','/g/3.jpg','indexed')`)
+		require.NoError(t, err)
+		_, err = db.Exec(`INSERT INTO albums(id, name) VALUES('al1','A')`)
+		require.NoError(t, err)
+		_, err = db.Exec(`INSERT INTO album_assets(album_id, asset_id, added_at, position) VALUES
+			('al1','a1','2026-01-01',0),
+			('al1','a2','2026-01-02',0),
+			('al1','a3','2026-01-03',0)`)
+		require.NoError(t, err)
+	}()
+
+	// Phase 2: re-open should trigger backfill.
 	db, err := sqlite.Open(dbPath)
-	require.NoError(t, err)
-
-	_, err = db.Exec(`INSERT INTO assets(id, file_path, status) VALUES('a1','/g/1.jpg','indexed'),('a2','/g/2.jpg','indexed'),('a3','/g/3.jpg','indexed')`)
-	require.NoError(t, err)
-	_, err = db.Exec(`INSERT INTO albums(id, name) VALUES('al1','A')`)
-	require.NoError(t, err)
-	// 模拟旧库：直接以 INSERT 写入，position 全为默认 0
-	_, err = db.Exec(`INSERT INTO album_assets(album_id, asset_id, added_at, position) VALUES
-		('al1','a1','2026-01-01',0),
-		('al1','a2','2026-01-02',0),
-		('al1','a3','2026-01-03',0)`)
-	require.NoError(t, err)
-	db.Close()
-
-	// 重新打开应触发回填
-	db, err = sqlite.Open(dbPath)
 	require.NoError(t, err)
 	defer db.Close()
 
@@ -332,4 +340,74 @@ func TestMigrateAlbumAssetsBackfillsPosition(t *testing.T) {
 		got = append(got, [2]any{aid, pos})
 	}
 	require.Equal(t, [][2]any{{"a1", 0}, {"a2", 1}, {"a3", 2}}, got)
+}
+
+func TestMigrateAlbumAssetsBackfillIsIdempotent(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+
+	// Phase 1: seed legacy state.
+	func() {
+		db, err := sqlite.Open(dbPath)
+		require.NoError(t, err)
+		defer db.Close()
+
+		_, err = db.Exec(`INSERT INTO assets(id, file_path, status) VALUES('a1','/g/1.jpg','indexed'),('a2','/g/2.jpg','indexed')`)
+		require.NoError(t, err)
+		_, err = db.Exec(`INSERT INTO albums(id, name) VALUES('al1','A')`)
+		require.NoError(t, err)
+		_, err = db.Exec(`INSERT INTO album_assets(album_id, asset_id, added_at, position) VALUES
+			('al1','a1','2026-01-01',0),
+			('al1','a2','2026-01-02',0)`)
+		require.NoError(t, err)
+	}()
+
+	// Phase 2: first re-open triggers backfill (0,1).
+	func() {
+		db, err := sqlite.Open(dbPath)
+		require.NoError(t, err)
+		defer db.Close()
+	}()
+
+	// Phase 3: second re-open should be a no-op. Assert positions still 0,1.
+	db, err := sqlite.Open(dbPath)
+	require.NoError(t, err)
+	defer db.Close()
+
+	rows, err := db.Query(`SELECT asset_id, position FROM album_assets WHERE album_id='al1' ORDER BY position`)
+	require.NoError(t, err)
+	defer rows.Close()
+	got := map[string]int{}
+	for rows.Next() {
+		var aid string
+		var pos int
+		require.NoError(t, rows.Scan(&aid, &pos))
+		got[aid] = pos
+	}
+	require.Equal(t, map[string]int{"a1": 0, "a2": 1}, got)
+}
+
+func TestMigrateAlbumAssetsBackfillSkipsSingleItemAlbum(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+
+	func() {
+		db, err := sqlite.Open(dbPath)
+		require.NoError(t, err)
+		defer db.Close()
+
+		_, err = db.Exec(`INSERT INTO assets(id, file_path, status) VALUES('solo','/g/s.jpg','indexed')`)
+		require.NoError(t, err)
+		_, err = db.Exec(`INSERT INTO albums(id, name) VALUES('al-solo','Solo')`)
+		require.NoError(t, err)
+		_, err = db.Exec(`INSERT INTO album_assets(album_id, asset_id, added_at, position) VALUES
+			('al-solo','solo','2026-01-01',0)`)
+		require.NoError(t, err)
+	}()
+
+	db, err := sqlite.Open(dbPath)
+	require.NoError(t, err)
+	defer db.Close()
+
+	var pos int
+	require.NoError(t, db.QueryRow(`SELECT position FROM album_assets WHERE album_id='al-solo' AND asset_id='solo'`).Scan(&pos))
+	require.Equal(t, 0, pos, "single-item album position must remain 0 (not falsely backfilled)")
 }
