@@ -220,6 +220,83 @@ func (s *AlbumService) BatchAddAssets(albumID string, assetIDs []string) error {
 	return tx.Commit()
 }
 
+// ReorderAssets replaces position 0..n-1 for every asset in the album.
+// assetIDs must be a strict permutation of the album's current asset set:
+// empty slice, duplicates, extra IDs, or missing IDs all return ErrInvalidInput.
+func (s *AlbumService) ReorderAssets(albumID string, assetIDs []string) error {
+	// Reject empty input early.
+	if len(assetIDs) == 0 {
+		return ErrInvalidInput
+	}
+
+	// Reject duplicate IDs (a strict-set requirement).
+	seen := make(map[string]struct{}, len(assetIDs))
+	for _, id := range assetIDs {
+		if _, dup := seen[id]; dup {
+			return ErrInvalidInput
+		}
+		seen[id] = struct{}{}
+	}
+
+	// Verify album exists.
+	var dummy string
+	err := s.db.QueryRow(`SELECT id FROM albums WHERE id=?`, albumID).Scan(&dummy)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return err
+	}
+
+	// Load current asset set.
+	rows, err := s.db.Query(`SELECT asset_id FROM album_assets WHERE album_id=?`, albumID)
+	if err != nil {
+		return err
+	}
+	current := map[string]struct{}{}
+	for rows.Next() {
+		var aid string
+		if err := rows.Scan(&aid); err != nil {
+			rows.Close()
+			return err
+		}
+		current[aid] = struct{}{}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	// Strict set equality: any difference is an invalid input.
+	if len(current) != len(assetIDs) {
+		return ErrInvalidInput
+	}
+	for _, id := range assetIDs {
+		if _, ok := current[id]; !ok {
+			return ErrInvalidInput
+		}
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	stmt, err := tx.Prepare(`UPDATE album_assets SET position=? WHERE album_id=? AND asset_id=?`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
+	for i, id := range assetIDs {
+		if _, err := stmt.Exec(i, albumID, id); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 func (s *AlbumService) ListAssets(albumID string) ([]Asset, error) {
 	rows, err := s.db.Query(`
 		SELECT a.id, a.file_path, a.file_size, COALESCE(a.mime_type,''),

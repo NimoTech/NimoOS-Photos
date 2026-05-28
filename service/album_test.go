@@ -332,6 +332,78 @@ func TestAlbumListAssetsOrderedByPosition(t *testing.T) {
 	require.Equal(t, "a2", assets[2].ID)
 }
 
+func TestAlbumReorderAssetsSuccess(t *testing.T) {
+	db, err := sqlite.Open(filepath.Join(t.TempDir(), "test.db"))
+	require.NoError(t, err)
+	defer db.Close()
+
+	_, err = db.Exec(`INSERT INTO assets(id, file_path, status) VALUES
+		('a1','/g/1.jpg','indexed'),('a2','/g/2.jpg','indexed'),('a3','/g/3.jpg','indexed')`)
+	require.NoError(t, err)
+	svc := service.NewAlbumService(db)
+	a, _ := svc.Create("X")
+	svc.AddAsset(a.ID, "a1")
+	svc.AddAsset(a.ID, "a2")
+	svc.AddAsset(a.ID, "a3")
+
+	require.NoError(t, svc.ReorderAssets(a.ID, []string{"a3", "a1", "a2"}))
+
+	require.Equal(t, map[string]int{"a3": 0, "a1": 1, "a2": 2}, queryPositions(t, db, a.ID))
+}
+
+func TestAlbumReorderRejectsMismatchedSets(t *testing.T) {
+	db, err := sqlite.Open(filepath.Join(t.TempDir(), "test.db"))
+	require.NoError(t, err)
+	defer db.Close()
+
+	_, err = db.Exec(`INSERT INTO assets(id, file_path, status) VALUES
+		('a1','/g/1.jpg','indexed'),('a2','/g/2.jpg','indexed'),('a3','/g/3.jpg','indexed')`)
+	require.NoError(t, err)
+	svc := service.NewAlbumService(db)
+	a, _ := svc.Create("X")
+	svc.AddAsset(a.ID, "a1")
+	svc.AddAsset(a.ID, "a2")
+
+	// more than current
+	require.ErrorIs(t, svc.ReorderAssets(a.ID, []string{"a1", "a2", "a3"}), service.ErrInvalidInput)
+	// fewer than current
+	require.ErrorIs(t, svc.ReorderAssets(a.ID, []string{"a1"}), service.ErrInvalidInput)
+	// same length but different set
+	require.ErrorIs(t, svc.ReorderAssets(a.ID, []string{"a1", "a3"}), service.ErrInvalidInput)
+}
+
+func TestAlbumReorderRejectsEmpty(t *testing.T) {
+	svc, cleanup := openTestAlbumSvc(t)
+	defer cleanup()
+	a, _ := svc.Create("X")
+
+	require.ErrorIs(t, svc.ReorderAssets(a.ID, []string{}), service.ErrInvalidInput)
+}
+
+func TestAlbumReorderAlbumNotFound(t *testing.T) {
+	svc, cleanup := openTestAlbumSvc(t)
+	defer cleanup()
+
+	require.ErrorIs(t, svc.ReorderAssets("nope", []string{"a1"}), service.ErrNotFound)
+}
+
+func TestAlbumReorderRejectsDuplicateIDs(t *testing.T) {
+	db, err := sqlite.Open(filepath.Join(t.TempDir(), "test.db"))
+	require.NoError(t, err)
+	defer db.Close()
+
+	_, err = db.Exec(`INSERT INTO assets(id, file_path, status) VALUES
+		('a1','/g/1.jpg','indexed'),('a2','/g/2.jpg','indexed')`)
+	require.NoError(t, err)
+	svc := service.NewAlbumService(db)
+	a, _ := svc.Create("X")
+	svc.AddAsset(a.ID, "a1")
+	svc.AddAsset(a.ID, "a2")
+
+	// duplicate IDs in the array
+	require.ErrorIs(t, svc.ReorderAssets(a.ID, []string{"a1", "a1"}), service.ErrInvalidInput)
+}
+
 // queryPositions 读取某 album 的 (asset_id -> position) map。
 func queryPositions(t *testing.T, db *sql.DB, albumID string) map[string]int {
 	t.Helper()
