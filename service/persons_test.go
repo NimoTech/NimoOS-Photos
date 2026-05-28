@@ -3,6 +3,10 @@ package service_test
 import (
 	"context"
 	"database/sql"
+	"image"
+	"image/jpeg"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/NimoTech/NimoOS-Photos/pkg/sqlite"
@@ -247,6 +251,49 @@ func TestMergeSuggestions_StableOrder(t *testing.T) {
 	require.Greater(t, len(r1), 0)
 	require.Equal(t, r1[0].FromID, r2[0].FromID)
 	require.Equal(t, r1[0].IntoID, r2[0].IntoID)
+}
+
+func writeTestJPEG(t *testing.T, path string, w, h int) {
+	t.Helper()
+	img := image.NewRGBA(image.Rect(0, 0, w, h))
+	f, err := os.Create(path)
+	require.NoError(t, err)
+	defer f.Close()
+	require.NoError(t, jpeg.Encode(f, img, nil))
+}
+
+func TestFaceThumbnail_CropsAndCaches(t *testing.T) {
+	db := makeTestFaceDB(t)
+	dir := t.TempDir()
+	srcPath := filepath.Join(dir, "src.jpg")
+	writeTestJPEG(t, srcPath, 400, 300)
+	_, err := db.Exec(`INSERT INTO assets(id, file_path, status) VALUES('fa', ?, 'indexed')`, srcPath)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO face_detections(id, asset_id, bbox, embedding) VALUES('face1','fa',?,?)`,
+		`{"x1":0.25,"y1":0.25,"x2":0.6,"y2":0.7}`, sqlite.SerializeFloat32(make([]float32, 512)))
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO persons(id, name, cover_asset_id, cover_face_id) VALUES('pp','','fa','face1')`)
+	require.NoError(t, err)
+
+	ps := service.NewPersonService(db)
+	cacheDir := filepath.Join(dir, "face-thumbs")
+	out, err := ps.FaceThumbnail("pp", cacheDir)
+	require.NoError(t, err)
+	st, err := os.Stat(out)
+	require.NoError(t, err)
+	require.Greater(t, st.Size(), int64(0))
+
+	// 第二次命中缓存：路径相同且不重建（mtime 不变即缓存命中）
+	stat1, _ := os.Stat(out)
+	out2, err := ps.FaceThumbnail("pp", cacheDir)
+	require.NoError(t, err)
+	require.Equal(t, out, out2)
+	stat2, _ := os.Stat(out2)
+	require.Equal(t, stat1.ModTime(), stat2.ModTime())
+
+	// 不存在 person 返回 ErrNotFound
+	_, err = ps.FaceThumbnail("no-such", cacheDir)
+	require.ErrorIs(t, err, service.ErrNotFound)
 }
 
 func TestMergeSuggestions_RespectRejections(t *testing.T) {

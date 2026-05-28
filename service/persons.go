@@ -2,11 +2,16 @@ package service
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
+	"image"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 
 	"github.com/NimoTech/NimoOS-Photos/pkg/sqlite"
+	"github.com/disintegration/imaging"
 )
 
 // PersonService provides People list/detail/edit/relations/places/merge suggestions.
@@ -384,4 +389,78 @@ func suggestionReason(name string, conf float64) string {
 		return fmt.Sprintf("两个集群的人脸高度相似（%.0f%%），可能都是 %s。", conf*100, name)
 	}
 	return fmt.Sprintf("两个集群的人脸高度相似（%.0f%%），可能是同一个人。", conf*100)
+}
+
+// FaceThumbnail 按 cover_face 的 bbox 从原图裁出方形人脸缓存到 cacheDir，返回文件路径。
+// 已缓存则直接返回。person 无 cover_face 或不存在返回 ErrNotFound。
+func (s *PersonService) FaceThumbnail(personID, cacheDir string) (string, error) {
+	var faceID, bbox, srcPath string
+	err := s.db.QueryRow(`
+SELECT fd.id, fd.bbox, a.file_path
+FROM persons p
+JOIN face_detections fd ON fd.id=p.cover_face_id
+JOIN assets a ON a.id=fd.asset_id
+WHERE p.id=? AND p.hidden=0`, personID).Scan(&faceID, &bbox, &srcPath)
+	if err == sql.ErrNoRows {
+		return "", ErrNotFound
+	}
+	if err != nil {
+		return "", fmt.Errorf("FaceThumbnail query: %w", err)
+	}
+
+	outPath := filepath.Join(cacheDir, faceID+".jpg")
+	if st, statErr := os.Stat(outPath); statErr == nil && st.Size() > 0 {
+		return outPath, nil
+	}
+	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
+		return "", fmt.Errorf("FaceThumbnail mkdir: %w", err)
+	}
+
+	var bb struct {
+		X1 float64 `json:"x1"`
+		Y1 float64 `json:"y1"`
+		X2 float64 `json:"x2"`
+		Y2 float64 `json:"y2"`
+	}
+	if err := json.Unmarshal([]byte(bbox), &bb); err != nil {
+		return "", fmt.Errorf("FaceThumbnail bbox: %w", err)
+	}
+	img, err := imaging.Open(srcPath, imaging.AutoOrientation(true))
+	if err != nil {
+		return "", fmt.Errorf("FaceThumbnail open: %w", err)
+	}
+	w := img.Bounds().Dx()
+	h := img.Bounds().Dy()
+
+	// 归一化 → 像素，加 30% padding 取方形。
+	cx := (bb.X1 + bb.X2) / 2 * float64(w)
+	cy := (bb.Y1 + bb.Y2) / 2 * float64(h)
+	side := (bb.X2 - bb.X1) * float64(w)
+	if hSide := (bb.Y2 - bb.Y1) * float64(h); hSide > side {
+		side = hSide
+	}
+	side *= 1.3
+	half := side / 2
+	x0 := int(cx - half)
+	y0 := int(cy - half)
+	x1 := int(cx + half)
+	y1 := int(cy + half)
+	if x0 < 0 {
+		x0 = 0
+	}
+	if y0 < 0 {
+		y0 = 0
+	}
+	if x1 > w {
+		x1 = w
+	}
+	if y1 > h {
+		y1 = h
+	}
+	cropped := imaging.Crop(img, image.Rect(x0, y0, x1, y1))
+	square := imaging.Fill(cropped, 256, 256, imaging.Center, imaging.Lanczos)
+	if err := imaging.Save(square, outPath); err != nil {
+		return "", fmt.Errorf("FaceThumbnail save: %w", err)
+	}
+	return outPath, nil
 }
