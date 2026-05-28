@@ -314,12 +314,15 @@ FROM persons WHERE hidden=0 AND centroid IS NOT NULL`)
 			if rejected[pairKey(a.id, b.id)] {
 				continue
 			}
-			// 目标取有名的一方；都无名/都同有名则按 id 稳定。
+			// 目标取有名的一方；都无名/都有名则按 id 稳定。
 			from, into := a, b
-			if a.name != "" && b.name == "" {
-				from, into = b, a
-			} else if a.name == "" && b.name == "" && a.id > b.id {
-				from, into = b, a
+			switch {
+			case a.name != "" && b.name == "":
+				from, into = b, a // a 有名 → 取 a 为 into
+			case a.name == "" && b.name == "" && a.id > b.id:
+				from, into = b, a // 都无名 → 按 id 稳定
+			case a.name != "" && b.name != "" && a.id > b.id:
+				from, into = b, a // 都有名 → 按 id 稳定
 			}
 			conf := 1.0 - d
 			out = append(out, MergeSuggestion{

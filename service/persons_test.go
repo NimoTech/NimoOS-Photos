@@ -202,6 +202,51 @@ func TestPersonPlaces(t *testing.T) {
 	pts, err := ps.PersonPlaces(id)
 	require.NoError(t, err)
 	require.Len(t, pts, 2)
+
+	// 至少一个点带 TakenAt（pp-a1 有 taken_at）
+	hasTime := false
+	for _, p := range pts {
+		if p.TakenAt != nil {
+			hasTime = true
+		}
+	}
+	require.True(t, hasTime)
+}
+
+func TestMergeSuggestions_StableOrder(t *testing.T) {
+	db := makeTestFaceDB(t)
+	dim := 512
+	a := make([]float32, dim); a[0] = 1.0
+	c := make([]float32, dim); c[0] = 0.3; c[1] = 0.954
+	insertAssetFace(t, db, "so-a", normalize(a))
+	insertAssetFace(t, db, "so-c", normalize(c))
+	require.NoError(t, service.NewFaceService(db).RunClustering(context.Background()))
+
+	// 两个 person 都命名
+	rows, err := db.Query(`SELECT id FROM persons ORDER BY rowid`)
+	require.NoError(t, err)
+	var ids []string
+	for rows.Next() {
+		var id string
+		require.NoError(t, rows.Scan(&id))
+		ids = append(ids, id)
+	}
+	rows.Close()
+	require.Len(t, ids, 2)
+	_, err = db.Exec(`UPDATE persons SET name='Alice' WHERE id=?`, ids[0])
+	require.NoError(t, err)
+	_, err = db.Exec(`UPDATE persons SET name='Bob' WHERE id=?`, ids[1])
+	require.NoError(t, err)
+
+	ps := service.NewPersonService(db)
+	r1, err := ps.MergeSuggestions()
+	require.NoError(t, err)
+	r2, err := ps.MergeSuggestions()
+	require.NoError(t, err)
+	require.Equal(t, len(r1), len(r2))
+	require.Greater(t, len(r1), 0)
+	require.Equal(t, r1[0].FromID, r2[0].FromID)
+	require.Equal(t, r1[0].IntoID, r2[0].IntoID)
 }
 
 func TestMergeSuggestions_RespectRejections(t *testing.T) {
