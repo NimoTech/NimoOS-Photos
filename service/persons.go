@@ -439,6 +439,9 @@ WHERE p.id=? AND p.hidden=0`, personID).Scan(&faceID, &bbox, &srcPath)
 	if hSide := (bb.Y2 - bb.Y1) * float64(h); hSide > side {
 		side = hSide
 	}
+	if side <= 0 {
+		return "", fmt.Errorf("FaceThumbnail: degenerate bbox %+v", bb)
+	}
 	side *= 1.3
 	half := side / 2
 	x0 := int(cx - half)
@@ -456,6 +459,9 @@ WHERE p.id=? AND p.hidden=0`, personID).Scan(&faceID, &bbox, &srcPath)
 	}
 	if y1 > h {
 		y1 = h
+	}
+	if x1 <= x0 || y1 <= y0 {
+		return "", fmt.Errorf("FaceThumbnail: empty crop rect after clamp")
 	}
 	cropped := imaging.Crop(img, image.Rect(x0, y0, x1, y1))
 	square := imaging.Fill(cropped, 256, 256, imaging.Center, imaging.Lanczos)

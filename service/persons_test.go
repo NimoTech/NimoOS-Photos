@@ -296,6 +296,24 @@ func TestFaceThumbnail_CropsAndCaches(t *testing.T) {
 	require.ErrorIs(t, err, service.ErrNotFound)
 }
 
+func TestFaceThumbnail_HiddenReturnsNotFound(t *testing.T) {
+	db := makeTestFaceDB(t)
+	dir := t.TempDir()
+	srcPath := filepath.Join(dir, "src.jpg")
+	writeTestJPEG(t, srcPath, 400, 300)
+	_, err := db.Exec(`INSERT INTO assets(id, file_path, status) VALUES('fh', ?, 'indexed')`, srcPath)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO face_detections(id, asset_id, bbox, embedding) VALUES('face-h','fh',?,?)`,
+		`{"x1":0.25,"y1":0.25,"x2":0.6,"y2":0.7}`, sqlite.SerializeFloat32(make([]float32, 512)))
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO persons(id, name, cover_asset_id, cover_face_id, hidden) VALUES('ph','','fh','face-h',1)`)
+	require.NoError(t, err)
+
+	ps := service.NewPersonService(db)
+	_, err = ps.FaceThumbnail("ph", filepath.Join(dir, "fh-cache"))
+	require.ErrorIs(t, err, service.ErrNotFound)
+}
+
 func TestMergeSuggestions_RespectRejections(t *testing.T) {
 	db := makeTestFaceDB(t)
 	dim := 512
