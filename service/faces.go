@@ -397,43 +397,208 @@ func (s *FaceService) rebuildPersonsWithProgress(ctx context.Context, faces []fa
 		}
 	}()
 
-	if _, err = tx.Exec(`DELETE FROM face_person`); err != nil {
+	// 1. 载入锚定 person（有名字/收藏/关系/隐藏）及其当前成员脸，算质心。
+	type anchor struct {
+		id       string
+		centroid []float32
+	}
+	anchorRows, err := tx.QueryContext(ctx,
+		`SELECT id FROM persons WHERE name!='' OR favorite=1 OR relation!='' OR hidden=1`)
+	if err != nil {
 		return err
 	}
-	if _, err = tx.Exec(`DELETE FROM persons`); err != nil {
+	var anchorIDs []string
+	for anchorRows.Next() {
+		var id string
+		if err = anchorRows.Scan(&id); err != nil {
+			anchorRows.Close()
+			return err
+		}
+		anchorIDs = append(anchorIDs, id)
+	}
+	anchorRows.Close()
+
+	anchored := map[string]bool{}   // 锚定 person 名下的 face_id 集合
+	anchors := make([]anchor, 0, len(anchorIDs))
+	for _, pid := range anchorIDs {
+		fr, ferr := tx.QueryContext(ctx, `
+			SELECT fd.embedding
+			FROM face_person fp
+			JOIN face_detections fd ON fd.id = fp.face_id
+			JOIN assets a ON a.id = fd.asset_id
+			WHERE fp.person_id = ?`, pid)
+		if ferr != nil {
+			err = ferr
+			return err
+		}
+		var vecs [][]float32
+		for fr.Next() {
+			var blob []byte
+			if err = fr.Scan(&blob); err != nil {
+				fr.Close()
+				return err
+			}
+			vecs = append(vecs, sqlite.DeserializeFloat32(blob))
+		}
+		fr.Close()
+		// 记录锚定成员
+		mr, merr := tx.QueryContext(ctx, `SELECT face_id FROM face_person WHERE person_id=?`, pid)
+		if merr != nil {
+			err = merr
+			return err
+		}
+		for mr.Next() {
+			var fid string
+			if err = mr.Scan(&fid); err != nil {
+				mr.Close()
+				return err
+			}
+			anchored[fid] = true
+		}
+		mr.Close()
+		anchors = append(anchors, anchor{id: pid, centroid: ComputeCentroid(vecs)})
+	}
+
+	// 2. 删除自动 person（非锚定）及其 face_person 行。
+	if _, err = tx.Exec(`
+		DELETE FROM face_person
+		WHERE person_id IN (SELECT id FROM persons WHERE NOT (name!='' OR favorite=1 OR relation!='' OR hidden=1))`); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(`
+		DELETE FROM persons
+		WHERE NOT (name!='' OR favorite=1 OR relation!='' OR hidden=1)`); err != nil {
 		return err
 	}
 
-	labelToPersonID := map[int]string{}
+	// 3. 游离脸 = 不在锚定成员集合内的脸；先尝试吸附到最近锚定质心。
+	type freeFace struct {
+		face faceRow
+		idx  int
+	}
+	var free []freeFace
 	for i, f := range faces {
-		l := labels[i]
-		if _, ok := labelToPersonID[l]; !ok {
-			personID := uuid.NewString()
-			labelToPersonID[l] = personID
-			if _, err = tx.Exec(`INSERT INTO persons(id, name, cover_asset_id) VALUES(?, '', ?)`,
-				personID, f.assetID); err != nil {
+		if anchored[f.id] {
+			continue
+		}
+		assigned := false
+		bestDist := assignEpsilon
+		bestAnchor := ""
+		for _, an := range anchors {
+			if an.centroid == nil {
+				continue
+			}
+			d := cosDist(f.vec, an.centroid)
+			if d <= bestDist {
+				bestDist = d
+				bestAnchor = an.id
+			}
+		}
+		if bestAnchor != "" {
+			if _, err = tx.Exec(`INSERT INTO face_person(face_id, person_id) VALUES(?,?)`, f.id, bestAnchor); err != nil {
+				return err
+			}
+			assigned = true
+		}
+		if !assigned {
+			free = append(free, freeFace{face: f, idx: i})
+		}
+	}
+
+	// 4. 剩余游离脸按 DBSCAN label 聚成新自动 person。
+	labelToPersonID := map[int]string{}
+	now := time.Now()
+	for _, ff := range free {
+		l := labels[ff.idx]
+		pid, ok := labelToPersonID[l]
+		if !ok {
+			pid = uuid.NewString()
+			labelToPersonID[l] = pid
+			if _, err = tx.Exec(
+				`INSERT INTO persons(id, name, cover_asset_id, created_at, updated_at) VALUES(?, '', ?, ?, ?)`,
+				pid, ff.face.assetID, now, now); err != nil {
 				return err
 			}
 		}
+		if _, err = tx.Exec(`INSERT INTO face_person(face_id, person_id) VALUES(?,?)`, ff.face.id, pid); err != nil {
+			return err
+		}
+	}
+
+	// 5. 为所有非隐藏 person 回写 centroid/confidence/cover_face_id。
+	if err = s.recomputePersonStatsTx(ctx, tx); err != nil {
+		return err
 	}
 
 	n := len(faces)
-	lastReport := -1
-	for i, f := range faces {
-		if _, err = tx.Exec(`INSERT INTO face_person(face_id, person_id) VALUES(?, ?)`,
-			f.id, labelToPersonID[labels[i]]); err != nil {
-			return err
-		}
-		if n > 0 {
-			if b := (i + 1) * 100 / n; b != lastReport {
-				onProgress(i+1, n)
-				lastReport = b
-			}
-		}
-	}
 	onProgress(n, n)
 	err = tx.Commit()
 	return err
+}
+
+// recomputePersonStatsTx 在事务内为每个 person 重算 centroid、confidence、cover_face_id。
+// cover_face_id 取该 person 名下「最接近质心」的脸；cover_asset_id 同步为该脸所属 asset。
+func (s *FaceService) recomputePersonStatsTx(ctx context.Context, tx *sql.Tx) error {
+	prows, err := tx.QueryContext(ctx, `SELECT id FROM persons`)
+	if err != nil {
+		return err
+	}
+	var ids []string
+	for prows.Next() {
+		var id string
+		if err = prows.Scan(&id); err != nil {
+			prows.Close()
+			return err
+		}
+		ids = append(ids, id)
+	}
+	prows.Close()
+
+	now := time.Now()
+	for _, pid := range ids {
+		fr, ferr := tx.QueryContext(ctx, `
+			SELECT fd.id, fd.asset_id, fd.embedding
+			FROM face_person fp
+			JOIN face_detections fd ON fd.id = fp.face_id
+			WHERE fp.person_id = ?`, pid)
+		if ferr != nil {
+			return ferr
+		}
+		var faceIDs, assetIDs []string
+		var vecs [][]float32
+		for fr.Next() {
+			var fid, aid string
+			var blob []byte
+			if err = fr.Scan(&fid, &aid, &blob); err != nil {
+				fr.Close()
+				return err
+			}
+			faceIDs = append(faceIDs, fid)
+			assetIDs = append(assetIDs, aid)
+			vecs = append(vecs, sqlite.DeserializeFloat32(blob))
+		}
+		fr.Close()
+
+		if len(vecs) == 0 {
+			continue
+		}
+		centroid := ComputeCentroid(vecs)
+		conf := ClusterConfidence(vecs, centroid)
+		// 选最接近质心的脸做封面
+		bestIdx, bestDist := 0, math.MaxFloat64
+		for i, v := range vecs {
+			if d := cosDist(v, centroid); d < bestDist {
+				bestDist = d
+				bestIdx = i
+			}
+		}
+		if _, err = tx.Exec(
+			`UPDATE persons SET centroid=?, confidence=?, cover_face_id=?, cover_asset_id=?, updated_at=? WHERE id=?`,
+			sqlite.SerializeFloat32(centroid), conf, faceIDs[bestIdx], assetIDs[bestIdx], now, pid); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // StartScheduler runs a background goroutine that triggers RunClustering:

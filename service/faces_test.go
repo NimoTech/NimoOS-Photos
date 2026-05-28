@@ -249,3 +249,54 @@ func TestComputeCentroidAndConfidence(t *testing.T) {
 	// 维度不一致返回 nil
 	require.Nil(t, service.ComputeCentroid([][]float32{make([]float32, 4), make([]float32, 5)}))
 }
+
+// insertAssetFace 是测试辅助：写一个 asset 与一张人脸 embedding。
+func insertAssetFace(t *testing.T, db *sql.DB, assetID string, vec []float32) string {
+	t.Helper()
+	_, err := db.Exec(`INSERT INTO assets(id, file_path, status) VALUES(?,?, 'indexed')`,
+		assetID, "/x/"+assetID+".jpg")
+	require.NoError(t, err)
+	faceID := uuid.NewString()
+	_, err = db.Exec(`INSERT INTO face_detections(id, asset_id, bbox, embedding) VALUES(?,?,?,?)`,
+		faceID, assetID, `{"x1":0,"y1":0,"x2":1,"y2":1}`, sqlite.SerializeFloat32(vec))
+	require.NoError(t, err)
+	return faceID
+}
+
+func TestRunClustering_PreservesNamedAcrossReruns(t *testing.T) {
+	db := makeTestFaceDB(t)
+	dim := 512
+	a := make([]float32, dim); a[0] = 1.0
+	insertAssetFace(t, db, "asset-a1", normalize(a))
+
+	svc := service.NewFaceService(db)
+	require.NoError(t, svc.RunClustering(context.Background()))
+
+	// 给生成的（唯一）person 命名
+	var pid string
+	require.NoError(t, db.QueryRow(`SELECT id FROM persons`).Scan(&pid))
+	_, err := db.Exec(`UPDATE persons SET name='Alice' WHERE id=?`, pid)
+	require.NoError(t, err)
+
+	// 加入一张与 Alice 相近的新脸后重跑聚类
+	a2 := make([]float32, dim); a2[0] = 0.97; a2[1] = 0.03
+	insertAssetFace(t, db, "asset-a2", normalize(a2))
+	require.NoError(t, svc.RunClustering(context.Background()))
+
+	// Alice 仍在且仍叫 Alice
+	var name string
+	require.NoError(t, db.QueryRow(`SELECT name FROM persons WHERE id=?`, pid).Scan(&name))
+	require.Equal(t, "Alice", name)
+
+	// 新近脸被吸附到 Alice（Alice 名下 2 张脸）
+	var cnt int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM face_person WHERE person_id=?`, pid).Scan(&cnt))
+	require.Equal(t, 2, cnt)
+
+	// centroid/confidence 已回写
+	var conf float64
+	var centroid []byte
+	require.NoError(t, db.QueryRow(`SELECT confidence, centroid FROM persons WHERE id=?`, pid).Scan(&conf, &centroid))
+	require.Greater(t, conf, 0.0)
+	require.NotEmpty(t, centroid)
+}
