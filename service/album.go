@@ -90,6 +90,34 @@ func (s *AlbumService) Delete(id string) error {
 	return nil
 }
 
+func (s *AlbumService) UpdateName(id, name string) error {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return ErrInvalidInput
+	}
+
+	var existingID string
+	err := s.db.QueryRow(`SELECT id FROM albums WHERE id=?`, id).Scan(&existingID)
+	if err == sql.ErrNoRows {
+		return ErrNotFound
+	}
+	if err != nil {
+		return err
+	}
+
+	var conflictID string
+	err = s.db.QueryRow(`SELECT id FROM albums WHERE name=? AND id<>? LIMIT 1`, name, id).Scan(&conflictID)
+	if err == nil {
+		return ErrAlbumNameExists
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+
+	_, err = s.db.Exec(`UPDATE albums SET name=? WHERE id=?`, name, id)
+	return err
+}
+
 func (s *AlbumService) AddAsset(albumID, assetID string) error {
 	_, err := s.db.Exec(
 		`INSERT OR IGNORE INTO album_assets(album_id, asset_id, added_at) VALUES(?,?,?)`,

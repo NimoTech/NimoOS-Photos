@@ -144,3 +144,54 @@ func TestBatchAddUnknownAlbum(t *testing.T) {
 	err := svc.BatchAddAssets("nonexistent-id", []string{"a1"})
 	require.ErrorIs(t, err, service.ErrNotFound)
 }
+
+func TestAlbumUpdateName(t *testing.T) {
+	svc, cleanup := openTestAlbumSvc(t)
+	defer cleanup()
+
+	a, _ := svc.Create("Original")
+	require.NoError(t, svc.UpdateName(a.ID, "Renamed"))
+
+	got, _ := svc.Get(a.ID)
+	require.Equal(t, "Renamed", got.Name)
+}
+
+func TestAlbumUpdateNameTrimsAndRejectsBlank(t *testing.T) {
+	svc, cleanup := openTestAlbumSvc(t)
+	defer cleanup()
+
+	a, _ := svc.Create("X")
+
+	require.ErrorIs(t, svc.UpdateName(a.ID, ""), service.ErrInvalidInput)
+	require.ErrorIs(t, svc.UpdateName(a.ID, "   "), service.ErrInvalidInput)
+
+	require.NoError(t, svc.UpdateName(a.ID, "  Trimmed  "))
+	got, _ := svc.Get(a.ID)
+	require.Equal(t, "Trimmed", got.Name)
+}
+
+func TestAlbumUpdateNameConflict(t *testing.T) {
+	svc, cleanup := openTestAlbumSvc(t)
+	defer cleanup()
+
+	svc.Create("A")
+	b, _ := svc.Create("B")
+
+	require.ErrorIs(t, svc.UpdateName(b.ID, "A"), service.ErrAlbumNameExists)
+}
+
+func TestAlbumUpdateNameNotFound(t *testing.T) {
+	svc, cleanup := openTestAlbumSvc(t)
+	defer cleanup()
+
+	require.ErrorIs(t, svc.UpdateName("nope", "X"), service.ErrNotFound)
+}
+
+func TestAlbumUpdateNameSameValue(t *testing.T) {
+	// 自己改成自己的名字应成功（不算冲突）
+	svc, cleanup := openTestAlbumSvc(t)
+	defer cleanup()
+
+	a, _ := svc.Create("Same")
+	require.NoError(t, svc.UpdateName(a.ID, "Same"))
+}
