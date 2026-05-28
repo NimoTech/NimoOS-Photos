@@ -145,11 +145,28 @@ func (s *AlbumService) UpdateCover(id, assetID string) error {
 }
 
 func (s *AlbumService) AddAsset(albumID, assetID string) error {
-	_, err := s.db.Exec(
-		`INSERT OR IGNORE INTO album_assets(album_id, asset_id, added_at) VALUES(?,?,?)`,
-		albumID, assetID, time.Now(),
-	)
-	return err
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	var nextPos int
+	err = tx.QueryRow(
+		`SELECT COALESCE(MAX(position), -1) + 1 FROM album_assets WHERE album_id=?`,
+		albumID,
+	).Scan(&nextPos)
+	if err != nil {
+		return err
+	}
+
+	if _, err := tx.Exec(
+		`INSERT OR IGNORE INTO album_assets(album_id, asset_id, added_at, position) VALUES(?,?,?,?)`,
+		albumID, assetID, time.Now(), nextPos,
+	); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *AlbumService) RemoveAsset(albumID, assetID string) error {
@@ -162,7 +179,7 @@ func (s *AlbumService) RemoveAsset(albumID, assetID string) error {
 func (s *AlbumService) BatchAddAssets(albumID string, assetIDs []string) error {
 	var dummy string
 	err := s.db.QueryRow(`SELECT id FROM albums WHERE id=?`, albumID).Scan(&dummy)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return ErrNotFound
 	}
 	if err != nil {
@@ -175,7 +192,15 @@ func (s *AlbumService) BatchAddAssets(albumID string, assetIDs []string) error {
 	}
 	defer tx.Rollback() //nolint:errcheck
 
-	stmt, err := tx.Prepare(`INSERT OR IGNORE INTO album_assets(album_id, asset_id, added_at) VALUES(?,?,?)`)
+	var nextPos int
+	if err := tx.QueryRow(
+		`SELECT COALESCE(MAX(position), -1) + 1 FROM album_assets WHERE album_id=?`,
+		albumID,
+	).Scan(&nextPos); err != nil {
+		return err
+	}
+
+	stmt, err := tx.Prepare(`INSERT OR IGNORE INTO album_assets(album_id, asset_id, added_at, position) VALUES(?,?,?,?)`)
 	if err != nil {
 		return err
 	}
@@ -183,8 +208,13 @@ func (s *AlbumService) BatchAddAssets(albumID string, assetIDs []string) error {
 
 	now := time.Now()
 	for _, id := range assetIDs {
-		if _, err := stmt.Exec(albumID, id, now); err != nil {
+		res, err := stmt.Exec(albumID, id, now, nextPos)
+		if err != nil {
 			return err
+		}
+		// 仅在真正插入新行时递增 position（INSERT OR IGNORE 重复时 RowsAffected=0）
+		if n, _ := res.RowsAffected(); n > 0 {
+			nextPos++
 		}
 	}
 	return tx.Commit()

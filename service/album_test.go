@@ -1,6 +1,7 @@
 package service_test
 
 import (
+	"database/sql"
 	"path/filepath"
 	"testing"
 
@@ -241,4 +242,81 @@ func TestAlbumUpdateCoverAssetNotExist(t *testing.T) {
 
 	a, _ := svc.Create("X")
 	require.ErrorIs(t, svc.UpdateCover(a.ID, "ghost-id"), service.ErrCoverNotInAlbum)
+}
+
+func TestAlbumAddAssetAssignsIncrementalPosition(t *testing.T) {
+	db, err := sqlite.Open(filepath.Join(t.TempDir(), "test.db"))
+	require.NoError(t, err)
+	defer db.Close()
+
+	_, err = db.Exec(`INSERT INTO assets(id, file_path, status) VALUES
+		('a1','/g/1.jpg','indexed'),
+		('a2','/g/2.jpg','indexed'),
+		('a3','/g/3.jpg','indexed')`)
+	require.NoError(t, err)
+	svc := service.NewAlbumService(db)
+	a, _ := svc.Create("X")
+
+	require.NoError(t, svc.AddAsset(a.ID, "a1"))
+	require.NoError(t, svc.AddAsset(a.ID, "a2"))
+	require.NoError(t, svc.AddAsset(a.ID, "a3"))
+
+	positions := queryPositions(t, db, a.ID)
+	require.Equal(t, map[string]int{"a1": 0, "a2": 1, "a3": 2}, positions)
+}
+
+func TestAlbumAddAssetAfterRemoveContinuesMaxPlusOne(t *testing.T) {
+	db, err := sqlite.Open(filepath.Join(t.TempDir(), "test.db"))
+	require.NoError(t, err)
+	defer db.Close()
+
+	_, err = db.Exec(`INSERT INTO assets(id, file_path, status) VALUES
+		('a1','/g/1.jpg','indexed'),('a2','/g/2.jpg','indexed'),('a3','/g/3.jpg','indexed')`)
+	require.NoError(t, err)
+	svc := service.NewAlbumService(db)
+	a, _ := svc.Create("X")
+
+	svc.AddAsset(a.ID, "a1") // pos=0
+	svc.AddAsset(a.ID, "a2") // pos=1
+	require.NoError(t, svc.RemoveAsset(a.ID, "a1"))
+	require.NoError(t, svc.AddAsset(a.ID, "a3")) // pos=2 (MAX+1)
+
+	positions := queryPositions(t, db, a.ID)
+	require.Equal(t, map[string]int{"a2": 1, "a3": 2}, positions)
+}
+
+func TestAlbumBatchAddAssetsAssignsContiguousPosition(t *testing.T) {
+	db, err := sqlite.Open(filepath.Join(t.TempDir(), "test.db"))
+	require.NoError(t, err)
+	defer db.Close()
+
+	_, err = db.Exec(`INSERT INTO assets(id, file_path, status) VALUES
+		('a1','/g/1.jpg','indexed'),('a2','/g/2.jpg','indexed'),
+		('a3','/g/3.jpg','indexed'),('a4','/g/4.jpg','indexed'),
+		('a5','/g/5.jpg','indexed')`)
+	require.NoError(t, err)
+	svc := service.NewAlbumService(db)
+	a, _ := svc.Create("X")
+
+	require.NoError(t, svc.BatchAddAssets(a.ID, []string{"a1", "a2", "a3"}))
+	require.NoError(t, svc.BatchAddAssets(a.ID, []string{"a4", "a5"}))
+
+	positions := queryPositions(t, db, a.ID)
+	require.Equal(t, map[string]int{"a1": 0, "a2": 1, "a3": 2, "a4": 3, "a5": 4}, positions)
+}
+
+// queryPositions 读取某 album 的 (asset_id -> position) map。
+func queryPositions(t *testing.T, db *sql.DB, albumID string) map[string]int {
+	t.Helper()
+	rows, err := db.Query(`SELECT asset_id, position FROM album_assets WHERE album_id=?`, albumID)
+	require.NoError(t, err)
+	defer rows.Close()
+	out := map[string]int{}
+	for rows.Next() {
+		var aid string
+		var pos int
+		require.NoError(t, rows.Scan(&aid, &pos))
+		out[aid] = pos
+	}
+	return out
 }
