@@ -74,7 +74,7 @@ func (s *PersonService) GetPerson(id string) (*Person, error) {
 	err := s.db.QueryRow(`
 SELECT p.id, p.name, COALESCE(p.cover_asset_id,''), COALESCE(p.cover_face_id,''),
        p.favorite, COALESCE(p.relation,''), p.confidence
-FROM persons p WHERE p.id=?`, id).Scan(
+FROM persons p WHERE p.id=? AND p.hidden=0`, id).Scan(
 		&p.ID, &p.Name, &p.CoverAssetID, &p.CoverFaceID, &fav, &p.Relation, &p.Confidence)
 	if err == sql.ErrNoRows {
 		return nil, ErrNotFound

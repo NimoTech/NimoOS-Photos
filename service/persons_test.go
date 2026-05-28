@@ -2,6 +2,7 @@ package service_test
 
 import (
 	"context"
+	"database/sql"
 	"testing"
 
 	"github.com/NimoTech/NimoOS-Photos/service"
@@ -93,5 +94,27 @@ func TestGetPerson_Stats(t *testing.T) {
 	require.Equal(t, 1, p.Count)
 
 	_, err = ps.GetPerson("no-such")
+	require.ErrorIs(t, err, service.ErrNotFound)
+}
+
+func mustFirstPersonID(t *testing.T, db *sql.DB) string {
+	t.Helper()
+	var id string
+	require.NoError(t, db.QueryRow(`SELECT id FROM persons`).Scan(&id))
+	return id
+}
+
+func TestGetPerson_HiddenReturnsNotFound(t *testing.T) {
+	db := makeTestFaceDB(t)
+	dim := 512
+	a := make([]float32, dim); a[0] = 1.0
+	insertAssetFace(t, db, "gh-a1", normalize(a))
+	require.NoError(t, service.NewFaceService(db).RunClustering(context.Background()))
+
+	id := mustFirstPersonID(t, db)
+	_, err := db.Exec(`UPDATE persons SET hidden=1 WHERE id=?`, id)
+	require.NoError(t, err)
+
+	_, err = service.NewPersonService(db).GetPerson(id)
 	require.ErrorIs(t, err, service.ErrNotFound)
 }
