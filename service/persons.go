@@ -67,6 +67,60 @@ ORDER BY cnt DESC, p.rowid`)
 	return out, rows.Err()
 }
 
+// GetPerson 返回单个 person 富对象（含 count/首末次出现/地点数）。
+func (s *PersonService) GetPerson(id string) (*Person, error) {
+	var p Person
+	var fav int
+	err := s.db.QueryRow(`
+SELECT p.id, p.name, COALESCE(p.cover_asset_id,''), COALESCE(p.cover_face_id,''),
+       p.favorite, COALESCE(p.relation,''), p.confidence
+FROM persons p WHERE p.id=?`, id).Scan(
+		&p.ID, &p.Name, &p.CoverAssetID, &p.CoverFaceID, &fav, &p.Relation, &p.Confidence)
+	if err == sql.ErrNoRows {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("GetPerson: %w", err)
+	}
+	p.Favorite = fav != 0
+
+	// count / first / last
+	var cnt int
+	var first, last sql.NullTime
+	if err := s.db.QueryRow(`
+SELECT COUNT(DISTINCT a.id), MIN(a.taken_at), MAX(a.taken_at)
+FROM face_person fp JOIN face_detections fd ON fd.id=fp.face_id
+JOIN assets a ON a.id=fd.asset_id
+WHERE fp.person_id=? AND a.deleted_at IS NULL AND a.is_live_photo_video=0`, id).
+		Scan(&cnt, &first, &last); err != nil {
+		return nil, fmt.Errorf("GetPerson stats: %w", err)
+	}
+	p.Count = cnt
+	if first.Valid {
+		t := first.Time
+		p.FirstSeen = &t
+	}
+	if last.Valid {
+		t := last.Time
+		p.LastSeen = &t
+	}
+
+	// placesCount：distinct 粗粒度 GPS cell（0.5° ≈ 城市级聚合），过滤 0,0 与软删/live video。
+	var places int
+	if err := s.db.QueryRow(`
+SELECT COUNT(DISTINCT (CAST(e.latitude*2 AS INT) || ',' || CAST(e.longitude*2 AS INT)))
+FROM face_person fp JOIN face_detections fd ON fd.id=fp.face_id
+JOIN assets a ON a.id=fd.asset_id
+JOIN asset_exif e ON e.asset_id=fd.asset_id
+WHERE fp.person_id=? AND a.deleted_at IS NULL AND a.is_live_photo_video=0
+  AND e.latitude IS NOT NULL AND e.longitude IS NOT NULL
+  AND NOT (e.latitude=0 AND e.longitude=0)`, id).Scan(&places); err != nil {
+		return nil, fmt.Errorf("GetPerson places: %w", err)
+	}
+	p.PlacesCount = places
+	return &p, nil
+}
+
 // FacesIndexedUpTo returns the most recent indexed_at of assets with face detections (for banner use), nil if none.
 func (s *PersonService) FacesIndexedUpTo() (*string, error) {
 	var ts sql.NullString

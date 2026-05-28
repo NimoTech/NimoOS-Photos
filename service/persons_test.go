@@ -78,3 +78,20 @@ func TestFacesIndexedUpTo(t *testing.T) {
 	require.NotNil(t, ts2)
 	require.Contains(t, *ts2, "2026")
 }
+
+func TestGetPerson_Stats(t *testing.T) {
+	db := makeTestFaceDB(t)
+	dim := 512
+	a := make([]float32, dim); a[0] = 1.0
+	insertAssetFace(t, db, "g-a1", normalize(a))
+	require.NoError(t, service.NewFaceService(db).RunClustering(context.Background()))
+
+	ps := service.NewPersonService(db)
+	list, _ := ps.ListPersons()
+	p, err := ps.GetPerson(list[0].ID)
+	require.NoError(t, err)
+	require.Equal(t, 1, p.Count)
+
+	_, err = ps.GetPerson("no-such")
+	require.ErrorIs(t, err, service.ErrNotFound)
+}
