@@ -263,6 +263,36 @@ func insertAssetFace(t *testing.T, db *sql.DB, assetID string, vec []float32) st
 	return faceID
 }
 
+func TestRunClustering_HiddenPersonNotDeletedAndExcludedFromNewClusters(t *testing.T) {
+	db := makeTestFaceDB(t)
+	dim := 512
+	a := make([]float32, dim); a[0] = 1.0
+	insertAssetFace(t, db, "hp-1", normalize(a))
+	svc := service.NewFaceService(db)
+	require.NoError(t, svc.RunClustering(context.Background()))
+
+	// 取唯一 person，标 hidden=1
+	var pid string
+	require.NoError(t, db.QueryRow(`SELECT id FROM persons`).Scan(&pid))
+	_, err := db.Exec(`UPDATE persons SET hidden=1 WHERE id=?`, pid)
+	require.NoError(t, err)
+
+	// 加一张与 hidden 相近的脸再跑
+	a2 := make([]float32, dim); a2[0] = 0.97; a2[1] = 0.03
+	insertAssetFace(t, db, "hp-2", normalize(a2))
+	require.NoError(t, svc.RunClustering(context.Background()))
+
+	// 隐藏 person 仍在
+	var hidden int
+	require.NoError(t, db.QueryRow(`SELECT hidden FROM persons WHERE id=?`, pid).Scan(&hidden))
+	require.Equal(t, 1, hidden)
+
+	// 近邻脸被吸附到隐藏 person（hidden 也作为锚定参与吸附）
+	var cnt int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM face_person WHERE person_id=?`, pid).Scan(&cnt))
+	require.Equal(t, 2, cnt)
+}
+
 func TestRunClustering_PreservesNamedAcrossReruns(t *testing.T) {
 	db := makeTestFaceDB(t)
 	dim := 512

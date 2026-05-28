@@ -416,6 +416,10 @@ func (s *FaceService) rebuildPersonsWithProgress(ctx context.Context, faces []fa
 		}
 		anchorIDs = append(anchorIDs, id)
 	}
+	if cerr := anchorRows.Err(); cerr != nil {
+		anchorRows.Close()
+		return cerr
+	}
 	anchorRows.Close()
 
 	anchored := map[string]bool{}   // 锚定 person 名下的 face_id 集合
@@ -440,6 +444,10 @@ func (s *FaceService) rebuildPersonsWithProgress(ctx context.Context, faces []fa
 			}
 			vecs = append(vecs, sqlite.DeserializeFloat32(blob))
 		}
+		if cerr := fr.Err(); cerr != nil {
+			fr.Close()
+			return cerr
+		}
 		fr.Close()
 		// 记录锚定成员
 		mr, merr := tx.QueryContext(ctx, `SELECT face_id FROM face_person WHERE person_id=?`, pid)
@@ -454,6 +462,10 @@ func (s *FaceService) rebuildPersonsWithProgress(ctx context.Context, faces []fa
 				return err
 			}
 			anchored[fid] = true
+		}
+		if cerr := mr.Err(); cerr != nil {
+			mr.Close()
+			return cerr
 		}
 		mr.Close()
 		anchors = append(anchors, anchor{id: pid, centroid: ComputeCentroid(vecs)})
@@ -472,6 +484,13 @@ func (s *FaceService) rebuildPersonsWithProgress(ctx context.Context, faces []fa
 	}
 
 	// 3. 游离脸 = 不在锚定成员集合内的脸；先尝试吸附到最近锚定质心。
+	// 预编译 face_person INSERT，步骤 3 和 4 共用。
+	fpStmt, err := tx.PrepareContext(ctx, `INSERT INTO face_person(face_id, person_id) VALUES(?,?)`)
+	if err != nil {
+		return err
+	}
+	defer fpStmt.Close()
+
 	type freeFace struct {
 		face faceRow
 		idx  int
@@ -495,7 +514,7 @@ func (s *FaceService) rebuildPersonsWithProgress(ctx context.Context, faces []fa
 			}
 		}
 		if bestAnchor != "" {
-			if _, err = tx.Exec(`INSERT INTO face_person(face_id, person_id) VALUES(?,?)`, f.id, bestAnchor); err != nil {
+			if _, err = fpStmt.ExecContext(ctx, f.id, bestAnchor); err != nil {
 				return err
 			}
 			assigned = true
@@ -506,6 +525,13 @@ func (s *FaceService) rebuildPersonsWithProgress(ctx context.Context, faces []fa
 	}
 
 	// 4. 剩余游离脸按 DBSCAN label 聚成新自动 person。
+	// cover_asset_id / cover_face_id 由 recomputePersonStatsTx 统一设置，这里 INSERT 时不填。
+	personStmt, err := tx.PrepareContext(ctx, `INSERT INTO persons(id, name, created_at, updated_at) VALUES(?, '', ?, ?)`)
+	if err != nil {
+		return err
+	}
+	defer personStmt.Close()
+
 	labelToPersonID := map[int]string{}
 	now := time.Now()
 	for _, ff := range free {
@@ -514,18 +540,17 @@ func (s *FaceService) rebuildPersonsWithProgress(ctx context.Context, faces []fa
 		if !ok {
 			pid = uuid.NewString()
 			labelToPersonID[l] = pid
-			if _, err = tx.Exec(
-				`INSERT INTO persons(id, name, cover_asset_id, created_at, updated_at) VALUES(?, '', ?, ?, ?)`,
-				pid, ff.face.assetID, now, now); err != nil {
+			if _, err = personStmt.ExecContext(ctx, pid, now, now); err != nil {
 				return err
 			}
 		}
-		if _, err = tx.Exec(`INSERT INTO face_person(face_id, person_id) VALUES(?,?)`, ff.face.id, pid); err != nil {
+		if _, err = fpStmt.ExecContext(ctx, ff.face.id, pid); err != nil {
 			return err
 		}
 	}
 
-	// 5. 为所有非隐藏 person 回写 centroid/confidence/cover_face_id。
+	// 5. 为所有 person（含 hidden）回写 centroid/confidence/cover_face_id：
+	//    隐藏 person 也需要保持最新质心，否则下次聚类的吸附阶段会用陈旧质心。
 	if err = s.recomputePersonStatsTx(ctx, tx); err != nil {
 		return err
 	}
@@ -552,7 +577,19 @@ func (s *FaceService) recomputePersonStatsTx(ctx context.Context, tx *sql.Tx) er
 		}
 		ids = append(ids, id)
 	}
+	if cerr := prows.Err(); cerr != nil {
+		prows.Close()
+		return cerr
+	}
 	prows.Close()
+
+	// 预编译 UPDATE，避免在循环内重复解析 SQL。
+	updateStmt, err := tx.PrepareContext(ctx,
+		`UPDATE persons SET centroid=?, confidence=?, cover_face_id=?, cover_asset_id=?, updated_at=? WHERE id=?`)
+	if err != nil {
+		return err
+	}
+	defer updateStmt.Close()
 
 	now := time.Now()
 	for _, pid := range ids {
@@ -577,6 +614,10 @@ func (s *FaceService) recomputePersonStatsTx(ctx context.Context, tx *sql.Tx) er
 			assetIDs = append(assetIDs, aid)
 			vecs = append(vecs, sqlite.DeserializeFloat32(blob))
 		}
+		if cerr := fr.Err(); cerr != nil {
+			fr.Close()
+			return cerr
+		}
 		fr.Close()
 
 		if len(vecs) == 0 {
@@ -592,8 +633,7 @@ func (s *FaceService) recomputePersonStatsTx(ctx context.Context, tx *sql.Tx) er
 				bestIdx = i
 			}
 		}
-		if _, err = tx.Exec(
-			`UPDATE persons SET centroid=?, confidence=?, cover_face_id=?, cover_asset_id=?, updated_at=? WHERE id=?`,
+		if _, err = updateStmt.ExecContext(ctx,
 			sqlite.SerializeFloat32(centroid), conf, faceIDs[bestIdx], assetIDs[bestIdx], now, pid); err != nil {
 			return err
 		}
