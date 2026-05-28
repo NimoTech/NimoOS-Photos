@@ -134,6 +134,7 @@ func migrate(db *sql.DB) error {
 			album_id TEXT NOT NULL REFERENCES albums(id) ON DELETE CASCADE,
 			asset_id TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
 			added_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			position INTEGER NOT NULL DEFAULT 0,
 			PRIMARY KEY (album_id, asset_id)
 		)`,
 
@@ -241,6 +242,7 @@ func migrate(db *sql.DB) error {
 		`ALTER TABLE persons ADD COLUMN centroid BLOB`,
 		`ALTER TABLE persons ADD COLUMN created_at DATETIME`,
 		`ALTER TABLE persons ADD COLUMN updated_at DATETIME`,
+		`ALTER TABLE album_assets ADD COLUMN position INTEGER NOT NULL DEFAULT 0`,
 	}
 	for _, stmt := range alters {
 		if _, err := db.Exec(stmt); err != nil &&
@@ -250,6 +252,32 @@ func migrate(db *sql.DB) error {
 	}
 	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_assets_deleted_at ON assets(deleted_at)`); err != nil {
 		return fmt.Errorf("migrate index deleted_at: %w", err)
+	}
+
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_album_assets_position ON album_assets(album_id, position)`); err != nil {
+		return fmt.Errorf("migrate index album_assets_position: %w", err)
+	}
+
+	// 回填 position：只有当某 album 内所有行 position == 0 且行数 >= 2 时执行
+	// （区分"全新空表"与"旧库未回填"两种状态）。多次执行幂等。
+	if _, err := db.Exec(`
+		WITH targets AS (
+			SELECT album_id FROM album_assets
+			GROUP BY album_id
+			HAVING COUNT(*) >= 2 AND MIN(position) = 0 AND MAX(position) = 0
+		),
+		ordered AS (
+			SELECT album_id, asset_id,
+			       ROW_NUMBER() OVER (PARTITION BY album_id ORDER BY added_at, asset_id) - 1 AS pos
+			FROM album_assets WHERE album_id IN (SELECT album_id FROM targets)
+		)
+		UPDATE album_assets SET position = (
+			SELECT pos FROM ordered o
+			WHERE o.album_id = album_assets.album_id AND o.asset_id = album_assets.asset_id
+		)
+		WHERE album_id IN (SELECT album_id FROM targets)
+	`); err != nil {
+		return fmt.Errorf("migrate backfill album_assets.position: %w", err)
 	}
 
 	return nil

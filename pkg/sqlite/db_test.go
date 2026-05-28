@@ -268,3 +268,68 @@ func TestMergeRejectionsTable(t *testing.T) {
 	_, err = db.Exec(`INSERT INTO merge_rejections(person_a, person_b) VALUES('p-b','p-a')`)
 	require.Error(t, err, "expected CHECK constraint to reject reversed pair")
 }
+
+func TestMigrateAlbumAssetsHasPositionColumn(t *testing.T) {
+	db, err := sqlite.Open(filepath.Join(t.TempDir(), "test.db"))
+	require.NoError(t, err)
+	defer db.Close()
+
+	rows, err := db.Query(`PRAGMA table_info(album_assets)`)
+	require.NoError(t, err)
+	defer rows.Close()
+
+	cols := map[string]struct {
+		ctype   string
+		notnull int
+	}{}
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notnull, pk int
+		var dflt sql.NullString
+		require.NoError(t, rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk))
+		cols[name] = struct {
+			ctype   string
+			notnull int
+		}{ctype, notnull}
+	}
+	pos, ok := cols["position"]
+	require.True(t, ok, "album_assets.position column should exist")
+	require.Equal(t, "INTEGER", pos.ctype)
+	require.Equal(t, 1, pos.notnull)
+}
+
+func TestMigrateAlbumAssetsBackfillsPosition(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	db, err := sqlite.Open(dbPath)
+	require.NoError(t, err)
+
+	_, err = db.Exec(`INSERT INTO assets(id, file_path, status) VALUES('a1','/g/1.jpg','indexed'),('a2','/g/2.jpg','indexed'),('a3','/g/3.jpg','indexed')`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO albums(id, name) VALUES('al1','A')`)
+	require.NoError(t, err)
+	// 模拟旧库：直接以 INSERT 写入，position 全为默认 0
+	_, err = db.Exec(`INSERT INTO album_assets(album_id, asset_id, added_at, position) VALUES
+		('al1','a1','2026-01-01',0),
+		('al1','a2','2026-01-02',0),
+		('al1','a3','2026-01-03',0)`)
+	require.NoError(t, err)
+	db.Close()
+
+	// 重新打开应触发回填
+	db, err = sqlite.Open(dbPath)
+	require.NoError(t, err)
+	defer db.Close()
+
+	rows, err := db.Query(`SELECT asset_id, position FROM album_assets WHERE album_id='al1' ORDER BY position`)
+	require.NoError(t, err)
+	defer rows.Close()
+	var got [][2]any
+	for rows.Next() {
+		var aid string
+		var pos int
+		require.NoError(t, rows.Scan(&aid, &pos))
+		got = append(got, [2]any{aid, pos})
+	}
+	require.Equal(t, [][2]any{{"a1", 0}, {"a2", 1}, {"a3", 2}}, got)
+}
