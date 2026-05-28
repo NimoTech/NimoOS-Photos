@@ -31,3 +31,23 @@ func TestListPersons_ExcludesHiddenAndCounts(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, list2, 0)
 }
+
+func TestFacesIndexedUpTo(t *testing.T) {
+	db := makeTestFaceDB(t)
+	// 空库
+	ps := service.NewPersonService(db)
+	ts, err := ps.FacesIndexedUpTo()
+	require.NoError(t, err)
+	require.Nil(t, ts)
+
+	// 有脸：插入 asset + indexed_at + face
+	_, err = db.Exec(`INSERT INTO assets(id, file_path, status, indexed_at) VALUES('fi-a', '/x/fi-a.jpg', 'indexed', '2026-05-01 12:00:00')`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO face_detections(id, asset_id, bbox, embedding) VALUES('fi-f', 'fi-a', '{}', X'00000000')`)
+	require.NoError(t, err)
+
+	ts2, err := ps.FacesIndexedUpTo()
+	require.NoError(t, err)
+	require.NotNil(t, ts2)
+	require.Contains(t, *ts2, "2026")
+}

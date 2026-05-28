@@ -75,6 +75,7 @@ type Person struct {
 	PlacesCount  int        `json:"placesCount"`
 }
 
+// PersonRelation 是 PersonService.PersonRelations 返回的共现统计行。
 type PersonRelation struct {
 	PersonID    string `json:"personId"`
 	Name        string `json:"name"`
@@ -82,6 +83,7 @@ type PersonRelation struct {
 	Count       int    `json:"count"`
 }
 
+// MergeSuggestion 是 PersonService.MergeSuggestions 返回的候选合并对。
 type MergeSuggestion struct {
 	ID         string  `json:"id"`
 	FromID     string  `json:"fromId"`
@@ -93,6 +95,7 @@ type MergeSuggestion struct {
 	Reason     string  `json:"reason"`
 }
 
+// PersonPlace 是 PersonService.PersonPlaces 返回的 GPS 点。
 type PersonPlace struct {
 	Latitude  float64    `json:"latitude"`
 	Longitude float64    `json:"longitude"`
