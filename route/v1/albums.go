@@ -125,3 +125,55 @@ func (h *AlbumsHandler) BatchAdd(c echo.Context) error {
 	}
 	return c.NoContent(http.StatusNoContent)
 }
+
+// Update partially updates an album (name and/or coverAssetId).
+//
+// PATCH /v1/photos/albums/:id
+//
+//	{ "name"?: string, "coverAssetId"?: string }
+func (h *AlbumsHandler) Update(c echo.Context) error {
+	var req struct {
+		Name         *string `json:"name"`
+		CoverAssetID *string `json:"coverAssetId"`
+	}
+	if err := c.Bind(&req); err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, "invalid body")
+	}
+	if req.Name == nil && req.CoverAssetID == nil {
+		return echo.NewHTTPError(http.StatusBadRequest, "at least one of name/coverAssetId is required")
+	}
+
+	id := c.Param("id")
+	if req.Name != nil {
+		if err := h.svc.Albums().UpdateName(id, *req.Name); err != nil {
+			return mapAlbumErr(err)
+		}
+	}
+	if req.CoverAssetID != nil {
+		if err := h.svc.Albums().UpdateCover(id, *req.CoverAssetID); err != nil {
+			return mapAlbumErr(err)
+		}
+	}
+
+	album, err := h.svc.Albums().Get(id)
+	if err != nil {
+		return mapAlbumErr(err)
+	}
+	return c.JSON(http.StatusOK, album)
+}
+
+// mapAlbumErr maps service-layer errors to HTTP responses.
+func mapAlbumErr(err error) error {
+	switch {
+	case errors.Is(err, service.ErrNotFound):
+		return echo.NewHTTPError(http.StatusNotFound)
+	case errors.Is(err, service.ErrAlbumNameExists):
+		return echo.NewHTTPError(http.StatusConflict, "album name already exists")
+	case errors.Is(err, service.ErrCoverNotInAlbum):
+		return echo.NewHTTPError(http.StatusUnprocessableEntity, "cover asset not in album")
+	case errors.Is(err, service.ErrInvalidInput):
+		return echo.NewHTTPError(http.StatusBadRequest, err.Error())
+	default:
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	}
+}
