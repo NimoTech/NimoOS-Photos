@@ -1,8 +1,10 @@
 package route
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"net/http"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -17,7 +19,7 @@ import (
 )
 
 // InitRouter sets up the Echo router with JWT middleware and all v1 routes.
-func InitRouter(svc service.Services, runtimePath string, thumbDir string) http.Handler {
+func InitRouter(ctx context.Context, svc service.Services, runtimePath string, thumbDir string) http.Handler {
 	e := echo.New()
 	e.HideBanner = true
 
@@ -78,8 +80,8 @@ func InitRouter(svc service.Services, runtimePath string, thumbDir string) http.
 	search := v1.NewSearchHandler(svc)
 	tl := v1.NewTimelineHandler(svc)
 	albums := v1.NewAlbumsHandler(svc)
-	faceThumbDir := thumbDir[:strings.LastIndex(thumbDir, "/")] + "/face-thumbs"
-	persons := v1.NewPersonsHandler(svc, faceThumbDir)
+	faceThumbDir := filepath.Join(filepath.Dir(thumbDir), "face-thumbs")
+	persons := v1.NewPersonsHandler(svc, faceThumbDir, ctx)
 	index := v1.NewIndexHandler(svc, "/DATA/Gallery")
 	favorites := v1.NewFavoritesHandler(svc, "/DATA/Gallery", runtimePath)
 	trash := v1.NewTrashHandler(svc)

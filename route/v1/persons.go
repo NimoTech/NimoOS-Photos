@@ -14,10 +14,11 @@ import (
 type PersonsHandler struct {
 	svc          service.Services
 	faceThumbDir string
+	ctx          context.Context
 }
 
-func NewPersonsHandler(svc service.Services, faceThumbDir string) *PersonsHandler {
-	return &PersonsHandler{svc: svc, faceThumbDir: faceThumbDir}
+func NewPersonsHandler(svc service.Services, faceThumbDir string, ctx context.Context) *PersonsHandler {
+	return &PersonsHandler{svc: svc, faceThumbDir: faceThumbDir, ctx: ctx}
 }
 
 // GET /v1/photos/persons
@@ -42,7 +43,10 @@ func (h *PersonsHandler) Get(c echo.Context) error {
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
 	}
-	rels, _ := h.svc.Persons().PersonRelations(p.ID)
+	rels, err := h.svc.Persons().PersonRelations(p.ID)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	}
 	return c.JSON(http.StatusOK, map[string]any{"person": p, "relations": rels})
 }
 
@@ -176,6 +180,6 @@ func (h *PersonsHandler) RejectSuggestion(c echo.Context) error {
 
 // POST /v1/photos/persons/recluster
 func (h *PersonsHandler) Recluster(c echo.Context) error {
-	go h.svc.Faces().RunClustering(context.Background()) //nolint:errcheck
+	go h.svc.Faces().RunClustering(h.ctx) //nolint:errcheck
 	return c.JSON(http.StatusAccepted, map[string]string{"status": "started"})
 }
