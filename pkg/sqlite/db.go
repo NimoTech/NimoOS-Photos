@@ -169,10 +169,11 @@ func migrate(db *sql.DB) error {
 
 		// ── Merge rejections（拒绝过的合并建议对，(min,max) 唯一）─────────
 		`CREATE TABLE IF NOT EXISTS merge_rejections (
-			person_a    TEXT NOT NULL,
-			person_b    TEXT NOT NULL,
+			person_a    TEXT NOT NULL REFERENCES persons(id) ON DELETE CASCADE,
+			person_b    TEXT NOT NULL REFERENCES persons(id) ON DELETE CASCADE,
 			rejected_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-			PRIMARY KEY (person_a, person_b)
+			PRIMARY KEY (person_a, person_b),
+			CHECK (person_a < person_b)
 		)`,
 	}
 

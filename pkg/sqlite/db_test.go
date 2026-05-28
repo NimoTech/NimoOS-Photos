@@ -30,6 +30,7 @@ func TestOpenDB(t *testing.T) {
 		"albums",
 		"album_assets",
 		"asset_clip_idx",
+		"merge_rejections",
 	}
 
 	for _, table := range expectedTables {
@@ -229,7 +230,7 @@ func TestMigrateAddsNewColumns(t *testing.T) {
 	}
 }
 
-func TestPersonsColumnsAndMergeRejections(t *testing.T) {
+func TestPersonsExtendedColumns(t *testing.T) {
 	db, err := sqlite.Open(filepath.Join(t.TempDir(), "m.db"))
 	require.NoError(t, err)
 	defer db.Close()
@@ -248,7 +249,22 @@ func TestPersonsColumnsAndMergeRejections(t *testing.T) {
 	for _, c := range []string{"cover_face_id", "favorite", "relation", "hidden", "confidence", "centroid", "created_at", "updated_at"} {
 		require.True(t, cols[c], "persons 缺列 %s", c)
 	}
+}
 
-	_, err = db.Exec(`INSERT INTO merge_rejections(person_a, person_b) VALUES('a','b')`)
+func TestMergeRejectionsTable(t *testing.T) {
+	db, err := sqlite.Open(filepath.Join(t.TempDir(), "r.db"))
 	require.NoError(t, err)
+	defer db.Close()
+
+	// Insert two persons so FK constraints are satisfied.
+	_, err = db.Exec(`INSERT INTO persons(id) VALUES('p-a'),('p-b')`)
+	require.NoError(t, err)
+
+	// Valid ordered pair must succeed.
+	_, err = db.Exec(`INSERT INTO merge_rejections(person_a, person_b) VALUES('p-a','p-b')`)
+	require.NoError(t, err)
+
+	// Reversed pair (b, a) must be rejected by the CHECK (person_a < person_b) constraint.
+	_, err = db.Exec(`INSERT INTO merge_rejections(person_a, person_b) VALUES('p-b','p-a')`)
+	require.Error(t, err, "expected CHECK constraint to reject reversed pair")
 }
