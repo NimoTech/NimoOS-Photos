@@ -118,6 +118,32 @@ func (s *AlbumService) UpdateName(id, name string) error {
 	return err
 }
 
+func (s *AlbumService) UpdateCover(id, assetID string) error {
+	var albumID string
+	err := s.db.QueryRow(`SELECT id FROM albums WHERE id=?`, id).Scan(&albumID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return err
+	}
+
+	var dummy string
+	err = s.db.QueryRow(
+		`SELECT asset_id FROM album_assets WHERE album_id=? AND asset_id=?`,
+		id, assetID,
+	).Scan(&dummy)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrCoverNotInAlbum
+	}
+	if err != nil {
+		return err
+	}
+
+	_, err = s.db.Exec(`UPDATE albums SET cover_asset_id=? WHERE id=?`, assetID, id)
+	return err
+}
+
 func (s *AlbumService) AddAsset(albumID, assetID string) error {
 	_, err := s.db.Exec(
 		`INSERT OR IGNORE INTO album_assets(album_id, asset_id, added_at) VALUES(?,?,?)`,

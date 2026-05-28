@@ -195,3 +195,50 @@ func TestAlbumUpdateNameSameValue(t *testing.T) {
 	a, _ := svc.Create("Same")
 	require.NoError(t, svc.UpdateName(a.ID, "Same"))
 }
+
+func TestAlbumUpdateCoverSuccess(t *testing.T) {
+	db, err := sqlite.Open(filepath.Join(t.TempDir(), "test.db"))
+	require.NoError(t, err)
+	defer db.Close()
+
+	_, err = db.Exec(`INSERT INTO assets(id, file_path, status) VALUES('a1','/g/1.jpg','indexed')`)
+	require.NoError(t, err)
+	svc := service.NewAlbumService(db)
+	a, _ := svc.Create("With Cover")
+	require.NoError(t, svc.AddAsset(a.ID, "a1"))
+
+	require.NoError(t, svc.UpdateCover(a.ID, "a1"))
+
+	got, _ := svc.Get(a.ID)
+	require.Equal(t, "a1", got.CoverAssetID)
+}
+
+func TestAlbumUpdateCoverNotInAlbum(t *testing.T) {
+	db, err := sqlite.Open(filepath.Join(t.TempDir(), "test.db"))
+	require.NoError(t, err)
+	defer db.Close()
+
+	_, err = db.Exec(`INSERT INTO assets(id, file_path, status) VALUES('a1','/g/1.jpg','indexed'),('a2','/g/2.jpg','indexed')`)
+	require.NoError(t, err)
+	svc := service.NewAlbumService(db)
+	a, _ := svc.Create("Album")
+	require.NoError(t, svc.AddAsset(a.ID, "a1"))
+
+	require.ErrorIs(t, svc.UpdateCover(a.ID, "a2"), service.ErrCoverNotInAlbum)
+}
+
+func TestAlbumUpdateCoverAlbumNotFound(t *testing.T) {
+	svc, cleanup := openTestAlbumSvc(t)
+	defer cleanup()
+
+	require.ErrorIs(t, svc.UpdateCover("nope", "a1"), service.ErrNotFound)
+}
+
+func TestAlbumUpdateCoverAssetNotExist(t *testing.T) {
+	// asset 完全不存在，也算 ErrCoverNotInAlbum（语义：当前 album 没有这个 asset）
+	svc, cleanup := openTestAlbumSvc(t)
+	defer cleanup()
+
+	a, _ := svc.Create("X")
+	require.ErrorIs(t, svc.UpdateCover(a.ID, "ghost-id"), service.ErrCoverNotInAlbum)
+}
