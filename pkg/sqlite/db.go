@@ -100,11 +100,13 @@ func migrate(db *sql.DB) error {
 		)`,
 
 		// ── Face detections ───────────────────────────────────────────────
+		// excluded=1 标记用户从某 person 移出的脸，从此不参与聚类/吸附/列表。
 		`CREATE TABLE IF NOT EXISTS face_detections (
 			id        TEXT PRIMARY KEY,
 			asset_id  TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
 			bbox      TEXT NOT NULL,
-			embedding BLOB NOT NULL
+			embedding BLOB NOT NULL,
+			excluded  INTEGER NOT NULL DEFAULT 0
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_faces_asset ON face_detections(asset_id)`,
 
@@ -244,6 +246,7 @@ func migrate(db *sql.DB) error {
 		`ALTER TABLE persons ADD COLUMN created_at DATETIME`,
 		`ALTER TABLE persons ADD COLUMN updated_at DATETIME`,
 		`ALTER TABLE album_assets ADD COLUMN position INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE face_detections ADD COLUMN excluded INTEGER NOT NULL DEFAULT 0`,
 	}
 	for _, stmt := range alters {
 		if _, err := db.Exec(stmt); err != nil &&

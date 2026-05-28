@@ -279,15 +279,16 @@ func TestFaceThumbnail_CropsAndCaches(t *testing.T) {
 	writeTestJPEG(t, srcPath, 400, 300)
 	_, err := db.Exec(`INSERT INTO assets(id, file_path, status) VALUES('fa', ?, 'indexed')`, srcPath)
 	require.NoError(t, err)
+	// bbox 是基于 ML 输入图的绝对像素坐标（400×300 测试图上的人脸框）。
 	_, err = db.Exec(`INSERT INTO face_detections(id, asset_id, bbox, embedding) VALUES('face1','fa',?,?)`,
-		`{"x1":0.25,"y1":0.25,"x2":0.6,"y2":0.7}`, sqlite.SerializeFloat32(make([]float32, 512)))
+		`{"x1":100,"y1":75,"x2":240,"y2":210}`, sqlite.SerializeFloat32(make([]float32, 512)))
 	require.NoError(t, err)
 	_, err = db.Exec(`INSERT INTO persons(id, name, cover_asset_id, cover_face_id) VALUES('pp','','fa','face1')`)
 	require.NoError(t, err)
 
 	ps := service.NewPersonService(db)
 	cacheDir := filepath.Join(dir, "face-thumbs")
-	out, err := ps.FaceThumbnail("pp", cacheDir)
+	out, err := ps.FaceThumbnail("pp", cacheDir, "")
 	require.NoError(t, err)
 	st, err := os.Stat(out)
 	require.NoError(t, err)
@@ -295,14 +296,14 @@ func TestFaceThumbnail_CropsAndCaches(t *testing.T) {
 
 	// 第二次命中缓存：路径相同且不重建（mtime 不变即缓存命中）
 	stat1, _ := os.Stat(out)
-	out2, err := ps.FaceThumbnail("pp", cacheDir)
+	out2, err := ps.FaceThumbnail("pp", cacheDir, "")
 	require.NoError(t, err)
 	require.Equal(t, out, out2)
 	stat2, _ := os.Stat(out2)
 	require.Equal(t, stat1.ModTime(), stat2.ModTime())
 
 	// 不存在 person 返回 ErrNotFound
-	_, err = ps.FaceThumbnail("no-such", cacheDir)
+	_, err = ps.FaceThumbnail("no-such", cacheDir, "")
 	require.ErrorIs(t, err, service.ErrNotFound)
 }
 
@@ -314,14 +315,44 @@ func TestFaceThumbnail_HiddenReturnsNotFound(t *testing.T) {
 	_, err := db.Exec(`INSERT INTO assets(id, file_path, status) VALUES('fh', ?, 'indexed')`, srcPath)
 	require.NoError(t, err)
 	_, err = db.Exec(`INSERT INTO face_detections(id, asset_id, bbox, embedding) VALUES('face-h','fh',?,?)`,
-		`{"x1":0.25,"y1":0.25,"x2":0.6,"y2":0.7}`, sqlite.SerializeFloat32(make([]float32, 512)))
+		`{"x1":100,"y1":75,"x2":240,"y2":210}`, sqlite.SerializeFloat32(make([]float32, 512)))
 	require.NoError(t, err)
 	_, err = db.Exec(`INSERT INTO persons(id, name, cover_asset_id, cover_face_id, hidden) VALUES('ph','','fh','face-h',1)`)
 	require.NoError(t, err)
 
 	ps := service.NewPersonService(db)
-	_, err = ps.FaceThumbnail("ph", filepath.Join(dir, "fh-cache"))
+	_, err = ps.FaceThumbnail("ph", filepath.Join(dir, "fh-cache"), "")
 	require.ErrorIs(t, err, service.ErrNotFound)
+}
+
+// 视频源：bbox 基于关键帧（asset_exif W/H = 1920×1080），thumb large.jpg 是 1280×720。
+// FaceThumbnail 必须按 thumb/exif 比例缩放 bbox，否则坐标爆掉。
+func TestFaceThumbnail_VideoScalesBBoxToThumb(t *testing.T) {
+	db := makeTestFaceDB(t)
+	dir := t.TempDir()
+
+	thumbDir := filepath.Join(dir, "thumbs")
+	assetID := "fv"
+	largeDir := filepath.Join(thumbDir, assetID)
+	require.NoError(t, os.MkdirAll(largeDir, 0o755))
+	writeTestJPEG(t, filepath.Join(largeDir, "large.jpg"), 1280, 720)
+
+	_, err := db.Exec(`INSERT INTO assets(id, file_path, mime_type, status) VALUES(?, '/x.mp4', 'video/mp4', 'indexed')`, assetID)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO asset_exif(asset_id, width, height) VALUES(?, 1920, 1080)`, assetID)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO face_detections(id, asset_id, bbox, embedding) VALUES('fv-face',?,?,?)`,
+		assetID, `{"x1":480,"y1":270,"x2":960,"y2":810}`, sqlite.SerializeFloat32(make([]float32, 512)))
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO persons(id, name, cover_asset_id, cover_face_id) VALUES('pv','','`+assetID+`','fv-face')`)
+	require.NoError(t, err)
+
+	ps := service.NewPersonService(db)
+	out, err := ps.FaceThumbnail("pv", filepath.Join(dir, "face-thumbs"), thumbDir)
+	require.NoError(t, err)
+	st, err := os.Stat(out)
+	require.NoError(t, err)
+	require.Greater(t, st.Size(), int64(0))
 }
 
 func TestMergeSuggestions_RespectRejections(t *testing.T) {
@@ -351,6 +382,113 @@ func TestMergeSuggestions_RespectRejections(t *testing.T) {
 				(s.FromID == sugs[0].IntoID && s.IntoID == sugs[0].FromID),
 			"被拒绝的配对不应再出现")
 	}
+}
+
+func TestDetachAssetsFromPerson_MarksExcludedAndUnbinds(t *testing.T) {
+	db := makeTestFaceDB(t)
+	dim := 512
+	a := make([]float32, dim)
+	a[0] = 1.0
+	insertAssetFace(t, db, "d-a1", normalize(a))
+	insertAssetFace(t, db, "d-a2", normalize(a))
+	insertAssetFace(t, db, "d-a3", normalize(a))
+	require.NoError(t, service.NewFaceService(db).RunClustering(context.Background()))
+	list, _ := service.NewPersonService(db).ListPersons()
+	require.Len(t, list, 1)
+	personID := list[0].ID
+	require.Equal(t, 3, list[0].Count)
+
+	ps := service.NewPersonService(db)
+	removed, err := ps.DetachAssetsFromPerson(personID, []string{"d-a1", "d-a2"})
+	require.NoError(t, err)
+	require.Equal(t, 2, removed)
+
+	// face_person 行减少
+	var bound int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM face_person WHERE person_id=?`, personID).Scan(&bound))
+	require.Equal(t, 1, bound)
+
+	// 被移除的脸 excluded=1
+	var excl int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM face_detections WHERE excluded=1`).Scan(&excl))
+	require.Equal(t, 2, excl)
+
+	// 重跑聚类，excluded 脸不会再被聚回该 person
+	require.NoError(t, service.NewFaceService(db).RunClustering(context.Background()))
+	list2, _ := ps.ListPersons()
+	for _, p := range list2 {
+		require.LessOrEqual(t, p.Count, 1, "excluded faces 不应再被聚回任何 person")
+	}
+}
+
+func TestDetachAssetsFromPerson_AutomaticEmptyPersonDeleted(t *testing.T) {
+	db := makeTestFaceDB(t)
+	dim := 512
+	a := make([]float32, dim)
+	a[0] = 1.0
+	insertAssetFace(t, db, "de-a1", normalize(a))
+	require.NoError(t, service.NewFaceService(db).RunClustering(context.Background()))
+	list, _ := service.NewPersonService(db).ListPersons()
+	require.Len(t, list, 1)
+	personID := list[0].ID
+
+	ps := service.NewPersonService(db)
+	_, err := ps.DetachAssetsFromPerson(personID, []string{"de-a1"})
+	require.NoError(t, err)
+
+	var n int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM persons WHERE id=?`, personID).Scan(&n))
+	require.Equal(t, 0, n, "自动 person 移出最后一张脸后应被删除")
+}
+
+func TestDetachAssetsFromPerson_AnchoredEmptyPersonKept(t *testing.T) {
+	db := makeTestFaceDB(t)
+	dim := 512
+	a := make([]float32, dim)
+	a[0] = 1.0
+	insertAssetFace(t, db, "dk-a1", normalize(a))
+	require.NoError(t, service.NewFaceService(db).RunClustering(context.Background()))
+	list, _ := service.NewPersonService(db).ListPersons()
+	require.Len(t, list, 1)
+	personID := list[0].ID
+
+	// 给该 person 取个名变成锚定
+	_, err := db.Exec(`UPDATE persons SET name='Alice' WHERE id=?`, personID)
+	require.NoError(t, err)
+
+	ps := service.NewPersonService(db)
+	_, err = ps.DetachAssetsFromPerson(personID, []string{"dk-a1"})
+	require.NoError(t, err)
+
+	// 锚定 person 应被保留，但 cover/centroid 清空
+	var name string
+	var coverFace sql.NullString
+	require.NoError(t, db.QueryRow(`SELECT name, cover_face_id FROM persons WHERE id=?`, personID).Scan(&name, &coverFace))
+	require.Equal(t, "Alice", name)
+	require.False(t, coverFace.Valid)
+}
+
+func TestDetachAssetsFromPerson_EmptyAssetsNoOp(t *testing.T) {
+	db := makeTestFaceDB(t)
+	dim := 512
+	a := make([]float32, dim)
+	a[0] = 1.0
+	insertAssetFace(t, db, "dn-a1", normalize(a))
+	require.NoError(t, service.NewFaceService(db).RunClustering(context.Background()))
+	list, _ := service.NewPersonService(db).ListPersons()
+	personID := list[0].ID
+
+	ps := service.NewPersonService(db)
+	removed, err := ps.DetachAssetsFromPerson(personID, nil)
+	require.NoError(t, err)
+	require.Equal(t, 0, removed)
+}
+
+func TestDetachAssetsFromPerson_NotFound(t *testing.T) {
+	db := makeTestFaceDB(t)
+	ps := service.NewPersonService(db)
+	_, err := ps.DetachAssetsFromPerson("nonexistent", []string{"x"})
+	require.ErrorIs(t, err, service.ErrNotFound)
 }
 
 func TestMergePersons_RecomputesCentroid(t *testing.T) {

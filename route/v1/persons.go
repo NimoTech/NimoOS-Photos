@@ -14,11 +14,12 @@ import (
 type PersonsHandler struct {
 	svc          service.Services
 	faceThumbDir string
+	thumbDir     string
 	ctx          context.Context
 }
 
-func NewPersonsHandler(svc service.Services, faceThumbDir string, ctx context.Context) *PersonsHandler {
-	return &PersonsHandler{svc: svc, faceThumbDir: faceThumbDir, ctx: ctx}
+func NewPersonsHandler(svc service.Services, faceThumbDir, thumbDir string, ctx context.Context) *PersonsHandler {
+	return &PersonsHandler{svc: svc, faceThumbDir: faceThumbDir, thumbDir: thumbDir, ctx: ctx}
 }
 
 // GET /v1/photos/persons
@@ -129,7 +130,7 @@ func (h *PersonsHandler) Places(c echo.Context) error {
 
 // GET /v1/photos/persons/:id/face-thumbnail
 func (h *PersonsHandler) FaceThumbnail(c echo.Context) error {
-	path, err := h.svc.Persons().FaceThumbnail(c.Param("id"), h.faceThumbDir)
+	path, err := h.svc.Persons().FaceThumbnail(c.Param("id"), h.faceThumbDir, h.thumbDir)
 	if errors.Is(err, service.ErrNotFound) {
 		return echo.NewHTTPError(http.StatusNotFound)
 	}
@@ -137,6 +138,27 @@ func (h *PersonsHandler) FaceThumbnail(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
 	}
 	return c.File(path)
+}
+
+// POST /v1/photos/persons/:id/detach  { assetIds: [...] }
+//
+// 把 assetIds 里所有属于该 person 的脸移除，并标记 excluded=1 永久不再聚回。
+// 返回 { removed: N }。person 不存在返回 404；空 assetIds 返回 { removed: 0 }。
+func (h *PersonsHandler) Detach(c echo.Context) error {
+	var req struct {
+		AssetIDs []string `json:"assetIds"`
+	}
+	if err := c.Bind(&req); err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, "invalid body")
+	}
+	removed, err := h.svc.Persons().DetachAssetsFromPerson(c.Param("id"), req.AssetIDs)
+	if errors.Is(err, service.ErrNotFound) {
+		return echo.NewHTTPError(http.StatusNotFound)
+	}
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	}
+	return c.JSON(http.StatusOK, map[string]int{"removed": removed})
 }
 
 // POST /v1/photos/persons/merge  { from_id, into_id }

@@ -274,7 +274,8 @@ func (s *FaceService) RunClustering(ctx context.Context) error {
 	// 与 loadFacesWithProgress 一致：只算关联到现存 asset 的 face_detections。
 	if err := s.db.QueryRowContext(ctx, `
 		SELECT COUNT(*) FROM face_detections fd
-		JOIN assets a ON a.id = fd.asset_id`).Scan(&total); err != nil {
+		JOIN assets a ON a.id = fd.asset_id
+		WHERE fd.excluded = 0`).Scan(&total); err != nil {
 		return err
 	}
 	if total == 0 {
@@ -357,7 +358,8 @@ func (s *FaceService) loadFacesWithProgress(ctx context.Context, total int64,
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT fd.id, fd.asset_id, fd.embedding
 		FROM face_detections fd
-		JOIN assets a ON a.id = fd.asset_id`)
+		JOIN assets a ON a.id = fd.asset_id
+		WHERE fd.excluded = 0`)
 	if err != nil {
 		return nil, err
 	}
@@ -431,7 +433,7 @@ func (s *FaceService) rebuildPersonsWithProgress(ctx context.Context, faces []fa
 			FROM face_person fp
 			JOIN face_detections fd ON fd.id = fp.face_id
 			JOIN assets a ON a.id = fd.asset_id
-			WHERE fp.person_id = ?`, pid)
+			WHERE fp.person_id = ? AND fd.excluded = 0`, pid)
 		if ferr != nil {
 			err = ferr
 			return err
@@ -598,7 +600,7 @@ func (s *FaceService) recomputePersonStatsTx(ctx context.Context, tx *sql.Tx) er
 			SELECT fd.id, fd.asset_id, fd.embedding
 			FROM face_person fp
 			JOIN face_detections fd ON fd.id = fp.face_id
-			WHERE fp.person_id = ?`, pid)
+			WHERE fp.person_id = ? AND fd.excluded = 0`, pid)
 		if ferr != nil {
 			return ferr
 		}
@@ -676,7 +678,8 @@ func (s *FaceService) StartScheduler(ctx context.Context) {
 					var unassigned int
 					err := s.db.QueryRowContext(ctx,
 						`SELECT COUNT(*) FROM face_detections fd
-						 WHERE NOT EXISTS (
+						 WHERE fd.excluded = 0
+						   AND NOT EXISTS (
 							SELECT 1 FROM face_person fp WHERE fp.face_id = fd.id
 						 )`,
 					).Scan(&unassigned)

@@ -81,7 +81,7 @@ func InitRouter(ctx context.Context, svc service.Services, runtimePath string, t
 	tl := v1.NewTimelineHandler(svc)
 	albums := v1.NewAlbumsHandler(svc)
 	faceThumbDir := filepath.Join(filepath.Dir(thumbDir), "face-thumbs")
-	persons := v1.NewPersonsHandler(svc, faceThumbDir, ctx)
+	persons := v1.NewPersonsHandler(svc, faceThumbDir, thumbDir, ctx)
 	index := v1.NewIndexHandler(svc, "/DATA/Gallery")
 	favorites := v1.NewFavoritesHandler(svc, "/DATA/Gallery", runtimePath)
 	trash := v1.NewTrashHandler(svc)
@@ -148,6 +148,7 @@ func InitRouter(ctx context.Context, svc service.Services, runtimePath string, t
 	g.GET("/persons/:id/relations", persons.Relations)
 	g.GET("/persons/:id/places", persons.Places)
 	g.GET("/persons/:id/face-thumbnail", persons.FaceThumbnail)
+	g.POST("/persons/:id/detach", persons.Detach)
 
 	// Indexer status/control
 	g.GET("/status", index.Status)

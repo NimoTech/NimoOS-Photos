@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/NimoTech/NimoOS-Photos/pkg/sqlite"
 	"github.com/disintegration/imaging"
@@ -56,19 +57,17 @@ ORDER BY cnt DESC, p.rowid`)
 	for rows.Next() {
 		var p Person
 		var fav int
-		var first, last sql.NullTime
+		var first, last sql.NullString
 		var places int
 		if err := rows.Scan(&p.ID, &p.Name, &p.CoverAssetID, &p.CoverFaceID, &fav, &p.Relation, &p.Confidence, &p.Count, &first, &last, &places); err != nil {
 			return nil, err
 		}
 		p.Favorite = fav != 0
-		if first.Valid {
-			tt := first.Time
-			p.FirstSeen = &tt
+		if tt := parseSQLiteTime(first); tt != nil {
+			p.FirstSeen = tt
 		}
-		if last.Valid {
-			tt := last.Time
-			p.LastSeen = &tt
+		if tt := parseSQLiteTime(last); tt != nil {
+			p.LastSeen = tt
 		}
 		p.PlacesCount = places
 		out = append(out, p)
@@ -95,7 +94,7 @@ FROM persons p WHERE p.id=? AND p.hidden=0`, id).Scan(
 
 	// count / first / last
 	var cnt int
-	var first, last sql.NullTime
+	var first, last sql.NullString
 	if err := s.db.QueryRow(`
 SELECT COUNT(DISTINCT a.id), MIN(a.taken_at), MAX(a.taken_at)
 FROM face_person fp JOIN face_detections fd ON fd.id=fp.face_id
@@ -105,13 +104,11 @@ WHERE fp.person_id=? AND a.deleted_at IS NULL AND a.is_live_photo_video=0`, id).
 		return nil, fmt.Errorf("GetPerson stats: %w", err)
 	}
 	p.Count = cnt
-	if first.Valid {
-		t := first.Time
-		p.FirstSeen = &t
+	if tt := parseSQLiteTime(first); tt != nil {
+		p.FirstSeen = tt
 	}
-	if last.Valid {
-		t := last.Time
-		p.LastSeen = &t
+	if tt := parseSQLiteTime(last); tt != nil {
+		p.LastSeen = tt
 	}
 
 	// placesCount：distinct 粗粒度 GPS cell（0.5° ≈ 城市级聚合），过滤 0,0 与软删/live video。
@@ -256,13 +253,12 @@ WHERE fp.person_id=? AND e.latitude IS NOT NULL AND e.longitude IS NOT NULL
 	var out []PersonPlace
 	for rows.Next() {
 		var pl PersonPlace
-		var taken sql.NullTime
+		var taken sql.NullString
 		if err := rows.Scan(&pl.Latitude, &pl.Longitude, &taken); err != nil {
 			return nil, fmt.Errorf("PersonPlaces scan: %w", err)
 		}
-		if taken.Valid {
-			tt := taken.Time
-			pl.TakenAt = &tt
+		if tt := parseSQLiteTime(taken); tt != nil {
+			pl.TakenAt = tt
 		}
 		out = append(out, pl)
 	}
@@ -373,6 +369,150 @@ func (s *PersonService) loadRejections() (map[string]bool, error) {
 	return m, rows.Err()
 }
 
+// parseSQLiteTime parses a TEXT timestamp returned by SQLite (from a direct
+// column or an aggregate like MIN/MAX) using the formats GORM writes:
+// RFC3339 with offset, or the legacy "2006-01-02 15:04:05.000000-07:00" form.
+// Returns nil if the string is NULL/empty or unparseable.
+func parseSQLiteTime(s sql.NullString) *time.Time {
+	if !s.Valid || s.String == "" {
+		return nil
+	}
+	layouts := []string{
+		time.RFC3339Nano,
+		time.RFC3339,
+		"2006-01-02 15:04:05.999999999-07:00",
+		"2006-01-02 15:04:05-07:00",
+		"2006-01-02 15:04:05",
+	}
+	for _, l := range layouts {
+		if t, err := time.Parse(l, s.String); err == nil {
+			return &t
+		}
+	}
+	return nil
+}
+
+// DetachAssetsFromPerson 把若干 asset 中所有属于该 person 的脸从该 person 移除，
+// 同时把这些脸标记为 excluded=1（不再参与未来聚类/吸附/列表）。
+// 自动 person（非锚定）若移除后剩 0 脸则连带删除。
+//
+// 返回值 affected 为本次实际移除的 face 数。如果 person 不存在返回 ErrNotFound。
+func (s *PersonService) DetachAssetsFromPerson(personID string, assetIDs []string) (int, error) {
+	if personID == "" {
+		return 0, ErrNotFound
+	}
+	if len(assetIDs) == 0 {
+		return 0, nil
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, fmt.Errorf("DetachAssetsFromPerson begin: %w", err)
+	}
+	defer tx.Rollback()
+
+	// 校验 person 存在
+	var exists int
+	if err := tx.QueryRow(`SELECT 1 FROM persons WHERE id=?`, personID).Scan(&exists); err != nil {
+		if err == sql.ErrNoRows {
+			return 0, ErrNotFound
+		}
+		return 0, fmt.Errorf("DetachAssetsFromPerson check: %w", err)
+	}
+
+	// 找出该 person 在指定 asset 中已绑定且未被 excluded 的脸
+	placeholders := make([]string, len(assetIDs))
+	args := make([]any, 0, len(assetIDs)+1)
+	args = append(args, personID)
+	for i, id := range assetIDs {
+		placeholders[i] = "?"
+		args = append(args, id)
+	}
+	q := fmt.Sprintf(`
+SELECT fd.id
+FROM face_person fp
+JOIN face_detections fd ON fd.id = fp.face_id
+WHERE fp.person_id = ? AND fd.excluded = 0 AND fd.asset_id IN (%s)`, strings.Join(placeholders, ","))
+	rows, err := tx.Query(q, args...)
+	if err != nil {
+		return 0, fmt.Errorf("DetachAssetsFromPerson select: %w", err)
+	}
+	var faceIDs []string
+	for rows.Next() {
+		var fid string
+		if err := rows.Scan(&fid); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		faceIDs = append(faceIDs, fid)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return 0, err
+	}
+	rows.Close()
+	if len(faceIDs) == 0 {
+		return 0, nil
+	}
+
+	// 标 excluded + 解绑
+	fph := make([]string, len(faceIDs))
+	fargs := make([]any, len(faceIDs))
+	for i, fid := range faceIDs {
+		fph[i] = "?"
+		fargs[i] = fid
+	}
+	if _, err := tx.Exec(
+		fmt.Sprintf(`UPDATE face_detections SET excluded=1 WHERE id IN (%s)`, strings.Join(fph, ",")),
+		fargs...); err != nil {
+		return 0, fmt.Errorf("DetachAssetsFromPerson mark excluded: %w", err)
+	}
+	if _, err := tx.Exec(
+		fmt.Sprintf(`DELETE FROM face_person WHERE face_id IN (%s)`, strings.Join(fph, ",")),
+		fargs...); err != nil {
+		return 0, fmt.Errorf("DetachAssetsFromPerson unbind: %w", err)
+	}
+
+	// 重算质心 / cover / confidence（vecs=0 时 recomputeOneCentroidTx 直接 return，不会清空字段）
+	if err := recomputeOneCentroidTx(tx, personID); err != nil {
+		return 0, fmt.Errorf("DetachAssetsFromPerson recompute: %w", err)
+	}
+
+	// 若剩余 0 脸且 person 非锚定，删除该 person
+	var remaining int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM face_person WHERE person_id=?`, personID).Scan(&remaining); err != nil {
+		return 0, fmt.Errorf("DetachAssetsFromPerson count: %w", err)
+	}
+	if remaining == 0 {
+		var name, relation string
+		var fav, hidden int
+		if err := tx.QueryRow(
+			`SELECT COALESCE(name,''), favorite, COALESCE(relation,''), hidden FROM persons WHERE id=?`, personID,
+		).Scan(&name, &fav, &relation, &hidden); err != nil {
+			return 0, fmt.Errorf("DetachAssetsFromPerson load anchor: %w", err)
+		}
+		isAnchored := name != "" || fav != 0 || relation != "" || hidden != 0
+		if !isAnchored {
+			if _, err := tx.Exec(`DELETE FROM persons WHERE id=?`, personID); err != nil {
+				return 0, fmt.Errorf("DetachAssetsFromPerson delete empty: %w", err)
+			}
+		} else {
+			// 锚定 person 保留，但清空 cover_*（recomputeOneCentroidTx 在 vecs=0 时已 return，未更新）
+			if _, err := tx.Exec(
+				`UPDATE persons SET cover_face_id=NULL, cover_asset_id=NULL, centroid=NULL, confidence=0, updated_at=CURRENT_TIMESTAMP WHERE id=?`,
+				personID,
+			); err != nil {
+				return 0, fmt.Errorf("DetachAssetsFromPerson clear cover: %w", err)
+			}
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("DetachAssetsFromPerson commit: %w", err)
+	}
+	return len(faceIDs), nil
+}
+
 func orderPair(a, b string) (string, string) {
 	if a <= b {
 		return a, b
@@ -437,19 +577,27 @@ WHERE fp.person_id=?`, personID)
 
 // FaceThumbnail 按 cover_face 的 bbox 从原图裁出方形人脸缓存到 cacheDir，返回文件路径。
 // 已缓存则直接返回。person 无 cover_face 或不存在返回 ErrNotFound。
-func (s *PersonService) FaceThumbnail(personID, cacheDir string) (string, error) {
-	var faceID, bbox, srcPath string
+// 视频源用已生成的 large.jpg 缩略图（face detection 时也是对关键帧做的，bbox 归一化后与
+// 缩略图比例一致）；图片源仍用原始文件以保留清晰度。
+func (s *PersonService) FaceThumbnail(personID, cacheDir, thumbDir string) (string, error) {
+	var faceID, bbox, srcPath, mimeType, assetID string
+	var origW, origH sql.NullInt64
 	err := s.db.QueryRow(`
-SELECT fd.id, fd.bbox, a.file_path
+SELECT fd.id, fd.bbox, a.file_path, COALESCE(a.mime_type,''), a.id, e.width, e.height
 FROM persons p
 JOIN face_detections fd ON fd.id=p.cover_face_id
 JOIN assets a ON a.id=fd.asset_id
-WHERE p.id=? AND p.hidden=0`, personID).Scan(&faceID, &bbox, &srcPath)
+LEFT JOIN asset_exif e ON e.asset_id=a.id
+WHERE p.id=? AND p.hidden=0`, personID).Scan(&faceID, &bbox, &srcPath, &mimeType, &assetID, &origW, &origH)
 	if err == sql.ErrNoRows {
 		return "", ErrNotFound
 	}
 	if err != nil {
 		return "", fmt.Errorf("FaceThumbnail query: %w", err)
+	}
+
+	if strings.HasPrefix(mimeType, "video/") {
+		srcPath = filepath.Join(thumbDir, assetID, "large.jpg")
 	}
 
 	outPath := filepath.Join(cacheDir, faceID+".jpg")
@@ -476,11 +624,18 @@ WHERE p.id=? AND p.hidden=0`, personID).Scan(&faceID, &bbox, &srcPath)
 	w := img.Bounds().Dx()
 	h := img.Bounds().Dy()
 
-	// 归一化 → 像素，加 30% padding 取方形。
-	cx := (bb.X1 + bb.X2) / 2 * float64(w)
-	cy := (bb.Y1 + bb.Y2) / 2 * float64(h)
-	side := (bb.X2 - bb.X1) * float64(w)
-	if hSide := (bb.Y2 - bb.Y1) * float64(h); hSide > side {
+	// bbox 是基于 ML 输入图（视频关键帧或原图）的绝对像素坐标。
+	// 视频被压成 thumb large.jpg（max 长边 1280px）后，bbox 必须按 thumb/原 比例缩放。
+	// 图片源就是原图，sx=sy=1（除非缺 EXIF W/H，此时回退到 1:1，bbox 当作就是当前图的像素）。
+	sx, sy := 1.0, 1.0
+	if origW.Valid && origH.Valid && origW.Int64 > 0 && origH.Int64 > 0 {
+		sx = float64(w) / float64(origW.Int64)
+		sy = float64(h) / float64(origH.Int64)
+	}
+	cx := (bb.X1 + bb.X2) / 2 * sx
+	cy := (bb.Y1 + bb.Y2) / 2 * sy
+	side := (bb.X2 - bb.X1) * sx
+	if hSide := (bb.Y2 - bb.Y1) * sy; hSide > side {
 		side = hSide
 	}
 	if side <= 0 {
