@@ -166,6 +166,14 @@ func migrate(db *sql.DB) error {
 			last_viewed_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
 			PRIMARY KEY (user_id, asset_id)
 		)`,
+
+		// ── Merge rejections（拒绝过的合并建议对，(min,max) 唯一）─────────
+		`CREATE TABLE IF NOT EXISTS merge_rejections (
+			person_a    TEXT NOT NULL,
+			person_b    TEXT NOT NULL,
+			rejected_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			PRIMARY KEY (person_a, person_b)
+		)`,
 	}
 
 	for _, stmt := range statements {
@@ -224,6 +232,14 @@ func migrate(db *sql.DB) error {
 	alters := []string{
 		`ALTER TABLE assets ADD COLUMN deleted_at DATETIME`,
 		`ALTER TABLE assets ADD COLUMN original_path TEXT`,
+		`ALTER TABLE persons ADD COLUMN cover_face_id TEXT`,
+		`ALTER TABLE persons ADD COLUMN favorite INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE persons ADD COLUMN relation TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE persons ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE persons ADD COLUMN confidence REAL NOT NULL DEFAULT 0`,
+		`ALTER TABLE persons ADD COLUMN centroid BLOB`,
+		`ALTER TABLE persons ADD COLUMN created_at DATETIME`,
+		`ALTER TABLE persons ADD COLUMN updated_at DATETIME`,
 	}
 	for _, stmt := range alters {
 		if _, err := db.Exec(stmt); err != nil &&

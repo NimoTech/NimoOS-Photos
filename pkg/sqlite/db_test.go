@@ -228,3 +228,27 @@ func TestMigrateAddsNewColumns(t *testing.T) {
 		require.True(t, cols[c], "expected column %s to exist", c)
 	}
 }
+
+func TestPersonsColumnsAndMergeRejections(t *testing.T) {
+	db, err := sqlite.Open(filepath.Join(t.TempDir(), "m.db"))
+	require.NoError(t, err)
+	defer db.Close()
+
+	cols := map[string]bool{}
+	rows, err := db.Query(`PRAGMA table_info(persons)`)
+	require.NoError(t, err)
+	for rows.Next() {
+		var cid, notnull, pk int
+		var name, ctype string
+		var dflt sql.NullString
+		require.NoError(t, rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk))
+		cols[name] = true
+	}
+	rows.Close()
+	for _, c := range []string{"cover_face_id", "favorite", "relation", "hidden", "confidence", "centroid", "created_at", "updated_at"} {
+		require.True(t, cols[c], "persons 缺列 %s", c)
+	}
+
+	_, err = db.Exec(`INSERT INTO merge_rejections(person_a, person_b) VALUES('a','b')`)
+	require.NoError(t, err)
+}
