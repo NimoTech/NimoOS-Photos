@@ -50,15 +50,21 @@ func cosDist(a, b []float32) float64 {
 	return 1.0 - cos
 }
 
-// ComputeCentroid 返回向量集合的逐维平均（质心）。空集合返回 nil。
+// ComputeCentroid 返回向量集合的逐维平均（质心）。
+// 空集合或维度不一致返回 nil。调用方需保证所有向量等长。
 func ComputeCentroid(vecs [][]float32) []float32 {
 	if len(vecs) == 0 {
 		return nil
 	}
 	dim := len(vecs[0])
+	for _, v := range vecs {
+		if len(v) != dim {
+			return nil
+		}
+	}
 	out := make([]float32, dim)
 	for _, v := range vecs {
-		for i := 0; i < dim && i < len(v); i++ {
+		for i := 0; i < dim; i++ {
 			out[i] += v[i]
 		}
 	}

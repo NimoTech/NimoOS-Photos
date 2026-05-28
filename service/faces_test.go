@@ -237,4 +237,15 @@ func TestComputeCentroidAndConfidence(t *testing.T) {
 	require.Equal(t, 1.0, service.ClusterConfidence([][]float32{normalize(v1)}, normalize(v1)))
 	// 空簇安全
 	require.Equal(t, 0.0, service.ClusterConfidence(nil, nil))
+
+	// 对立向量簇置信度应低
+	v3 := make([]float32, dim)
+	v3[0] = -1.0
+	vecs2 := [][]float32{normalize(v1), normalize(v3)}
+	c2 := service.ComputeCentroid(vecs2)
+	conf2 := service.ClusterConfidence(vecs2, c2)
+	require.Less(t, conf2, 0.1, "对立向量簇置信度应低")
+
+	// 维度不一致返回 nil
+	require.Nil(t, service.ComputeCentroid([][]float32{make([]float32, 4), make([]float32, 5)}))
 }
