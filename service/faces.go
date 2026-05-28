@@ -18,6 +18,10 @@ const (
 	dbscanEpsilon    = 0.6
 	dbscanMinPoints  = 1
 	clusterBatchSize = 50
+	// assignEpsilon 是游离脸吸附到锚定 person 质心的最大余弦距离。
+	assignEpsilon = 0.55
+	// suggestEpsilon 是「合并建议」配对的余弦距离上界（下界为 dbscanEpsilon）。
+	suggestEpsilon = 0.75
 )
 
 // cosDist computes the cosine distance between two float32 vectors.
@@ -44,6 +48,48 @@ func cosDist(a, b []float32) float64 {
 		cos = -1.0
 	}
 	return 1.0 - cos
+}
+
+// ComputeCentroid 返回向量集合的逐维平均（质心）。空集合返回 nil。
+func ComputeCentroid(vecs [][]float32) []float32 {
+	if len(vecs) == 0 {
+		return nil
+	}
+	dim := len(vecs[0])
+	out := make([]float32, dim)
+	for _, v := range vecs {
+		for i := 0; i < dim && i < len(v); i++ {
+			out[i] += v[i]
+		}
+	}
+	n := float32(len(vecs))
+	for i := range out {
+		out[i] /= n
+	}
+	return out
+}
+
+// ClusterConfidence 返回簇内聚合度 [0,1]：成员到质心平均余弦相似度。
+// 单元素簇返回 1.0；空簇返回 0.0。
+func ClusterConfidence(vecs [][]float32, centroid []float32) float64 {
+	if len(vecs) == 0 || centroid == nil {
+		return 0.0
+	}
+	if len(vecs) == 1 {
+		return 1.0
+	}
+	var sum float64
+	for _, v := range vecs {
+		sum += 1.0 - cosDist(v, centroid)
+	}
+	conf := sum / float64(len(vecs))
+	if conf < 0 {
+		conf = 0
+	}
+	if conf > 1 {
+		conf = 1
+	}
+	return conf
 }
 
 // regionQuery returns indices of all vectors (excluding idx itself) whose

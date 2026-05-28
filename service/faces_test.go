@@ -216,3 +216,25 @@ func TestDBSCANWithProgress(t *testing.T) {
 		require.GreaterOrEqual(t, calls[i][0], calls[i-1][0], "done 应单调递增")
 	}
 }
+
+func TestComputeCentroidAndConfidence(t *testing.T) {
+	dim := 512
+	v1 := make([]float32, dim)
+	v2 := make([]float32, dim)
+	v1[0] = 1.0
+	v2[0] = 0.98
+	v2[1] = 0.02
+	vecs := [][]float32{normalize(v1), normalize(v2)}
+
+	c := service.ComputeCentroid(vecs)
+	require.Len(t, c, dim)
+
+	conf := service.ClusterConfidence(vecs, c)
+	require.Greater(t, conf, 0.9, "近似向量簇置信度应高")
+	require.LessOrEqual(t, conf, 1.0)
+
+	// 单元素簇置信度为 1.0
+	require.Equal(t, 1.0, service.ClusterConfidence([][]float32{normalize(v1)}, normalize(v1)))
+	// 空簇安全
+	require.Equal(t, 0.0, service.ClusterConfidence(nil, nil))
+}
