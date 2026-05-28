@@ -185,6 +185,34 @@ func (s *PersonService) setHidden(id string, hidden bool) error {
 	return nil
 }
 
+// PersonRelations 返回与该 person 在同一 asset 共同出镜的其他 person，按共现次数降序。
+func (s *PersonService) PersonRelations(id string) ([]PersonRelation, error) {
+	rows, err := s.db.Query(`
+SELECT fp2.person_id, COALESCE(p.name,''), COALESCE(p.cover_face_id,''), COUNT(DISTINCT a.id) AS cnt
+FROM face_person fp1
+JOIN face_detections fd1 ON fd1.id=fp1.face_id
+JOIN face_detections fd2 ON fd2.asset_id=fd1.asset_id AND fd2.id!=fd1.id
+JOIN face_person fp2 ON fp2.face_id=fd2.id
+JOIN assets a ON a.id=fd1.asset_id AND a.deleted_at IS NULL
+JOIN persons p ON p.id=fp2.person_id AND p.hidden=0
+WHERE fp1.person_id=? AND fp2.person_id!=fp1.person_id
+GROUP BY fp2.person_id
+ORDER BY cnt DESC`, id)
+	if err != nil {
+		return nil, fmt.Errorf("PersonRelations: %w", err)
+	}
+	defer rows.Close()
+	var out []PersonRelation
+	for rows.Next() {
+		var r PersonRelation
+		if err := rows.Scan(&r.PersonID, &r.Name, &r.CoverFaceID, &r.Count); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
 // FacesIndexedUpTo returns the most recent indexed_at of assets with face detections (for banner use), nil if none.
 func (s *PersonService) FacesIndexedUpTo() (*string, error) {
 	var ts sql.NullString

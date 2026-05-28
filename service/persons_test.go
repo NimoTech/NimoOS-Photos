@@ -5,7 +5,9 @@ import (
 	"database/sql"
 	"testing"
 
+	"github.com/NimoTech/NimoOS-Photos/pkg/sqlite"
 	"github.com/NimoTech/NimoOS-Photos/service"
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 )
 
@@ -145,4 +147,33 @@ func TestUpdatePerson_AndHideRestore(t *testing.T) {
 	require.Len(t, l2, 1)
 
 	require.ErrorIs(t, ps.UpdatePerson("nope", service.PersonPatch{Name: &name}), service.ErrNotFound)
+}
+
+func insertFaceOnAsset(t *testing.T, db *sql.DB, assetID string, vec []float32) {
+	t.Helper()
+	fid := uuid.NewString()
+	_, err := db.Exec(`INSERT INTO face_detections(id, asset_id, bbox, embedding) VALUES(?,?,?,?)`,
+		fid, assetID, `{"x1":0,"y1":0,"x2":1,"y2":1}`, sqlite.SerializeFloat32(vec))
+	require.NoError(t, err)
+}
+
+func TestPersonRelations(t *testing.T) {
+	db := makeTestFaceDB(t)
+	dim := 512
+	a := make([]float32, dim); a[0] = 1.0
+	b := make([]float32, dim); b[1] = 1.0
+	// 同一张 asset 内放 A、B 两张脸 → 共现
+	_, err := db.Exec(`INSERT INTO assets(id, file_path, status) VALUES('shared','/x/s.jpg','indexed')`)
+	require.NoError(t, err)
+	insertFaceOnAsset(t, db, "shared", normalize(a))
+	insertFaceOnAsset(t, db, "shared", normalize(b))
+	require.NoError(t, service.NewFaceService(db).RunClustering(context.Background()))
+
+	ps := service.NewPersonService(db)
+	list, _ := ps.ListPersons()
+	require.Len(t, list, 2)
+	rels, err := ps.PersonRelations(list[0].ID)
+	require.NoError(t, err)
+	require.Len(t, rels, 1)
+	require.Equal(t, 1, rels[0].Count)
 }
