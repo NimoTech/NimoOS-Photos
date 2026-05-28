@@ -3,6 +3,7 @@ package service
 import (
 	"database/sql"
 	"fmt"
+	"strings"
 )
 
 // PersonService provides People list/detail/edit/relations/places/merge suggestions.
@@ -119,6 +120,69 @@ WHERE fp.person_id=? AND a.deleted_at IS NULL AND a.is_live_photo_video=0
 	}
 	p.PlacesCount = places
 	return &p, nil
+}
+
+// PersonPatch 局部更新字段，nil 表示不改。
+type PersonPatch struct {
+	Name     *string
+	Favorite *bool
+	Relation *string
+}
+
+// UpdatePerson 局部更新 name/favorite/relation。person 不存在返回 ErrNotFound。
+func (s *PersonService) UpdatePerson(id string, patch PersonPatch) error {
+	sets := []string{}
+	args := []any{}
+	if patch.Name != nil {
+		sets = append(sets, "name=?")
+		args = append(args, *patch.Name)
+	}
+	if patch.Favorite != nil {
+		v := 0
+		if *patch.Favorite {
+			v = 1
+		}
+		sets = append(sets, "favorite=?")
+		args = append(args, v)
+	}
+	if patch.Relation != nil {
+		sets = append(sets, "relation=?")
+		args = append(args, *patch.Relation)
+	}
+	if len(sets) == 0 {
+		return nil
+	}
+	sets = append(sets, "updated_at=CURRENT_TIMESTAMP")
+	args = append(args, id)
+	res, err := s.db.Exec(`UPDATE persons SET `+strings.Join(sets, ", ")+` WHERE id=?`, args...)
+	if err != nil {
+		return fmt.Errorf("UpdatePerson: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// HidePerson 软删除（hidden=1）。
+func (s *PersonService) HidePerson(id string) error { return s.setHidden(id, true) }
+
+// RestorePerson 恢复（hidden=0）。
+func (s *PersonService) RestorePerson(id string) error { return s.setHidden(id, false) }
+
+func (s *PersonService) setHidden(id string, hidden bool) error {
+	v := 0
+	if hidden {
+		v = 1
+	}
+	res, err := s.db.Exec(`UPDATE persons SET hidden=?, updated_at=CURRENT_TIMESTAMP WHERE id=?`, v, id)
+	if err != nil {
+		return fmt.Errorf("setHidden: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 // FacesIndexedUpTo returns the most recent indexed_at of assets with face detections (for banner use), nil if none.

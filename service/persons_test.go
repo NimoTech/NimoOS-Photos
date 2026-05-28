@@ -118,3 +118,31 @@ func TestGetPerson_HiddenReturnsNotFound(t *testing.T) {
 	_, err = service.NewPersonService(db).GetPerson(id)
 	require.ErrorIs(t, err, service.ErrNotFound)
 }
+
+func TestUpdatePerson_AndHideRestore(t *testing.T) {
+	db := makeTestFaceDB(t)
+	dim := 512
+	a := make([]float32, dim); a[0] = 1.0
+	insertAssetFace(t, db, "u-a1", normalize(a))
+	require.NoError(t, service.NewFaceService(db).RunClustering(context.Background()))
+	ps := service.NewPersonService(db)
+	id := mustFirstPersonID(t, db)
+
+	name := "Bob"
+	fav := true
+	rel := "family"
+	require.NoError(t, ps.UpdatePerson(id, service.PersonPatch{Name: &name, Favorite: &fav, Relation: &rel}))
+	p, _ := ps.GetPerson(id)
+	require.Equal(t, "Bob", p.Name)
+	require.True(t, p.Favorite)
+	require.Equal(t, "family", p.Relation)
+
+	require.NoError(t, ps.HidePerson(id))
+	l, _ := ps.ListPersons()
+	require.Len(t, l, 0)
+	require.NoError(t, ps.RestorePerson(id))
+	l2, _ := ps.ListPersons()
+	require.Len(t, l2, 1)
+
+	require.ErrorIs(t, ps.UpdatePerson("nope", service.PersonPatch{Name: &name}), service.ErrNotFound)
+}
