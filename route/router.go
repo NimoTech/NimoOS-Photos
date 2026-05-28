@@ -115,12 +115,12 @@ func InitRouter(ctx context.Context, svc service.Services, runtimePath string, t
 	g.POST("/albums/:id/assets/batch", albums.BatchAdd)
 
 	// Favorites
-	g.POST("/favorites/:asset_id",   favorites.Favorite)
+	g.POST("/favorites/:asset_id", favorites.Favorite)
 	g.DELETE("/favorites/:asset_id", favorites.Unfavorite)
-	g.GET("/favorites/ids",          favorites.ListIDs)
-	g.GET("/favorites",              favorites.List)
-	g.GET("/favorites/export",       favorites.Export)
-	g.GET("/favorites/top",          favorites.Top)
+	g.GET("/favorites/ids", favorites.ListIDs)
+	g.GET("/favorites", favorites.List)
+	g.GET("/favorites/export", favorites.Export)
+	g.GET("/favorites/top", favorites.Top)
 
 	// Trash（回收站）
 	g.GET("/trash", trash.List)

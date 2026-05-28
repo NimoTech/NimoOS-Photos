@@ -47,18 +47,18 @@ type services struct {
 	parentCtx context.Context
 }
 
-func (s *services) DB() *sql.DB            { return s.db }
-func (s *services) Indexer() *Indexer      { return s.indexer }
-func (s *services) Watcher() *Watcher      { return s.watcher }
-func (s *services) Albums() *AlbumService  { return s.albums }
-func (s *services) Search() *SearchService { return s.search }
-func (s *services) Faces() *FaceService    { return s.faces }
-func (s *services) Tasks() *TaskRegistry   { return s.tasks }
+func (s *services) DB() *sql.DB                  { return s.db }
+func (s *services) Indexer() *Indexer            { return s.indexer }
+func (s *services) Watcher() *Watcher            { return s.watcher }
+func (s *services) Albums() *AlbumService        { return s.albums }
+func (s *services) Search() *SearchService       { return s.search }
+func (s *services) Faces() *FaceService          { return s.faces }
+func (s *services) Tasks() *TaskRegistry         { return s.tasks }
 func (s *services) Embedder() *Embedder          { return s.embedder }
 func (s *services) Favorites() *FavoritesService { return s.favorites }
-func (s *services) Trash() *TrashService          { return s.trash }
-func (s *services) Views() *ViewsService             { return s.views }
-func (s *services) Persons() *PersonService          { return s.persons }
+func (s *services) Trash() *TrashService         { return s.trash }
+func (s *services) Views() *ViewsService         { return s.views }
+func (s *services) Persons() *PersonService      { return s.persons }
 
 // NewService wires all service-layer components together from cfg and returns a
 // ready-to-use Services handle. It panics if the database cannot be opened.

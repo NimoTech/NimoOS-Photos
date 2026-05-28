@@ -42,7 +42,8 @@ func TestListPersons_ExcludesHiddenAndCounts(t *testing.T) {
 func TestListPersons_PlacesCount(t *testing.T) {
 	db := makeTestFaceDB(t)
 	dim := 512
-	a := make([]float32, dim); a[0] = 1.0
+	a := make([]float32, dim)
+	a[0] = 1.0
 	insertAssetFace(t, db, "pl-a1", normalize(a))
 	insertAssetFace(t, db, "pl-a2", normalize(a))
 	// 给两张 asset 不同 GPS（粗粒度 cell 不同），asset_exif 行
@@ -89,7 +90,8 @@ func TestFacesIndexedUpTo(t *testing.T) {
 func TestGetPerson_Stats(t *testing.T) {
 	db := makeTestFaceDB(t)
 	dim := 512
-	a := make([]float32, dim); a[0] = 1.0
+	a := make([]float32, dim)
+	a[0] = 1.0
 	insertAssetFace(t, db, "g-a1", normalize(a))
 	require.NoError(t, service.NewFaceService(db).RunClustering(context.Background()))
 
@@ -113,7 +115,8 @@ func mustFirstPersonID(t *testing.T, db *sql.DB) string {
 func TestGetPerson_HiddenReturnsNotFound(t *testing.T) {
 	db := makeTestFaceDB(t)
 	dim := 512
-	a := make([]float32, dim); a[0] = 1.0
+	a := make([]float32, dim)
+	a[0] = 1.0
 	insertAssetFace(t, db, "gh-a1", normalize(a))
 	require.NoError(t, service.NewFaceService(db).RunClustering(context.Background()))
 
@@ -128,7 +131,8 @@ func TestGetPerson_HiddenReturnsNotFound(t *testing.T) {
 func TestUpdatePerson_AndHideRestore(t *testing.T) {
 	db := makeTestFaceDB(t)
 	dim := 512
-	a := make([]float32, dim); a[0] = 1.0
+	a := make([]float32, dim)
+	a[0] = 1.0
 	insertAssetFace(t, db, "u-a1", normalize(a))
 	require.NoError(t, service.NewFaceService(db).RunClustering(context.Background()))
 	ps := service.NewPersonService(db)
@@ -164,8 +168,10 @@ func insertFaceOnAsset(t *testing.T, db *sql.DB, assetID string, vec []float32) 
 func TestPersonRelations(t *testing.T) {
 	db := makeTestFaceDB(t)
 	dim := 512
-	a := make([]float32, dim); a[0] = 1.0
-	b := make([]float32, dim); b[1] = 1.0
+	a := make([]float32, dim)
+	a[0] = 1.0
+	b := make([]float32, dim)
+	b[1] = 1.0
 	// 同一张 asset 内放 A、B 两张脸 → 共现
 	_, err := db.Exec(`INSERT INTO assets(id, file_path, status) VALUES('shared','/x/s.jpg','indexed')`)
 	require.NoError(t, err)
@@ -190,7 +196,8 @@ func TestPersonRelations(t *testing.T) {
 func TestPersonPlaces(t *testing.T) {
 	db := makeTestFaceDB(t)
 	dim := 512
-	a := make([]float32, dim); a[0] = 1.0
+	a := make([]float32, dim)
+	a[0] = 1.0
 	insertAssetFace(t, db, "pp-a1", normalize(a))
 	insertAssetFace(t, db, "pp-a2", normalize(a))
 	_, err := db.Exec(`INSERT INTO asset_exif(asset_id, latitude, longitude) VALUES('pp-a1', 35.6, 139.6)`)
@@ -220,8 +227,11 @@ func TestPersonPlaces(t *testing.T) {
 func TestMergeSuggestions_StableOrder(t *testing.T) {
 	db := makeTestFaceDB(t)
 	dim := 512
-	a := make([]float32, dim); a[0] = 1.0
-	c := make([]float32, dim); c[0] = 0.3; c[1] = 0.954
+	a := make([]float32, dim)
+	a[0] = 1.0
+	c := make([]float32, dim)
+	c[0] = 0.3
+	c[1] = 0.954
 	insertAssetFace(t, db, "so-a", normalize(a))
 	insertAssetFace(t, db, "so-c", normalize(c))
 	require.NoError(t, service.NewFaceService(db).RunClustering(context.Background()))
@@ -318,8 +328,11 @@ func TestMergeSuggestions_RespectRejections(t *testing.T) {
 	db := makeTestFaceDB(t)
 	dim := 512
 	// 两个簇质心 cosine 距离落在 (dbscanEpsilon=0.6, suggestEpsilon=0.75) 带内
-	a := make([]float32, dim); a[0] = 1.0
-	c := make([]float32, dim); c[0] = 0.3; c[1] = 0.954 // cos≈0.3 → dist≈0.7
+	a := make([]float32, dim)
+	a[0] = 1.0
+	c := make([]float32, dim)
+	c[0] = 0.3
+	c[1] = 0.954 // cos≈0.3 → dist≈0.7
 	insertAssetFace(t, db, "ms-a", normalize(a))
 	insertAssetFace(t, db, "ms-c", normalize(c))
 	require.NoError(t, service.NewFaceService(db).RunClustering(context.Background()))
@@ -343,8 +356,10 @@ func TestMergeSuggestions_RespectRejections(t *testing.T) {
 func TestMergePersons_RecomputesCentroid(t *testing.T) {
 	db := makeTestFaceDB(t)
 	dim := 512
-	a := make([]float32, dim); a[0] = 1.0
-	b := make([]float32, dim); b[1] = 1.0
+	a := make([]float32, dim)
+	a[0] = 1.0
+	b := make([]float32, dim)
+	b[1] = 1.0
 	insertAssetFace(t, db, "mp-a", normalize(a))
 	insertAssetFace(t, db, "mp-b", normalize(b))
 	require.NoError(t, service.NewFaceService(db).RunClustering(context.Background()))

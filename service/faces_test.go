@@ -40,8 +40,8 @@ func TestDBSCAN_TwoClusters(t *testing.T) {
 	dim := 512
 	v1, v2, v3 := make([]float32, dim), make([]float32, dim), make([]float32, dim)
 	v1[0] = 1.0
-	v2[0] = 0.99  // 接近 v1，余弦距离 ≈ 0
-	v3[1] = 1.0   // 与 v1 正交，余弦距离 = 1.0
+	v2[0] = 0.99 // 接近 v1，余弦距离 ≈ 0
+	v3[1] = 1.0  // 与 v1 正交，余弦距离 = 1.0
 
 	labels := service.DBSCAN([][]float32{normalize(v1), normalize(v2), normalize(v3)}, 0.4, 1)
 	require.Len(t, labels, 3)
@@ -55,7 +55,7 @@ func TestDBSCAN_SingletonClusters(t *testing.T) {
 	dim := 512
 	v1, v2 := make([]float32, dim), make([]float32, dim)
 	v1[0] = 1.0
-	v2[1] = 1.0  // 正交，余弦距离 = 1.0 > 0.4
+	v2[1] = 1.0 // 正交，余弦距离 = 1.0 > 0.4
 	labels := service.DBSCAN([][]float32{normalize(v1), normalize(v2)}, 0.4, 1)
 	require.NotEqual(t, labels[0], labels[1])
 	require.GreaterOrEqual(t, labels[0], 0)
@@ -266,7 +266,8 @@ func insertAssetFace(t *testing.T, db *sql.DB, assetID string, vec []float32) st
 func TestRunClustering_HiddenPersonNotDeletedAndExcludedFromNewClusters(t *testing.T) {
 	db := makeTestFaceDB(t)
 	dim := 512
-	a := make([]float32, dim); a[0] = 1.0
+	a := make([]float32, dim)
+	a[0] = 1.0
 	insertAssetFace(t, db, "hp-1", normalize(a))
 	svc := service.NewFaceService(db)
 	require.NoError(t, svc.RunClustering(context.Background()))
@@ -278,7 +279,9 @@ func TestRunClustering_HiddenPersonNotDeletedAndExcludedFromNewClusters(t *testi
 	require.NoError(t, err)
 
 	// 加一张与 hidden 相近的脸再跑
-	a2 := make([]float32, dim); a2[0] = 0.97; a2[1] = 0.03
+	a2 := make([]float32, dim)
+	a2[0] = 0.97
+	a2[1] = 0.03
 	insertAssetFace(t, db, "hp-2", normalize(a2))
 	require.NoError(t, svc.RunClustering(context.Background()))
 
@@ -296,7 +299,8 @@ func TestRunClustering_HiddenPersonNotDeletedAndExcludedFromNewClusters(t *testi
 func TestRunClustering_PreservesNamedAcrossReruns(t *testing.T) {
 	db := makeTestFaceDB(t)
 	dim := 512
-	a := make([]float32, dim); a[0] = 1.0
+	a := make([]float32, dim)
+	a[0] = 1.0
 	insertAssetFace(t, db, "asset-a1", normalize(a))
 
 	svc := service.NewFaceService(db)
@@ -309,7 +313,9 @@ func TestRunClustering_PreservesNamedAcrossReruns(t *testing.T) {
 	require.NoError(t, err)
 
 	// 加入一张与 Alice 相近的新脸后重跑聚类
-	a2 := make([]float32, dim); a2[0] = 0.97; a2[1] = 0.03
+	a2 := make([]float32, dim)
+	a2[0] = 0.97
+	a2[1] = 0.03
 	insertAssetFace(t, db, "asset-a2", normalize(a2))
 	require.NoError(t, svc.RunClustering(context.Background()))
 

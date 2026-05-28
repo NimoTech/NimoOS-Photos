@@ -120,17 +120,17 @@ func ExtractEmbeddedVideo(jpegPath, outPath string) error {
 // MediaInfo carries all metadata that one ffprobe call extracts from a video file.
 // Every field is best-effort: zero value means "not present" or "couldn't parse".
 type MediaInfo struct {
-	DurationMs int64
-	Width      int
-	Height     int
-	VideoCodec string
-	AudioCodec string
-	FrameRate  float64
-	BitRate    int64 // bps
-	Rotation   int   // 0, 90, 180, 270
-	TakenAt    time.Time
-	Latitude   float64
-	Longitude  float64
+	DurationMs  int64
+	Width       int
+	Height      int
+	VideoCodec  string
+	AudioCodec  string
+	FrameRate   float64
+	BitRate     int64 // bps
+	Rotation    int   // 0, 90, 180, 270
+	TakenAt     time.Time
+	Latitude    float64
+	Longitude   float64
 	HasLocation bool // true when Latitude/Longitude were actually parsed (distinguishes "no GPS" from Null Island)
 }
 

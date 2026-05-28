@@ -14,8 +14,8 @@ import (
 // stubServices implements service.Services with only Tasks() backed by a registry.
 // Other methods are no-ops returning nil; this is enough for tasks handler tests.
 type stubServices struct {
-	service.Services    // embed nil interface — panics only if unimplemented methods are called
-	registry *service.TaskRegistry
+	service.Services // embed nil interface — panics only if unimplemented methods are called
+	registry         *service.TaskRegistry
 }
 
 func (s stubServices) Tasks() *service.TaskRegistry { return s.registry }

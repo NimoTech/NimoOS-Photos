@@ -246,7 +246,7 @@ type FaceService struct {
 	running atomic.Bool
 
 	// 失败 backoff：RunClustering 出错后短期内不再触发，避免每分钟重试风暴。
-	failMu   sync.Mutex
+	failMu      sync.Mutex
 	nextAttempt time.Time
 }
 
@@ -423,7 +423,7 @@ func (s *FaceService) rebuildPersonsWithProgress(ctx context.Context, faces []fa
 	}
 	anchorRows.Close()
 
-	anchored := map[string]bool{}   // 锚定 person 名下的 face_id 集合
+	anchored := map[string]bool{} // 锚定 person 名下的 face_id 集合
 	anchors := make([]anchor, 0, len(anchorIDs))
 	for _, pid := range anchorIDs {
 		fr, ferr := tx.QueryContext(ctx, `

@@ -287,4 +287,3 @@ func (s *SearchService) DeleteAsset(id string) error {
 	}
 	return nil
 }
-
