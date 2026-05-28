@@ -19,6 +19,7 @@ type Config struct {
 	Workers       int
 	WatchDirs     []string
 	RetentionDays int
+	FacesEnabled  bool
 }
 
 func Init(configFile, confSample string) error {
@@ -54,6 +55,7 @@ func Init(configFile, confSample string) error {
 		Workers:       v.GetInt("photos.Workers"),
 		WatchDirs:     watchDirs,
 		RetentionDays: v.GetInt("photos.RetentionDays"),
+		FacesEnabled:  v.GetBool("photos.FacesEnabled"),
 	}
 	if Cfg.RuntimePath == "" {
 		Cfg.RuntimePath = "/var/run/nimoos"
@@ -73,11 +75,15 @@ func Init(configFile, confSample string) error {
 	if Cfg.RetentionDays <= 0 {
 		Cfg.RetentionDays = 30
 	}
+	// FacesEnabled 缺省（配置无此 key）时默认开启。
+	if !v.IsSet("photos.FacesEnabled") {
+		Cfg.FacesEnabled = true
+	}
 	return nil
 }
 
-// Save writes watchDirs and retentionDays back to the config file and updates Cfg.
-func Save(watchDirs []string, retentionDays int) error {
+// Save writes watchDirs, retentionDays and facesEnabled back to the config file and updates Cfg.
+func Save(watchDirs []string, retentionDays int, facesEnabled bool) error {
 	if Cfg == nil {
 		return fmt.Errorf("config not initialized")
 	}
@@ -89,6 +95,7 @@ func Save(watchDirs []string, retentionDays int) error {
 	if retentionDays > 0 {
 		v.Set("photos.RetentionDays", retentionDays)
 	}
+	v.Set("photos.FacesEnabled", facesEnabled)
 	if err := v.WriteConfig(); err != nil {
 		return fmt.Errorf("config.Save: %w", err)
 	}
@@ -96,5 +103,6 @@ func Save(watchDirs []string, retentionDays int) error {
 	if retentionDays > 0 {
 		Cfg.RetentionDays = retentionDays
 	}
+	Cfg.FacesEnabled = facesEnabled
 	return nil
 }

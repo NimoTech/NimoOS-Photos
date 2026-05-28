@@ -43,7 +43,7 @@ func (h *ConfigHandler) UpdateConfig(c echo.Context) error {
 	if req.RetentionDays != 0 && (req.RetentionDays < 1 || req.RetentionDays > 365) {
 		return echo.NewHTTPError(http.StatusBadRequest, "retentionDays must be between 1 and 365")
 	}
-	if err := config.Save(req.WatchDirs, req.RetentionDays); err != nil {
+	if err := config.Save(req.WatchDirs, req.RetentionDays, config.Cfg.FacesEnabled); err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
 	}
 	h.svc.RestartWatcher(req.WatchDirs)

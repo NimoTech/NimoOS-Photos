@@ -7,3 +7,4 @@ DataPath = /DATA/.system_data/photos
 MLEndpoint = http://127.0.0.1:3003
 Workers = 3
 WatchDirs = /DATA/Gallery,/DATA/Documents,/DATA/Downloads
+FacesEnabled = true
