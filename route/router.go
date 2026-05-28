@@ -38,6 +38,7 @@ func InitRouter(svc service.Services, runtimePath string, thumbDir string) http.
 			// protected by the Gateway; <img> tags can't send Authorization headers.
 			p := c.Path()
 			if strings.HasSuffix(p, "/thumbnail") ||
+				strings.HasSuffix(p, "/face-thumbnail") ||
 				strings.HasSuffix(p, "/original") ||
 				strings.HasSuffix(p, "/live") ||
 				strings.HasSuffix(p, "/favorites/export") {
@@ -77,7 +78,8 @@ func InitRouter(svc service.Services, runtimePath string, thumbDir string) http.
 	search := v1.NewSearchHandler(svc)
 	tl := v1.NewTimelineHandler(svc)
 	albums := v1.NewAlbumsHandler(svc)
-	persons := v1.NewPersonsHandler(svc)
+	faceThumbDir := thumbDir[:strings.LastIndex(thumbDir, "/")] + "/face-thumbs"
+	persons := v1.NewPersonsHandler(svc, faceThumbDir)
 	index := v1.NewIndexHandler(svc, "/DATA/Gallery")
 	favorites := v1.NewFavoritesHandler(svc, "/DATA/Gallery", runtimePath)
 	trash := v1.NewTrashHandler(svc)
@@ -130,9 +132,18 @@ func InitRouter(svc service.Services, runtimePath string, thumbDir string) http.
 
 	// Person endpoints
 	g.GET("/persons", persons.List)
-	g.PUT("/persons/:id", persons.UpdateName)
-	g.GET("/persons/:id/assets", persons.Assets)
+	g.GET("/persons/merge-suggestions", persons.MergeSuggestions)
+	g.POST("/persons/merge-suggestions/reject", persons.RejectSuggestion)
 	g.POST("/persons/merge", persons.Merge)
+	g.POST("/persons/recluster", persons.Recluster)
+	g.GET("/persons/:id", persons.Get)
+	g.PUT("/persons/:id", persons.Update)
+	g.DELETE("/persons/:id", persons.Delete)
+	g.POST("/persons/:id/restore", persons.Restore)
+	g.GET("/persons/:id/assets", persons.Assets)
+	g.GET("/persons/:id/relations", persons.Relations)
+	g.GET("/persons/:id/places", persons.Places)
+	g.GET("/persons/:id/face-thumbnail", persons.FaceThumbnail)
 
 	// Indexer status/control
 	g.GET("/status", index.Status)

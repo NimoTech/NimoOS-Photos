@@ -1,6 +1,7 @@
 package v1
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"strconv"
@@ -9,36 +10,54 @@ import (
 	"github.com/labstack/echo/v4"
 )
 
-// PersonsHandler manages face-cluster persons and their associated assets.
-type PersonsHandler struct{ svc service.Services }
+// PersonsHandler 提供 People 相关 HTTP 端点。
+type PersonsHandler struct {
+	svc          service.Services
+	faceThumbDir string
+}
 
-// NewPersonsHandler constructs a PersonsHandler.
-func NewPersonsHandler(svc service.Services) *PersonsHandler { return &PersonsHandler{svc} }
+func NewPersonsHandler(svc service.Services, faceThumbDir string) *PersonsHandler {
+	return &PersonsHandler{svc: svc, faceThumbDir: faceThumbDir}
+}
 
-// List returns all known persons.
-//
 // GET /v1/photos/persons
 func (h *PersonsHandler) List(c echo.Context) error {
-	persons, err := h.svc.Search().ListPersons()
+	persons, err := h.svc.Persons().ListPersons()
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
 	}
-	return c.JSON(http.StatusOK, persons)
+	indexedUpTo, _ := h.svc.Persons().FacesIndexedUpTo()
+	return c.JSON(http.StatusOK, map[string]any{
+		"persons":          persons,
+		"facesIndexedUpTo": indexedUpTo,
+	})
 }
 
-// UpdateName sets a display name for a person.
-//
-// PUT /v1/photos/persons/:id
-//
-//	{ "name": "Alice" }
-func (h *PersonsHandler) UpdateName(c echo.Context) error {
+// GET /v1/photos/persons/:id
+func (h *PersonsHandler) Get(c echo.Context) error {
+	p, err := h.svc.Persons().GetPerson(c.Param("id"))
+	if errors.Is(err, service.ErrNotFound) {
+		return echo.NewHTTPError(http.StatusNotFound)
+	}
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	}
+	rels, _ := h.svc.Persons().PersonRelations(p.ID)
+	return c.JSON(http.StatusOK, map[string]any{"person": p, "relations": rels})
+}
+
+// PUT /v1/photos/persons/:id  { name?, favorite?, relation? }
+func (h *PersonsHandler) Update(c echo.Context) error {
 	var req struct {
-		Name string `json:"name"`
+		Name     *string `json:"name"`
+		Favorite *bool   `json:"favorite"`
+		Relation *string `json:"relation"`
 	}
 	if err := c.Bind(&req); err != nil {
 		return echo.NewHTTPError(http.StatusBadRequest, "invalid request body")
 	}
-	err := h.svc.Search().UpdatePersonName(c.Param("id"), req.Name)
+	err := h.svc.Persons().UpdatePerson(c.Param("id"),
+		service.PersonPatch{Name: req.Name, Favorite: req.Favorite, Relation: req.Relation})
 	if errors.Is(err, service.ErrNotFound) {
 		return echo.NewHTTPError(http.StatusNotFound)
 	}
@@ -48,14 +67,36 @@ func (h *PersonsHandler) UpdateName(c echo.Context) error {
 	return c.JSON(http.StatusOK, map[string]string{"status": "updated"})
 }
 
-// Assets returns paginated assets associated with a person.
-//
-// GET /v1/photos/persons/:id/assets?limit=50&offset=0
+// DELETE /v1/photos/persons/:id  (soft hide)
+func (h *PersonsHandler) Delete(c echo.Context) error {
+	err := h.svc.Persons().HidePerson(c.Param("id"))
+	if errors.Is(err, service.ErrNotFound) {
+		return echo.NewHTTPError(http.StatusNotFound)
+	}
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	}
+	return c.JSON(http.StatusOK, map[string]string{"status": "hidden"})
+}
+
+// POST /v1/photos/persons/:id/restore
+func (h *PersonsHandler) Restore(c echo.Context) error {
+	err := h.svc.Persons().RestorePerson(c.Param("id"))
+	if errors.Is(err, service.ErrNotFound) {
+		return echo.NewHTTPError(http.StatusNotFound)
+	}
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	}
+	return c.JSON(http.StatusOK, map[string]string{"status": "restored"})
+}
+
+// GET /v1/photos/persons/:id/assets?limit=&offset=
 func (h *PersonsHandler) Assets(c echo.Context) error {
 	limit, _ := strconv.Atoi(c.QueryParam("limit"))
 	offset, _ := strconv.Atoi(c.QueryParam("offset"))
-	if limit <= 0 || limit > 200 {
-		limit = 50
+	if limit <= 0 || limit > 500 {
+		limit = 100
 	}
 	assets, err := h.svc.Search().PersonAssets(c.Param("id"), limit, offset)
 	if err != nil {
@@ -64,11 +105,37 @@ func (h *PersonsHandler) Assets(c echo.Context) error {
 	return c.JSON(http.StatusOK, assets)
 }
 
-// Merge merges one person cluster into another, then deletes the source.
-//
-// POST /v1/photos/persons/merge
-//
-//	{ "from_id": "<uuid>", "into_id": "<uuid>" }
+// GET /v1/photos/persons/:id/relations
+func (h *PersonsHandler) Relations(c echo.Context) error {
+	rels, err := h.svc.Persons().PersonRelations(c.Param("id"))
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	}
+	return c.JSON(http.StatusOK, rels)
+}
+
+// GET /v1/photos/persons/:id/places
+func (h *PersonsHandler) Places(c echo.Context) error {
+	places, err := h.svc.Persons().PersonPlaces(c.Param("id"))
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	}
+	return c.JSON(http.StatusOK, places)
+}
+
+// GET /v1/photos/persons/:id/face-thumbnail
+func (h *PersonsHandler) FaceThumbnail(c echo.Context) error {
+	path, err := h.svc.Persons().FaceThumbnail(c.Param("id"), h.faceThumbDir)
+	if errors.Is(err, service.ErrNotFound) {
+		return echo.NewHTTPError(http.StatusNotFound)
+	}
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	}
+	return c.File(path)
+}
+
+// POST /v1/photos/persons/merge  { from_id, into_id }
 func (h *PersonsHandler) Merge(c echo.Context) error {
 	var req struct {
 		FromID string `json:"from_id"`
@@ -81,4 +148,34 @@ func (h *PersonsHandler) Merge(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
 	}
 	return c.JSON(http.StatusOK, map[string]string{"status": "merged"})
+}
+
+// GET /v1/photos/persons/merge-suggestions
+func (h *PersonsHandler) MergeSuggestions(c echo.Context) error {
+	sugs, err := h.svc.Persons().MergeSuggestions()
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	}
+	return c.JSON(http.StatusOK, sugs)
+}
+
+// POST /v1/photos/persons/merge-suggestions/reject  { from_id, into_id }
+func (h *PersonsHandler) RejectSuggestion(c echo.Context) error {
+	var req struct {
+		FromID string `json:"from_id"`
+		IntoID string `json:"into_id"`
+	}
+	if err := c.Bind(&req); err != nil || req.FromID == "" || req.IntoID == "" {
+		return echo.NewHTTPError(http.StatusBadRequest, "from_id and into_id required")
+	}
+	if err := h.svc.Persons().RejectMerge(req.FromID, req.IntoID); err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	}
+	return c.JSON(http.StatusOK, map[string]string{"status": "rejected"})
+}
+
+// POST /v1/photos/persons/recluster
+func (h *PersonsHandler) Recluster(c echo.Context) error {
+	go h.svc.Faces().RunClustering(context.Background()) //nolint:errcheck
+	return c.JSON(http.StatusAccepted, map[string]string{"status": "started"})
 }

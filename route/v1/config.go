@@ -25,6 +25,7 @@ func (h *ConfigHandler) GetConfig(c echo.Context) error {
 	return c.JSON(http.StatusOK, map[string]interface{}{
 		"watchDirs":     dirs,
 		"retentionDays": retention,
+		"facesEnabled":  config.Cfg.FacesEnabled,
 	})
 }
 
@@ -33,6 +34,7 @@ func (h *ConfigHandler) UpdateConfig(c echo.Context) error {
 	var req struct {
 		WatchDirs     []string `json:"watchDirs"`
 		RetentionDays int      `json:"retentionDays"`
+		FacesEnabled  *bool    `json:"facesEnabled"`
 	}
 	if err := c.Bind(&req); err != nil {
 		return echo.NewHTTPError(http.StatusBadRequest, "invalid request body")
@@ -43,12 +45,17 @@ func (h *ConfigHandler) UpdateConfig(c echo.Context) error {
 	if req.RetentionDays != 0 && (req.RetentionDays < 1 || req.RetentionDays > 365) {
 		return echo.NewHTTPError(http.StatusBadRequest, "retentionDays must be between 1 and 365")
 	}
-	if err := config.Save(req.WatchDirs, req.RetentionDays, config.Cfg.FacesEnabled); err != nil {
+	faces := config.Cfg.FacesEnabled
+	if req.FacesEnabled != nil {
+		faces = *req.FacesEnabled
+	}
+	if err := config.Save(req.WatchDirs, req.RetentionDays, faces); err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
 	}
 	h.svc.RestartWatcher(req.WatchDirs)
 	return c.JSON(http.StatusOK, map[string]interface{}{
 		"watchDirs":     req.WatchDirs,
 		"retentionDays": config.Cfg.RetentionDays,
+		"facesEnabled":  config.Cfg.FacesEnabled,
 	})
 }
