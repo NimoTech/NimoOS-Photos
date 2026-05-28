@@ -26,6 +26,7 @@ type Services interface {
 	Favorites() *FavoritesService
 	Trash() *TrashService
 	Views() *ViewsService
+	Persons() *PersonService
 	RestartWatcher(dirs []string)
 }
 
@@ -42,6 +43,7 @@ type services struct {
 	favorites *FavoritesService
 	trash     *TrashService
 	views     *ViewsService
+	persons   *PersonService
 	parentCtx context.Context
 }
 
@@ -55,7 +57,8 @@ func (s *services) Tasks() *TaskRegistry   { return s.tasks }
 func (s *services) Embedder() *Embedder          { return s.embedder }
 func (s *services) Favorites() *FavoritesService { return s.favorites }
 func (s *services) Trash() *TrashService          { return s.trash }
-func (s *services) Views() *ViewsService           { return s.views }
+func (s *services) Views() *ViewsService             { return s.views }
+func (s *services) Persons() *PersonService          { return s.persons }
 
 // NewService wires all service-layer components together from cfg and returns a
 // ready-to-use Services handle. It panics if the database cannot be opened.
@@ -85,6 +88,7 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 	trash := NewTrashService(db, "/DATA/Gallery", thumbDir)
 	views := NewViewsService(db)
 	search := NewSearchService(db, ml)
+	persons := NewPersonService(db)
 	faces := NewFaceService(db)
 	faces.SetTaskRegistry(taskReg)
 	embedder := NewEmbedder(db, ml, idx, taskReg)
@@ -146,6 +150,7 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 		favorites: favorites,
 		trash:     trash,
 		views:     views,
+		persons:   persons,
 		parentCtx: parentCtx,
 	}
 }

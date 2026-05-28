@@ -62,9 +62,41 @@ type FaceDetection struct {
 }
 
 type Person struct {
-	ID           string `json:"id"`
-	Name         string `json:"name"`
-	CoverAssetID string `json:"coverAssetId,omitempty"`
+	ID           string     `json:"id"`
+	Name         string     `json:"name"`
+	CoverAssetID string     `json:"coverAssetId,omitempty"`
+	CoverFaceID  string     `json:"coverFaceId,omitempty"`
+	Favorite     bool       `json:"favorite"`
+	Relation     string     `json:"relation"`
+	Confidence   float64    `json:"confidence"`
+	Count        int        `json:"count"`
+	FirstSeen    *time.Time `json:"firstSeen,omitempty"`
+	LastSeen     *time.Time `json:"lastSeen,omitempty"`
+	PlacesCount  int        `json:"placesCount"`
+}
+
+type PersonRelation struct {
+	PersonID    string `json:"personId"`
+	Name        string `json:"name"`
+	CoverFaceID string `json:"coverFaceId,omitempty"`
+	Count       int    `json:"count"`
+}
+
+type MergeSuggestion struct {
+	ID         string  `json:"id"`
+	FromID     string  `json:"fromId"`
+	IntoID     string  `json:"intoId"`
+	FromFaceID string  `json:"fromFaceId,omitempty"`
+	IntoFaceID string  `json:"intoFaceId,omitempty"`
+	IntoName   string  `json:"intoName,omitempty"`
+	Confidence float64 `json:"confidence"`
+	Reason     string  `json:"reason"`
+}
+
+type PersonPlace struct {
+	Latitude  float64    `json:"latitude"`
+	Longitude float64    `json:"longitude"`
+	TakenAt   *time.Time `json:"takenAt,omitempty"`
 }
 
 type Album struct {
