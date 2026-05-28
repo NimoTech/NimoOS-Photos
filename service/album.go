@@ -98,7 +98,7 @@ func (s *AlbumService) UpdateName(id, name string) error {
 
 	var existingID string
 	err := s.db.QueryRow(`SELECT id FROM albums WHERE id=?`, id).Scan(&existingID)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return ErrNotFound
 	}
 	if err != nil {
