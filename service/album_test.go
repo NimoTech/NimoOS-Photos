@@ -305,6 +305,33 @@ func TestAlbumBatchAddAssetsAssignsContiguousPosition(t *testing.T) {
 	require.Equal(t, map[string]int{"a1": 0, "a2": 1, "a3": 2, "a4": 3, "a5": 4}, positions)
 }
 
+func TestAlbumListAssetsOrderedByPosition(t *testing.T) {
+	db, err := sqlite.Open(filepath.Join(t.TempDir(), "test.db"))
+	require.NoError(t, err)
+	defer db.Close()
+
+	// 故意按 taken_at desc 顺序插，但 position 顺序为 a3,a1,a2
+	_, err = db.Exec(`INSERT INTO assets(id, file_path, taken_at, status) VALUES
+		('a1','/g/1.jpg','2026-01-01','indexed'),
+		('a2','/g/2.jpg','2026-02-01','indexed'),
+		('a3','/g/3.jpg','2026-03-01','indexed')`)
+	require.NoError(t, err)
+	svc := service.NewAlbumService(db)
+	a, _ := svc.Create("X")
+
+	// 直接插入 album_assets 控制 position 用于测试
+	_, err = db.Exec(`INSERT INTO album_assets(album_id, asset_id, position) VALUES
+		(?, 'a3', 0), (?, 'a1', 1), (?, 'a2', 2)`, a.ID, a.ID, a.ID)
+	require.NoError(t, err)
+
+	assets, err := svc.ListAssets(a.ID)
+	require.NoError(t, err)
+	require.Len(t, assets, 3)
+	require.Equal(t, "a3", assets[0].ID)
+	require.Equal(t, "a1", assets[1].ID)
+	require.Equal(t, "a2", assets[2].ID)
+}
+
 // queryPositions 读取某 album 的 (asset_id -> position) map。
 func queryPositions(t *testing.T, db *sql.DB, albumID string) map[string]int {
 	t.Helper()
