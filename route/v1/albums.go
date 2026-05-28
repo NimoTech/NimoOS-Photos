@@ -162,6 +162,28 @@ func (h *AlbumsHandler) Update(c echo.Context) error {
 	return c.JSON(http.StatusOK, album)
 }
 
+// Reorder writes a new full ordering of the album's assets.
+//
+// PATCH /v1/photos/albums/:id/assets/order
+//
+//	{ "assetIds": ["uuid1", "uuid2", ...] }
+func (h *AlbumsHandler) Reorder(c echo.Context) error {
+	var req struct {
+		AssetIDs []string `json:"assetIds"`
+	}
+	if err := c.Bind(&req); err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, "invalid body")
+	}
+	if len(req.AssetIDs) == 0 {
+		return echo.NewHTTPError(http.StatusBadRequest, "assetIds is required")
+	}
+
+	if err := h.svc.Albums().ReorderAssets(c.Param("id"), req.AssetIDs); err != nil {
+		return mapAlbumErr(err)
+	}
+	return c.NoContent(http.StatusNoContent)
+}
+
 // mapAlbumErr maps service-layer errors to HTTP responses.
 func mapAlbumErr(err error) error {
 	switch {

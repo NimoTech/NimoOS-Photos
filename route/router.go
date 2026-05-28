@@ -114,6 +114,7 @@ func InitRouter(ctx context.Context, svc service.Services, runtimePath string, t
 	// Album batch
 	g.POST("/albums/:id/assets/batch", albums.BatchAdd)
 	g.PATCH("/albums/:id", albums.Update)
+	g.PATCH("/albums/:id/assets/order", albums.Reorder)
 
 	// Favorites
 	g.POST("/favorites/:asset_id", favorites.Favorite)
