@@ -2,7 +2,9 @@ package service_test
 
 import (
 	"database/sql"
+	"fmt"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/NimoTech/NimoOS-Photos/pkg/sqlite"
@@ -64,7 +66,7 @@ func TestAlbumAddRemoveAsset(t *testing.T) {
 	require.NoError(t, err)
 	defer db.Close()
 
-	// 先插入一个 asset
+	// Insert one asset first
 	_, err = db.Exec(`INSERT INTO assets(id, file_path, status) VALUES('a1','/DATA/Gallery/test.jpg','indexed')`)
 	require.NoError(t, err)
 
@@ -189,7 +191,7 @@ func TestAlbumUpdateNameNotFound(t *testing.T) {
 }
 
 func TestAlbumUpdateNameSameValue(t *testing.T) {
-	// 自己改成自己的名字应成功（不算冲突）
+	// Renaming to the same name must succeed (not a conflict)
 	svc, cleanup := openTestAlbumSvc(t)
 	defer cleanup()
 
@@ -236,7 +238,7 @@ func TestAlbumUpdateCoverAlbumNotFound(t *testing.T) {
 }
 
 func TestAlbumUpdateCoverAssetNotExist(t *testing.T) {
-	// asset 完全不存在，也算 ErrCoverNotInAlbum（语义：当前 album 没有这个 asset）
+	// Non-existent asset also returns ErrCoverNotInAlbum (semantics: this album doesn't contain it)
 	svc, cleanup := openTestAlbumSvc(t)
 	defer cleanup()
 
@@ -310,7 +312,7 @@ func TestAlbumListAssetsOrderedByPosition(t *testing.T) {
 	require.NoError(t, err)
 	defer db.Close()
 
-	// 故意按 taken_at desc 顺序插，但 position 顺序为 a3,a1,a2
+	// Intentionally insert assets in taken_at desc order while position order is a3,a1,a2
 	_, err = db.Exec(`INSERT INTO assets(id, file_path, taken_at, status) VALUES
 		('a1','/g/1.jpg','2026-01-01','indexed'),
 		('a2','/g/2.jpg','2026-02-01','indexed'),
@@ -319,7 +321,7 @@ func TestAlbumListAssetsOrderedByPosition(t *testing.T) {
 	svc := service.NewAlbumService(db)
 	a, _ := svc.Create("X")
 
-	// 直接插入 album_assets 控制 position 用于测试
+	// Insert album_assets directly to control position for the test
 	_, err = db.Exec(`INSERT INTO album_assets(album_id, asset_id, position) VALUES
 		(?, 'a3', 0), (?, 'a1', 1), (?, 'a2', 2)`, a.ID, a.ID, a.ID)
 	require.NoError(t, err)
@@ -404,7 +406,7 @@ func TestAlbumReorderRejectsDuplicateIDs(t *testing.T) {
 	require.ErrorIs(t, svc.ReorderAssets(a.ID, []string{"a1", "a1"}), service.ErrInvalidInput)
 }
 
-// queryPositions 读取某 album 的 (asset_id -> position) map。
+// queryPositions is a test helper that reads the (asset_id -> position) map for an album.
 func queryPositions(t *testing.T, db *sql.DB, albumID string) map[string]int {
 	t.Helper()
 	rows, err := db.Query(`SELECT asset_id, position FROM album_assets WHERE album_id=?`, albumID)
@@ -418,4 +420,67 @@ func queryPositions(t *testing.T, db *sql.DB, albumID string) map[string]int {
 		out[aid] = pos
 	}
 	return out
+}
+
+func TestAlbumBatchAddAssetsConcurrentNoPositionConflict(t *testing.T) {
+	db, err := sqlite.Open(filepath.Join(t.TempDir(), "test.db"))
+	require.NoError(t, err)
+	defer db.Close()
+	// Limit to one open connection so concurrent transactions are serialised
+	// by the connection pool rather than hitting SQLite's writer-lock limit.
+	// This is realistic: production also uses a single writer connection.
+	db.SetMaxOpenConns(1)
+
+	// Pre-insert 20 assets to give all goroutines distinct asset_ids
+	const total = 20
+	for i := 0; i < total; i++ {
+		_, err := db.Exec(
+			`INSERT INTO assets(id, file_path, status) VALUES(?, ?, 'indexed')`,
+			fmt.Sprintf("a%d", i), fmt.Sprintf("/g/%d.jpg", i),
+		)
+		require.NoError(t, err)
+	}
+
+	svc := service.NewAlbumService(db)
+	a, _ := svc.Create("X")
+
+	// Fire 4 goroutines each adding 5 distinct assets concurrently
+	const goroutines = 4
+	const perGoroutine = 5
+	var wg sync.WaitGroup
+	errCh := make(chan error, goroutines)
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func(start int) {
+			defer wg.Done()
+			ids := make([]string, perGoroutine)
+			for i := 0; i < perGoroutine; i++ {
+				ids[i] = fmt.Sprintf("a%d", start+i)
+			}
+			if err := svc.BatchAddAssets(a.ID, ids); err != nil {
+				errCh <- err
+			}
+		}(g * perGoroutine)
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		require.NoError(t, err)
+	}
+
+	// Verify: no position conflicts (all positions unique within this album)
+	// and positions form a contiguous 0..N-1 range with N=20.
+	positions := queryPositions(t, db, a.ID)
+	require.Len(t, positions, total, "all 20 assets should be in the album")
+	seen := map[int]string{}
+	for aid, pos := range positions {
+		if other, dup := seen[pos]; dup {
+			t.Fatalf("position %d collision: %s and %s", pos, aid, other)
+		}
+		seen[pos] = aid
+	}
+	for i := 0; i < total; i++ {
+		_, ok := seen[i]
+		require.True(t, ok, "position %d should be assigned", i)
+	}
 }

@@ -174,8 +174,8 @@ func (s *AlbumService) RemoveAsset(albumID, assetID string) error {
 	return err
 }
 
-// BatchAddAssets 在单 transaction 内一次添加多个 asset。
-// 幂等（INSERT OR IGNORE）。album 不存在返回 ErrNotFound。
+// BatchAddAssets adds multiple assets to an album in a single transaction.
+// Idempotent (INSERT OR IGNORE). Returns ErrNotFound if the album does not exist.
 func (s *AlbumService) BatchAddAssets(albumID string, assetIDs []string) error {
 	var dummy string
 	err := s.db.QueryRow(`SELECT id FROM albums WHERE id=?`, albumID).Scan(&dummy)
@@ -212,7 +212,7 @@ func (s *AlbumService) BatchAddAssets(albumID string, assetIDs []string) error {
 		if err != nil {
 			return err
 		}
-		// 仅在真正插入新行时递增 position（INSERT OR IGNORE 重复时 RowsAffected=0）
+		// Only advance position when a new row was actually inserted (INSERT OR IGNORE returns RowsAffected=0 for duplicates)
 		if n, _ := res.RowsAffected(); n > 0 {
 			nextPos++
 		}

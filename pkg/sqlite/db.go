@@ -168,7 +168,7 @@ func migrate(db *sql.DB) error {
 			PRIMARY KEY (user_id, asset_id)
 		)`,
 
-		// ── Merge rejections（拒绝过的合并建议对，(min,max) 唯一）─────────
+		// ── Merge rejections (rejected merge-suggestion pairs, (min,max) unique) ──
 		`CREATE TABLE IF NOT EXISTS merge_rejections (
 			person_a    TEXT NOT NULL REFERENCES persons(id) ON DELETE CASCADE,
 			person_b    TEXT NOT NULL REFERENCES persons(id) ON DELETE CASCADE,
@@ -229,8 +229,9 @@ func migrate(db *sql.DB) error {
 		}
 	}
 
-	// ── 幂等列迁移：旧库用 CREATE TABLE IF NOT EXISTS 不会获得新列，
-	//    用 ALTER TABLE ADD COLUMN 补齐；列已存在时 SQLite 报 "duplicate column"，忽略之。
+	// ── Idempotent column migration: legacy DBs created with CREATE TABLE IF NOT EXISTS
+	//    won't have new columns; ALTER TABLE ADD COLUMN fills them in.
+	//    SQLite raises "duplicate column" when the column already exists — ignore it.
 	alters := []string{
 		`ALTER TABLE assets ADD COLUMN deleted_at DATETIME`,
 		`ALTER TABLE assets ADD COLUMN original_path TEXT`,
@@ -261,10 +262,9 @@ func migrate(db *sql.DB) error {
 	// Backfill position: only runs when an album has >=2 rows all at position=0,
 	// which distinguishes legacy unbackfilled rows from a freshly-created album.
 	// Idempotent: after backfill MAX(position) > 0, so HAVING never fires again.
-	// NOTE (follow-up): once AddAsset/ReorderAssets land (Tasks 5,7), an album
-	// whose positions are all reset to 0 by buggy callers would falsely re-trigger
-	// this. Acceptable for now; revisit if a metadata-backed migration guard
-	// becomes warranted.
+	// NOTE: AddAsset/ReorderAssets now write distinct positions, so any album
+	// where MAX(position) > 0 is treated as already backfilled. The HAVING guard
+	// remains as a safety net for legacy DBs and is harmless on re-run.
 	if _, err := db.Exec(`
 		WITH targets AS (
 			SELECT album_id FROM album_assets
