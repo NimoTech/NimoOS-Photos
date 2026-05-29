@@ -60,7 +60,11 @@ func (s *AlbumService) List() ([]Album, error) {
 		       ), '') AS cover,
 		       COUNT(aa.asset_id) AS cnt,
 		       MIN(sp.taken_at) AS date_start,
-		       MAX(sp.taken_at) AS date_end
+		       MAX(sp.taken_at) AS date_end,
+		       SUM(CASE WHEN sp.is_live_photo_video = 0 AND sp.deleted_at IS NULL
+		                 AND sp.mime_type NOT LIKE 'video/%' THEN 1 ELSE 0 END) AS photo_cnt,
+		       SUM(CASE WHEN sp.is_live_photo_video = 0 AND sp.deleted_at IS NULL
+		                 AND sp.mime_type LIKE 'video/%' THEN 1 ELSE 0 END) AS video_cnt
 		FROM albums a
 		LEFT JOIN album_assets aa ON aa.album_id = a.id
 		LEFT JOIN assets sp ON sp.id = aa.asset_id
@@ -74,7 +78,8 @@ func (s *AlbumService) List() ([]Album, error) {
 	for rows.Next() {
 		var a Album
 		var dateStart, dateEnd sql.NullString
-		if err := rows.Scan(&a.ID, &a.Name, &a.CreatedAt, &a.CoverAssetID, &a.AssetCount, &dateStart, &dateEnd); err != nil {
+		if err := rows.Scan(&a.ID, &a.Name, &a.CreatedAt, &a.CoverAssetID, &a.AssetCount,
+			&dateStart, &dateEnd, &a.PhotoCount, &a.VideoCount); err != nil {
 			return nil, err
 		}
 		a.DateStart = dateStart.String

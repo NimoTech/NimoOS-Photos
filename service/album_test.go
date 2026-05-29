@@ -625,3 +625,51 @@ func TestAlbumGetReturnsTakenAtSpan(t *testing.T) {
 	require.Equal(t, "2025-06-03", got.DateStart)
 	require.Equal(t, "2025-09-30", got.DateEnd)
 }
+
+// --- Per-album photo / video counts (live-photo videos and trashed excluded) ---
+
+func TestAlbumListReturnsPhotoVideoCounts(t *testing.T) {
+	db, err := sqlite.Open(filepath.Join(t.TempDir(), "test.db"))
+	require.NoError(t, err)
+	defer db.Close()
+
+	_, err = db.Exec(`INSERT INTO assets(id, file_path, mime_type, is_live_photo_video, status) VALUES
+		('p1','/g/1.jpg','image/jpeg',0,'indexed'),
+		('p2','/g/2.png','image/png',0,'indexed'),
+		('v1','/g/3.mp4','video/mp4',0,'indexed')`)
+	require.NoError(t, err)
+	svc := service.NewAlbumService(db)
+	a, _ := svc.Create("Mixed")
+	require.NoError(t, svc.AddAsset(a.ID, "p1"))
+	require.NoError(t, svc.AddAsset(a.ID, "p2"))
+	require.NoError(t, svc.AddAsset(a.ID, "v1"))
+
+	albums, err := svc.List()
+	require.NoError(t, err)
+	require.Len(t, albums, 1)
+	require.Equal(t, 2, albums[0].PhotoCount)
+	require.Equal(t, 1, albums[0].VideoCount)
+}
+
+func TestAlbumListPhotoVideoCountsExcludeLiveAndTrashed(t *testing.T) {
+	db, err := sqlite.Open(filepath.Join(t.TempDir(), "test.db"))
+	require.NoError(t, err)
+	defer db.Close()
+
+	_, err = db.Exec(`INSERT INTO assets(id, file_path, mime_type, is_live_photo_video, deleted_at, status) VALUES
+		('p1','/g/1.jpg','image/jpeg',0,NULL,'indexed'),
+		('lv','/g/2.mov','video/quicktime',1,NULL,'indexed'),
+		('del','/g/3.jpg','image/jpeg',0,'2026-01-01','indexed')`)
+	require.NoError(t, err)
+	svc := service.NewAlbumService(db)
+	a, _ := svc.Create("Filtered")
+	require.NoError(t, svc.AddAsset(a.ID, "p1"))
+	require.NoError(t, svc.AddAsset(a.ID, "lv"))
+	require.NoError(t, svc.AddAsset(a.ID, "del"))
+
+	albums, err := svc.List()
+	require.NoError(t, err)
+	require.Len(t, albums, 1)
+	require.Equal(t, 1, albums[0].PhotoCount, "live-photo video and trashed asset excluded")
+	require.Equal(t, 0, albums[0].VideoCount, "the only video is a live-photo companion")
+}

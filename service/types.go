@@ -114,6 +114,12 @@ type Album struct {
 	// assets). The UI parses year/month from them to render a span label.
 	DateStart string `json:"dateStart,omitempty"`
 	DateEnd   string `json:"dateEnd,omitempty"`
+
+	// PhotoCount / VideoCount split the album's visible assets by media type
+	// (live-photo companion videos and trashed assets excluded). The UI sums
+	// these across all albums for the Albums topbar.
+	PhotoCount int `json:"photoCount"`
+	VideoCount int `json:"videoCount"`
 }
 
 type TimelineGroup struct {
