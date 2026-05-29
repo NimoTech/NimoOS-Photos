@@ -4,8 +4,12 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sync/atomic"
 	"time"
+
+	"go.uber.org/zap"
 )
 
 const defaultEmbedderPollInterval = 30 * time.Second
@@ -169,6 +173,36 @@ func (e *Embedder) tick(ctx context.Context) {
 	ready := e.ml.IsReady()
 	prev := e.lastReady.Swap(ready)
 	if ready && !prev {
-		go func() { _ = e.Backfill(ctx) }()
+		go func() {
+			// Backfill first (fills assets that never got an embedding), then the
+			// one-time re-embed of all existing assets from their thumbnails.
+			_ = e.Backfill(ctx)
+			e.reembedThumbnailsOnce()
+		}()
+	}
+}
+
+// reembedThumbnailsOnce performs a one-time CLIP re-embed of every existing asset
+// from its displayed thumbnail, the first time the service comes up after the
+// switch to thumbnail-based embeddings. Previously the embedding was computed on
+// the full-resolution source, which diverged from the shown frame (especially for
+// high-detail video keyframes) and let irrelevant videos outrank better photo
+// matches. A marker file in the data dir ensures this runs exactly once; delete it
+// to force a re-run (e.g. after a model change).
+func (e *Embedder) reembedThumbnailsOnce() {
+	if e.indexer == nil {
+		return
+	}
+	marker := filepath.Join(filepath.Dir(e.indexer.thumbDir), ".clip_reembed_thumb_v1.done")
+	if _, err := os.Stat(marker); err == nil {
+		return // already done
+	}
+	ok, failed := e.indexer.ReembedAllClip()
+	zap.L().Info("one-time CLIP re-embed from thumbnails complete",
+		zap.Int("reembedded", ok), zap.Int("failed", failed))
+	if failed == 0 {
+		if err := os.WriteFile(marker, []byte(fmt.Sprintf("reembedded=%d\n", ok)), 0o644); err != nil {
+			zap.L().Warn("failed to write re-embed marker", zap.Error(err))
+		}
 	}
 }

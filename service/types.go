@@ -47,6 +47,11 @@ type Asset struct {
 	// OriginalPath 为软删除前的原始 file_path，用于恢复与来源文件夹名展示。
 	DeletedAt    *time.Time `json:"deletedAt,omitempty"`
 	OriginalPath string     `json:"originalPath,omitempty"`
+
+	// MatchScore is the semantic-search similarity in [0,1], populated only by
+	// SmartSearch (nil elsewhere). Derived from the CLIP embedding L2 distance
+	// over unit vectors: sim = 1 - d²/2.
+	MatchScore *float64 `json:"matchScore,omitempty"`
 }
 
 type AssetExif struct {

@@ -632,23 +632,26 @@ func (ix *Indexer) processFileInternal(path string, opts processOpts) (success b
 
 	// 9. ML inference (only when ML service is ready).
 	if ix.ml.IsReady() {
-		// Determine which image bytes to use for ML.
-		var mlData []byte
+		// Face detection needs full-resolution detail, so it uses the original
+		// image (photos) or the full keyframe (videos).
+		var faceData []byte
 		if isVideo && keyframePath != "" {
-			mlData, _ = os.ReadFile(keyframePath)
+			faceData, _ = os.ReadFile(keyframePath)
 		} else {
-			mlData = data
+			faceData = data
 		}
 
-		if len(mlData) > 0 {
-			// CLIP embedding.
-			if vec, clipErr := ix.ml.CLIPImageEmbed(mlData); clipErr == nil {
-				ix.writeClipEmbedding(assetID, vec)
-			}
+		// CLIP embedding instead uses the displayed (small) thumbnail — see
+		// embedClip — so the stored vector represents the frame the user actually
+		// sees and photos/videos share one resize pipeline. Embedding the full-
+		// resolution source biased rankings: high-detail video keyframes could
+		// outrank better photo matches.
+		_ = ix.embedClip(assetID, faceData)
 
+		if len(faceData) > 0 {
 			// Face detection + recognition（FacesEnabled 关闭时跳过）。
 			if config.Cfg == nil || config.Cfg.FacesEnabled {
-				if faces, faceErr := ix.ml.DetectAndRecognizeFaces(mlData); faceErr == nil {
+				if faces, faceErr := ix.ml.DetectAndRecognizeFaces(faceData); faceErr == nil {
 					for _, face := range faces {
 						if len(face.Embedding) != 512 {
 							continue
@@ -678,12 +681,58 @@ func (ix *Indexer) processFileInternal(path string, opts processOpts) (success b
 	return true
 }
 
+// embedClip computes and stores the CLIP vector for assetID from its displayed
+// (small) thumbnail, falling back to the provided full-resolution bytes when the
+// thumbnail is unavailable. Centralised so live indexing and the re-embed
+// backfill produce identical vectors.
+func (ix *Indexer) embedClip(assetID string, fallback []byte) error {
+	img := fallback
+	if b, err := os.ReadFile(filepath.Join(ix.thumbDir, assetID, "small.jpg")); err == nil && len(b) > 0 {
+		img = b
+	}
+	if len(img) == 0 {
+		return fmt.Errorf("embedClip: no image for %s", assetID)
+	}
+	vec, err := ix.ml.CLIPImageEmbed(img)
+	if err != nil {
+		return err
+	}
+	return ix.writeClipEmbedding(assetID, vec)
+}
+
+// ReembedAllClip recomputes the CLIP embedding for every indexed asset from its
+// displayed thumbnail. One-time backfill after changing the embedding input so
+// existing assets match the new (thumbnail-based) pipeline. Returns counts of
+// (succeeded, failed). Faces/EXIF/thumbnails are left untouched.
+func (ix *Indexer) ReembedAllClip() (succeeded, failed int) {
+	rows, err := ix.db.Query(`SELECT id FROM assets WHERE status='indexed' AND deleted_at IS NULL`)
+	if err != nil {
+		return 0, 0
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err == nil {
+			ids = append(ids, id)
+		}
+	}
+	rows.Close()
+	for _, id := range ids {
+		if err := ix.embedClip(id, nil); err != nil {
+			failed++
+		} else {
+			succeeded++
+		}
+	}
+	return succeeded, failed
+}
+
 // writeClipEmbedding upserts the CLIP embedding for the given asset.
 // clip_embeddings is a sqlite-vec vec0 virtual table that does NOT support
 // INSERT OR REPLACE, so we try UPDATE first and fall back to INSERT when no row
 // is affected. That also self-heals partial state (asset_clip_idx row exists
 // but clip_embeddings row was never written).
-func (ix *Indexer) writeClipEmbedding(assetID string, vec []float32) {
+func (ix *Indexer) writeClipEmbedding(assetID string, vec []float32) error {
 	var rowid int64
 	err := ix.db.QueryRow(`SELECT rowid FROM asset_clip_idx WHERE asset_id=?`, assetID).Scan(&rowid)
 	if err != nil {
@@ -693,20 +742,22 @@ func (ix *Indexer) writeClipEmbedding(assetID string, vec []float32) {
 		}
 	}
 	if rowid <= 0 {
-		return
+		return fmt.Errorf("writeClipEmbedding: no rowid for %s", assetID)
 	}
 	blob := sqlite.SerializeFloat32(vec)
 	res, err := ix.db.Exec(`UPDATE clip_embeddings SET embedding=? WHERE rowid=?`, blob, rowid)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[indexer] update clip_embeddings %s: %v\n", assetID, err)
-		return
+		return err
 	}
 	if n, _ := res.RowsAffected(); n > 0 {
-		return
+		return nil
 	}
 	if _, err := ix.db.Exec(`INSERT INTO clip_embeddings(rowid, embedding) VALUES(?,?)`, rowid, blob); err != nil {
 		fmt.Fprintf(os.Stderr, "[indexer] insert clip_embeddings %s: %v\n", assetID, err)
+		return err
 	}
+	return nil
 }
 
 // sha256File returns the hex-encoded SHA-256 hash of data.

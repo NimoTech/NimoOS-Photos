@@ -34,6 +34,19 @@ func NewSearchService(db *sql.DB, ml textEmbedder) *SearchService {
 
 // ─── Smart (CLIP) search ─────────────────────────────────────────────────────
 
+// minMatchSimilarity, when > 0, drops SmartSearch results whose cosine similarity
+// (1 - d²/2 over unit-length CLIP vectors, i.e. Asset.MatchScore) is below it.
+//
+// Why this knob exists: KNN always returns the k nearest neighbours regardless of
+// absolute similarity, so on a small library every query returns a long tail of
+// barely-related fillers. Empirically for this corpus the distribution is:
+// noise ~0.16–0.19, mediocre ~0.20–0.23, confident matches ≥0.24. Setting this to
+// ~0.22 cuts the irrelevant tail (and the "irrelevant videos at high %" symptom).
+//
+// Left at 0 (no filtering) by default — current behaviour is unchanged. Bump it
+// here to enable a relevance floor.
+const minMatchSimilarity = 0.0
+
 // SmartSearch performs KNN vector search on CLIP embeddings filtered by optional
 // year/month, returning at most limit results.
 func (s *SearchService) SmartSearch(query string, limit int, filters SearchFilters) ([]Asset, error) {
@@ -48,7 +61,7 @@ func (s *SearchService) SmartSearch(query string, limit int, filters SearchFilte
 SELECT a.id, a.file_path, a.file_size, COALESCE(a.mime_type,''),
        COALESCE(a.original_name,''), a.taken_at, a.duration_ms,
        COALESCE(a.live_photo_video_id,''), a.is_live_photo_video,
-       a.indexed_at, a.status
+       a.indexed_at, a.status, vec.distance
 FROM clip_embeddings AS vec
 JOIN asset_clip_idx AS idx ON idx.rowid = vec.rowid
 JOIN assets a ON a.id = idx.asset_id
@@ -79,7 +92,73 @@ WHERE vec.embedding MATCH ? AND k = ?
 		return nil, fmt.Errorf("SmartSearch query: %w", err)
 	}
 	defer rows.Close()
-	return scanAssets(rows)
+
+	assets, err := scanSearchAssets(rows)
+	if err != nil {
+		return nil, err
+	}
+	if minMatchSimilarity > 0 {
+		kept := assets[:0]
+		for _, a := range assets {
+			if a.MatchScore == nil || *a.MatchScore >= minMatchSimilarity {
+				kept = append(kept, a)
+			}
+		}
+		assets = kept
+	}
+	// Attach named persons so the client can offer a People filter on results.
+	if err := s.attachNamedFaces(assets); err != nil {
+		return nil, err
+	}
+	return assets, nil
+}
+
+// attachNamedFaces fills each asset's Faces with the names of the named persons
+// detected in it (deduplicated). Unnamed/hidden persons and excluded faces are
+// skipped. A no-op for an empty slice. Mirrors FavoritesService.attachNamedFaces.
+func (s *SearchService) attachNamedFaces(assets []Asset) error {
+	if len(assets) == 0 {
+		return nil
+	}
+	idIndex := make(map[string]int, len(assets))
+	placeholders := make([]string, len(assets))
+	args := make([]interface{}, len(assets))
+	for i, a := range assets {
+		idIndex[a.ID] = i
+		placeholders[i] = "?"
+		args[i] = a.ID
+	}
+	rows, err := s.db.Query(`
+SELECT fd.asset_id, p.name
+FROM face_detections fd
+JOIN face_person fp ON fp.face_id = fd.id
+JOIN persons p ON p.id = fp.person_id
+WHERE fd.asset_id IN (`+strings.Join(placeholders, ",")+`)
+  AND p.name <> '' AND COALESCE(p.hidden, 0) = 0 AND COALESCE(fd.excluded, 0) = 0`, args...)
+	if err != nil {
+		return fmt.Errorf("attachNamedFaces query: %w", err)
+	}
+	defer rows.Close()
+	seen := make(map[string]map[string]bool, len(assets))
+	for rows.Next() {
+		var assetID, name string
+		if err := rows.Scan(&assetID, &name); err != nil {
+			return err
+		}
+		i, ok := idIndex[assetID]
+		if !ok {
+			continue
+		}
+		if seen[assetID] == nil {
+			seen[assetID] = map[string]bool{}
+		}
+		if seen[assetID][name] {
+			continue
+		}
+		seen[assetID][name] = true
+		assets[i].Faces = append(assets[i].Faces, name)
+	}
+	return rows.Err()
 }
 
 // ─── Timeline ────────────────────────────────────────────────────────────────
