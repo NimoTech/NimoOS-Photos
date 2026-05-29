@@ -3,6 +3,7 @@ package service
 import (
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -107,7 +108,62 @@ ORDER BY f.favorited_at DESC`
 		return nil, fmt.Errorf("List query: %w", err)
 	}
 	defer rows.Close()
-	return scanAssetsDetailedWithFav(rows)
+	assets, err := scanAssetsDetailedWithFav(rows)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.attachNamedFaces(assets); err != nil {
+		return nil, err
+	}
+	return assets, nil
+}
+
+// attachNamedFaces fills each asset's Faces with the names of the named
+// persons detected in it (deduplicated). Unnamed/hidden persons and excluded
+// faces are skipped. A no-op for an empty slice.
+func (s *FavoritesService) attachNamedFaces(assets []Asset) error {
+	if len(assets) == 0 {
+		return nil
+	}
+	idIndex := make(map[string]int, len(assets))
+	placeholders := make([]string, len(assets))
+	args := make([]interface{}, len(assets))
+	for i, a := range assets {
+		idIndex[a.ID] = i
+		placeholders[i] = "?"
+		args[i] = a.ID
+	}
+	rows, err := s.db.Query(`
+SELECT fd.asset_id, p.name
+FROM face_detections fd
+JOIN face_person fp ON fp.face_id = fd.id
+JOIN persons p ON p.id = fp.person_id
+WHERE fd.asset_id IN (`+strings.Join(placeholders, ",")+`)
+  AND p.name <> '' AND COALESCE(p.hidden, 0) = 0 AND COALESCE(fd.excluded, 0) = 0`, args...)
+	if err != nil {
+		return fmt.Errorf("attachNamedFaces query: %w", err)
+	}
+	defer rows.Close()
+	seen := make(map[string]map[string]bool, len(assets))
+	for rows.Next() {
+		var assetID, name string
+		if err := rows.Scan(&assetID, &name); err != nil {
+			return err
+		}
+		i, ok := idIndex[assetID]
+		if !ok {
+			continue
+		}
+		if seen[assetID] == nil {
+			seen[assetID] = map[string]bool{}
+		}
+		if seen[assetID][name] {
+			continue
+		}
+		seen[assetID][name] = true
+		assets[i].Faces = append(assets[i].Faces, name)
+	}
+	return rows.Err()
 }
 
 func (s *FavoritesService) IsFavorited(userID, assetID string) (bool, error) {
@@ -155,5 +211,12 @@ LIMIT ?`
 		return nil, fmt.Errorf("Top query: %w", err)
 	}
 	defer rows.Close()
-	return scanAssetsDetailedWithFav(rows)
+	assets, err := scanAssetsDetailedWithFav(rows)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.attachNamedFaces(assets); err != nil {
+		return nil, err
+	}
+	return assets, nil
 }

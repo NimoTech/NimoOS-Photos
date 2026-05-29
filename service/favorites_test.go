@@ -168,3 +168,38 @@ func TestTopEmptyWhenNoFavorites(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, top, 0)
 }
+
+func TestListFavoritesPopulatesNamedPersonFaces(t *testing.T) {
+	db, err := sqlite.Open(filepath.Join(t.TempDir(), "test.db"))
+	require.NoError(t, err)
+	defer db.Close()
+
+	// Two assets; a1 has Biden + an unnamed person, a2 has nobody.
+	_, err = db.Exec(`INSERT INTO assets(id, file_path, status) VALUES
+		('a1','/x/a1.jpg','indexed'), ('a2','/x/a2.jpg','indexed')`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO persons(id, name) VALUES ('p1','Biden'), ('p2','')`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO face_detections(id, asset_id, bbox, embedding) VALUES
+		('f1','a1','{}',x'00'), ('f2','a1','{}',x'00')`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO face_person(face_id, person_id) VALUES ('f1','p1'), ('f2','p2')`)
+	require.NoError(t, err)
+
+	svc := service.NewFavoritesService(db)
+	_, err = svc.Favorite("default", "a1")
+	require.NoError(t, err)
+	_, err = svc.Favorite("default", "a2")
+	require.NoError(t, err)
+
+	assets, err := svc.List("default", service.ListFavoritesOpts{})
+	require.NoError(t, err)
+	require.Len(t, assets, 2)
+
+	byID := map[string][]string{}
+	for _, a := range assets {
+		byID[a.ID] = a.Faces
+	}
+	require.Equal(t, []string{"Biden"}, byID["a1"], "only the named person should appear")
+	require.Empty(t, byID["a2"], "asset with no faces has no names")
+}
