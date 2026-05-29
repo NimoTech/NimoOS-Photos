@@ -561,3 +561,67 @@ func TestAlbumGetResolvesNewestAssetAsDefaultCover(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "new", got.CoverAssetID, "Get should resolve newest as default cover")
 }
+
+// --- Taken-at span (min/max of album assets' taken_at) ---
+
+func TestAlbumListReturnsTakenAtSpan(t *testing.T) {
+	db, err := sqlite.Open(filepath.Join(t.TempDir(), "test.db"))
+	require.NoError(t, err)
+	defer db.Close()
+
+	_, err = db.Exec(`INSERT INTO assets(id, file_path, taken_at, status) VALUES
+		('a1','/g/1.jpg','2023-05-01','indexed'),
+		('a2','/g/2.jpg','2024-08-15','indexed'),
+		('a3','/g/3.jpg','2025-02-20','indexed')`)
+	require.NoError(t, err)
+	svc := service.NewAlbumService(db)
+	a, _ := svc.Create("Spanning")
+	require.NoError(t, svc.AddAsset(a.ID, "a1"))
+	require.NoError(t, svc.AddAsset(a.ID, "a2"))
+	require.NoError(t, svc.AddAsset(a.ID, "a3"))
+
+	albums, err := svc.List()
+	require.NoError(t, err)
+	require.Len(t, albums, 1)
+	require.Equal(t, "2023-05-01", albums[0].DateStart)
+	require.Equal(t, "2025-02-20", albums[0].DateEnd)
+}
+
+func TestAlbumListSpanEmptyWhenNoDatedAssets(t *testing.T) {
+	db, err := sqlite.Open(filepath.Join(t.TempDir(), "test.db"))
+	require.NoError(t, err)
+	defer db.Close()
+
+	// Asset has no taken_at; empty album below has nothing at all.
+	_, err = db.Exec(`INSERT INTO assets(id, file_path, status) VALUES('a1','/g/1.jpg','indexed')`)
+	require.NoError(t, err)
+	svc := service.NewAlbumService(db)
+	a, _ := svc.Create("No Dates")
+	require.NoError(t, svc.AddAsset(a.ID, "a1"))
+
+	albums, err := svc.List()
+	require.NoError(t, err)
+	require.Len(t, albums, 1)
+	require.Empty(t, albums[0].DateStart)
+	require.Empty(t, albums[0].DateEnd)
+}
+
+func TestAlbumGetReturnsTakenAtSpan(t *testing.T) {
+	db, err := sqlite.Open(filepath.Join(t.TempDir(), "test.db"))
+	require.NoError(t, err)
+	defer db.Close()
+
+	_, err = db.Exec(`INSERT INTO assets(id, file_path, taken_at, status) VALUES
+		('a1','/g/1.jpg','2025-06-03','indexed'),
+		('a2','/g/2.jpg','2025-09-30','indexed')`)
+	require.NoError(t, err)
+	svc := service.NewAlbumService(db)
+	a, _ := svc.Create("Get Span")
+	require.NoError(t, svc.AddAsset(a.ID, "a1"))
+	require.NoError(t, svc.AddAsset(a.ID, "a2"))
+
+	got, err := svc.Get(a.ID)
+	require.NoError(t, err)
+	require.Equal(t, "2025-06-03", got.DateStart)
+	require.Equal(t, "2025-09-30", got.DateEnd)
+}

@@ -108,6 +108,12 @@ type Album struct {
 	CreatedAt    time.Time `json:"createdAt"`
 	CoverAssetID string    `json:"coverAssetId,omitempty"`
 	AssetCount   int       `json:"assetCount,omitempty"`
+
+	// DateStart / DateEnd are the raw taken_at strings of the earliest and
+	// latest dated assets in the album (empty when the album has no dated
+	// assets). The UI parses year/month from them to render a span label.
+	DateStart string `json:"dateStart,omitempty"`
+	DateEnd   string `json:"dateEnd,omitempty"`
 }
 
 type TimelineGroup struct {

@@ -58,9 +58,12 @@ func (s *AlbumService) List() ([]Album, error) {
 		           ORDER BY s.taken_at IS NULL, s.taken_at DESC, s.indexed_at DESC
 		           LIMIT 1
 		       ), '') AS cover,
-		       COUNT(aa.asset_id) AS cnt
+		       COUNT(aa.asset_id) AS cnt,
+		       MIN(sp.taken_at) AS date_start,
+		       MAX(sp.taken_at) AS date_end
 		FROM albums a
 		LEFT JOIN album_assets aa ON aa.album_id = a.id
+		LEFT JOIN assets sp ON sp.id = aa.asset_id
 		GROUP BY a.id ORDER BY a.created_at DESC
 	`)
 	if err != nil {
@@ -70,9 +73,12 @@ func (s *AlbumService) List() ([]Album, error) {
 	var albums []Album
 	for rows.Next() {
 		var a Album
-		if err := rows.Scan(&a.ID, &a.Name, &a.CreatedAt, &a.CoverAssetID, &a.AssetCount); err != nil {
+		var dateStart, dateEnd sql.NullString
+		if err := rows.Scan(&a.ID, &a.Name, &a.CreatedAt, &a.CoverAssetID, &a.AssetCount, &dateStart, &dateEnd); err != nil {
 			return nil, err
 		}
+		a.DateStart = dateStart.String
+		a.DateEnd = dateEnd.String
 		albums = append(albums, a)
 	}
 	return albums, rows.Err()
@@ -80,6 +86,7 @@ func (s *AlbumService) List() ([]Album, error) {
 
 func (s *AlbumService) Get(id string) (*Album, error) {
 	var a Album
+	var dateStart, dateEnd sql.NullString
 	err := s.db.QueryRow(`
 		SELECT id, name, created_at,
 		       COALESCE(NULLIF(cover_asset_id,''), (
@@ -89,12 +96,18 @@ func (s *AlbumService) Get(id string) (*Album, error) {
 		           WHERE aa2.album_id = albums.id
 		           ORDER BY s.taken_at IS NULL, s.taken_at DESC, s.indexed_at DESC
 		           LIMIT 1
-		       ), '')
+		       ), ''),
+		       (SELECT MIN(s.taken_at) FROM album_assets aa
+		          JOIN assets s ON s.id = aa.asset_id WHERE aa.album_id = albums.id),
+		       (SELECT MAX(s.taken_at) FROM album_assets aa
+		          JOIN assets s ON s.id = aa.asset_id WHERE aa.album_id = albums.id)
 		FROM albums WHERE id=?`, id,
-	).Scan(&a.ID, &a.Name, &a.CreatedAt, &a.CoverAssetID)
+	).Scan(&a.ID, &a.Name, &a.CreatedAt, &a.CoverAssetID, &dateStart, &dateEnd)
 	if err == sql.ErrNoRows {
 		return nil, ErrNotFound
 	}
+	a.DateStart = dateStart.String
+	a.DateEnd = dateEnd.String
 	return &a, err
 }
 
