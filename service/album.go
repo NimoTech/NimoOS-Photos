@@ -45,8 +45,19 @@ func (s *AlbumService) Create(name string) (*Album, error) {
 }
 
 func (s *AlbumService) List() ([]Album, error) {
+	// Cover resolves to the explicit cover_asset_id when set; otherwise it falls
+	// back to the newest asset in the album (by taken_at, then indexed_at). NULL
+	// taken_at values sort last so dated photos win.
 	rows, err := s.db.Query(`
-		SELECT a.id, a.name, a.created_at, COALESCE(a.cover_asset_id,''),
+		SELECT a.id, a.name, a.created_at,
+		       COALESCE(NULLIF(a.cover_asset_id,''), (
+		           SELECT aa2.asset_id
+		           FROM album_assets aa2
+		           JOIN assets s ON s.id = aa2.asset_id
+		           WHERE aa2.album_id = a.id
+		           ORDER BY s.taken_at IS NULL, s.taken_at DESC, s.indexed_at DESC
+		           LIMIT 1
+		       ), '') AS cover,
 		       COUNT(aa.asset_id) AS cnt
 		FROM albums a
 		LEFT JOIN album_assets aa ON aa.album_id = a.id
@@ -70,7 +81,16 @@ func (s *AlbumService) List() ([]Album, error) {
 func (s *AlbumService) Get(id string) (*Album, error) {
 	var a Album
 	err := s.db.QueryRow(`
-		SELECT id, name, created_at, COALESCE(cover_asset_id,'') FROM albums WHERE id=?`, id,
+		SELECT id, name, created_at,
+		       COALESCE(NULLIF(cover_asset_id,''), (
+		           SELECT aa2.asset_id
+		           FROM album_assets aa2
+		           JOIN assets s ON s.id = aa2.asset_id
+		           WHERE aa2.album_id = albums.id
+		           ORDER BY s.taken_at IS NULL, s.taken_at DESC, s.indexed_at DESC
+		           LIMIT 1
+		       ), '')
+		FROM albums WHERE id=?`, id,
 	).Scan(&a.ID, &a.Name, &a.CreatedAt, &a.CoverAssetID)
 	if err == sql.ErrNoRows {
 		return nil, ErrNotFound

@@ -484,3 +484,80 @@ func TestAlbumBatchAddAssetsConcurrentNoPositionConflict(t *testing.T) {
 		require.True(t, ok, "position %d should be assigned", i)
 	}
 }
+
+// --- Default cover resolution (falls back to newest asset when none set) ---
+
+func TestAlbumListResolvesNewestAssetAsDefaultCover(t *testing.T) {
+	db, err := sqlite.Open(filepath.Join(t.TempDir(), "test.db"))
+	require.NoError(t, err)
+	defer db.Close()
+
+	_, err = db.Exec(`INSERT INTO assets(id, file_path, taken_at, status) VALUES
+		('old','/g/1.jpg','2026-01-01','indexed'),
+		('mid','/g/2.jpg','2026-02-01','indexed'),
+		('new','/g/3.jpg','2026-03-01','indexed')`)
+	require.NoError(t, err)
+	svc := service.NewAlbumService(db)
+	a, _ := svc.Create("No Cover Set")
+	require.NoError(t, svc.AddAsset(a.ID, "old"))
+	require.NoError(t, svc.AddAsset(a.ID, "mid"))
+	require.NoError(t, svc.AddAsset(a.ID, "new"))
+
+	albums, err := svc.List()
+	require.NoError(t, err)
+	require.Len(t, albums, 1)
+	require.Equal(t, "new", albums[0].CoverAssetID, "default cover should be newest by taken_at")
+}
+
+func TestAlbumListExplicitCoverWinsOverNewest(t *testing.T) {
+	db, err := sqlite.Open(filepath.Join(t.TempDir(), "test.db"))
+	require.NoError(t, err)
+	defer db.Close()
+
+	_, err = db.Exec(`INSERT INTO assets(id, file_path, taken_at, status) VALUES
+		('old','/g/1.jpg','2026-01-01','indexed'),
+		('new','/g/2.jpg','2026-03-01','indexed')`)
+	require.NoError(t, err)
+	svc := service.NewAlbumService(db)
+	a, _ := svc.Create("Explicit Cover")
+	require.NoError(t, svc.AddAsset(a.ID, "old"))
+	require.NoError(t, svc.AddAsset(a.ID, "new"))
+	require.NoError(t, svc.UpdateCover(a.ID, "old"))
+
+	albums, err := svc.List()
+	require.NoError(t, err)
+	require.Len(t, albums, 1)
+	require.Equal(t, "old", albums[0].CoverAssetID, "explicit cover must win over newest fallback")
+}
+
+func TestAlbumListEmptyAlbumHasNoCover(t *testing.T) {
+	svc, cleanup := openTestAlbumSvc(t)
+	defer cleanup()
+
+	a, _ := svc.Create("Empty")
+
+	albums, err := svc.List()
+	require.NoError(t, err)
+	require.Len(t, albums, 1)
+	require.Equal(t, a.ID, albums[0].ID)
+	require.Empty(t, albums[0].CoverAssetID, "empty album must have no cover")
+}
+
+func TestAlbumGetResolvesNewestAssetAsDefaultCover(t *testing.T) {
+	db, err := sqlite.Open(filepath.Join(t.TempDir(), "test.db"))
+	require.NoError(t, err)
+	defer db.Close()
+
+	_, err = db.Exec(`INSERT INTO assets(id, file_path, taken_at, status) VALUES
+		('old','/g/1.jpg','2026-01-01','indexed'),
+		('new','/g/2.jpg','2026-03-01','indexed')`)
+	require.NoError(t, err)
+	svc := service.NewAlbumService(db)
+	a, _ := svc.Create("Get Cover")
+	require.NoError(t, svc.AddAsset(a.ID, "old"))
+	require.NoError(t, svc.AddAsset(a.ID, "new"))
+
+	got, err := svc.Get(a.ID)
+	require.NoError(t, err)
+	require.Equal(t, "new", got.CoverAssetID, "Get should resolve newest as default cover")
+}
