@@ -60,3 +60,33 @@ func TestListPlaces(t *testing.T) {
 	require.NotEmpty(t, tokyo.Thumbs)
 	require.Equal(t, "asia", tokyo.Region)
 }
+
+func TestTripsSplitByGap(t *testing.T) {
+	db, err := sqlite.Open(filepath.Join(t.TempDir(), "t.db"))
+	require.NoError(t, err)
+	defer db.Close()
+	gaz, _ := geo.Load()
+	geoSvc := service.NewGeoService(db, gaz)
+
+	mk := func(id string, daysAgo int) {
+		taken := time.Now().AddDate(0, 0, -daysAgo).UTC().Format("2006-01-02 15:04:05")
+		db.Exec(`INSERT INTO assets(id,file_path,status,taken_at,is_live_photo_video) VALUES(?,?, 'indexed', ?, 0)`, id, "/x/"+id, taken)
+		db.Exec(`INSERT INTO asset_exif(asset_id,latitude,longitude) VALUES(?,35.6895,139.6917)`, id)
+		geoSvc.GeocodeAsset(id)
+	}
+	mk("a1", 300)
+	mk("a2", 299)
+	mk("b1", 5)
+	mk("b2", 4)
+
+	svc := service.NewPlacesService(db, gaz, geoSvc)
+	resp, _ := svc.ListPlaces()
+	key := resp.Places[0].Key
+	require.Equal(t, 2, resp.Places[0].Trips)
+
+	visits, err := svc.Visits(key)
+	require.NoError(t, err)
+	require.Len(t, visits, 2)
+	require.True(t, visits[0].Current)
+	require.Equal(t, 2, visits[0].Photos)
+}

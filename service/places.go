@@ -123,5 +123,134 @@ LIMIT ?`, cityID, n)
 	return out
 }
 
-// tripCount is a placeholder replaced in a later task.
-func (s *PlacesService) tripCount(cityID int32) int { return 1 }
+const tripGapDays = 14
+
+type takenItem struct {
+	id string
+	t  time.Time
+}
+
+// loadTakenTimes returns ordered (asc) taken_at + asset id for a city.
+func (s *PlacesService) loadTakenTimes(cityID int32) ([]takenItem, error) {
+	rows, err := s.db.Query(`
+SELECT a.id, a.taken_at FROM asset_geo g
+JOIN assets a ON a.id=g.asset_id AND a.deleted_at IS NULL AND a.is_live_photo_video=0
+WHERE g.city_id=? AND a.taken_at IS NOT NULL
+ORDER BY a.taken_at ASC`, cityID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []takenItem
+	for rows.Next() {
+		var id string
+		var ts sql.NullString
+		if err := rows.Scan(&id, &ts); err != nil {
+			return nil, err
+		}
+		if tt := parseSQLiteTime(ts); tt != nil {
+			out = append(out, takenItem{id: id, t: *tt})
+		}
+	}
+	return out, rows.Err()
+}
+
+type segment struct{ start, end int }
+
+func splitTrips(times []time.Time) []segment {
+	if len(times) == 0 {
+		return nil
+	}
+	segs := []segment{{0, 0}}
+	for i := 1; i < len(times); i++ {
+		if times[i].Sub(times[i-1]) > tripGapDays*24*time.Hour {
+			segs = append(segs, segment{i, i})
+		} else {
+			segs[len(segs)-1].end = i
+		}
+	}
+	return segs
+}
+
+func (s *PlacesService) tripCount(cityID int32) int {
+	items, err := s.loadTakenTimes(cityID)
+	if err != nil || len(items) == 0 {
+		return 1
+	}
+	ts := make([]time.Time, len(items))
+	for i := range items {
+		ts[i] = items[i].t
+	}
+	return len(splitTrips(ts))
+}
+
+// Visits returns detected trips, most recent first.
+func (s *PlacesService) Visits(cityID int32) ([]Visit, error) {
+	items, err := s.loadTakenTimes(cityID)
+	if err != nil {
+		return nil, err
+	}
+	ts := make([]time.Time, len(items))
+	for i := range items {
+		ts[i] = items[i].t
+	}
+	segs := splitTrips(ts)
+	var out []Visit
+	for _, seg := range segs {
+		from := items[seg.start].t
+		to := items[seg.end].t
+		v := Visit{
+			From:    from.Format("2006-01-02"),
+			To:      to.Format("2006-01-02"),
+			Days:    int(to.Sub(from).Hours()/24) + 1,
+			Photos:  seg.end - seg.start + 1,
+			Current: time.Since(to) <= recentDays*24*time.Hour,
+		}
+		if from.Format("Jan 2, 2006") == to.Format("Jan 2, 2006") {
+			v.When = from.Format("Jan 2, 2006")
+		} else {
+			v.When = from.Format("Jan 2") + " – " + to.Format("Jan 2, 2006")
+		}
+		for i := seg.start; i <= seg.end && len(v.Thumbs) < 6; i++ {
+			v.Thumbs = append(v.Thumbs, items[i].id)
+		}
+		v.Faces = s.topFacesBetween(cityID, from, to, 3)
+		v.Spots = len(s.spots(cityID))
+		out = append(out, v)
+	}
+	// reverse → most recent first
+	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+		out[i], out[j] = out[j], out[i]
+	}
+	return out, nil
+}
+
+// topFacesBetween returns up to n person names appearing in a city within [from,to].
+func (s *PlacesService) topFacesBetween(cityID int32, from, to time.Time, n int) []string {
+	rows, err := s.db.Query(`
+SELECT p.name, COUNT(*) c FROM asset_geo g
+JOIN assets a ON a.id=g.asset_id AND a.deleted_at IS NULL
+JOIN face_person fp ON fp.face_id IN (
+    SELECT fd.id FROM face_detections fd WHERE fd.asset_id=a.id
+)
+JOIN persons p ON p.id=fp.person_id
+WHERE g.city_id=? AND a.taken_at>=? AND a.taken_at<=? AND p.name IS NOT NULL AND p.name<>''
+GROUP BY p.id ORDER BY c DESC LIMIT ?`,
+		cityID, from.Format("2006-01-02 15:04:05"), to.Format("2006-01-02 15:04:05"), n)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var name string
+		var c int
+		if rows.Scan(&name, &c) == nil {
+			out = append(out, name)
+		}
+	}
+	return out
+}
+
+// spots is a placeholder replaced in a later task.
+func (s *PlacesService) spots(cityID int32) []Spot { return nil }
