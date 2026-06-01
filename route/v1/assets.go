@@ -29,14 +29,28 @@ func NewAssetsHandler(svc service.Services, thumbDir string) *AssetsHandler {
 }
 
 // List returns a paginated list of assets.
-// Query params: limit (default 50, max 200), offset (default 0).
+// Query params: limit (default 50, max 200), offset (default 0),
+// place_key (city geonameid, int), spot_key ("cityID:gx:gy").
 func (h *AssetsHandler) List(c echo.Context) error {
 	limit, _ := strconv.Atoi(c.QueryParam("limit"))
 	offset, _ := strconv.Atoi(c.QueryParam("offset"))
 	if limit <= 0 || limit > 200 {
 		limit = 50
 	}
-	assets, err := h.svc.Search().ListAssets(JWTUserID(c), limit, offset)
+
+	placeKeyStr := c.QueryParam("place_key")
+	spotKey := c.QueryParam("spot_key")
+
+	var f service.AssetFilter
+	f.SpotKey = spotKey
+	if placeKeyStr != "" {
+		pk, err := strconv.Atoi(placeKeyStr)
+		if err == nil {
+			f.PlaceKey = int32(pk)
+		}
+	}
+
+	assets, err := h.svc.Search().ListAssets(JWTUserID(c), limit, offset, f)
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
 	}

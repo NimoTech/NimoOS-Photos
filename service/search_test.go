@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/NimoTech/NimoOS-Photos/pkg/geo"
 	"github.com/NimoTech/NimoOS-Photos/pkg/sqlite"
 	"github.com/NimoTech/NimoOS-Photos/service"
 	"github.com/stretchr/testify/require"
@@ -140,4 +141,90 @@ func TestGetAssetWithoutExifRow(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "bare", a.ID)
 	require.Equal(t, 0, a.Width)
+}
+
+// TestListAssetsByPlaceKey 验证 place_key 过滤只返回该城市的照片。
+// TestListAssetsBySpotKey 验证 spot_key 精确过滤到网格单元内的照片。
+func TestListAssetsByPlaceAndSpotKey(t *testing.T) {
+	db, err := sqlite.Open(filepath.Join(t.TempDir(), "geo_filter.db"))
+	require.NoError(t, err)
+	defer db.Close()
+
+	gaz, err := geo.Load()
+	require.NoError(t, err)
+	geoSvc := service.NewGeoService(db, gaz)
+
+	// seed 辅助：插入 asset + exif，并反向地理编码写入 asset_geo
+	seed := func(id string, lat, lon float64) {
+		_, err := db.Exec(
+			`INSERT INTO assets(id,file_path,status,taken_at,is_live_photo_video)
+			 VALUES(?,?,'indexed','2026-01-01 00:00:00',0)`,
+			id, "/x/"+id,
+		)
+		require.NoError(t, err)
+		_, err = db.Exec(`INSERT INTO asset_exif(asset_id,latitude,longitude) VALUES(?,?,?)`, id, lat, lon)
+		require.NoError(t, err)
+		require.NoError(t, geoSvc.GeocodeAsset(id))
+	}
+
+	// 东京 2 张：同网格坐标 (35.6895, 139.6917)
+	seed("tok1", 35.6895, 139.6917)
+	seed("tok2", 35.6895, 139.6917)
+	// 纽约 1 张
+	seed("nyc1", 40.71, -74.00)
+
+	// 取东京的 city_id（通过 PlacesService.ListPlaces 查 City=="Tokyo"）
+	placesSvc := service.NewPlacesService(db, gaz, geoSvc)
+	resp, err := placesSvc.ListPlaces()
+	require.NoError(t, err)
+
+	var tokyoCityID int32
+	for _, p := range resp.Places {
+		if p.City == "Tokyo" {
+			tokyoCityID = p.Key
+			break
+		}
+	}
+	require.NotZero(t, tokyoCityID, "Tokyo must appear in ListPlaces")
+
+	searchSvc := service.NewSearchService(db, nil)
+
+	// ── 测试 place_key 过滤 ─────────────────────────────────
+	assets, err := searchSvc.ListAssets("default", 50, 0,
+		service.AssetFilter{PlaceKey: tokyoCityID})
+	require.NoError(t, err)
+	require.Len(t, assets, 2, "place_key filter must return only Tokyo photos")
+	for _, a := range assets {
+		require.Contains(t, []string{"tok1", "tok2"}, a.ID)
+	}
+
+	// ── 测试 spot_key 过滤 ──────────────────────────────────
+	// spot_key 格式：cityID:int(lat/0.01):int(lon/0.01)
+	tokLat, tokLon := 35.6895, 139.6917
+	gx := int(tokLat / 0.01) // 3568
+	gy := int(tokLon / 0.01) // 13969
+	spotKey := fmt.Sprintf("%d:%d:%d", tokyoCityID, gx, gy)
+
+	assets, err = searchSvc.ListAssets("default", 50, 0,
+		service.AssetFilter{SpotKey: spotKey})
+	require.NoError(t, err)
+	require.Len(t, assets, 2, "spot_key filter must return only the 2 Tokyo photos in that grid cell")
+	for _, a := range assets {
+		require.Contains(t, []string{"tok1", "tok2"}, a.ID)
+	}
+
+	// ── 纽约 place_key 过滤 ─────────────────────────────────
+	var nycCityID int32
+	for _, p := range resp.Places {
+		if p.City != "Tokyo" {
+			nycCityID = p.Key
+			break
+		}
+	}
+	require.NotZero(t, nycCityID)
+	assets, err = searchSvc.ListAssets("default", 50, 0,
+		service.AssetFilter{PlaceKey: nycCityID})
+	require.NoError(t, err)
+	require.Len(t, assets, 1)
+	require.Equal(t, "nyc1", assets[0].ID)
 }

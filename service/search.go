@@ -3,10 +3,42 @@ package service
 import (
 	"database/sql"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/NimoTech/NimoOS-Photos/pkg/sqlite"
 )
+
+// AssetFilter carries optional geo filters for ListAssets.
+// PlaceKey > 0 filters by city (geonameid).
+// SpotKey non-empty filters by spot grid cell in format "cityID:gx:gy".
+// When both are set, SpotKey takes precedence (it already implies the city).
+type AssetFilter struct {
+	PlaceKey int32
+	SpotKey  string
+}
+
+// parseSpotKey splits a spot_key of the form "cityID:gx:gy" into its three
+// integer components. Returns an error if the format is invalid.
+func parseSpotKey(key string) (cityID int32, gx, gy int, err error) {
+	parts := strings.SplitN(key, ":", 3)
+	if len(parts) != 3 {
+		return 0, 0, 0, fmt.Errorf("invalid spot_key %q: expected cityID:gx:gy", key)
+	}
+	c, e := strconv.ParseInt(parts[0], 10, 32)
+	if e != nil {
+		return 0, 0, 0, fmt.Errorf("invalid spot_key city: %w", e)
+	}
+	gxi, e := strconv.Atoi(parts[1])
+	if e != nil {
+		return 0, 0, 0, fmt.Errorf("invalid spot_key gx: %w", e)
+	}
+	gyi, e := strconv.Atoi(parts[2])
+	if e != nil {
+		return 0, 0, 0, fmt.Errorf("invalid spot_key gy: %w", e)
+	}
+	return int32(c), gxi, gyi, nil
+}
 
 // textEmbedder is the minimal interface SearchService needs from the ML layer.
 // It is satisfied by MLProvider (defined in indexer.go) without coupling.
@@ -301,8 +333,50 @@ func (s *SearchService) MergePersons(fromID, intoID string) error {
 
 // ListAssets returns paginated assets (non-live-photo-video) ordered by
 // descending taken_at / indexed_at.
-func (s *SearchService) ListAssets(userID string, limit, offset int) ([]Asset, error) {
-	rows, err := s.db.Query(`
+//
+// An optional AssetFilter may be passed as the fourth argument to restrict
+// results by city (PlaceKey) or spot grid cell (SpotKey). When SpotKey is
+// set it takes precedence over PlaceKey.
+func (s *SearchService) ListAssets(userID string, limit, offset int, filters ...AssetFilter) ([]Asset, error) {
+	var f AssetFilter
+	if len(filters) > 0 {
+		f = filters[0]
+	}
+
+	// Build the geo JOIN + WHERE clauses.
+	var geoJoin string
+	var geoClauses []string
+	var geoArgs []any
+
+	if f.SpotKey != "" {
+		cityID, gx, gy, err := parseSpotKey(f.SpotKey)
+		if err != nil {
+			return nil, fmt.Errorf("ListAssets: %w", err)
+		}
+		geoJoin = `JOIN asset_geo g ON g.asset_id = a.id`
+		geoClauses = append(geoClauses,
+			`g.city_id = ?`,
+			`CAST(g.lat / 0.01 AS INT) = ?`,
+			`CAST(g.lon / 0.01 AS INT) = ?`,
+		)
+		geoArgs = append(geoArgs, cityID, gx, gy)
+	} else if f.PlaceKey > 0 {
+		geoJoin = `JOIN asset_geo g ON g.asset_id = a.id`
+		geoClauses = append(geoClauses, `g.city_id = ?`)
+		geoArgs = append(geoArgs, f.PlaceKey)
+	}
+
+	whereExtra := ""
+	if len(geoClauses) > 0 {
+		whereExtra = " AND " + strings.Join(geoClauses, " AND ")
+	}
+
+	// userID must be first (for the favorites LEFT JOIN ON clause).
+	args := []any{userID}
+	args = append(args, geoArgs...)
+	args = append(args, limit, offset)
+
+	q := `
 SELECT a.id, a.file_path, a.file_size, COALESCE(a.mime_type,''),
        COALESCE(a.original_name,''), a.taken_at, a.duration_ms,
        COALESCE(a.live_photo_video_id,''), a.is_live_photo_video,
@@ -314,9 +388,12 @@ SELECT a.id, a.file_path, a.file_size, COALESCE(a.mime_type,''),
 FROM assets a
 LEFT JOIN asset_exif e ON e.asset_id = a.id
 LEFT JOIN asset_favorites f ON f.asset_id = a.id AND f.user_id = ?
-WHERE a.is_live_photo_video = 0 AND a.deleted_at IS NULL
+` + geoJoin + `
+WHERE a.is_live_photo_video = 0 AND a.deleted_at IS NULL` + whereExtra + `
 ORDER BY COALESCE(a.taken_at, a.indexed_at) DESC
-LIMIT ? OFFSET ?`, userID, limit, offset)
+LIMIT ? OFFSET ?`
+
+	rows, err := s.db.Query(q, args...)
 	if err != nil {
 		return nil, fmt.Errorf("ListAssets query: %w", err)
 	}
