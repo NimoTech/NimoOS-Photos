@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/NimoTech/NimoOS-Photos/pkg/config"
+	"github.com/NimoTech/NimoOS-Photos/pkg/geo"
 	"github.com/NimoTech/NimoOS-Photos/pkg/mlclient"
 	"github.com/NimoTech/NimoOS-Photos/pkg/sqlite"
 	"go.uber.org/zap"
@@ -27,6 +28,7 @@ type Services interface {
 	Trash() *TrashService
 	Views() *ViewsService
 	Persons() *PersonService
+	Geo() *GeoService
 	RestartWatcher(dirs []string)
 }
 
@@ -44,6 +46,7 @@ type services struct {
 	trash     *TrashService
 	views     *ViewsService
 	persons   *PersonService
+	geo       *GeoService
 	parentCtx context.Context
 }
 
@@ -59,6 +62,7 @@ func (s *services) Favorites() *FavoritesService { return s.favorites }
 func (s *services) Trash() *TrashService         { return s.trash }
 func (s *services) Views() *ViewsService         { return s.views }
 func (s *services) Persons() *PersonService      { return s.persons }
+func (s *services) Geo() *GeoService             { return s.geo }
 
 // NewService wires all service-layer components together from cfg and returns a
 // ready-to-use Services handle. It panics if the database cannot be opened.
@@ -89,6 +93,11 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 	views := NewViewsService(db)
 	search := NewSearchService(db, ml)
 	persons := NewPersonService(db)
+	gaz, gerr := geo.Load()
+	if gerr != nil {
+		panic("nimoos-photos: failed to load gazetteer: " + gerr.Error())
+	}
+	geoSvc := NewGeoService(db, gaz)
 	faces := NewFaceService(db)
 	faces.SetTaskRegistry(taskReg)
 	embedder := NewEmbedder(db, ml, idx, taskReg)
@@ -99,6 +108,14 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 		go func() {
 			if err := faces.RunClustering(parentCtx); err != nil {
 				zap.L().Warn("post-batch face clustering failed", zap.Error(err))
+			}
+		}()
+		go func() {
+			for {
+				n, err := geoSvc.BackfillPending(500)
+				if err != nil || n == 0 {
+					return
+				}
 			}
 		}()
 	})
@@ -113,6 +130,8 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 		}
 		watcher.PairLivePhotos() //nolint:errcheck
 	}()
+
+	geoSvc.StartScheduler(parentCtx)
 
 	// 回收站自动清理：启动时跑一次，之后每 24 小时跑一次，到期项永久删除。
 	go func() {
@@ -151,6 +170,7 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 		trash:     trash,
 		views:     views,
 		persons:   persons,
+		geo:       geoSvc,
 		parentCtx: parentCtx,
 	}
 }

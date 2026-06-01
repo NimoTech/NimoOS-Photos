@@ -10,6 +10,23 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// TestServicesExposesGeo 断言 NewService 构造的 Services 能通过 Geo() 拿到非 nil 的 GeoService。
+func TestServicesExposesGeo(t *testing.T) {
+	tmp := t.TempDir()
+	cfg := &config.Config{
+		DataPath:   tmp,
+		MLEndpoint: "http://127.0.0.1:0",
+		Workers:    1,
+		WatchDirs:  nil,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	svc := NewService(ctx, cfg, func(Task) {})
+
+	require.NotNil(t, svc.Geo())
+}
+
 // TestNewService_TaskPublisherWired 断言 NewService 把 publisher 接到 TaskRegistry
 // 上，registry.Upsert 走通后回调被触发。
 func TestNewService_TaskPublisherWired(t *testing.T) {
