@@ -11,14 +11,20 @@ import (
 
 // PlacesService aggregates geocoded assets into places, spots, trips and insights.
 type PlacesService struct {
-	db  *sql.DB
-	gaz *geo.Gazetteer
-	geo *GeoService
+	db     *sql.DB
+	gaz    *geo.Gazetteer
+	geo    *GeoService
+	albums *AlbumService
 }
 
 // NewPlacesService constructs a PlacesService.
 func NewPlacesService(db *sql.DB, gaz *geo.Gazetteer, geoSvc *GeoService) *PlacesService {
 	return &PlacesService{db: db, gaz: gaz, geo: geoSvc}
+}
+
+// NewPlacesServiceWithAlbums constructs a PlacesService with album creation support.
+func NewPlacesServiceWithAlbums(db *sql.DB, gaz *geo.Gazetteer, geoSvc *GeoService, albums *AlbumService) *PlacesService {
+	return &PlacesService{db: db, gaz: gaz, geo: geoSvc, albums: albums}
 }
 
 const recentDays = 30
@@ -386,4 +392,91 @@ func (s *PlacesService) insights(cityID int32, p Place, resp PlacesResponse) []I
 			Params: map[string]interface{}{"count": p.Count, "trips": p.Trips}})
 	}
 	return out
+}
+
+// SetCover persists a per-user cover override for a place. Validates the asset exists.
+func (s *PlacesService) SetCover(userID string, placeKey int32, assetID string) error {
+	var n int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM assets WHERE id=? AND deleted_at IS NULL`, assetID).Scan(&n); err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrNotFound
+	}
+	_, err := s.db.Exec(`
+INSERT INTO place_cover_overrides(user_id, place_key, asset_id) VALUES(?,?,?)
+ON CONFLICT(user_id, place_key) DO UPDATE SET asset_id=excluded.asset_id`,
+		userID, placeKey, assetID)
+	return err
+}
+
+// GetCover returns the override asset id, validating it still exists ("" if none/stale).
+func (s *PlacesService) GetCover(userID string, placeKey int32) (string, error) {
+	var id string
+	err := s.db.QueryRow(`SELECT asset_id FROM place_cover_overrides WHERE user_id=? AND place_key=?`,
+		userID, placeKey).Scan(&id)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	var n int
+	s.db.QueryRow(`SELECT COUNT(*) FROM assets WHERE id=? AND deleted_at IS NULL`, id).Scan(&n) //nolint:errcheck
+	if n == 0 {
+		return "", nil
+	}
+	return id, nil
+}
+
+// ResetCover removes a place's cover override.
+func (s *PlacesService) ResetCover(userID string, placeKey int32) error {
+	_, err := s.db.Exec(`DELETE FROM place_cover_overrides WHERE user_id=? AND place_key=?`, userID, placeKey)
+	return err
+}
+
+// placeAssetIDs returns all asset ids for a city, optionally within [from, to] (YYYY-MM-DD).
+func (s *PlacesService) placeAssetIDs(cityID int32, from, to string) ([]string, error) {
+	q := `
+SELECT a.id FROM asset_geo g
+JOIN assets a ON a.id=g.asset_id AND a.deleted_at IS NULL AND a.is_live_photo_video=0
+WHERE g.city_id=?`
+	args := []any{cityID}
+	if from != "" && to != "" {
+		q += ` AND a.taken_at>=? AND a.taken_at<=?`
+		args = append(args, from+" 00:00:00", to+" 23:59:59")
+	}
+	q += ` ORDER BY a.taken_at ASC`
+	rows, err := s.db.Query(q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if rows.Scan(&id) == nil {
+			ids = append(ids, id)
+		}
+	}
+	return ids, rows.Err()
+}
+
+// CreateAlbumFromPlace creates an album from a city's assets (optionally a trip window).
+func (s *PlacesService) CreateAlbumFromPlace(cityID int32, name, from, to string) (string, int, error) {
+	ids, err := s.placeAssetIDs(cityID, from, to)
+	if err != nil {
+		return "", 0, err
+	}
+	if len(ids) == 0 {
+		return "", 0, ErrInvalidInput
+	}
+	album, err := s.albums.Create(name)
+	if err != nil {
+		return "", 0, err
+	}
+	if err := s.albums.BatchAddAssets(album.ID, ids); err != nil {
+		return "", 0, err
+	}
+	return album.ID, len(ids), nil
 }

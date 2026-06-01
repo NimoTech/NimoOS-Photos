@@ -117,6 +117,43 @@ func TestGetPlaceFull(t *testing.T) {
 	}
 }
 
+func TestCoverOverride(t *testing.T) {
+	svc := placesFixture(t)
+	resp, _ := svc.ListPlaces()
+	key := resp.Places[0].Key
+
+	require.NoError(t, svc.SetCover("1", key, resp.Places[0].Thumbs[0]))
+	got, err := svc.GetCover("1", key)
+	require.NoError(t, err)
+	require.Equal(t, resp.Places[0].Thumbs[0], got)
+
+	require.NoError(t, svc.ResetCover("1", key))
+	got, _ = svc.GetCover("1", key)
+	require.Equal(t, "", got)
+}
+
+func TestCreateAlbumFromPlace(t *testing.T) {
+	db, err := sqlite.Open(filepath.Join(t.TempDir(), "t.db"))
+	require.NoError(t, err)
+	defer db.Close()
+	gaz, _ := geo.Load()
+	geoSvc := service.NewGeoService(db, gaz)
+	for _, a := range []string{"a1", "a2"} {
+		db.Exec(`INSERT INTO assets(id,file_path,status,taken_at,is_live_photo_video) VALUES(?,?, 'indexed', '2026-03-01 10:00:00', 0)`, a, "/x/"+a)
+		db.Exec(`INSERT INTO asset_exif(asset_id,latitude,longitude) VALUES(?,35.6895,139.6917)`, a)
+		geoSvc.GeocodeAsset(a)
+	}
+	albums := service.NewAlbumService(db)
+	svc := service.NewPlacesServiceWithAlbums(db, gaz, geoSvc, albums)
+	resp, _ := svc.ListPlaces()
+	key := resp.Places[0].Key
+
+	albumID, count, err := svc.CreateAlbumFromPlace(key, "Tokyo Trip", "", "")
+	require.NoError(t, err)
+	require.NotEmpty(t, albumID)
+	require.Equal(t, 2, count)
+}
+
 func TestTripsSplitByGap(t *testing.T) {
 	db, err := sqlite.Open(filepath.Join(t.TempDir(), "t.db"))
 	require.NoError(t, err)
