@@ -154,6 +154,22 @@ func TestCreateAlbumFromPlace(t *testing.T) {
 	require.Equal(t, 2, count)
 }
 
+func TestCoverCandidatesTabs(t *testing.T) {
+	svc := placesFixture(t)
+	resp, _ := svc.ListPlaces()
+	key := resp.Places[0].Key
+
+	res, err := svc.CoverCandidates(key, "all", "", 0, 40)
+	require.NoError(t, err)
+	require.Equal(t, resp.Places[0].Count, res.Total)
+	require.Len(t, res.Items, resp.Places[0].Count)
+	require.Equal(t, 1, res.TotalPages)
+
+	recent, err := svc.CoverCandidates(key, "recent", "", 0, 40)
+	require.NoError(t, err)
+	require.NotEmpty(t, recent.Items)
+}
+
 func TestTripsSplitByGap(t *testing.T) {
 	db, err := sqlite.Open(filepath.Join(t.TempDir(), "t.db"))
 	require.NoError(t, err)

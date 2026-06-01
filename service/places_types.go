@@ -81,3 +81,20 @@ var regionLabels = map[string]string{
 	"asia": "Asia", "americas": "Americas", "europe": "Europe",
 	"africa": "Africa", "oceania": "Oceania", "antarctica": "Antarctica",
 }
+
+// CoverCandidatesResult is the GET /places/{key}/cover-candidates payload.
+type CoverCandidatesResult struct {
+	Tabs       []CoverTab `json:"tabs"`
+	Items      []string   `json:"items"`
+	Page       int        `json:"page"`
+	TotalPages int        `json:"totalPages"`
+	Total      int        `json:"total"`
+}
+
+// CoverTab is one source tab with its photo count.
+type CoverTab struct {
+	ID    string `json:"id"`
+	Label string `json:"label"`
+	Icon  string `json:"icon"`
+	Count int    `json:"count"`
+}

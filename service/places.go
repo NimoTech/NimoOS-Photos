@@ -462,6 +462,78 @@ WHERE g.city_id=?`
 	return ids, rows.Err()
 }
 
+// CoverCandidates returns paged asset ids for the cover picker.
+// tab: "recent" | "top" | "fav" | "all"
+// q is reserved for future search filtering (ignored this release).
+// asset_favorites has a user_id column; fav counts here are cross-user (all favorites for the place).
+func (s *PlacesService) CoverCandidates(cityID int32, tab, q string, page, pageSize int) (CoverCandidatesResult, error) {
+	base := `
+FROM asset_geo g
+JOIN assets a ON a.id=g.asset_id AND a.deleted_at IS NULL AND a.is_live_photo_video=0`
+	order := ` ORDER BY a.taken_at DESC`
+	join := ``
+	where := ` WHERE g.city_id=?`
+	switch tab {
+	case "top":
+		join = ` LEFT JOIN asset_views v ON v.asset_id=a.id`
+		order = ` ORDER BY COALESCE(v.view_count,0) DESC, a.taken_at DESC`
+	case "fav":
+		join = ` JOIN asset_favorites f ON f.asset_id=a.id`
+	}
+	rows, err := s.db.Query(`SELECT a.id `+base+join+where+order, cityID)
+	if err != nil {
+		return CoverCandidatesResult{}, err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if rows.Scan(&id) == nil {
+			ids = append(ids, id)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return CoverCandidatesResult{}, err
+	}
+
+	res := CoverCandidatesResult{Page: page, Total: len(ids)}
+	res.TotalPages = (len(ids) + pageSize - 1) / pageSize
+	if res.TotalPages < 1 {
+		res.TotalPages = 1
+	}
+	start := page * pageSize
+	if start < len(ids) {
+		end := start + pageSize
+		if end > len(ids) {
+			end = len(ids)
+		}
+		res.Items = ids[start:end]
+	}
+	res.Tabs = s.coverTabCounts(cityID)
+	return res, nil
+}
+
+func (s *PlacesService) coverTabCounts(cityID int32) []CoverTab {
+	count := func(extra string) int {
+		var n int
+		s.db.QueryRow(`SELECT COUNT(*) FROM asset_geo g
+JOIN assets a ON a.id=g.asset_id AND a.deleted_at IS NULL AND a.is_live_photo_video=0`+extra+
+			` WHERE g.city_id=?`, cityID).Scan(&n) //nolint:errcheck
+		return n
+	}
+	all := count("")
+	recent := all
+	if recent > 12 {
+		recent = 12
+	}
+	return []CoverTab{
+		{ID: "recent", Label: "近期", Icon: "clock", Count: recent},
+		{ID: "top", Label: "最高分", Icon: "sparkles", Count: count(" LEFT JOIN asset_views v ON v.asset_id=a.id")},
+		{ID: "fav", Label: "已收藏", Icon: "star", Count: count(" JOIN asset_favorites f ON f.asset_id=a.id")},
+		{ID: "all", Label: "全部", Icon: "grid", Count: all},
+	}
+}
+
 // CreateAlbumFromPlace creates an album from a city's assets (optionally a trip window).
 func (s *PlacesService) CreateAlbumFromPlace(cityID int32, name, from, to string) (string, int, error) {
 	ids, err := s.placeAssetIDs(cityID, from, to)
