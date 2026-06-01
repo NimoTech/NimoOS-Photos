@@ -18,9 +18,9 @@ type AssetFilter struct {
 	SpotKey  string
 }
 
-// parseSpotKey splits a spot_key of the form "cityID:gx:gy" into its three
+// ParseSpotKey splits a spot_key of the form "cityID:gx:gy" into its three
 // integer components. Returns an error if the format is invalid.
-func parseSpotKey(key string) (cityID int32, gx, gy int, err error) {
+func ParseSpotKey(key string) (cityID int32, gx, gy int, err error) {
 	parts := strings.SplitN(key, ":", 3)
 	if len(parts) != 3 {
 		return 0, 0, 0, fmt.Errorf("invalid spot_key %q: expected cityID:gx:gy", key)
@@ -349,7 +349,7 @@ func (s *SearchService) ListAssets(userID string, limit, offset int, filters ...
 	var geoArgs []any
 
 	if f.SpotKey != "" {
-		cityID, gx, gy, err := parseSpotKey(f.SpotKey)
+		cityID, gx, gy, err := ParseSpotKey(f.SpotKey)
 		if err != nil {
 			return nil, fmt.Errorf("ListAssets: %w", err)
 		}

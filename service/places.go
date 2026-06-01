@@ -201,6 +201,7 @@ func (s *PlacesService) Visits(cityID int32) ([]Visit, error) {
 		ts[i] = items[i].t
 	}
 	segs := splitTrips(ts)
+	spotCount := len(s.spots(cityID))
 	var out []Visit
 	for _, seg := range segs {
 		from := items[seg.start].t
@@ -221,7 +222,7 @@ func (s *PlacesService) Visits(cityID int32) ([]Visit, error) {
 			v.Thumbs = append(v.Thumbs, items[i].id)
 		}
 		v.Faces = s.topFacesBetween(cityID, from, to, 3)
-		v.Spots = len(s.spots(cityID))
+		v.Spots = spotCount
 		out = append(out, v)
 	}
 	// reverse → most recent first
@@ -236,11 +237,11 @@ func (s *PlacesService) topFacesBetween(cityID int32, from, to time.Time, n int)
 	rows, err := s.db.Query(`
 SELECT p.name, COUNT(*) c FROM asset_geo g
 JOIN assets a ON a.id=g.asset_id AND a.deleted_at IS NULL
-JOIN face_person fp ON fp.face_id IN (
-    SELECT fd.id FROM face_detections fd WHERE fd.asset_id=a.id
-)
+JOIN face_detections fd ON fd.asset_id=a.id
+JOIN face_person fp ON fp.face_id=fd.id
 JOIN persons p ON p.id=fp.person_id
 WHERE g.city_id=? AND a.taken_at>=? AND a.taken_at<=? AND p.name IS NOT NULL AND p.name<>''
+  AND COALESCE(fd.excluded,0)=0 AND COALESCE(p.hidden,0)=0
 GROUP BY p.id ORDER BY c DESC LIMIT ?`,
 		cityID, from.Format("2006-01-02 15:04:05"), to.Format("2006-01-02 15:04:05"), n)
 	if err != nil {
@@ -496,6 +497,9 @@ JOIN assets a ON a.id=g.asset_id AND a.deleted_at IS NULL AND a.is_live_photo_vi
 		return CoverCandidatesResult{}, err
 	}
 
+	if page < 0 {
+		page = 0
+	}
 	res := CoverCandidatesResult{Page: page, Total: len(ids)}
 	res.TotalPages = (len(ids) + pageSize - 1) / pageSize
 	if res.TotalPages < 1 {
@@ -548,6 +552,7 @@ func (s *PlacesService) CreateAlbumFromPlace(cityID int32, name, from, to string
 		return "", 0, err
 	}
 	if err := s.albums.BatchAddAssets(album.ID, ids); err != nil {
+		_ = s.albums.Delete(album.ID)
 		return "", 0, err
 	}
 	return album.ID, len(ids), nil

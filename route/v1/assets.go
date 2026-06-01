@@ -42,12 +42,18 @@ func (h *AssetsHandler) List(c echo.Context) error {
 	spotKey := c.QueryParam("spot_key")
 
 	var f service.AssetFilter
-	f.SpotKey = spotKey
 	if placeKeyStr != "" {
 		pk, err := strconv.Atoi(placeKeyStr)
-		if err == nil {
-			f.PlaceKey = int32(pk)
+		if err != nil {
+			return echo.NewHTTPError(http.StatusBadRequest, "invalid place_key")
 		}
+		f.PlaceKey = int32(pk)
+	}
+	if spotKey != "" {
+		if _, _, _, err := service.ParseSpotKey(spotKey); err != nil {
+			return echo.NewHTTPError(http.StatusBadRequest, "invalid spot_key")
+		}
+		f.SpotKey = spotKey
 	}
 
 	assets, err := h.svc.Search().ListAssets(JWTUserID(c), limit, offset, f)

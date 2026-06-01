@@ -79,6 +79,9 @@ LIMIT ?`, limit)
 		ids = append(ids, id)
 	}
 	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, fmt.Errorf("BackfillPending iterate: %w", err)
+	}
 	n := 0
 	for _, id := range ids {
 		if err := s.GeocodeAsset(id); err != nil {

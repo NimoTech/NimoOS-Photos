@@ -170,6 +170,20 @@ func TestCoverCandidatesTabs(t *testing.T) {
 	require.NotEmpty(t, recent.Items)
 }
 
+// TestCoverCandidatesNegativePage 确认 page<0 不 panic，且行为等同于 page=0。
+func TestCoverCandidatesNegativePage(t *testing.T) {
+	svc := placesFixture(t)
+	resp, _ := svc.ListPlaces()
+	key := resp.Places[0].Key
+
+	// page=-1 不应 panic，且应等同于 page=0 的结果。
+	res, err := svc.CoverCandidates(key, "all", "", -1, 40)
+	require.NoError(t, err)
+	require.Equal(t, 0, res.Page)
+	require.Equal(t, resp.Places[0].Count, res.Total)
+	require.Len(t, res.Items, resp.Places[0].Count)
+}
+
 func TestTripsSplitByGap(t *testing.T) {
 	db, err := sqlite.Open(filepath.Join(t.TempDir(), "t.db"))
 	require.NoError(t, err)
