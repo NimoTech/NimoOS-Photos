@@ -36,3 +36,30 @@ func TestGeocodeAssetWritesRow(t *testing.T) {
 	require.Equal(t, "asia", region)
 	require.NotZero(t, cityID)
 }
+
+func TestBackfillPending(t *testing.T) {
+	db, err := sqlite.Open(filepath.Join(t.TempDir(), "t.db"))
+	require.NoError(t, err)
+	defer db.Close()
+
+	for _, a := range []struct {
+		id       string
+		lat, lon float64
+	}{{"a1", 35.68, 139.76}, {"a2", 40.71, -74.0}} {
+		_, err = db.Exec(`INSERT INTO assets(id, file_path, status) VALUES(?,?, 'indexed')`, a.id, "/x/"+a.id)
+		require.NoError(t, err)
+		_, err = db.Exec(`INSERT INTO asset_exif(asset_id, latitude, longitude) VALUES(?,?,?)`, a.id, a.lat, a.lon)
+		require.NoError(t, err)
+	}
+
+	gaz, _ := geo.Load()
+	svc := service.NewGeoService(db, gaz)
+
+	n, err := svc.BackfillPending(10)
+	require.NoError(t, err)
+	require.Equal(t, 2, n)
+
+	n, err = svc.BackfillPending(10)
+	require.NoError(t, err)
+	require.Equal(t, 0, n)
+}
