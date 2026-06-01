@@ -122,3 +122,12 @@ func (g *Gazetteer) CityByID(id int32) (City, bool) {
 
 // Len returns the number of loaded cities.
 func (g *Gazetteer) Len() int { return len(g.cities) }
+
+// NearestFeature returns the closest city name within maxKm, else ("", false).
+func (g *Gazetteer) NearestFeature(lat, lon, maxKm float64) (string, bool) {
+	idx, d := g.nearest(lat, lon)
+	if idx < 0 || d > maxKm {
+		return "", false
+	}
+	return g.cities[idx].Name, true
+}

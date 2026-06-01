@@ -252,5 +252,76 @@ GROUP BY p.id ORDER BY c DESC LIMIT ?`,
 	return out
 }
 
-// spots is a placeholder replaced in a later task.
-func (s *PlacesService) spots(cityID int32) []Spot { return nil }
+const spotGrid = 0.01 // ~1km
+const spotMinPhotos = 3
+const spotMaxCount = 8
+
+// Spots clusters a city's assets into fine-grained spots.
+func (s *PlacesService) Spots(cityID int32) []Spot { return s.spots(cityID) }
+
+func (s *PlacesService) spots(cityID int32) []Spot {
+	rows, err := s.db.Query(`
+SELECT a.id, g.lat, g.lon FROM asset_geo g
+JOIN assets a ON a.id=g.asset_id AND a.deleted_at IS NULL AND a.is_live_photo_video=0
+WHERE g.city_id=? AND g.lat IS NOT NULL AND g.lon IS NOT NULL
+ORDER BY a.taken_at DESC`, cityID)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+
+	type bucket struct {
+		count   int
+		sumLat  float64
+		sumLon  float64
+		firstID string
+	}
+	buckets := map[[2]int]*bucket{}
+	var order [][2]int
+	for rows.Next() {
+		var id string
+		var lat, lon float64
+		if rows.Scan(&id, &lat, &lon) != nil {
+			continue
+		}
+		k := [2]int{int(lat / spotGrid), int(lon / spotGrid)}
+		b := buckets[k]
+		if b == nil {
+			b = &bucket{firstID: id}
+			buckets[k] = b
+			order = append(order, k)
+		}
+		b.count++
+		b.sumLat += lat
+		b.sumLon += lon
+	}
+
+	var spots []Spot
+	n := 0
+	for _, k := range order {
+		b := buckets[k]
+		if b.count < spotMinPhotos {
+			continue
+		}
+		cLat := b.sumLat / float64(b.count)
+		cLon := b.sumLon / float64(b.count)
+		name, ok := s.gaz.NearestFeature(cLat, cLon, 5)
+		if !ok {
+			n++
+			name = fmt.Sprintf("Spot %d", n)
+		}
+		spots = append(spots, Spot{
+			Key:   fmt.Sprintf("%d:%d:%d", cityID, k[0], k[1]),
+			Name:  name,
+			Lat:   cLat,
+			Lon:   cLon,
+			Count: b.count,
+			Thumb: b.firstID,
+		})
+	}
+	sort.Slice(spots, func(i, j int) bool { return spots[i].Count > spots[j].Count })
+	if len(spots) > spotMaxCount {
+		spots = spots[:spotMaxCount]
+	}
+	return spots
+}

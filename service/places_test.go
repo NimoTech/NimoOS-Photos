@@ -61,6 +61,37 @@ func TestListPlaces(t *testing.T) {
 	require.Equal(t, "asia", tokyo.Region)
 }
 
+func TestSpotsCluster(t *testing.T) {
+	db, err := sqlite.Open(filepath.Join(t.TempDir(), "t.db"))
+	require.NoError(t, err)
+	defer db.Close()
+	gaz, _ := geo.Load()
+	geoSvc := service.NewGeoService(db, gaz)
+	mk := func(id string, lat, lon float64) {
+		db.Exec(`INSERT INTO assets(id,file_path,status,taken_at,is_live_photo_video) VALUES(?,?, 'indexed', '2026-03-01 10:00:00', 0)`, id, "/x/"+id)
+		db.Exec(`INSERT INTO asset_exif(asset_id,latitude,longitude) VALUES(?,?,?)`, id, lat, lon)
+		geoSvc.GeocodeAsset(id)
+	}
+	// Both clusters inside Shibuya (city_id=11808021), separated by lon bucket boundary at 139.710.
+	// Cluster A: lon ~139.7036 → bucket [3565,13970]
+	// Cluster B: lon ~139.7116 → bucket [3565,13971]
+	mk("s1", 35.6579, 139.7036)
+	mk("s2", 35.6569, 139.7046)
+	mk("s3", 35.6589, 139.7036)
+	mk("k1", 35.6579, 139.7116)
+	mk("k2", 35.6569, 139.7126)
+	mk("k3", 35.6589, 139.7116)
+
+	svc := service.NewPlacesService(db, gaz, geoSvc)
+	resp, _ := svc.ListPlaces()
+	require.NotEmpty(t, resp.Places)
+	key := resp.Places[0].Key
+	spots := svc.Spots(key)
+	require.GreaterOrEqual(t, len(spots), 2)
+	require.NotEmpty(t, spots[0].Thumb)
+	require.NotZero(t, spots[0].Count)
+}
+
 func TestTripsSplitByGap(t *testing.T) {
 	db, err := sqlite.Open(filepath.Join(t.TempDir(), "t.db"))
 	require.NoError(t, err)
