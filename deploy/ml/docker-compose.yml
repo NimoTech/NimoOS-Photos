@@ -1,0 +1,29 @@
+name: nimoos-photos-ml
+
+# Photos AI — the immich-machine-learning backend behind NimoOS Photos
+# (CLIP search + face recognition). Shipped as an OFFLINE bundle: the image is
+# docker-loaded from the tar packaged by script/package-photos-ml.sh, so the
+# device never contacts a registry (frozen version, works on isolated/intranet
+# installs). AppManagement auto-discovers this running stack and, via the labels
+# below, hides it from the user App grid and shows it as "Photos AI".
+services:
+  immich-machine-learning:
+    image: localhost/nimoos-photos-ml:bundled
+    pull_policy: never
+    ports:
+      - "127.0.0.1:3003:3003"
+    volumes:
+      - type: bind
+        source: /DATA/.system_data/photos/ml-cache
+        target: /cache
+        bind:
+          create_host_path: true
+    restart: unless-stopped
+    labels:
+      nimoos.system: "true"            # hide from the user-facing App grid
+      nimoos.display_name: "Photos AI" # friendly name in UI / container stats
+      icon: "/img/system-apps/photos.svg"
+    environment:
+      MACHINE_LEARNING_WORKERS: "1"
+      MACHINE_LEARNING_WORKER_TIMEOUT: "120"
+      MACHINE_LEARNING_CACHE_FOLDER: "/cache"

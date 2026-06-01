@@ -3,6 +3,7 @@ package mlclient
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -196,8 +197,16 @@ func (c *MLClient) DetectAndRecognizeFaces(imageData []byte) ([]FaceResult, erro
 }
 
 // IsReady returns true if the ml-service /ping endpoint responds with "pong".
+// Bounded to a short timeout (independent of the client's long /predict timeout)
+// so callers like the /status handler never block on a hung ML backend.
 func (c *MLClient) IsReady() bool {
-	resp, err := c.http.Get(c.endpoint + "/ping")
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.endpoint+"/ping", nil)
+	if err != nil {
+		return false
+	}
+	resp, err := c.http.Do(req)
 	if err != nil {
 		return false
 	}

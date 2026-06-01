@@ -28,6 +28,7 @@ func NewIndexHandler(svc service.Services, galleryDir string) *IndexHandler {
 // GET /v1/photos/status
 func (h *IndexHandler) Status(c echo.Context) error {
 	s := h.svc.Indexer().StatusCounts()
+	s.MLReady = h.svc.Indexer().MLReady()
 	s.GalleryDir = h.galleryDir
 	if h.galleryDir != "" {
 		var fs syscall.Statfs_t

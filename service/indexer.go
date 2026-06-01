@@ -955,6 +955,10 @@ func (ix *Indexer) ScanPending() error {
 	return rows.Err()
 }
 
+// MLReady reports whether the ML backend (immich-machine-learning) is reachable.
+// Bounded by the ml client's short /ping timeout, safe to call from handlers.
+func (ix *Indexer) MLReady() bool { return ix.ml.IsReady() }
+
 // StatusCounts returns current indexing statistics.
 func (ix *Indexer) StatusCounts() IndexStatus {
 	var s IndexStatus

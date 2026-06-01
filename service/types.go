@@ -147,4 +147,6 @@ type IndexStatus struct {
 	GalleryDir string `json:"galleryDir,omitempty"`
 	DiskTotal  int64  `json:"diskTotal,omitempty"`
 	DiskAvail  int64  `json:"diskAvail,omitempty"`
+	// MLReady reflects whether the immich-machine-learning backend answers /ping.
+	MLReady bool `json:"mlReady"`
 }
