@@ -325,3 +325,65 @@ ORDER BY a.taken_at DESC`, cityID)
 	}
 	return spots
 }
+
+// GetPlace returns the full detail payload for a city.
+func (s *PlacesService) GetPlace(cityID int32) (PlaceDetail, error) {
+	resp, err := s.ListPlaces()
+	if err != nil {
+		return PlaceDetail{}, err
+	}
+	var base *Place
+	for i := range resp.Places {
+		if resp.Places[i].Key == cityID {
+			base = &resp.Places[i]
+			break
+		}
+	}
+	if base == nil {
+		return PlaceDetail{}, ErrNotFound
+	}
+	d := PlaceDetail{Place: *base}
+	d.Spots = s.spots(cityID)
+	d.Recent = s.recentThumbs(cityID, 8)
+	d.Visits, _ = s.Visits(cityID)
+	d.Insights = s.insights(cityID, *base, resp)
+	return d, nil
+}
+
+// insights builds template-based observations. Each returns an i18n key + params;
+// the frontend renders the localized string.
+func (s *PlacesService) insights(cityID int32, p Place, resp PlacesResponse) []Insight {
+	var out []Insight
+
+	// 1. Most-photographed city this period.
+	top := true
+	for _, o := range resp.Places {
+		if o.Count > p.Count {
+			top = false
+			break
+		}
+	}
+	if top {
+		out = append(out, Insight{Ico: "sparkles", Key: "photos.places.insight.mostPhotographed",
+			Params: map[string]interface{}{"count": p.Count}})
+	}
+
+	// 2. Top spot.
+	if sp := s.spots(cityID); len(sp) > 0 {
+		out = append(out, Insight{Ico: "sparkles", Key: "photos.places.insight.topSpot",
+			Params: map[string]interface{}{"spot": sp[0].Name, "count": sp[0].Count}})
+	}
+
+	// 3. Companions (top co-occurring people in this city).
+	if faces := s.topFacesBetween(cityID, time.Unix(0, 0), time.Now().AddDate(1, 0, 0), 2); len(faces) > 0 {
+		out = append(out, Insight{Ico: "person", Key: "photos.places.insight.companions",
+			Params: map[string]interface{}{"names": faces}})
+	}
+
+	// 4. Home base.
+	if p.Home {
+		out = append(out, Insight{Ico: "home", Key: "photos.places.insight.home",
+			Params: map[string]interface{}{"count": p.Count, "trips": p.Trips}})
+	}
+	return out
+}

@@ -92,6 +92,31 @@ func TestSpotsCluster(t *testing.T) {
 	require.NotZero(t, spots[0].Count)
 }
 
+func TestGetPlaceFull(t *testing.T) {
+	svc := placesFixture(t)
+	resp, _ := svc.ListPlaces()
+	// Find the place with the highest count (Tokyo in the fixture, 3 photos).
+	var key int32
+	var city string
+	for _, p := range resp.Places {
+		if p.Count > 1 {
+			key = p.Key
+			city = p.City
+			break
+		}
+	}
+	require.NotZero(t, key)
+	d, err := svc.GetPlace(key)
+	require.NoError(t, err)
+	require.Equal(t, city, d.City)
+	require.NotEmpty(t, d.Recent)
+	require.NotEmpty(t, d.Insights)
+	require.NotEmpty(t, d.Visits)
+	for _, ins := range d.Insights {
+		require.NotEmpty(t, ins.Key)
+	}
+}
+
 func TestTripsSplitByGap(t *testing.T) {
 	db, err := sqlite.Open(filepath.Join(t.TempDir(), "t.db"))
 	require.NoError(t, err)
