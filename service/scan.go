@@ -41,22 +41,29 @@ func scanAssets(rows *sql.Rows) ([]Asset, error) {
 }
 
 // scanSearchAssets scans rows from SmartSearch: the scanAssets column list PLUS
-// a trailing vec.distance column. The L2 distance over unit-length CLIP vectors
-// is converted to a cosine similarity in [0,1] (sim = 1 - d²/2) and stored on
-// Asset.MatchScore so the UI can show a per-result match percentage.
+// latitude, longitude (from asset_exif) and a trailing vec.distance column. The
+// L2 distance over unit-length CLIP vectors is converted to a cosine similarity
+// in [0,1] (sim = 1 - d²/2) and stored on Asset.MatchScore so the UI can show a
+// per-result match percentage.
 func scanSearchAssets(rows *sql.Rows) ([]Asset, error) {
 	var assets []Asset
 	for rows.Next() {
 		var a Asset
 		var takenAt, indexedAt sql.NullTime
 		var fileSize, durationMs sql.NullInt64
-		var distance sql.NullFloat64
+		var lat, lng, distance sql.NullFloat64
 		if err := rows.Scan(
 			&a.ID, &a.FilePath, &fileSize, &a.MimeType, &a.OriginalName,
 			&takenAt, &durationMs, &a.LivePhotoVideoID, &a.IsLivePhotoVideo,
-			&indexedAt, &a.Status, &distance,
+			&indexedAt, &a.Status, &lat, &lng, &distance,
 		); err != nil {
 			return nil, err
+		}
+		if lat.Valid {
+			a.Latitude = lat.Float64
+		}
+		if lng.Valid {
+			a.Longitude = lng.Float64
 		}
 		if fileSize.Valid {
 			a.FileSize = fileSize.Int64

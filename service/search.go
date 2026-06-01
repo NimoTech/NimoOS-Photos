@@ -89,14 +89,17 @@ func (s *SearchService) SmartSearch(query string, limit int, filters SearchFilte
 	blob := sqlite.SerializeFloat32(queryVec)
 
 	// Base KNN query — sqlite-vec uses "MATCH ? AND k = ?" syntax.
+	// asset_exif is LEFT JOINed for latitude/longitude so the client can offer a
+	// Places filter on results (reverse-geocoded to country in the UI).
 	baseSQL := `
 SELECT a.id, a.file_path, a.file_size, COALESCE(a.mime_type,''),
        COALESCE(a.original_name,''), a.taken_at, a.duration_ms,
        COALESCE(a.live_photo_video_id,''), a.is_live_photo_video,
-       a.indexed_at, a.status, vec.distance
+       a.indexed_at, a.status, e.latitude, e.longitude, vec.distance
 FROM clip_embeddings AS vec
 JOIN asset_clip_idx AS idx ON idx.rowid = vec.rowid
 JOIN assets a ON a.id = idx.asset_id
+LEFT JOIN asset_exif AS e ON e.asset_id = a.id
 WHERE vec.embedding MATCH ? AND k = ?
   AND a.is_live_photo_video = 0
   AND a.deleted_at IS NULL`
