@@ -1,0 +1,13 @@
+[Unit]
+After=nimoos-message-bus.service
+After=docker.service
+Description=NimoOS Photos Service
+
+[Service]
+ExecStartPre=/usr/bin/nimoos-photos -v
+ExecStart=/usr/bin/nimoos-photos -c /etc/nimoos/photos.conf
+Restart=always
+Type=notify
+
+[Install]
+WantedBy=multi-user.target
