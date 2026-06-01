@@ -178,6 +178,27 @@ func migrate(db *sql.DB) error {
 			PRIMARY KEY (person_a, person_b),
 			CHECK (person_a < person_b)
 		)`,
+
+		// ── Geo location per asset ────────────────────────────────────────────
+		`CREATE TABLE IF NOT EXISTS asset_geo (
+			asset_id    TEXT PRIMARY KEY REFERENCES assets(id) ON DELETE CASCADE,
+			city_id     INTEGER,
+			city        TEXT,
+			country     TEXT,
+			region      TEXT,
+			admin1      TEXT,
+			lat         REAL,
+			lon         REAL,
+			geocoded_at DATETIME
+		)`,
+
+		// ── Place cover overrides (per-user custom cover asset) ───────────────
+		`CREATE TABLE IF NOT EXISTS place_cover_overrides (
+			user_id   TEXT NOT NULL,
+			place_key INTEGER NOT NULL,
+			asset_id  TEXT NOT NULL,
+			PRIMARY KEY (user_id, place_key)
+		)`,
 	}
 
 	for _, stmt := range statements {
@@ -260,6 +281,10 @@ func migrate(db *sql.DB) error {
 
 	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_album_assets_position ON album_assets(album_id, position)`); err != nil {
 		return fmt.Errorf("migrate index album_assets_position: %w", err)
+	}
+
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_asset_geo_city ON asset_geo(city_id)`); err != nil {
+		return fmt.Errorf("migrate index asset_geo_city: %w", err)
 	}
 
 	// Backfill position: only runs when an album has >=2 rows all at position=0,

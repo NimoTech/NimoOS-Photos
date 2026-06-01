@@ -411,3 +411,21 @@ func TestMigrateAlbumAssetsBackfillSkipsSingleItemAlbum(t *testing.T) {
 	require.NoError(t, db.QueryRow(`SELECT position FROM album_assets WHERE album_id='al-solo' AND asset_id='solo'`).Scan(&pos))
 	require.Equal(t, 0, pos, "single-item album position must remain 0 (not falsely backfilled)")
 }
+
+func TestMigrateCreatesGeoTables(t *testing.T) {
+	db, err := sqlite.Open(filepath.Join(t.TempDir(), "t.db"))
+	require.NoError(t, err)
+	defer db.Close()
+
+	var n int
+	require.NoError(t, db.QueryRow(
+		`SELECT count(*) FROM sqlite_master WHERE type='table' AND name='asset_geo'`).Scan(&n))
+	require.Equal(t, 1, n)
+	require.NoError(t, db.QueryRow(
+		`SELECT count(*) FROM sqlite_master WHERE type='table' AND name='place_cover_overrides'`).Scan(&n))
+	require.Equal(t, 1, n)
+
+	db2, err := sqlite.Open(filepath.Join(t.TempDir(), "t2.db"))
+	require.NoError(t, err)
+	db2.Close()
+}
