@@ -116,6 +116,15 @@ func InitRouter(ctx context.Context, svc service.Services, runtimePath string, t
 	g.PATCH("/albums/:id", albums.Update)
 	g.PATCH("/albums/:id/assets/order", albums.Reorder)
 
+	// Places
+	places := v1.NewPlacesHandler(svc)
+	g.GET("/places", places.List)
+	g.GET("/places/:key", places.Get)
+	g.GET("/places/:key/cover-candidates", places.CoverCandidates)
+	g.PUT("/places/:key/cover", places.SetCover)
+	g.DELETE("/places/:key/cover", places.ResetCover)
+	g.POST("/places/:key/album", places.CreateAlbum)
+
 	// Favorites
 	g.POST("/favorites/:asset_id", favorites.Favorite)
 	g.DELETE("/favorites/:asset_id", favorites.Unfavorite)

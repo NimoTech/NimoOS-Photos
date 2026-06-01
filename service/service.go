@@ -29,6 +29,7 @@ type Services interface {
 	Views() *ViewsService
 	Persons() *PersonService
 	Geo() *GeoService
+	Places() *PlacesService
 	RestartWatcher(dirs []string)
 }
 
@@ -47,6 +48,7 @@ type services struct {
 	views     *ViewsService
 	persons   *PersonService
 	geo       *GeoService
+	places    *PlacesService
 	parentCtx context.Context
 }
 
@@ -63,6 +65,7 @@ func (s *services) Trash() *TrashService         { return s.trash }
 func (s *services) Views() *ViewsService         { return s.views }
 func (s *services) Persons() *PersonService      { return s.persons }
 func (s *services) Geo() *GeoService             { return s.geo }
+func (s *services) Places() *PlacesService       { return s.places }
 
 // NewService wires all service-layer components together from cfg and returns a
 // ready-to-use Services handle. It panics if the database cannot be opened.
@@ -98,6 +101,7 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 		panic("nimoos-photos: failed to load gazetteer: " + gerr.Error())
 	}
 	geoSvc := NewGeoService(db, gaz)
+	placesSvc := NewPlacesServiceWithAlbums(db, gaz, geoSvc, albums)
 	faces := NewFaceService(db)
 	faces.SetTaskRegistry(taskReg)
 	embedder := NewEmbedder(db, ml, idx, taskReg)
@@ -171,6 +175,7 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 		views:     views,
 		persons:   persons,
 		geo:       geoSvc,
+		places:    placesSvc,
 		parentCtx: parentCtx,
 	}
 }
