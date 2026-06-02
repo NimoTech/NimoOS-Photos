@@ -526,6 +526,95 @@ func scanIDSet(rows *sql.Rows, err error) (map[string]struct{}, error) {
 	return out, nil
 }
 
+// SmartViewActivity is one activity log entry.
+type SmartViewActivity struct {
+	ID         string    `json:"id"`
+	EventType  string    `json:"eventType"`
+	Detail     string    `json:"detail,omitempty"`
+	AssetIDs   []string  `json:"assetIds,omitempty"`
+	OccurredAt time.Time `json:"occurredAt"`
+}
+
+func (s *SmartViewService) Duplicate(id string) (*SmartView, error) {
+	var name, rawJSON, desc string
+	var threshold, live, vid, notify int
+	err := s.db.QueryRow(`SELECT name,description,conds_raw,threshold,live,include_videos,notify_weekly
+		FROM smart_views WHERE id=?`, id).Scan(&name, &desc, &rawJSON, &threshold, &live, &vid, &notify)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	var conds []string
+	_ = json.Unmarshal([]byte(rawJSON), &conds)
+	return s.Create(SmartViewInput{
+		ID:            newSVID("sv"),
+		Name:          name + " (copy)",
+		Description:   desc,
+		CondsRaw:      conds,
+		Threshold:     threshold,
+		Live:          live == 1,
+		IncludeVideos: vid == 1,
+		NotifyWeekly:  notify == 1,
+	})
+}
+
+func (s *SmartViewService) Activity(id string, limit int) ([]SmartViewActivity, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	rows, err := s.db.Query(`SELECT id,event_type,COALESCE(detail,''),COALESCE(asset_ids,''),occurred_at
+		FROM smart_view_activity WHERE smart_view_id=? ORDER BY occurred_at DESC LIMIT ?`, id, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []SmartViewActivity
+	for rows.Next() {
+		var a SmartViewActivity
+		var idsJSON string
+		if err := rows.Scan(&a.ID, &a.EventType, &a.Detail, &idsJSON, &a.OccurredAt); err != nil {
+			return nil, err
+		}
+		if idsJSON != "" {
+			_ = json.Unmarshal([]byte(idsJSON), &a.AssetIDs)
+		}
+		out = append(out, a)
+	}
+	return out, nil
+}
+
+// IncrementalEvaluateNew re-evaluates all live smart views (paused skipped) to
+// absorb newly indexed assets. Reuses Evaluate's reconcile (new matches get
+// matched_at=now + a matched activity).
+func (s *SmartViewService) IncrementalEvaluateNew(assetIDs []string) error {
+	if len(assetIDs) == 0 {
+		return nil
+	}
+	rows, err := s.db.Query(`SELECT id FROM smart_views WHERE live=1`)
+	if err != nil {
+		return err
+	}
+	var liveIDs []string
+	for rows.Next() {
+		var id string
+		rows.Scan(&id)
+		liveIDs = append(liveIDs, id)
+	}
+	rows.Close()
+	for _, svID := range liveIDs {
+		if err := s.Evaluate(svID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *SmartViewService) evaluateAllLive() error {
+	return s.IncrementalEvaluateNew([]string{"__batch__"})
+}
+
 func intersect(sets []map[string]struct{}) map[string]struct{} {
 	if len(sets) == 0 {
 		return map[string]struct{}{}

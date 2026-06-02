@@ -30,6 +30,7 @@ type Services interface {
 	Persons() *PersonService
 	Geo() *GeoService
 	Places() *PlacesService
+	SmartViews() *SmartViewService
 	RestartWatcher(dirs []string)
 }
 
@@ -47,9 +48,10 @@ type services struct {
 	trash     *TrashService
 	views     *ViewsService
 	persons   *PersonService
-	geo       *GeoService
-	places    *PlacesService
-	parentCtx context.Context
+	geo        *GeoService
+	places     *PlacesService
+	smartViews *SmartViewService
+	parentCtx  context.Context
 }
 
 func (s *services) DB() *sql.DB                  { return s.db }
@@ -64,8 +66,9 @@ func (s *services) Favorites() *FavoritesService { return s.favorites }
 func (s *services) Trash() *TrashService         { return s.trash }
 func (s *services) Views() *ViewsService         { return s.views }
 func (s *services) Persons() *PersonService      { return s.persons }
-func (s *services) Geo() *GeoService             { return s.geo }
-func (s *services) Places() *PlacesService       { return s.places }
+func (s *services) Geo() *GeoService              { return s.geo }
+func (s *services) Places() *PlacesService        { return s.places }
+func (s *services) SmartViews() *SmartViewService { return s.smartViews }
 
 // NewService wires all service-layer components together from cfg and returns a
 // ready-to-use Services handle. It panics if the database cannot be opened.
@@ -95,6 +98,7 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 	trash := NewTrashService(db, "/DATA/Gallery", thumbDir)
 	views := NewViewsService(db)
 	search := NewSearchService(db, ml)
+	smartViews := NewSmartViewService(db, search)
 	persons := NewPersonService(db)
 	gaz, gerr := geo.Load()
 	if gerr != nil {
@@ -120,6 +124,11 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 				if err != nil || n == 0 {
 					return
 				}
+			}
+		}()
+		go func() {
+			if err := smartViews.evaluateAllLive(); err != nil {
+				zap.L().Warn("smart view incremental evaluate failed", zap.Error(err))
 			}
 		}()
 	})
@@ -162,21 +171,22 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 	}()
 
 	return &services{
-		db:        db,
-		indexer:   idx,
-		watcher:   watcher,
-		albums:    albums,
-		search:    search,
-		faces:     faces,
-		tasks:     taskReg,
-		embedder:  embedder,
-		favorites: favorites,
-		trash:     trash,
-		views:     views,
-		persons:   persons,
-		geo:       geoSvc,
-		places:    placesSvc,
-		parentCtx: parentCtx,
+		db:         db,
+		indexer:    idx,
+		watcher:    watcher,
+		albums:     albums,
+		search:     search,
+		faces:      faces,
+		tasks:      taskReg,
+		embedder:   embedder,
+		favorites:  favorites,
+		trash:      trash,
+		views:      views,
+		persons:    persons,
+		geo:        geoSvc,
+		places:     placesSvc,
+		smartViews: smartViews,
+		parentCtx:  parentCtx,
 	}
 }
 

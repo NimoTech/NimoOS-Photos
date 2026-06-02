@@ -138,3 +138,43 @@ func recentOrOld(i int) string {
 	}
 	return time.Now().UTC().AddDate(0, 0, -30).Format("2006-01-02T15:04:05Z")
 }
+
+func TestDuplicate(t *testing.T) {
+	s := svTestService(t)
+	_, err := s.Create(SmartViewInput{ID: "sv-a", Name: "Orig", CondsRaw: []string{}, Threshold: 70, Live: true})
+	require.NoError(t, err)
+	dup, err := s.Duplicate("sv-a")
+	require.NoError(t, err)
+	require.NotEqual(t, "sv-a", dup.ID)
+	require.Equal(t, "Orig (copy)", dup.Name)
+	require.Equal(t, 0, dup.AddedThisWeek)
+}
+
+func TestActivityLog(t *testing.T) {
+	s := svTestService(t)
+	_, _ = s.Create(SmartViewInput{ID: "sv-b", Name: "B", CondsRaw: []string{}, Threshold: 70, Live: true})
+	acts, err := s.Activity("sv-b", 10)
+	require.NoError(t, err)
+	require.NotEmpty(t, acts)
+	require.Equal(t, "created", acts[0].EventType)
+}
+
+func TestIncrementalEvaluateRespectsPaused(t *testing.T) {
+	s := svTestService(t)
+	db := s.db
+	_, _ = db.Exec(`INSERT INTO persons(id,name) VALUES('p-x','Xan')`)
+	_, _ = s.Create(SmartViewInput{ID: "sv-live", Name: "L", CondsRaw: []string{"Xan"}, Threshold: 50, Live: true})
+	_, _ = s.Create(SmartViewInput{ID: "sv-paused", Name: "P", CondsRaw: []string{"Xan"}, Threshold: 50, Live: false})
+
+	_, _ = db.Exec(`INSERT INTO assets(id,file_path,status,is_live_photo_video) VALUES('a-new','/p/n.jpg','indexed',0)`)
+	_, _ = db.Exec(`INSERT INTO face_detections(id,asset_id,bbox,embedding) VALUES('fn','a-new','{}',X'00')`)
+	_, _ = db.Exec(`INSERT INTO face_person(face_id,person_id) VALUES('fn','p-x')`)
+
+	require.NoError(t, s.IncrementalEvaluateNew([]string{"a-new"}))
+
+	var liveN, pausedN int
+	db.QueryRow(`SELECT COUNT(*) FROM smart_view_matches WHERE smart_view_id='sv-live'`).Scan(&liveN)
+	db.QueryRow(`SELECT COUNT(*) FROM smart_view_matches WHERE smart_view_id='sv-paused'`).Scan(&pausedN)
+	require.Equal(t, 1, liveN)
+	require.Equal(t, 0, pausedN)
+}
