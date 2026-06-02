@@ -170,7 +170,7 @@ func TestIncrementalEvaluateRespectsPaused(t *testing.T) {
 	_, _ = db.Exec(`INSERT INTO face_detections(id,asset_id,bbox,embedding) VALUES('fn','a-new','{}',X'00')`)
 	_, _ = db.Exec(`INSERT INTO face_person(face_id,person_id) VALUES('fn','p-x')`)
 
-	require.NoError(t, s.IncrementalEvaluateNew([]string{"a-new"}))
+	require.NoError(t, s.EvaluateAllLive())
 
 	var liveN, pausedN int
 	db.QueryRow(`SELECT COUNT(*) FROM smart_view_matches WHERE smart_view_id='sv-live'`).Scan(&liveN)

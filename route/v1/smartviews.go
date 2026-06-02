@@ -1,6 +1,7 @@
 package v1
 
 import (
+	"errors"
 	"net/http"
 	"strconv"
 
@@ -43,6 +44,9 @@ func (h *SmartViewsHandler) Create(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusBadRequest, "name is required")
 	}
 	sv, err := h.svc.SmartViews().Create(in)
+	if errors.Is(err, service.ErrInvalidInput) {
+		return echo.NewHTTPError(http.StatusBadRequest, "invalid input")
+	}
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
 	}
@@ -149,7 +153,13 @@ func (h *SmartViewsHandler) Export(c echo.Context) error {
 		}
 		return c.JSON(http.StatusOK, map[string]string{"albumId": albumID})
 	case "zip":
-		return h.svc.SmartViews().ExportZip(c.Response(), id)
+		if err := h.svc.SmartViews().ExportZip(c.Response(), id); err != nil {
+			if errors.Is(err, service.ErrInvalidInput) {
+				return echo.NewHTTPError(http.StatusBadRequest, "no matches to export")
+			}
+			return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+		}
+		return nil
 	default:
 		return echo.NewHTTPError(http.StatusBadRequest, "unsupported format")
 	}

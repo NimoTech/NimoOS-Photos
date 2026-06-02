@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -322,21 +323,21 @@ func joinComma(parts []string) string {
 
 // Evaluate runs a full match evaluation and reconciles smart_view_matches.
 func (s *SmartViewService) Evaluate(id string) error {
-	sv, err := s.Get(id)
-	if err != nil {
-		return err
-	}
 	var parsedJSON string
-	var includeVideos int
-	if err := s.db.QueryRow(`SELECT conds_parsed, include_videos FROM smart_views WHERE id=?`, id).
-		Scan(&parsedJSON, &includeVideos); err != nil {
+	var includeVideos, threshold int
+	err := s.db.QueryRow(`SELECT conds_parsed, include_videos, threshold FROM smart_views WHERE id=?`, id).
+		Scan(&parsedJSON, &includeVideos, &threshold)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
 		return err
 	}
 	var parsed []ParsedCond
 	_ = json.Unmarshal([]byte(parsedJSON), &parsed)
 
 	includeVideosBool := includeVideos == 1
-	scoreMap, err := s.evalParsed(parsed, sv.Threshold, !includeVideosBool)
+	scoreMap, err := s.evalParsed(parsed, threshold, !includeVideosBool)
 	if err != nil {
 		return err
 	}
@@ -446,14 +447,29 @@ func (s *SmartViewService) excludeVideos(in map[string]struct{}) map[string]stru
 	if len(in) == 0 {
 		return in
 	}
+	ph := make([]string, 0, len(in))
+	args := make([]any, 0, len(in))
+	for aid := range in {
+		ph = append(ph, "?")
+		args = append(args, aid)
+	}
+	q := `SELECT id FROM assets WHERE id IN (` + strings.Join(ph, ",") + `) AND mime_type LIKE 'video/%'`
+	rows, err := s.db.Query(q, args...)
+	if err != nil {
+		return in
+	}
+	defer rows.Close()
+	videos := map[string]struct{}{}
+	for rows.Next() {
+		var id string
+		rows.Scan(&id)
+		videos[id] = struct{}{}
+	}
 	out := map[string]struct{}{}
 	for aid := range in {
-		var mime string
-		s.db.QueryRow(`SELECT COALESCE(mime_type,'') FROM assets WHERE id=?`, aid).Scan(&mime)
-		if len(mime) >= 6 && mime[:6] == "video/" {
-			continue
+		if _, isVid := videos[aid]; !isVid {
+			out[aid] = struct{}{}
 		}
-		out[aid] = struct{}{}
 	}
 	return out
 }
@@ -533,13 +549,10 @@ func (s *SmartViewService) Activity(id string, limit int) ([]SmartViewActivity, 
 	return out, nil
 }
 
-// IncrementalEvaluateNew re-evaluates all live smart views (paused skipped) to
+// EvaluateAllLive re-evaluates all live smart views (paused skipped) to
 // absorb newly indexed assets. Reuses Evaluate's reconcile (new matches get
 // matched_at=now + a matched activity).
-func (s *SmartViewService) IncrementalEvaluateNew(assetIDs []string) error {
-	if len(assetIDs) == 0 {
-		return nil
-	}
+func (s *SmartViewService) EvaluateAllLive() error {
 	rows, err := s.db.Query(`SELECT id FROM smart_views WHERE live=1`)
 	if err != nil {
 		return err
@@ -557,10 +570,6 @@ func (s *SmartViewService) IncrementalEvaluateNew(assetIDs []string) error {
 		}
 	}
 	return nil
-}
-
-func (s *SmartViewService) evaluateAllLive() error {
-	return s.IncrementalEvaluateNew([]string{"__batch__"})
 }
 
 func intersect(sets []map[string]struct{}) map[string]struct{} {

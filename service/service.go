@@ -127,7 +127,7 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 			}
 		}()
 		go func() {
-			if err := smartViews.evaluateAllLive(); err != nil {
+			if err := smartViews.EvaluateAllLive(); err != nil {
 				zap.L().Warn("smart view incremental evaluate failed", zap.Error(err))
 			}
 		}()
