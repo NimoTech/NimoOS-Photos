@@ -3,6 +3,7 @@ package service
 import (
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	"github.com/NimoTech/NimoOS-Photos/pkg/sqlite"
@@ -106,4 +107,34 @@ func TestEvaluatePureStructuralScoreIsOne(t *testing.T) {
 	var score float64
 	require.NoError(t, db.QueryRow(`SELECT match_score FROM smart_view_matches WHERE smart_view_id='sv-p' AND asset_id='a1'`).Scan(&score))
 	require.Equal(t, 1.0, score)
+}
+
+func TestSmartViewStats(t *testing.T) {
+	s := svTestService(t)
+	db := s.db
+	_, _ = db.Exec(`INSERT INTO smart_views(id,name,conds_raw,conds_parsed,threshold) VALUES('sv-s','S','[]','[]',50)`)
+	for i, sc := range []float64{0.10, 0.35, 0.55, 0.75, 0.95} {
+		aid := "a" + string(rune('1'+i))
+		_, _ = db.Exec(`INSERT INTO assets(id,file_path,status,file_size) VALUES(?,?,?,?)`, aid, "/p/"+aid, "indexed", int64(100*(i+1)))
+		_, _ = db.Exec(`INSERT INTO smart_view_matches(smart_view_id,asset_id,match_score,matched_at) VALUES(?,?,?,?)`,
+			"sv-s", aid, sc, recentOrOld(i))
+	}
+	sv, err := s.Get("sv-s")
+	require.NoError(t, err)
+	require.Equal(t, 5, sv.Count)
+	require.Len(t, sv.Distribution, 10)
+	require.Equal(t, sv.Count, sumInts(sv.Distribution))
+	require.Equal(t, 3, sv.AddedThisWeek)
+	require.Greater(t, sv.StorageBytes, int64(0))
+	require.LessOrEqual(t, sv.Median, 100)
+	require.Len(t, sv.Seeds, 5)
+}
+
+func sumInts(a []int) int { s := 0; for _, v := range a { s += v }; return s }
+
+func recentOrOld(i int) string {
+	if i < 3 {
+		return time.Now().UTC().Format("2006-01-02T15:04:05Z")
+	}
+	return time.Now().UTC().AddDate(0, 0, -30).Format("2006-01-02T15:04:05Z")
 }

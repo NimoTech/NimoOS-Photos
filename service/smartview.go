@@ -206,7 +206,89 @@ func (s *SmartViewService) Delete(id string) error {
 
 func (s *SmartViewService) fillStats(sv *SmartView) {
 	sv.Seeds = []string{}
-	sv.Distribution = []int{}
+	sv.Distribution = make([]int, 10)
+
+	_ = s.db.QueryRow(`SELECT COUNT(*) FROM smart_view_matches WHERE smart_view_id=?`, sv.ID).Scan(&sv.Count)
+
+	_ = s.db.QueryRow(`SELECT COUNT(*) FROM smart_view_matches
+		WHERE smart_view_id=? AND matched_at >= datetime('now','-7 days')`, sv.ID).Scan(&sv.AddedThisWeek)
+
+	_ = s.db.QueryRow(`SELECT COALESCE(SUM(a.file_size),0) FROM smart_view_matches m
+		JOIN assets a ON a.id=m.asset_id WHERE m.smart_view_id=?`, sv.ID).Scan(&sv.StorageBytes)
+
+	rows, err := s.db.Query(`SELECT match_score FROM smart_view_matches WHERE smart_view_id=? ORDER BY match_score`, sv.ID)
+	if err == nil {
+		var scores []float64
+		for rows.Next() {
+			var sc float64
+			rows.Scan(&sc)
+			scores = append(scores, sc)
+			bucket := int(sc * 10)
+			if bucket > 9 {
+				bucket = 9
+			}
+			if bucket < 0 {
+				bucket = 0
+			}
+			sv.Distribution[bucket]++
+		}
+		rows.Close()
+		if n := len(scores); n > 0 {
+			med := scores[n/2]
+			if n%2 == 0 {
+				med = (scores[n/2-1] + scores[n/2]) / 2
+			}
+			sv.Median = int(med*100 + 0.5)
+		}
+	}
+
+	srows, err := s.db.Query(`SELECT asset_id FROM smart_view_matches
+		WHERE smart_view_id=? ORDER BY match_score DESC LIMIT 6`, sv.ID)
+	if err == nil {
+		for srows.Next() {
+			var aid string
+			srows.Scan(&aid)
+			sv.Seeds = append(sv.Seeds, aid)
+		}
+		srows.Close()
+	}
+}
+
+// MatchedAssets returns paginated matched assets, optionally only those added
+// in the last 7 days (recent=true), ordered by score then recency.
+func (s *SmartViewService) MatchedAssets(id string, limit, offset int, recent bool) ([]Asset, error) {
+	where := `m.smart_view_id=?`
+	args := []any{id}
+	if recent {
+		where += ` AND m.matched_at >= datetime('now','-7 days')`
+	}
+	q := `SELECT a.id, a.file_path, a.file_size, COALESCE(a.mime_type,''),
+	       COALESCE(a.original_name,''), a.taken_at, a.duration_ms,
+	       COALESCE(a.live_photo_video_id,''), a.is_live_photo_video, a.is_screenshot,
+	       a.indexed_at, a.status, m.match_score
+	FROM smart_view_matches m JOIN assets a ON a.id=m.asset_id
+	WHERE ` + where + ` AND a.deleted_at IS NULL
+	ORDER BY m.match_score DESC, COALESCE(a.taken_at,a.indexed_at) DESC
+	LIMIT ? OFFSET ?`
+	args = append(args, limit, offset)
+	rows, err := s.db.Query(q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Asset
+	for rows.Next() {
+		var a Asset
+		var score float64
+		if err := rows.Scan(&a.ID, &a.FilePath, &a.FileSize, &a.MimeType, &a.OriginalName,
+			&a.TakenAt, &a.DurationMs, &a.LivePhotoVideoID, &a.IsLivePhotoVideo, &a.IsScreenshot,
+			&a.IndexedAt, &a.Status, &score); err != nil {
+			return nil, err
+		}
+		a.MatchScore = &score
+		out = append(out, a)
+	}
+	return out, nil
 }
 
 func (s *SmartViewService) logActivity(svID, evType, detail string, assetIDs []string) {
