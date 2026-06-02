@@ -76,6 +76,9 @@ func (s *SmartViewService) Create(in SmartViewInput) (*SmartView, error) {
 		return nil, err
 	}
 	s.logActivity(in.ID, "created", "", nil)
+	if err := s.Evaluate(in.ID); err != nil {
+		return nil, err
+	}
 	return s.Get(in.ID)
 }
 
@@ -182,6 +185,11 @@ func (s *SmartViewService) Update(id string, p SmartViewPatch) (*SmartView, erro
 		}
 	}
 	s.logActivity(id, "updated", "", nil)
+	if p.CondsRaw != nil || p.Threshold != nil || p.IncludeVideos != nil {
+		if err := s.Evaluate(id); err != nil {
+			return nil, err
+		}
+	}
 	return s.Get(id)
 }
 
@@ -220,6 +228,244 @@ func joinComma(parts []string) string {
 			out += ", "
 		}
 		out += p
+	}
+	return out
+}
+
+// Evaluate runs a full match evaluation and reconciles smart_view_matches.
+func (s *SmartViewService) Evaluate(id string) error {
+	sv, err := s.Get(id)
+	if err != nil {
+		return err
+	}
+	var parsedJSON string
+	var includeVideos int
+	if err := s.db.QueryRow(`SELECT conds_parsed, include_videos FROM smart_views WHERE id=?`, id).
+		Scan(&parsedJSON, &includeVideos); err != nil {
+		return err
+	}
+	var parsed []ParsedCond
+	_ = json.Unmarshal([]byte(parsedJSON), &parsed)
+
+	var sets []map[string]struct{}
+	semanticScores := map[string][]float64{}
+	hasExecutable := false
+	for _, c := range parsed {
+		switch c.Kind {
+		case condPerson:
+			ids, err := s.assetsForPerson(c.Value)
+			if err != nil {
+				return err
+			}
+			sets = append(sets, ids)
+			hasExecutable = true
+		case condPlace:
+			ids, err := s.assetsForPlace(c.Value)
+			if err != nil {
+				return err
+			}
+			sets = append(sets, ids)
+			hasExecutable = true
+		case condDate:
+			if c.Start != nil && c.End != nil {
+				ids, err := s.assetsForDateRange(*c.Start, *c.End)
+				if err != nil {
+					return err
+				}
+				sets = append(sets, ids)
+				hasExecutable = true
+			}
+		case condSemantic:
+			scored, err := s.assetsForSemantic(c.Value)
+			if err != nil {
+				return err
+			}
+			set := map[string]struct{}{}
+			for aid, sc := range scored {
+				set[aid] = struct{}{}
+				semanticScores[aid] = append(semanticScores[aid], sc)
+			}
+			sets = append(sets, set)
+			hasExecutable = true
+		case condUnsupported:
+		}
+	}
+	if !hasExecutable {
+		_, _ = s.db.Exec(`DELETE FROM smart_view_matches WHERE smart_view_id=?`, id)
+		s.touchEvaluated(id)
+		return nil
+	}
+	inter := intersect(sets)
+	if includeVideos == 0 {
+		inter = s.excludeVideos(inter)
+	}
+	type scored struct {
+		id    string
+		score float64
+	}
+	thr := float64(sv.Threshold) / 100.0
+	var keep []scored
+	for aid := range inter {
+		score := 1.0
+		if vs := semanticScores[aid]; len(vs) > 0 {
+			sum := 0.0
+			for _, v := range vs {
+				sum += v
+			}
+			score = sum / float64(len(vs))
+		}
+		if score >= thr {
+			keep = append(keep, scored{aid, score})
+		}
+	}
+	existing := map[string]struct{}{}
+	rows, err := s.db.Query(`SELECT asset_id FROM smart_view_matches WHERE smart_view_id=?`, id)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var aid string
+		rows.Scan(&aid)
+		existing[aid] = struct{}{}
+	}
+	rows.Close()
+
+	keepSet := map[string]struct{}{}
+	var added []string
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck
+	for _, k := range keep {
+		keepSet[k.id] = struct{}{}
+		if _, ok := existing[k.id]; ok {
+			if _, err := tx.Exec(`UPDATE smart_view_matches SET match_score=? WHERE smart_view_id=? AND asset_id=?`,
+				k.score, id, k.id); err != nil {
+				return err
+			}
+		} else {
+			if _, err := tx.Exec(`INSERT INTO smart_view_matches(smart_view_id,asset_id,match_score) VALUES(?,?,?)`,
+				id, k.id, k.score); err != nil {
+				return err
+			}
+			added = append(added, k.id)
+		}
+	}
+	for aid := range existing {
+		if _, ok := keepSet[aid]; !ok {
+			if _, err := tx.Exec(`DELETE FROM smart_view_matches WHERE smart_view_id=? AND asset_id=?`, id, aid); err != nil {
+				return err
+			}
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	if len(added) > 0 {
+		s.logActivity(id, "matched", "", added)
+	}
+	s.touchEvaluated(id)
+	return nil
+}
+
+func (s *SmartViewService) touchEvaluated(id string) {
+	_, _ = s.db.Exec(`UPDATE smart_views SET evaluated_at=CURRENT_TIMESTAMP WHERE id=?`, id)
+}
+
+func (s *SmartViewService) assetsForPerson(personID string) (map[string]struct{}, error) {
+	rows, err := s.db.Query(`SELECT DISTINCT fd.asset_id
+		FROM face_detections fd JOIN face_person fp ON fp.face_id=fd.id
+		JOIN assets a ON a.id=fd.asset_id
+		WHERE fp.person_id=? AND a.is_live_photo_video=0 AND a.deleted_at IS NULL`, personID)
+	return scanIDSet(rows, err)
+}
+
+func (s *SmartViewService) assetsForPlace(text string) (map[string]struct{}, error) {
+	rows, err := s.db.Query(`SELECT DISTINCT g.asset_id FROM asset_geo g
+		JOIN assets a ON a.id=g.asset_id
+		WHERE (lower(g.city)=lower(?) OR lower(g.country)=lower(?) OR lower(g.region)=lower(?))
+		  AND a.is_live_photo_video=0 AND a.deleted_at IS NULL`, text, text, text)
+	return scanIDSet(rows, err)
+}
+
+func (s *SmartViewService) assetsForDateRange(start, end time.Time) (map[string]struct{}, error) {
+	rows, err := s.db.Query(`SELECT id FROM assets
+		WHERE taken_at BETWEEN ? AND ? AND is_live_photo_video=0 AND deleted_at IS NULL`,
+		start.UTC().Format("2006-01-02T15:04:05Z"), end.UTC().Format("2006-01-02T15:04:05Z"))
+	return scanIDSet(rows, err)
+}
+
+func (s *SmartViewService) assetsForSemantic(query string) (map[string]float64, error) {
+	results, err := s.search.SmartSearch(query, 500, SearchFilters{})
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]float64{}
+	for _, a := range results {
+		sc := 0.0
+		if a.MatchScore != nil {
+			sc = *a.MatchScore
+		}
+		out[a.ID] = sc
+	}
+	return out, nil
+}
+
+func (s *SmartViewService) excludeVideos(in map[string]struct{}) map[string]struct{} {
+	if len(in) == 0 {
+		return in
+	}
+	out := map[string]struct{}{}
+	for aid := range in {
+		var mime string
+		s.db.QueryRow(`SELECT COALESCE(mime_type,'') FROM assets WHERE id=?`, aid).Scan(&mime)
+		if len(mime) >= 6 && mime[:6] == "video/" {
+			continue
+		}
+		out[aid] = struct{}{}
+	}
+	return out
+}
+
+func scanIDSet(rows *sql.Rows, err error) (map[string]struct{}, error) {
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]struct{}{}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out[id] = struct{}{}
+	}
+	return out, nil
+}
+
+func intersect(sets []map[string]struct{}) map[string]struct{} {
+	if len(sets) == 0 {
+		return map[string]struct{}{}
+	}
+	base := sets[0]
+	for _, s := range sets[1:] {
+		if len(s) < len(base) {
+			base = s
+		}
+	}
+	out := map[string]struct{}{}
+	for id := range base {
+		in := true
+		for _, s := range sets {
+			if _, ok := s[id]; !ok {
+				in = false
+				break
+			}
+		}
+		if in {
+			out[id] = struct{}{}
+		}
 	}
 	return out
 }
