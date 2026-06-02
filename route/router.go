@@ -172,6 +172,9 @@ func InitRouter(ctx context.Context, svc service.Services, runtimePath string, t
 	g.GET("/config", cfg.GetConfig)
 	g.PUT("/config", cfg.UpdateConfig)
 
+	smartViews := v1.NewSmartViewsHandler(svc)
+	v1.RegisterSmartViewRoutes(g, smartViews)
+
 	// TUS resumable upload endpoints — register outside the v1 group so the
 	// path is exactly /v1/upload-tus (matching the frontend tusClient base URL).
 	tusH, err := v1.NewTUSHandler(svc, "/DATA/Gallery")

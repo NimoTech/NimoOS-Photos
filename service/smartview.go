@@ -1,9 +1,15 @@
 package service
 
 import (
+	"archive/zip"
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/google/uuid"
@@ -329,76 +335,18 @@ func (s *SmartViewService) Evaluate(id string) error {
 	var parsed []ParsedCond
 	_ = json.Unmarshal([]byte(parsedJSON), &parsed)
 
-	var sets []map[string]struct{}
-	semanticScores := map[string][]float64{}
-	hasExecutable := false
-	for _, c := range parsed {
-		switch c.Kind {
-		case condPerson:
-			ids, err := s.assetsForPerson(c.Value)
-			if err != nil {
-				return err
-			}
-			sets = append(sets, ids)
-			hasExecutable = true
-		case condPlace:
-			ids, err := s.assetsForPlace(c.Value)
-			if err != nil {
-				return err
-			}
-			sets = append(sets, ids)
-			hasExecutable = true
-		case condDate:
-			if c.Start != nil && c.End != nil {
-				ids, err := s.assetsForDateRange(*c.Start, *c.End)
-				if err != nil {
-					return err
-				}
-				sets = append(sets, ids)
-				hasExecutable = true
-			}
-		case condSemantic:
-			scored, err := s.assetsForSemantic(c.Value)
-			if err != nil {
-				return err
-			}
-			set := map[string]struct{}{}
-			for aid, sc := range scored {
-				set[aid] = struct{}{}
-				semanticScores[aid] = append(semanticScores[aid], sc)
-			}
-			sets = append(sets, set)
-			hasExecutable = true
-		case condUnsupported:
-		}
-	}
-	if !hasExecutable {
-		_, _ = s.db.Exec(`DELETE FROM smart_view_matches WHERE smart_view_id=?`, id)
-		s.touchEvaluated(id)
-		return nil
-	}
-	inter := intersect(sets)
-	if includeVideos == 0 {
-		inter = s.excludeVideos(inter)
+	includeVideosBool := includeVideos == 1
+	scoreMap, err := s.evalParsed(parsed, sv.Threshold, !includeVideosBool)
+	if err != nil {
+		return err
 	}
 	type scored struct {
 		id    string
 		score float64
 	}
-	thr := float64(sv.Threshold) / 100.0
-	var keep []scored
-	for aid := range inter {
-		score := 1.0
-		if vs := semanticScores[aid]; len(vs) > 0 {
-			sum := 0.0
-			for _, v := range vs {
-				sum += v
-			}
-			score = sum / float64(len(vs))
-		}
-		if score >= thr {
-			keep = append(keep, scored{aid, score})
-		}
+	keep := make([]scored, 0, len(scoreMap))
+	for aid, sc := range scoreMap {
+		keep = append(keep, scored{aid, sc})
 	}
 	existing := map[string]struct{}{}
 	rows, err := s.db.Query(`SELECT asset_id FROM smart_view_matches WHERE smart_view_id=?`, id)
@@ -639,4 +587,182 @@ func intersect(sets []map[string]struct{}) map[string]struct{} {
 		}
 	}
 	return out
+}
+
+// Preview evaluates condsRaw at threshold without persisting results.
+// Returns (totalMatched, topSeedIDs, error).
+func (s *SmartViewService) Preview(condsRaw []string, threshold int) (int, []string, error) {
+	if threshold < 50 || threshold > 99 {
+		threshold = 70
+	}
+	parsed := ParseConditions(s.db, condsRaw)
+	scored, err := s.evalParsed(parsed, threshold, true)
+	if err != nil {
+		return 0, nil, err
+	}
+	ids := topNByScore(scored, 6)
+	return len(scored), ids, nil
+}
+
+// evalParsed is the shared matcher used by Evaluate (persisted) and Preview.
+// excludeVideos=true drops video assets from the result set.
+// Returns a map of assetID -> score.
+func (s *SmartViewService) evalParsed(parsed []ParsedCond, threshold int, excludeVideos bool) (map[string]float64, error) {
+	var sets []map[string]struct{}
+	semanticScores := map[string][]float64{}
+	hasExecutable := false
+	for _, c := range parsed {
+		switch c.Kind {
+		case condPerson:
+			ids, err := s.assetsForPerson(c.Value)
+			if err != nil {
+				return nil, err
+			}
+			sets = append(sets, ids)
+			hasExecutable = true
+		case condPlace:
+			ids, err := s.assetsForPlace(c.Value)
+			if err != nil {
+				return nil, err
+			}
+			sets = append(sets, ids)
+			hasExecutable = true
+		case condDate:
+			if c.Start != nil && c.End != nil {
+				ids, err := s.assetsForDateRange(*c.Start, *c.End)
+				if err != nil {
+					return nil, err
+				}
+				sets = append(sets, ids)
+				hasExecutable = true
+			}
+		case condSemantic:
+			scored, err := s.assetsForSemantic(c.Value)
+			if err != nil {
+				return nil, err
+			}
+			set := map[string]struct{}{}
+			for aid, sc := range scored {
+				set[aid] = struct{}{}
+				semanticScores[aid] = append(semanticScores[aid], sc)
+			}
+			sets = append(sets, set)
+			hasExecutable = true
+		}
+	}
+	if !hasExecutable {
+		return map[string]float64{}, nil
+	}
+	inter := intersect(sets)
+	if excludeVideos {
+		inter = s.excludeVideos(inter)
+	}
+	thr := float64(threshold) / 100.0
+	out := map[string]float64{}
+	for aid := range inter {
+		score := 1.0
+		if vs := semanticScores[aid]; len(vs) > 0 {
+			sum := 0.0
+			for _, v := range vs {
+				sum += v
+			}
+			score = sum / float64(len(vs))
+		}
+		if score >= thr {
+			out[aid] = score
+		}
+	}
+	return out, nil
+}
+
+// topNByScore returns the IDs of the top n entries in m by score (descending).
+func topNByScore(m map[string]float64, n int) []string {
+	type kv struct {
+		id string
+		sc float64
+	}
+	arr := make([]kv, 0, len(m))
+	for id, sc := range m {
+		arr = append(arr, kv{id, sc})
+	}
+	for i := 0; i < len(arr) && i < n; i++ {
+		max := i
+		for j := i + 1; j < len(arr); j++ {
+			if arr[j].sc > arr[max].sc {
+				max = j
+			}
+		}
+		arr[i], arr[max] = arr[max], arr[i]
+	}
+	out := []string{}
+	for i := 0; i < len(arr) && i < n; i++ {
+		out = append(out, arr[i].id)
+	}
+	return out
+}
+
+// ExportAsAlbum creates a new album snapshot from the smart view's current matches.
+// Returns the new album's ID.
+func (s *SmartViewService) ExportAsAlbum(id string) (string, error) {
+	sv, err := s.Get(id)
+	if err != nil {
+		return "", err
+	}
+	albumSvc := NewAlbumService(s.db)
+	album, err := albumSvc.Create(sv.Name + " (snapshot)")
+	if err != nil {
+		return "", fmt.Errorf("ExportAsAlbum create album: %w", err)
+	}
+	assets, err := s.MatchedAssets(id, 100000, 0, false)
+	if err != nil {
+		return "", err
+	}
+	ids := make([]string, 0, len(assets))
+	for _, a := range assets {
+		ids = append(ids, a.ID)
+	}
+	if len(ids) > 0 {
+		if err := albumSvc.BatchAddAssets(album.ID, ids); err != nil {
+			return "", err
+		}
+	}
+	s.logActivity(id, "exported", "album", nil)
+	return album.ID, nil
+}
+
+// ExportZip streams all matched assets as a ZIP archive directly to w.
+func (s *SmartViewService) ExportZip(w http.ResponseWriter, id string) error {
+	assets, err := s.MatchedAssets(id, 100000, 0, false)
+	if err != nil {
+		return err
+	}
+	if len(assets) == 0 {
+		return ErrInvalidInput
+	}
+	w.Header().Set("Content-Type", "application/zip")
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="smartview-%s.zip"`, id))
+	w.WriteHeader(http.StatusOK)
+	zw := zip.NewWriter(w)
+	defer zw.Close()
+	for _, a := range assets {
+		name := a.OriginalName
+		if name == "" {
+			name = a.ID + filepath.Ext(a.FilePath)
+		}
+		zf, err := zw.Create(name)
+		if err != nil {
+			continue
+		}
+		f, err := os.Open(a.FilePath)
+		if err != nil {
+			continue
+		}
+		_, _ = io.Copy(zf, f)
+		f.Close()
+		if fl, ok := w.(http.Flusher); ok {
+			fl.Flush()
+		}
+	}
+	s.logActivity(id, "exported", "zip", nil)
+	return nil
 }

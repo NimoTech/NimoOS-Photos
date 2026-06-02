@@ -193,3 +193,22 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 func (s *services) RestartWatcher(dirs []string) {
 	s.watcher.Restart(s.parentCtx, dirs)
 }
+
+// NewTestServices builds a minimal Services backed by db, for handler tests.
+// Only SmartViews, Albums, and Search are wired; other accessors return nil.
+func NewTestServices(db *sql.DB) Services {
+	search := NewSearchService(db, zeroML{})
+	albums := NewAlbumService(db)
+	return &services{
+		db:         db,
+		search:     search,
+		albums:     albums,
+		smartViews: NewSmartViewService(db, search),
+	}
+}
+
+// zeroML satisfies the textEmbedder interface with zero-value CLIP embeddings.
+// It is used only in tests where actual ML inference is not needed.
+type zeroML struct{}
+
+func (zeroML) CLIPTextEmbed(string) ([]float32, error) { return make([]float32, 512), nil }
