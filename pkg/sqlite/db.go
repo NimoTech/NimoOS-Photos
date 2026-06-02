@@ -199,6 +199,14 @@ func migrate(db *sql.DB) error {
 			asset_id  TEXT NOT NULL,
 			PRIMARY KEY (user_id, place_key)
 		)`,
+
+		// ── Spot name overrides (per-user custom name for an auto-detected spot) ─
+		`CREATE TABLE IF NOT EXISTS spot_name_overrides (
+			user_id  TEXT NOT NULL,
+			spot_key TEXT NOT NULL,
+			name     TEXT NOT NULL,
+			PRIMARY KEY (user_id, spot_key)
+		)`,
 	}
 
 	for _, stmt := range statements {
@@ -323,7 +331,8 @@ func migrate(db *sql.DB) error {
 // geoGazVersion is bumped whenever the embedded gazetteer or the reverse-geocode
 // algorithm changes in a way that alters which city a coordinate resolves to.
 // v1: metro-snap + coarser gazetteer (drop PPLX & capital-swallowed sub-divisions),
-//     so dense metros (e.g. Hong Kong, Macau) resolve to one city instead of many.
+//
+//	so dense metros (e.g. Hong Kong, Macau) resolve to one city instead of many.
 const geoGazVersion = 1
 
 // regeocodeIfStale clears asset_geo when the gazetteer version stored in the DB

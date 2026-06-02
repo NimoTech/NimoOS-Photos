@@ -55,7 +55,43 @@ func (h *PlacesHandler) Get(c echo.Context) error {
 	if cover, _ := h.svc.Places().GetCover(placeUserID(c), key); cover != "" {
 		d.CoverAssetID = cover
 	}
+	if ov := h.svc.Places().SpotNameOverrides(placeUserID(c)); len(ov) > 0 {
+		for i := range d.Spots {
+			if n, ok := ov[d.Spots[i].Key]; ok {
+				d.Spots[i].Name = n
+			}
+		}
+	}
 	return c.JSON(http.StatusOK, d)
+}
+
+// SetSpotName — PUT /v1/photos/places/:key/spot-name  { spotKey, name }
+func (h *PlacesHandler) SetSpotName(c echo.Context) error {
+	var req struct {
+		SpotKey string `json:"spotKey"`
+		Name    string `json:"name"`
+	}
+	if e := c.Bind(&req); e != nil || req.SpotKey == "" || req.Name == "" {
+		return echo.NewHTTPError(http.StatusBadRequest, "spotKey and name are required")
+	}
+	if e := h.svc.Places().SetSpotName(placeUserID(c), req.SpotKey, req.Name); e != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, e.Error())
+	}
+	return c.JSON(http.StatusOK, map[string]interface{}{"ok": true, "name": req.Name})
+}
+
+// ResetSpotName — DELETE /v1/photos/places/:key/spot-name  { spotKey }
+func (h *PlacesHandler) ResetSpotName(c echo.Context) error {
+	var req struct {
+		SpotKey string `json:"spotKey"`
+	}
+	if e := c.Bind(&req); e != nil || req.SpotKey == "" {
+		return echo.NewHTTPError(http.StatusBadRequest, "spotKey is required")
+	}
+	if e := h.svc.Places().ResetSpotName(placeUserID(c), req.SpotKey); e != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, e.Error())
+	}
+	return c.JSON(http.StatusOK, map[string]interface{}{"ok": true})
 }
 
 // CoverCandidates — GET /v1/photos/places/:key/cover-candidates

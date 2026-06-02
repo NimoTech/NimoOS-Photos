@@ -10,10 +10,20 @@ import (
 )
 
 // Gazetteer holds all cities plus a 1°x1° bucket grid for fast nearest lookup.
+// It optionally also holds a finer POI layer (landmarks) used to name spots.
 type Gazetteer struct {
 	cities    []City
 	countries map[string]Country
 	grid      map[int][]int32 // bucket key -> indices into cities
+
+	pois    []poi
+	poiGrid map[int][]int32 // bucket key -> indices into pois
+}
+
+// poi is one landmark in the spot-naming layer.
+type poi struct {
+	name     string
+	lat, lon float64
 }
 
 func bucketKey(lat, lon float64) int {
@@ -184,8 +194,61 @@ func (g *Gazetteer) CityByID(id int32) (City, bool) {
 // Len returns the number of loaded cities.
 func (g *Gazetteer) Len() int { return len(g.cities) }
 
-// NearestFeature returns the closest city name within maxKm, else ("", false).
+// LoadPOIs populates the landmark layer from a TSV reader (name, lat, lon).
+// Call after LoadFrom. Safe to skip — without it spot naming falls back to
+// the nearest city.
+func (g *Gazetteer) LoadPOIs(r io.Reader) error {
+	g.poiGrid = map[int][]int32{}
+	sc := bufio.NewScanner(r)
+	sc.Buffer(make([]byte, 1024*1024), 1024*1024)
+	for sc.Scan() {
+		f := strings.Split(sc.Text(), "\t")
+		if len(f) < 3 {
+			continue
+		}
+		lat, err1 := strconv.ParseFloat(f[1], 64)
+		lon, err2 := strconv.ParseFloat(f[2], 64)
+		if err1 != nil || err2 != nil {
+			continue
+		}
+		idx := int32(len(g.pois))
+		g.pois = append(g.pois, poi{name: f[0], lat: lat, lon: lon})
+		k := bucketKey(lat, lon)
+		g.poiGrid[k] = append(g.poiGrid[k], idx)
+	}
+	return sc.Err()
+}
+
+// nearestPOI returns the closest landmark index and its distance in km, or
+// (-1, +Inf) when the POI layer is empty.
+func (g *Gazetteer) nearestPOI(lat, lon float64) (int32, float64) {
+	best := int32(-1)
+	bestD := math.MaxFloat64
+	bLat := int(math.Floor(lat + 90))
+	bLon := int(math.Floor(lon + 180))
+	for dy := -1; dy <= 1; dy++ {
+		for dx := -1; dx <= 1; dx++ {
+			for _, idx := range g.poiGrid[(bLat+dy)*1000+(bLon+dx)] {
+				p := g.pois[idx]
+				if d := HaversineKm(lat, lon, p.lat, p.lon); d < bestD {
+					bestD = d
+					best = idx
+				}
+			}
+		}
+	}
+	return best, bestD
+}
+
+// NearestFeature returns a name for a fine-grained spot: the closest landmark
+// within maxKm if the POI layer has one, otherwise the closest city within
+// maxKm. Returns ("", false) when nothing is close enough.
 func (g *Gazetteer) NearestFeature(lat, lon, maxKm float64) (string, bool) {
+	if len(g.pois) > 0 {
+		if idx, d := g.nearestPOI(lat, lon); idx >= 0 && d <= maxKm {
+			return g.pois[idx].name, true
+		}
+	}
 	idx, d := g.nearest(lat, lon)
 	if idx < 0 || d > maxKm {
 		return "", false

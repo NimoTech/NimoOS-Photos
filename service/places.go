@@ -287,12 +287,21 @@ GROUP BY p.id ORDER BY c DESC LIMIT ?`,
 	return out
 }
 
-const spotGrid = 0.01 // ~1km
-const spotMinPhotos = 3
-const spotMaxCount = 8
+const spotGrid = 0.01    // ~1km; resolution used only to derive a stable spot key
+const spotRadiusKm = 0.3 // greedy cluster merge radius (~300m) for grouping a spot
+const spotMinPhotos = 3  // discard clusters smaller than this
+const spotMaxCount = 8   // cap spots shown per city
 
 // Spots clusters a city's assets into fine-grained spots.
 func (s *PlacesService) Spots(cityID int32) []Spot { return s.spots(cityID) }
+
+type spotCluster struct {
+	count      int
+	sumLat     float64
+	sumLon     float64
+	cLat, cLon float64 // running centroid
+	firstID    string  // most-recent asset in the cluster (cover thumb)
+}
 
 func (s *PlacesService) spots(cityID int32) []Spot {
 	rows, err := s.db.Query(`
@@ -305,53 +314,56 @@ ORDER BY a.taken_at DESC`, cityID)
 	}
 	defer rows.Close()
 
-	type bucket struct {
-		count   int
-		sumLat  float64
-		sumLon  float64
-		firstID string
-	}
-	buckets := map[[2]int]*bucket{}
-	var order [][2]int
+	// Greedy radius clustering: assign each photo to the nearest existing cluster
+	// within spotRadiusKm, else start a new one. Unlike the old fixed grid, this
+	// keeps a single landmark's photos together even when they straddle a grid
+	// line. Rows arrive newest-first, so a cluster's firstID is its newest photo.
+	var clusters []*spotCluster
 	for rows.Next() {
 		var id string
 		var lat, lon float64
 		if rows.Scan(&id, &lat, &lon) != nil {
 			continue
 		}
-		k := [2]int{int(lat / spotGrid), int(lon / spotGrid)}
-		b := buckets[k]
-		if b == nil {
-			b = &bucket{firstID: id}
-			buckets[k] = b
-			order = append(order, k)
+		var best *spotCluster
+		bestD := spotRadiusKm
+		for _, c := range clusters {
+			if d := geo.HaversineKm(lat, lon, c.cLat, c.cLon); d <= bestD {
+				bestD = d
+				best = c
+			}
 		}
-		b.count++
-		b.sumLat += lat
-		b.sumLon += lon
+		if best == nil {
+			clusters = append(clusters, &spotCluster{count: 1, sumLat: lat, sumLon: lon, cLat: lat, cLon: lon, firstID: id})
+			continue
+		}
+		best.count++
+		best.sumLat += lat
+		best.sumLon += lon
+		best.cLat = best.sumLat / float64(best.count)
+		best.cLon = best.sumLon / float64(best.count)
 	}
 
 	var spots []Spot
 	n := 0
-	for _, k := range order {
-		b := buckets[k]
-		if b.count < spotMinPhotos {
+	for _, c := range clusters {
+		if c.count < spotMinPhotos {
 			continue
 		}
-		cLat := b.sumLat / float64(b.count)
-		cLon := b.sumLon / float64(b.count)
-		name, ok := s.gaz.NearestFeature(cLat, cLon, 5)
+		name, ok := s.gaz.NearestFeature(c.cLat, c.cLon, 5)
 		if !ok {
 			n++
 			name = fmt.Sprintf("Spot %d", n)
 		}
 		spots = append(spots, Spot{
-			Key:   fmt.Sprintf("%d:%d:%d", cityID, k[0], k[1]),
+			// Key derived from the centroid rounded to spotGrid so it stays stable
+			// across recomputes (used for spot dialogs and name overrides).
+			Key:   fmt.Sprintf("%d:%d:%d", cityID, int(c.cLat/spotGrid), int(c.cLon/spotGrid)),
 			Name:  name,
-			Lat:   cLat,
-			Lon:   cLon,
-			Count: b.count,
-			Thumb: b.firstID,
+			Lat:   c.cLat,
+			Lon:   c.cLon,
+			Count: c.count,
+			Thumb: c.firstID,
 		})
 	}
 	sort.Slice(spots, func(i, j int) bool { return spots[i].Count > spots[j].Count })
@@ -462,6 +474,38 @@ func (s *PlacesService) GetCover(userID string, placeKey int32) (string, error) 
 func (s *PlacesService) ResetCover(userID string, placeKey int32) error {
 	_, err := s.db.Exec(`DELETE FROM place_cover_overrides WHERE user_id=? AND place_key=?`, userID, placeKey)
 	return err
+}
+
+// SetSpotName stores a per-user custom name for an auto-detected spot.
+func (s *PlacesService) SetSpotName(userID, spotKey, name string) error {
+	_, err := s.db.Exec(`
+INSERT INTO spot_name_overrides(user_id, spot_key, name) VALUES(?,?,?)
+ON CONFLICT(user_id, spot_key) DO UPDATE SET name=excluded.name`,
+		userID, spotKey, name)
+	return err
+}
+
+// ResetSpotName removes a spot's custom name (reverting to the auto name).
+func (s *PlacesService) ResetSpotName(userID, spotKey string) error {
+	_, err := s.db.Exec(`DELETE FROM spot_name_overrides WHERE user_id=? AND spot_key=?`, userID, spotKey)
+	return err
+}
+
+// SpotNameOverrides returns a user's spot_key→name map for applying to spots.
+func (s *PlacesService) SpotNameOverrides(userID string) map[string]string {
+	rows, err := s.db.Query(`SELECT spot_key, name FROM spot_name_overrides WHERE user_id=?`, userID)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	out := map[string]string{}
+	for rows.Next() {
+		var k, n string
+		if rows.Scan(&k, &n) == nil {
+			out[k] = n
+		}
+	}
+	return out
 }
 
 // placeAssetIDs returns all asset ids for a city, optionally within [from, to] (YYYY-MM-DD).

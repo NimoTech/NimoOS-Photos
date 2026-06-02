@@ -23,6 +23,7 @@ import (
 func main() {
 	citiesIn := flag.String("cities", "", "path to GeoNames cities15000.txt")
 	countriesIn := flag.String("countries", "", "path to GeoNames countryInfo.txt")
+	allIn := flag.String("allcountries", "", "path to GeoNames allCountries.txt (optional; builds the POI layer for spot naming)")
 	out := flag.String("out", "pkg/geo/data", "output directory")
 	flag.Parse()
 	if *citiesIn == "" || *countriesIn == "" {
@@ -35,7 +36,74 @@ func main() {
 	if err := genCities(*citiesIn, filepath.Join(*out, "cities15000.tsv.gz")); err != nil {
 		panic(err)
 	}
+	if *allIn != "" {
+		n, err := genPOIs(*allIn, filepath.Join(*out, "pois.tsv.gz"))
+		if err != nil {
+			panic(err)
+		}
+		fmt.Printf("POI layer: %d landmarks\n", n)
+	}
 	fmt.Println("gazetteer generated into", *out)
+}
+
+// poiCodes is the whitelist of GeoNames feature codes kept for the spot-naming
+// POI layer: recognizable, photo-worthy landmarks and scenery. Keyed by the
+// feature code column (S = spots/structures, L = parks/areas, T = terrain,
+// H = a few scenic hydro features). Everything else (admin, roads, utilities,
+// generic buildings…) is dropped to keep the embedded layer small.
+var poiCodes = map[string]bool{
+	// S — structures / cultural / civic landmarks
+	"TMPL": true, "SHRN": true, "CH": true, "MSQE": true, "PGDA": true,
+	"MNMT": true, "MUS": true, "CSTL": true, "PAL": true, "HSTS": true,
+	"ANS": true, "RUIN": true, "TOWR": true, "OBS": true, "OBSR": true,
+	"ZOO": true, "AMTH": true, "OPRA": true, "THTR": true, "MKT": true,
+	"SQR": true, "STDM": true, "ARCH": true, "FT": true, "MALL": true,
+	"GHSE": true, "LIBR": true, "UNIV": true, "RLG": true, "MSTY": true,
+	"CTRR": true, "RSTN": true, "MTRO": true, "AIRP": true, "PIER": true,
+	"BDG": true, "GDN": true, "AQC": true, "CMTY": true, "HSP": false,
+	// L — parks / protected / recreation areas
+	"PRK": true, "RESN": true, "RESV": true, "RECG": true, "RECR": true,
+	"AMUS": true, "GRAZ": false,
+	// T — scenic natural features
+	"MT": true, "PK": true, "VLC": true, "BCH": true, "CAPE": true,
+	"ISL": true, "CLF": true, "DUNE": true, "GLCR": true, "VAL": true,
+	// H — scenic hydrographic features
+	"FLLS": true, "LK": true, "SPNG": true, "LGN": true,
+}
+
+// genPOIs extracts the whitelisted landmarks from allCountries.txt into a
+// compact gzipped TSV (name, lat, lon). Returns the number of POIs written.
+func genPOIs(in, out string) (int, error) {
+	f, err := os.Open(in)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+	w, gz, err := openGz(out)
+	if err != nil {
+		return 0, err
+	}
+	defer w.Close()
+	defer gz.Close()
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 1<<20), 1<<20)
+	n := 0
+	for sc.Scan() {
+		c := strings.Split(sc.Text(), "\t")
+		if len(c) < 15 {
+			continue
+		}
+		if !poiCodes[c[7]] { // c[7] = feature code
+			continue
+		}
+		name := c[1]
+		if name == "" {
+			continue
+		}
+		fmt.Fprintf(gz, "%s\t%s\t%s\n", name, c[4], c[5])
+		n++
+	}
+	return n, sc.Err()
 }
 
 // row is a parsed GeoNames city line we keep around for the two-pass filter.

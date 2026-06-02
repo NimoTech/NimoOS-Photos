@@ -123,6 +123,8 @@ func InitRouter(ctx context.Context, svc service.Services, runtimePath string, t
 	g.GET("/places/:key/cover-candidates", places.CoverCandidates)
 	g.PUT("/places/:key/cover", places.SetCover)
 	g.DELETE("/places/:key/cover", places.ResetCover)
+	g.PUT("/places/:key/spot-name", places.SetSpotName)
+	g.DELETE("/places/:key/spot-name", places.ResetSpotName)
 	g.POST("/places/:key/album", places.CreateAlbum)
 
 	// Favorites

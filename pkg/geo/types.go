@@ -4,8 +4,8 @@ package geo
 
 // City is one gazetteer entry.
 type City struct {
-	ID         int32   `json:"id"`         // GeoNames geonameid; used as place_key
-	Name       string  `json:"name"`       // city name
+	ID         int32   `json:"id"`   // GeoNames geonameid; used as place_key
+	Name       string  `json:"name"` // city name
 	Lat        float64 `json:"lat"`
 	Lon        float64 `json:"lon"`
 	ISO2       string  `json:"iso2"`       // country ISO-3166 alpha-2

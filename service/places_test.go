@@ -92,6 +92,35 @@ func TestSpotsCluster(t *testing.T) {
 	require.NotZero(t, spots[0].Count)
 }
 
+func TestSpotNameOverride(t *testing.T) {
+	db, err := sqlite.Open(filepath.Join(t.TempDir(), "t.db"))
+	require.NoError(t, err)
+	defer db.Close()
+	gaz, _ := geo.Load()
+	geoSvc := service.NewGeoService(db, gaz)
+	mk := func(id string, lat, lon float64) {
+		db.Exec(`INSERT INTO assets(id,file_path,status,taken_at,is_live_photo_video) VALUES(?,?, 'indexed', '2026-03-01 10:00:00', 0)`, id, "/x/"+id)
+		db.Exec(`INSERT INTO asset_exif(asset_id,latitude,longitude) VALUES(?,?,?)`, id, lat, lon)
+		require.NoError(t, geoSvc.GeocodeAsset(id))
+	}
+	mk("s1", 35.6579, 139.7036)
+	mk("s2", 35.6569, 139.7046)
+	mk("s3", 35.6589, 139.7036)
+
+	svc := service.NewPlacesService(db, gaz, geoSvc)
+	resp, _ := svc.ListPlaces()
+	spots := svc.Spots(resp.Places[0].Key)
+	require.NotEmpty(t, spots)
+	sk := spots[0].Key
+
+	require.NoError(t, svc.SetSpotName("0", sk, "teamLab Planets"))
+	require.Equal(t, "teamLab Planets", svc.SpotNameOverrides("0")[sk])
+	require.Empty(t, svc.SpotNameOverrides("other-user")[sk], "override is per-user")
+
+	require.NoError(t, svc.ResetSpotName("0", sk))
+	require.Empty(t, svc.SpotNameOverrides("0")[sk])
+}
+
 func TestGetPlaceFull(t *testing.T) {
 	svc := placesFixture(t)
 	resp, _ := svc.ListPlaces()
