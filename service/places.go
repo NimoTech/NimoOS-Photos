@@ -27,10 +27,12 @@ func NewPlacesServiceWithAlbums(db *sql.DB, gaz *geo.Gazetteer, geoSvc *GeoServi
 	return &PlacesService{db: db, gaz: gaz, geo: geoSvc, albums: albums}
 }
 
-const recentDays = 30
-
 // ListPlaces returns all places with aggregated stats.
 func (s *PlacesService) ListPlaces() (PlacesResponse, error) {
+	// The current trip is the single city of the latest photo (one green dot),
+	// computed up front before the main cursor is open.
+	curCity, hasCur := s.currentTripCity()
+
 	rows, err := s.db.Query(`
 SELECT g.city_id, g.city, g.country, g.region, COUNT(*) AS cnt, MAX(a.taken_at) AS last_taken
 FROM asset_geo g
@@ -71,8 +73,9 @@ ORDER BY cnt DESC`)
 		lt := parseSQLiteTime(lastTaken)
 		if lt != nil {
 			p.Last = lt.Format("Jan 2, 2006")
-			p.Recent = time.Since(*lt) <= recentDays*24*time.Hour
 		}
+		// Current trip = the one city holding the most recent photo.
+		p.Recent = hasCur && cityID == curCity
 		p.Trips = s.tripCount(cityID)
 		if p.Trips > maxTrips {
 			maxTrips = p.Trips
@@ -178,6 +181,25 @@ func splitTrips(times []time.Time) []segment {
 	return segs
 }
 
+// currentTripCity returns the city_id of the single globally-latest geo-tagged
+// photo — i.e. where the user most recently was. Only that one place is the
+// "current trip" (exactly one green dot on the map); it is anchored to the
+// latest photo rather than to "now", so it never expires just because no new
+// photos were taken. Returns ok=false when there is no geo-tagged photo at all.
+func (s *PlacesService) currentTripCity() (int32, bool) {
+	var cid sql.NullInt64
+	err := s.db.QueryRow(`
+SELECT g.city_id FROM asset_geo g
+JOIN assets a ON a.id=g.asset_id AND a.deleted_at IS NULL AND a.is_live_photo_video=0
+WHERE a.taken_at IS NOT NULL AND g.city_id IS NOT NULL
+ORDER BY a.taken_at DESC
+LIMIT 1`).Scan(&cid)
+	if err != nil || !cid.Valid {
+		return 0, false
+	}
+	return int32(cid.Int64), true
+}
+
 func (s *PlacesService) tripCount(cityID int32) int {
 	items, err := s.loadTakenTimes(cityID)
 	if err != nil || len(items) == 0 {
@@ -201,9 +223,15 @@ func (s *PlacesService) Visits(cityID int32) ([]Visit, error) {
 		ts[i] = items[i].t
 	}
 	segs := splitTrips(ts)
+	curCity, hasCur := s.currentTripCity()
+	// Only this city's most-recent visit can be the current trip, and only when
+	// this is the city of the globally-latest photo. segs are time-ascending, so
+	// the last one is the most recent.
+	isCurCity := hasCur && cityID == curCity
+	lastSeg := len(segs) - 1
 	spotCount := len(s.spots(cityID))
 	var out []Visit
-	for _, seg := range segs {
+	for i, seg := range segs {
 		from := items[seg.start].t
 		to := items[seg.end].t
 		v := Visit{
@@ -211,7 +239,7 @@ func (s *PlacesService) Visits(cityID int32) ([]Visit, error) {
 			To:      to.Format("2006-01-02"),
 			Days:    int(to.Sub(from).Hours()/24) + 1,
 			Photos:  seg.end - seg.start + 1,
-			Current: time.Since(to) <= recentDays*24*time.Hour,
+			Current: isCurCity && i == lastSeg,
 		}
 		if from.Format("Jan 2, 2006") == to.Format("Jan 2, 2006") {
 			v.When = from.Format("Jan 2, 2006")

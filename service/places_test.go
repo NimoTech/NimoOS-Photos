@@ -213,3 +213,52 @@ func TestTripsSplitByGap(t *testing.T) {
 	require.True(t, visits[0].Current)
 	require.Equal(t, 2, visits[0].Photos)
 }
+
+// The "current trip" is exactly one place: the city of the single most-recent
+// photo (one green dot). Even another city visited within the same gap-free
+// window is NOT current — only the latest photo's location is. This guards
+// against the old per-city bug where several places could all claim to be the
+// current trip at once.
+func TestCurrentTripIsLatestPhotoCityOnly(t *testing.T) {
+	db, err := sqlite.Open(filepath.Join(t.TempDir(), "t.db"))
+	require.NoError(t, err)
+	defer db.Close()
+	gaz, _ := geo.Load()
+	geoSvc := service.NewGeoService(db, gaz)
+
+	seed := func(id string, lat, lon float64, daysAgo int) {
+		taken := time.Now().AddDate(0, 0, -daysAgo).UTC().Format("2006-01-02 15:04:05")
+		db.Exec(`INSERT INTO assets(id,file_path,status,taken_at,is_live_photo_video) VALUES(?,?, 'indexed', ?, 0)`, id, "/x/"+id, taken)
+		db.Exec(`INSERT INTO asset_exif(asset_id,latitude,longitude) VALUES(?,?,?)`, id, lat, lon)
+		require.NoError(t, geoSvc.GeocodeAsset(id))
+	}
+	// Tokyo holds the single most-recent photo (1 day ago) → the one green dot.
+	seed("t1", 35.6895, 139.6917, 1)
+	// London 3 days ago: same gap-free window as Tokyo, yet NOT the latest photo,
+	// so it must NOT be current — only one place is ever the current trip.
+	seed("l1", 51.5085, -0.1257, 3)
+
+	svc := service.NewPlacesService(db, gaz, geoSvc)
+	resp, err := svc.ListPlaces()
+	require.NoError(t, err)
+
+	byCity := map[string]service.Place{}
+	for _, p := range resp.Places {
+		byCity[p.City] = p
+	}
+	require.True(t, byCity["Tokyo"].Recent, "Tokyo holds the latest photo → current trip")
+	require.False(t, byCity["London"].Recent, "London is not the latest photo's city")
+
+	// Exactly one place flagged as the current trip.
+	greenDots := 0
+	for _, p := range resp.Places {
+		if p.Recent {
+			greenDots++
+		}
+	}
+	require.Equal(t, 1, greenDots, "exactly one green dot")
+
+	lv, err := svc.Visits(byCity["London"].Key)
+	require.NoError(t, err)
+	require.False(t, lv[0].Current, "London visit must not be flagged current")
+}
