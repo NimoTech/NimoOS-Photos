@@ -52,7 +52,7 @@ func main() {
 // H = a few scenic hydro features). Everything else (admin, roads, utilities,
 // generic buildings…) is dropped to keep the embedded layer small.
 var poiCodes = map[string]bool{
-	// S — structures / cultural / civic landmarks
+	// S — structures / cultural / civic landmarks (the core of spot naming)
 	"TMPL": true, "SHRN": true, "CH": true, "MSQE": true, "PGDA": true,
 	"MNMT": true, "MUS": true, "CSTL": true, "PAL": true, "HSTS": true,
 	"ANS": true, "RUIN": true, "TOWR": true, "OBS": true, "OBSR": true,
@@ -60,15 +60,15 @@ var poiCodes = map[string]bool{
 	"SQR": true, "STDM": true, "ARCH": true, "FT": true, "MALL": true,
 	"GHSE": true, "LIBR": true, "UNIV": true, "RLG": true, "MSTY": true,
 	"CTRR": true, "RSTN": true, "MTRO": true, "AIRP": true, "PIER": true,
-	"BDG": true, "GDN": true, "AQC": true, "CMTY": true, "HSP": false,
+	"AQC": true,
 	// L — parks / protected / recreation areas
 	"PRK": true, "RESN": true, "RESV": true, "RECG": true, "RECR": true,
-	"AMUS": true, "GRAZ": false,
-	// T — scenic natural features
-	"MT": true, "PK": true, "VLC": true, "BCH": true, "CAPE": true,
-	"ISL": true, "CLF": true, "DUNE": true, "GLCR": true, "VAL": true,
-	// H — scenic hydrographic features
-	"FLLS": true, "LK": true, "SPNG": true, "LGN": true,
+	"AMUS": true,
+	// T / H — only the iconic scenic features. The bulk natural long-tail
+	// (MT, PK, LK, ISL, VAL, SPNG, CAPE, CLF, DUNE, LGN…) and non-landmarks
+	// (CMTY cemeteries, BDG bridges) are dropped — they're overwhelmingly minor
+	// unnamed/obscure features and would balloon the embedded layer ~3x.
+	"VLC": true, "BCH": true, "FLLS": true, "GLCR": true,
 }
 
 // genPOIs extracts the whitelisted landmarks from allCountries.txt into a

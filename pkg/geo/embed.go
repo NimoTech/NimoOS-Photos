@@ -6,10 +6,11 @@ import (
 	"fmt"
 )
 
-//go:embed data/cities15000.tsv.gz data/countries.tsv.gz
+//go:embed data/cities15000.tsv.gz data/countries.tsv.gz data/pois.tsv.gz
 var dataFS embed.FS
 
-// Load builds a Gazetteer from the embedded GeoNames subset.
+// Load builds a Gazetteer from the embedded GeoNames subset, including the
+// optional landmark (POI) layer used to name spots.
 func Load() (*Gazetteer, error) {
 	cf, err := dataFS.Open("data/cities15000.tsv.gz")
 	if err != nil {
@@ -33,5 +34,19 @@ func Load() (*Gazetteer, error) {
 	}
 	defer ngz.Close()
 
-	return LoadFrom(cgz, ngz)
+	g, err := LoadFrom(cgz, ngz)
+	if err != nil {
+		return nil, err
+	}
+
+	// POI layer is best-effort: if it's missing or unreadable, spot naming
+	// simply falls back to the nearest city.
+	if pf, err := dataFS.Open("data/pois.tsv.gz"); err == nil {
+		defer pf.Close()
+		if pgz, err := gzip.NewReader(pf); err == nil {
+			defer pgz.Close()
+			_ = g.LoadPOIs(pgz)
+		}
+	}
+	return g, nil
 }

@@ -60,6 +60,24 @@ func TestReverseGeocodeSnapsToMetro(t *testing.T) {
 	}
 }
 
+// NearestFeature names a spot from the POI layer when a landmark is in range,
+// and falls back to the nearest city when none is.
+func TestNearestFeaturePrefersPOIThenCity(t *testing.T) {
+	g := testGaz(t)
+	pois := "Sensō Ji\t35.7148\t139.7967\n" + "Tokyo Tower\t35.6586\t139.7454\n"
+	if err := g.LoadPOIs(strings.NewReader(pois)); err != nil {
+		t.Fatalf("LoadPOIs: %v", err)
+	}
+	// On top of Sensō-ji → the landmark, not the city.
+	if name, ok := g.NearestFeature(35.7148, 139.7966, 5); !ok || name != "Sensō Ji" {
+		t.Fatalf("expected Sensō Ji, got %q ok=%v", name, ok)
+	}
+	// Far from every POI but right on the FarTown city → falls back to the city.
+	if name, ok := g.NearestFeature(10.0, 10.0, 5); !ok || name != "FarTown" {
+		t.Fatalf("expected FarTown fallback, got %q ok=%v", name, ok)
+	}
+}
+
 // An isolated small town with no populous metro nearby must stay itself.
 func TestReverseGeocodeKeepsIsolatedTown(t *testing.T) {
 	g := testGaz(t)
