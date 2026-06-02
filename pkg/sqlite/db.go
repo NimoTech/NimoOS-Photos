@@ -207,6 +207,39 @@ func migrate(db *sql.DB) error {
 			name     TEXT NOT NULL,
 			PRIMARY KEY (user_id, spot_key)
 		)`,
+
+		// ── Smart Views ───────────────────────────────────────────────────────
+		`CREATE TABLE IF NOT EXISTS smart_views (
+			id            TEXT PRIMARY KEY,
+			name          TEXT NOT NULL,
+			description   TEXT,
+			conds_raw     TEXT NOT NULL,
+			conds_parsed  TEXT NOT NULL,
+			threshold     INTEGER NOT NULL DEFAULT 70,
+			live          INTEGER NOT NULL DEFAULT 1,
+			include_videos INTEGER NOT NULL DEFAULT 0,
+			notify_weekly INTEGER NOT NULL DEFAULT 0,
+			created_at    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			updated_at    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			evaluated_at  DATETIME
+		)`,
+		`CREATE TABLE IF NOT EXISTS smart_view_matches (
+			smart_view_id TEXT NOT NULL REFERENCES smart_views(id) ON DELETE CASCADE,
+			asset_id      TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+			match_score   REAL NOT NULL,
+			matched_at    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			PRIMARY KEY (smart_view_id, asset_id)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_svm_sv_score ON smart_view_matches(smart_view_id, match_score)`,
+		`CREATE INDEX IF NOT EXISTS idx_svm_matched  ON smart_view_matches(smart_view_id, matched_at)`,
+		`CREATE TABLE IF NOT EXISTS smart_view_activity (
+			id            TEXT PRIMARY KEY,
+			smart_view_id TEXT NOT NULL REFERENCES smart_views(id) ON DELETE CASCADE,
+			event_type    TEXT NOT NULL,
+			detail        TEXT,
+			asset_ids     TEXT,
+			occurred_at   DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+		)`,
 	}
 
 	for _, stmt := range statements {
@@ -258,6 +291,24 @@ func migrate(db *sql.DB) error {
 		if _, err := db.Exec(stmt); err != nil {
 			return fmt.Errorf("migrate add column %s: %w", col.name, err)
 		}
+	}
+
+	// ── is_screenshot: classification flag set at index time.
+	//    Added as its own ALTER so we can detect whether the column was *just*
+	//    created (err == nil) and, only then, run the one-time backfill over
+	//    pre-existing rows. On a fresh DB the column already exists from the
+	//    CREATE TABLE above is NOT the case (CREATE does not list it), so a fresh
+	//    DB also takes the "just created" path — harmless, the backfill simply
+	//    matches the not-yet-indexed (empty) table.
+	if _, err := db.Exec(`ALTER TABLE assets ADD COLUMN is_screenshot INTEGER NOT NULL DEFAULT 0`); err != nil {
+		if !strings.Contains(err.Error(), "duplicate column") {
+			return fmt.Errorf("migrate add is_screenshot: %w", err)
+		}
+	} else if err := backfillScreenshots(db); err != nil {
+		return fmt.Errorf("migrate backfill is_screenshot: %w", err)
+	}
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_assets_screenshot ON assets(is_screenshot)`); err != nil {
+		return fmt.Errorf("migrate index is_screenshot: %w", err)
 	}
 
 	// ── Idempotent column migration: legacy DBs created with CREATE TABLE IF NOT EXISTS
@@ -326,6 +377,40 @@ func migrate(db *sql.DB) error {
 	}
 
 	return nil
+}
+
+// backfillScreenshots classifies all pre-existing image assets that have not yet
+// been flagged, using the same heuristic as service.detectScreenshot (filename
+// markers OR PNG-without-camera-EXIF). Run exactly once, right after the
+// is_screenshot column is first created. All inputs (original_name, mime_type,
+// and the joined asset_exif camera fields) are already in the DB, so no files
+// are re-read. Keep this SQL in sync with service.detectScreenshot /
+// screenshotNameMarkers.
+func backfillScreenshots(db *sql.DB) error {
+	_, err := db.Exec(`
+UPDATE assets
+SET is_screenshot = 1
+WHERE is_live_photo_video = 0
+  AND LOWER(COALESCE(mime_type,'')) NOT LIKE 'video/%'
+  AND (
+        LOWER(COALESCE(original_name,'')) LIKE '%screenshot%'
+     OR LOWER(COALESCE(original_name,'')) LIKE '%screen shot%'
+     OR LOWER(COALESCE(original_name,'')) LIKE '%screen\_shot%' ESCAPE '\'
+     OR COALESCE(original_name,'') LIKE '%截屏%'
+     OR COALESCE(original_name,'') LIKE '%截图%'
+     OR COALESCE(original_name,'') LIKE '%屏幕快照%'
+     OR (
+          LOWER(COALESCE(mime_type,'')) = 'image/png'
+          AND NOT EXISTS (
+            SELECT 1 FROM asset_exif e
+            WHERE e.asset_id = assets.id
+              AND (COALESCE(e.make,'') <> '' OR COALESCE(e.model,'') <> ''
+                   OR COALESCE(e.iso,0) <> 0 OR COALESCE(e.aperture,0) <> 0
+                   OR COALESCE(e.focal_length,0) <> 0)
+          )
+        )
+  )`)
+	return err
 }
 
 // geoGazVersion is bumped whenever the embedded gazetteer or the reverse-geocode
