@@ -4,12 +4,13 @@ package geo
 
 // City is one gazetteer entry.
 type City struct {
-	ID     int32   `json:"id"`     // GeoNames geonameid; used as place_key
-	Name   string  `json:"name"`   // city name
-	Lat    float64 `json:"lat"`
-	Lon    float64 `json:"lon"`
-	ISO2   string  `json:"iso2"`   // country ISO-3166 alpha-2
-	Admin1 string  `json:"admin1"` // state/province code, used for spot naming fallback
+	ID         int32   `json:"id"`         // GeoNames geonameid; used as place_key
+	Name       string  `json:"name"`       // city name
+	Lat        float64 `json:"lat"`
+	Lon        float64 `json:"lon"`
+	ISO2       string  `json:"iso2"`       // country ISO-3166 alpha-2
+	Admin1     string  `json:"admin1"`     // state/province code, used for spot naming fallback
+	Population int64   `json:"population"` // GeoNames population; drives metro-snapping
 }
 
 // Country maps an ISO2 code to its display name and continent.

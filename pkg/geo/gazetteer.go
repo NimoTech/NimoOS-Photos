@@ -47,9 +47,13 @@ func LoadFrom(cities, countries io.Reader) (*Gazetteer, error) {
 		id, _ := strconv.Atoi(f[0])
 		lat, _ := strconv.ParseFloat(f[2], 64)
 		lon, _ := strconv.ParseFloat(f[3], 64)
+		var pop int64
+		if len(f) >= 7 {
+			pop, _ = strconv.ParseInt(f[6], 10, 64)
+		}
 		idx := int32(len(g.cities))
 		g.cities = append(g.cities, City{
-			ID: int32(id), Name: f[1], Lat: lat, Lon: lon, ISO2: f[4], Admin1: f[5],
+			ID: int32(id), Name: f[1], Lat: lat, Lon: lon, ISO2: f[4], Admin1: f[5], Population: pop,
 		})
 		k := bucketKey(lat, lon)
 		g.grid[k] = append(g.grid[k], idx)
@@ -92,11 +96,68 @@ func (g *Gazetteer) nearest(lat, lon float64) (int32, float64) {
 	return best, bestD
 }
 
-// ReverseGeocode returns the nearest city for a coordinate.
+// metroRadiusKm returns how far a city of the given population "pulls" nearby
+// points onto itself. Larger cities dominate a wider area so that the many
+// constituent towns of a metropolis (e.g. Hong Kong's districts) all resolve to
+// the one metro instead of fragmenting into neighbourhood-sized places.
+func metroRadiusKm(pop int64) float64 {
+	switch {
+	case pop >= 5_000_000:
+		return 40
+	case pop >= 1_000_000:
+		return 30
+	case pop >= 500_000:
+		return 22
+	case pop >= 200_000:
+		return 15
+	case pop >= 100_000:
+		return 10
+	default:
+		return 0 // only ever chosen by plain nearest-city fallback
+	}
+}
+
+// metroSnap returns the index of the most populous city (within the given
+// country) whose metro radius covers (lat, lon), or -1 if none qualifies. This
+// pulls a point onto the dominant nearby city rather than the literally-closest
+// hamlet. Candidates are restricted to `iso2` so that, e.g., a Hong Kong point
+// snaps to Hong Kong rather than to larger Shenzhen just across the border.
+func (g *Gazetteer) metroSnap(lat, lon float64, iso2 string) int32 {
+	best := int32(-1)
+	var bestPop int64 = -1
+	bLat := int(math.Floor(lat + 90))
+	bLon := int(math.Floor(lon + 180))
+	for dy := -1; dy <= 1; dy++ {
+		for dx := -1; dx <= 1; dx++ {
+			for _, idx := range g.grid[(bLat+dy)*1000+(bLon+dx)] {
+				c := g.cities[idx]
+				if c.ISO2 != iso2 {
+					continue
+				}
+				r := metroRadiusKm(c.Population)
+				if r <= 0 || c.Population <= bestPop {
+					continue
+				}
+				if HaversineKm(lat, lon, c.Lat, c.Lon) <= r {
+					bestPop = c.Population
+					best = idx
+				}
+			}
+		}
+	}
+	return best
+}
+
+// ReverseGeocode returns the dominant nearby city for a coordinate, falling back
+// to the literally-closest city when no populous metro covers the point.
 func (g *Gazetteer) ReverseGeocode(lat, lon float64) (Resolved, bool) {
 	idx, d := g.nearest(lat, lon)
 	if idx < 0 {
 		return Resolved{}, false
+	}
+	if snap := g.metroSnap(lat, lon, g.cities[idx].ISO2); snap >= 0 && snap != idx {
+		idx = snap
+		d = HaversineKm(lat, lon, g.cities[snap].Lat, g.cities[snap].Lon)
 	}
 	c := g.cities[idx]
 	ctry := g.countries[c.ISO2]

@@ -313,5 +313,37 @@ func migrate(db *sql.DB) error {
 		return fmt.Errorf("migrate backfill album_assets.position: %w", err)
 	}
 
+	if err := regeocodeIfStale(db); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// geoGazVersion is bumped whenever the embedded gazetteer or the reverse-geocode
+// algorithm changes in a way that alters which city a coordinate resolves to.
+// v1: metro-snap + coarser gazetteer (drop PPLX & capital-swallowed sub-divisions),
+//     so dense metros (e.g. Hong Kong, Macau) resolve to one city instead of many.
+const geoGazVersion = 1
+
+// regeocodeIfStale clears asset_geo when the gazetteer version stored in the DB
+// is older than geoGazVersion, so the GeoService scheduler re-geocodes every
+// asset against the current gazetteer. asset_geo is fully derived from
+// asset_exif lat/lon, so clearing it is safe and self-healing.
+func regeocodeIfStale(db *sql.DB) error {
+	var stored int
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&stored); err != nil {
+		return fmt.Errorf("migrate read user_version: %w", err)
+	}
+	if stored >= geoGazVersion {
+		return nil
+	}
+	if _, err := db.Exec(`DELETE FROM asset_geo`); err != nil {
+		return fmt.Errorf("migrate clear asset_geo for re-geocode: %w", err)
+	}
+	// PRAGMA user_version does not accept a bound parameter.
+	if _, err := db.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, geoGazVersion)); err != nil {
+		return fmt.Errorf("migrate set user_version: %w", err)
+	}
 	return nil
 }
