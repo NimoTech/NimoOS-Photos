@@ -312,8 +312,9 @@ func spotKeyForCentroid(cityID int32, cLat, cLon float64) string {
 
 // clusterCity runs the greedy radius clustering for a city and returns every
 // cluster (including sub-threshold ones), each carrying its member asset IDs.
-// Both spots() (for the dialog) and SpotMemberIDs() (for the library filter)
-// build on this so a spot's photo count matches what the filter returns exactly.
+// Both spots() (for the dialog) and SpotMemberIDs()/SpotMemberIDsAt() (for the
+// library filter) build on this so a spot's photo count matches what the filter
+// returns exactly.
 func (s *PlacesService) clusterCity(cityID int32) []*spotCluster {
 	rows, err := s.db.Query(`
 SELECT a.id, g.lat, g.lon FROM asset_geo g
