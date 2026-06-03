@@ -299,11 +299,22 @@ type spotCluster struct {
 	count      int
 	sumLat     float64
 	sumLon     float64
-	cLat, cLon float64 // running centroid
-	firstID    string  // most-recent asset in the cluster (cover thumb)
+	cLat, cLon float64  // running centroid
+	firstID    string   // most-recent asset in the cluster (cover thumb)
+	ids        []string // every asset in the cluster, newest-first
 }
 
-func (s *PlacesService) spots(cityID int32) []Spot {
+// spotKey derives the stable cityID:gx:gy key from a cluster centroid. Kept as a
+// single helper so the spots list and SpotMemberIDs round identically.
+func spotKeyForCentroid(cityID int32, cLat, cLon float64) string {
+	return fmt.Sprintf("%d:%d:%d", cityID, int(cLat/spotGrid), int(cLon/spotGrid))
+}
+
+// clusterCity runs the greedy radius clustering for a city and returns every
+// cluster (including sub-threshold ones), each carrying its member asset IDs.
+// Both spots() (for the dialog) and SpotMemberIDs() (for the library filter)
+// build on this so a spot's photo count matches what the filter returns exactly.
+func (s *PlacesService) clusterCity(cityID int32) []*spotCluster {
 	rows, err := s.db.Query(`
 SELECT a.id, g.lat, g.lon FROM asset_geo g
 JOIN assets a ON a.id=g.asset_id AND a.deleted_at IS NULL AND a.is_live_photo_video=0
@@ -334,7 +345,7 @@ ORDER BY a.taken_at DESC`, cityID)
 			}
 		}
 		if best == nil {
-			clusters = append(clusters, &spotCluster{count: 1, sumLat: lat, sumLon: lon, cLat: lat, cLon: lon, firstID: id})
+			clusters = append(clusters, &spotCluster{count: 1, sumLat: lat, sumLon: lon, cLat: lat, cLon: lon, firstID: id, ids: []string{id}})
 			continue
 		}
 		best.count++
@@ -342,7 +353,13 @@ ORDER BY a.taken_at DESC`, cityID)
 		best.sumLon += lon
 		best.cLat = best.sumLat / float64(best.count)
 		best.cLon = best.sumLon / float64(best.count)
+		best.ids = append(best.ids, id)
 	}
+	return clusters
+}
+
+func (s *PlacesService) spots(cityID int32) []Spot {
+	clusters := s.clusterCity(cityID)
 
 	var spots []Spot
 	n := 0
@@ -358,7 +375,7 @@ ORDER BY a.taken_at DESC`, cityID)
 		spots = append(spots, Spot{
 			// Key derived from the centroid rounded to spotGrid so it stays stable
 			// across recomputes (used for spot dialogs and name overrides).
-			Key:   fmt.Sprintf("%d:%d:%d", cityID, int(c.cLat/spotGrid), int(c.cLon/spotGrid)),
+			Key:   spotKeyForCentroid(cityID, c.cLat, c.cLon),
 			Name:  name,
 			Lat:   c.cLat,
 			Lon:   c.cLon,
@@ -371,6 +388,32 @@ ORDER BY a.taken_at DESC`, cityID)
 		spots = spots[:spotMaxCount]
 	}
 	return spots
+}
+
+// SpotMemberIDs returns the asset IDs of the spot identified by spotKey
+// ("cityID:gx:gy"), newest-first. It re-runs the exact clustering used to build
+// the spot dialog and returns the matching cluster's members, so the library
+// "view this spot" count equals the count shown on the spot. On a key collision
+// (two clusters rounding to the same grid cell) the larger cluster wins, since
+// the dialog sorts by count and that is the row the user most likely opened.
+func (s *PlacesService) SpotMemberIDs(spotKey string) ([]string, error) {
+	cityID, _, _, err := ParseSpotKey(spotKey)
+	if err != nil {
+		return nil, err
+	}
+	var best *spotCluster
+	for _, c := range s.clusterCity(cityID) {
+		if spotKeyForCentroid(cityID, c.cLat, c.cLon) != spotKey {
+			continue
+		}
+		if best == nil || c.count > best.count {
+			best = c
+		}
+	}
+	if best == nil {
+		return []string{}, nil
+	}
+	return best.ids, nil
 }
 
 // GetPlace returns the full detail payload for a city.

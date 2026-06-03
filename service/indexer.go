@@ -525,10 +525,13 @@ func (ix *Indexer) processFileInternal(path string, opts processOpts) (success b
 	}
 	originalName := filepath.Base(path)
 
+	// Classify screenshots (images only; videos/screen recordings never qualify).
+	isScreenshot := !isVideo && detectScreenshot(originalName, mime, exifResult)
+
 	_, err = ix.db.Exec(`
 		INSERT INTO assets(id, file_path, file_size, mime_type, original_name,
-		                   taken_at, duration_ms, is_live_photo_video, status, checksum)
-		VALUES(?,?,?,?,?,?,?,0,'pending',?)
+		                   taken_at, duration_ms, is_live_photo_video, is_screenshot, status, checksum)
+		VALUES(?,?,?,?,?,?,?,0,?,'pending',?)
 		ON CONFLICT(file_path) DO UPDATE SET
 		  checksum      = excluded.checksum,
 		  file_size     = excluded.file_size,
@@ -536,9 +539,10 @@ func (ix *Indexer) processFileInternal(path string, opts processOpts) (success b
 		  original_name = excluded.original_name,
 		  taken_at      = excluded.taken_at,
 		  duration_ms   = excluded.duration_ms,
+		  is_screenshot = excluded.is_screenshot,
 		  status        = 'pending'`,
 		assetID, path, fileSize, mime, originalName,
-		nullTime(takenAt), sqlNullInt64(durationMs),
+		nullTime(takenAt), sqlNullInt64(durationMs), boolToInt(isScreenshot),
 		checksum,
 	)
 	if err != nil {
@@ -990,6 +994,14 @@ func (ix *Indexer) StatusCounts() IndexStatus {
 		`SELECT COALESCE(SUM(file_size), 0) FROM assets WHERE status = 'indexed'`,
 	).Scan(&s.TotalBytes)
 	return s
+}
+
+// boolToInt maps a bool to the SQLite integer-boolean convention (0/1).
+func boolToInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
 }
 
 // sqlNullInt64 converts int64 to sql.NullInt64 (zero → invalid).

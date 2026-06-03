@@ -2,12 +2,71 @@ package service
 
 import (
 	"database/sql"
+	"strings"
 	"time"
 )
 
+// enrichPlaceNames fills each asset's PlaceName ("City" or "City, Country") from
+// asset_geo, so the client shows and filters by city instead of falling back to
+// a coordinate-derived country. Assets without a geocoded city are left blank.
+// The id lookup is chunked to stay within SQLite's bound-parameter limit on large
+// timelines. Best-effort: a query error leaves PlaceName unset rather than failing
+// the listing.
+func enrichPlaceNames(db *sql.DB, assets []Asset) {
+	if len(assets) == 0 {
+		return
+	}
+	place := make(map[string]string, len(assets))
+	ids := make([]string, len(assets))
+	for i := range assets {
+		ids[i] = assets[i].ID
+	}
+	const chunk = 900
+	for start := 0; start < len(ids); start += chunk {
+		end := start + chunk
+		if end > len(ids) {
+			end = len(ids)
+		}
+		part := ids[start:end]
+		ph := make([]string, len(part))
+		args := make([]any, len(part))
+		for i, id := range part {
+			ph[i] = "?"
+			args[i] = id
+		}
+		rows, err := db.Query(
+			`SELECT asset_id, COALESCE(city,''), COALESCE(country,'') FROM asset_geo WHERE asset_id IN (`+
+				strings.Join(ph, ",")+`)`, args...)
+		if err != nil {
+			return
+		}
+		for rows.Next() {
+			var id, city, country string
+			if err := rows.Scan(&id, &city, &country); err != nil {
+				continue
+			}
+			if city == "" {
+				continue
+			}
+			if country != "" {
+				place[id] = city + ", " + country
+			} else {
+				place[id] = city
+			}
+		}
+		rows.Close()
+	}
+	for i := range assets {
+		if p, ok := place[assets[i].ID]; ok {
+			assets[i].PlaceName = p
+		}
+	}
+}
+
 // scanAssets reads a list of Asset from *sql.Rows.
 // Column order must be: id, file_path, file_size, mime_type, original_name,
-// taken_at, duration_ms, live_photo_video_id, is_live_photo_video, indexed_at, status
+// taken_at, duration_ms, live_photo_video_id, is_live_photo_video,
+// is_screenshot, indexed_at, status
 func scanAssets(rows *sql.Rows) ([]Asset, error) {
 	var assets []Asset
 	for rows.Next() {
@@ -16,7 +75,7 @@ func scanAssets(rows *sql.Rows) ([]Asset, error) {
 		var fileSize, durationMs sql.NullInt64
 		if err := rows.Scan(
 			&a.ID, &a.FilePath, &fileSize, &a.MimeType, &a.OriginalName,
-			&takenAt, &durationMs, &a.LivePhotoVideoID, &a.IsLivePhotoVideo,
+			&takenAt, &durationMs, &a.LivePhotoVideoID, &a.IsLivePhotoVideo, &a.IsScreenshot,
 			&indexedAt, &a.Status,
 		); err != nil {
 			return nil, err
@@ -54,7 +113,7 @@ func scanSearchAssets(rows *sql.Rows) ([]Asset, error) {
 		var lat, lng, distance sql.NullFloat64
 		if err := rows.Scan(
 			&a.ID, &a.FilePath, &fileSize, &a.MimeType, &a.OriginalName,
-			&takenAt, &durationMs, &a.LivePhotoVideoID, &a.IsLivePhotoVideo,
+			&takenAt, &durationMs, &a.LivePhotoVideoID, &a.IsLivePhotoVideo, &a.IsScreenshot,
 			&indexedAt, &a.Status, &lat, &lng, &distance,
 		); err != nil {
 			return nil, err
@@ -106,7 +165,7 @@ func scanAssetsDetailed(rows *sql.Rows) ([]Asset, error) {
 		var makeS, modelS, shutter, vcodec, acodec sql.NullString
 		if err := rows.Scan(
 			&a.ID, &a.FilePath, &fileSize, &a.MimeType, &a.OriginalName,
-			&takenAt, &durationMs, &a.LivePhotoVideoID, &a.IsLivePhotoVideo,
+			&takenAt, &durationMs, &a.LivePhotoVideoID, &a.IsLivePhotoVideo, &a.IsScreenshot,
 			&indexedAt, &a.Status,
 			&width, &height, &latitude, &longitude, &makeS, &modelS,
 			&iso, &shutter, &aperture, &focalLength, &orientation,
@@ -195,7 +254,7 @@ func scanAssetsDetailedWithFav(rows *sql.Rows) ([]Asset, error) {
 		var makeS, modelS, shutter, vcodec, acodec sql.NullString
 		if err := rows.Scan(
 			&a.ID, &a.FilePath, &fileSize, &a.MimeType, &a.OriginalName,
-			&takenAt, &durationMs, &a.LivePhotoVideoID, &a.IsLivePhotoVideo,
+			&takenAt, &durationMs, &a.LivePhotoVideoID, &a.IsLivePhotoVideo, &a.IsScreenshot,
 			&indexedAt, &a.Status,
 			&width, &height, &latitude, &longitude, &makeS, &modelS,
 			&iso, &shutter, &aperture, &focalLength, &orientation,

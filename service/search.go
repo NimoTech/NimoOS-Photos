@@ -3,6 +3,7 @@ package service
 import (
 	"database/sql"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -16,6 +17,11 @@ import (
 type AssetFilter struct {
 	PlaceKey int32
 	SpotKey  string
+	// AssetIDs, when non-nil, restricts results to exactly these IDs. The spot
+	// filter resolves SpotKey to a cluster's member IDs upstream and passes them
+	// here so the library count matches the spot dialog count exactly. A non-nil
+	// but empty slice yields no results (the spot resolved to zero photos).
+	AssetIDs []string
 }
 
 // ParseSpotKey splits a spot_key of the form "cityID:gx:gy" into its three
@@ -94,7 +100,7 @@ func (s *SearchService) SmartSearch(query string, limit int, filters SearchFilte
 	baseSQL := `
 SELECT a.id, a.file_path, a.file_size, COALESCE(a.mime_type,''),
        COALESCE(a.original_name,''), a.taken_at, a.duration_ms,
-       COALESCE(a.live_photo_video_id,''), a.is_live_photo_video,
+       COALESCE(a.live_photo_video_id,''), a.is_live_photo_video, a.is_screenshot,
        a.indexed_at, a.status, e.latitude, e.longitude, vec.distance
 FROM clip_embeddings AS vec
 JOIN asset_clip_idx AS idx ON idx.rowid = vec.rowid
@@ -145,6 +151,7 @@ WHERE vec.embedding MATCH ? AND k = ?
 	if err := s.attachNamedFaces(assets); err != nil {
 		return nil, err
 	}
+	enrichPlaceNames(s.db, assets)
 	return assets, nil
 }
 
@@ -206,7 +213,7 @@ func (s *SearchService) Timeline(userID string) ([]TimelineGroup, error) {
 	rows, err := s.db.Query(`
 SELECT a.id, a.file_path, a.file_size, COALESCE(a.mime_type,''),
        COALESCE(a.original_name,''), a.taken_at, a.duration_ms,
-       COALESCE(a.live_photo_video_id,''), a.is_live_photo_video,
+       COALESCE(a.live_photo_video_id,''), a.is_live_photo_video, a.is_screenshot,
        a.indexed_at, a.status,
        e.width, e.height, e.latitude, e.longitude, e.make, e.model,
        e.iso, e.shutter_speed, e.aperture, e.focal_length, e.orientation,
@@ -226,6 +233,7 @@ ORDER BY COALESCE(a.taken_at, a.indexed_at) DESC`, userID)
 	if err != nil {
 		return nil, err
 	}
+	enrichPlaceNames(s.db, assets)
 
 	type key struct{ year, month int }
 	var order []key
@@ -260,7 +268,7 @@ func (s *SearchService) PersonAssets(personID string, limit, offset int) ([]Asse
 	rows, err := s.db.Query(`
 SELECT DISTINCT a.id, a.file_path, a.file_size, COALESCE(a.mime_type,''),
        COALESCE(a.original_name,''), a.taken_at, a.duration_ms,
-       COALESCE(a.live_photo_video_id,''), a.is_live_photo_video,
+       COALESCE(a.live_photo_video_id,''), a.is_live_photo_video, a.is_screenshot,
        a.indexed_at, a.status
 FROM assets a
 JOIN face_detections fd ON fd.asset_id = a.id
@@ -346,6 +354,15 @@ func (s *SearchService) ListAssets(userID string, limit, offset int, filters ...
 		f = filters[0]
 	}
 
+	// An explicit ID set (spot filter) short-circuits the geo path: restrict to
+	// exactly these IDs. A non-nil empty slice means "no photos" → return early.
+	if f.AssetIDs != nil {
+		if len(f.AssetIDs) == 0 {
+			return []Asset{}, nil
+		}
+		return s.listAssetsByIDs(userID, f.AssetIDs)
+	}
+
 	// Build the geo JOIN + WHERE clauses.
 	var geoJoin string
 	var geoClauses []string
@@ -382,7 +399,7 @@ func (s *SearchService) ListAssets(userID string, limit, offset int, filters ...
 	q := `
 SELECT a.id, a.file_path, a.file_size, COALESCE(a.mime_type,''),
        COALESCE(a.original_name,''), a.taken_at, a.duration_ms,
-       COALESCE(a.live_photo_video_id,''), a.is_live_photo_video,
+       COALESCE(a.live_photo_video_id,''), a.is_live_photo_video, a.is_screenshot,
        a.indexed_at, a.status,
        e.width, e.height, e.latitude, e.longitude, e.make, e.model,
        e.iso, e.shutter_speed, e.aperture, e.focal_length, e.orientation,
@@ -401,7 +418,58 @@ LIMIT ? OFFSET ?`
 		return nil, fmt.Errorf("ListAssets query: %w", err)
 	}
 	defer rows.Close()
-	return scanAssetsDetailedWithFav(rows)
+	assets, err := scanAssetsDetailedWithFav(rows)
+	if err != nil {
+		return nil, err
+	}
+	enrichPlaceNames(s.db, assets)
+	return assets, nil
+}
+
+// listAssetsByIDs fetches the given assets and preserves the caller's order
+// (newest-first from the spot cluster), since SQL IN(...) does not guarantee it.
+func (s *SearchService) listAssetsByIDs(userID string, ids []string) ([]Asset, error) {
+	placeholders := make([]string, len(ids))
+	args := []any{userID}
+	for i, id := range ids {
+		placeholders[i] = "?"
+		args = append(args, id)
+	}
+
+	q := `
+SELECT a.id, a.file_path, a.file_size, COALESCE(a.mime_type,''),
+       COALESCE(a.original_name,''), a.taken_at, a.duration_ms,
+       COALESCE(a.live_photo_video_id,''), a.is_live_photo_video, a.is_screenshot,
+       a.indexed_at, a.status,
+       e.width, e.height, e.latitude, e.longitude, e.make, e.model,
+       e.iso, e.shutter_speed, e.aperture, e.focal_length, e.orientation,
+       e.video_codec, e.audio_codec, e.frame_rate, e.bit_rate, e.rotation,
+       f.favorited_at
+FROM assets a
+LEFT JOIN asset_exif e ON e.asset_id = a.id
+LEFT JOIN asset_favorites f ON f.asset_id = a.id AND f.user_id = ?
+WHERE a.is_live_photo_video = 0 AND a.deleted_at IS NULL
+  AND a.id IN (` + strings.Join(placeholders, ",") + `)`
+
+	rows, err := s.db.Query(q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("listAssetsByIDs query: %w", err)
+	}
+	defer rows.Close()
+	assets, err := scanAssetsDetailedWithFav(rows)
+	if err != nil {
+		return nil, err
+	}
+
+	// Restore the caller's order (the cluster's newest-first sequence).
+	pos := make(map[string]int, len(ids))
+	for i, id := range ids {
+		pos[id] = i
+	}
+	sort.Slice(assets, func(i, j int) bool { return pos[assets[i].ID] < pos[assets[j].ID] })
+
+	enrichPlaceNames(s.db, assets)
+	return assets, nil
 }
 
 // GetAsset returns a single asset by ID; returns ErrNotFound when absent.
@@ -409,7 +477,7 @@ func (s *SearchService) GetAsset(userID, id string) (*Asset, error) {
 	rows, err := s.db.Query(`
 SELECT a.id, a.file_path, a.file_size, COALESCE(a.mime_type,''),
        COALESCE(a.original_name,''), a.taken_at, a.duration_ms,
-       COALESCE(a.live_photo_video_id,''), a.is_live_photo_video,
+       COALESCE(a.live_photo_video_id,''), a.is_live_photo_video, a.is_screenshot,
        a.indexed_at, a.status,
        e.width, e.height, e.latitude, e.longitude, e.make, e.model,
        e.iso, e.shutter_speed, e.aperture, e.focal_length, e.orientation,

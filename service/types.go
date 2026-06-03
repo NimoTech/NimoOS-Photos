@@ -12,6 +12,7 @@ type Asset struct {
 	DurationMs       int64      `json:"durationMs,omitempty"`
 	LivePhotoVideoID string     `json:"livePhotoVideoId,omitempty"`
 	IsLivePhotoVideo bool       `json:"isLivePhotoVideo"`
+	IsScreenshot     bool       `json:"isScreenshot"`
 	IndexedAt        *time.Time `json:"indexedAt,omitempty"`
 	Status           string     `json:"status"`
 	Checksum         string     `json:"checksum,omitempty"`
@@ -33,6 +34,11 @@ type Asset struct {
 	FrameRate    float64 `json:"frameRate,omitempty"`
 	BitRate      int64   `json:"bitRate,omitempty"`
 	Rotation     int     `json:"rotation,omitempty"`
+
+	// PlaceName is the human-readable location ("City" or "City, Country") derived
+	// from asset_geo. Populated by Timeline/ListAssets/SmartSearch/favorites via
+	// enrichPlaceNames so the client shows and filters by city, not just country.
+	PlaceName string `json:"placeName,omitempty"`
 
 	// Joined from asset_favorites (populated by List/Timeline/GetAsset when caller
 	// supplies a user_id; nil = not favorited by this user).

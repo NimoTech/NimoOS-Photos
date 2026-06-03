@@ -53,7 +53,16 @@ func (h *AssetsHandler) List(c echo.Context) error {
 		if _, _, _, err := service.ParseSpotKey(spotKey); err != nil {
 			return echo.NewHTTPError(http.StatusBadRequest, "invalid spot_key")
 		}
+		// Resolve the spot to its exact cluster membership so the library count
+		// equals the count shown on the spot dialog (a grid-cell WHERE would
+		// diverge from the radius clustering). AssetIDs takes precedence in
+		// ListAssets; a non-nil empty slice correctly yields zero photos.
+		ids, err := h.svc.Places().SpotMemberIDs(spotKey)
+		if err != nil {
+			return echo.NewHTTPError(http.StatusBadRequest, "invalid spot_key")
+		}
 		f.SpotKey = spotKey
+		f.AssetIDs = ids
 	}
 
 	assets, err := h.svc.Search().ListAssets(JWTUserID(c), limit, offset, f)

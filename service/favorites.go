@@ -85,7 +85,7 @@ func (s *FavoritesService) List(userID string, opts ListFavoritesOpts) ([]Asset,
 	q := `
 SELECT a.id, a.file_path, a.file_size, COALESCE(a.mime_type,''),
        COALESCE(a.original_name,''), a.taken_at, a.duration_ms,
-       COALESCE(a.live_photo_video_id,''), a.is_live_photo_video,
+       COALESCE(a.live_photo_video_id,''), a.is_live_photo_video, a.is_screenshot,
        a.indexed_at, a.status,
        e.width, e.height, e.latitude, e.longitude, e.make, e.model,
        e.iso, e.shutter_speed, e.aperture, e.focal_length, e.orientation,
@@ -115,6 +115,7 @@ ORDER BY f.favorited_at DESC`
 	if err := s.attachNamedFaces(assets); err != nil {
 		return nil, err
 	}
+	enrichPlaceNames(s.db, assets)
 	return assets, nil
 }
 
@@ -192,7 +193,7 @@ func (s *FavoritesService) Top(userID string, limit int) ([]Asset, error) {
 	q := `
 SELECT a.id, a.file_path, a.file_size, COALESCE(a.mime_type,''),
        COALESCE(a.original_name,''), a.taken_at, a.duration_ms,
-       COALESCE(a.live_photo_video_id,''), a.is_live_photo_video,
+       COALESCE(a.live_photo_video_id,''), a.is_live_photo_video, a.is_screenshot,
        a.indexed_at, a.status,
        e.width, e.height, e.latitude, e.longitude, e.make, e.model,
        e.iso, e.shutter_speed, e.aperture, e.focal_length, e.orientation,
@@ -218,5 +219,6 @@ LIMIT ?`
 	if err := s.attachNamedFaces(assets); err != nil {
 		return nil, err
 	}
+	enrichPlaceNames(s.db, assets)
 	return assets, nil
 }

@@ -1,6 +1,7 @@
 package service_test
 
 import (
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -90,6 +91,50 @@ func TestSpotsCluster(t *testing.T) {
 	require.GreaterOrEqual(t, len(spots), 2)
 	require.NotEmpty(t, spots[0].Thumb)
 	require.NotZero(t, spots[0].Count)
+}
+
+// TestSpotMemberIDsMatchesSpotCount is the regression guard for the library
+// "view this spot" count diverging from the spot dialog count: SpotMemberIDs
+// must return exactly Count IDs for every spot, since both derive from the same
+// radius clustering (previously the filter used a grid cell and undercounted).
+func TestSpotMemberIDsMatchesSpotCount(t *testing.T) {
+	db, err := sqlite.Open(filepath.Join(t.TempDir(), "t.db"))
+	require.NoError(t, err)
+	defer db.Close()
+	gaz, _ := geo.Load()
+	geoSvc := service.NewGeoService(db, gaz)
+	mk := func(id string, lat, lon float64) {
+		db.Exec(`INSERT INTO assets(id,file_path,status,taken_at,is_live_photo_video) VALUES(?,?, 'indexed', '2026-03-01 10:00:00', 0)`, id, "/x/"+id)
+		db.Exec(`INSERT INTO asset_exif(asset_id,latitude,longitude) VALUES(?,?,?)`, id, lat, lon)
+		geoSvc.GeocodeAsset(id)
+	}
+	// Two clusters that straddle the 139.710 lon grid-bucket boundary — the exact
+	// case where the old grid-cell filter diverged from the cluster count.
+	mk("s1", 35.6579, 139.7036)
+	mk("s2", 35.6569, 139.7046)
+	mk("s3", 35.6589, 139.7036)
+	mk("k1", 35.6579, 139.7116)
+	mk("k2", 35.6569, 139.7126)
+	mk("k3", 35.6589, 139.7116)
+
+	svc := service.NewPlacesService(db, gaz, geoSvc)
+	resp, _ := svc.ListPlaces()
+	require.NotEmpty(t, resp.Places)
+	cityKey := resp.Places[0].Key
+	spots := svc.Spots(cityKey)
+	require.GreaterOrEqual(t, len(spots), 2)
+
+	for _, sp := range spots {
+		ids, err := svc.SpotMemberIDs(sp.Key)
+		require.NoError(t, err)
+		require.Len(t, ids, sp.Count, "spot %s: member IDs must match displayed count", sp.Key)
+	}
+
+	// An unknown spot key resolves to zero photos (non-nil empty), never nil.
+	ids, err := svc.SpotMemberIDs(fmt.Sprintf("%d:0:0", cityKey))
+	require.NoError(t, err)
+	require.NotNil(t, ids)
+	require.Empty(t, ids)
 }
 
 func TestSpotNameOverride(t *testing.T) {

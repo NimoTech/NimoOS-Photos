@@ -65,6 +65,40 @@ func TestTimeline(t *testing.T) {
 	require.Len(t, groups[0].Assets, 1, "live photo video must be hidden")
 }
 
+// TestTimelineEnrichesPlaceName verifies Timeline/ListAssets surface a city-level
+// PlaceName ("City, Country") from asset_geo, so the client filters by city rather
+// than falling back to a coordinate-derived country.
+func TestTimelineEnrichesPlaceName(t *testing.T) {
+	db, err := sqlite.Open(filepath.Join(t.TempDir(), "place.db"))
+	require.NoError(t, err)
+	defer db.Close()
+
+	db.Exec(`INSERT INTO assets(id,file_path,status,taken_at,is_live_photo_video) VALUES('a1','/p1.jpg','indexed','2025-07-15 10:00:00',0)`)
+	db.Exec(`INSERT INTO assets(id,file_path,status,taken_at,is_live_photo_video) VALUES('a2','/p2.jpg','indexed','2025-07-15 11:00:00',0)`)
+	// a1 is geocoded to Tokyo, Japan; a2 has no geo row → PlaceName stays empty.
+	db.Exec(`INSERT INTO asset_geo(asset_id,city_id,city,country,region,lat,lon) VALUES('a1',1850147,'Tokyo','Japan','asia',35.68,139.69)`)
+
+	svc := service.NewSearchService(db, nil)
+	groups, err := svc.Timeline("default")
+	require.NoError(t, err)
+	got := map[string]string{}
+	for _, g := range groups {
+		for _, a := range g.Assets {
+			got[a.ID] = a.PlaceName
+		}
+	}
+	require.Equal(t, "Tokyo, Japan", got["a1"])
+	require.Equal(t, "", got["a2"])
+
+	assets, err := svc.ListAssets("default", 10, 0)
+	require.NoError(t, err)
+	for _, a := range assets {
+		if a.ID == "a1" {
+			require.Equal(t, "Tokyo, Japan", a.PlaceName)
+		}
+	}
+}
+
 func TestListAssets(t *testing.T) {
 	db, err := sqlite.Open(filepath.Join(t.TempDir(), "la.db"))
 	require.NoError(t, err)

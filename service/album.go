@@ -339,7 +339,7 @@ func (s *AlbumService) ListAssets(albumID string) ([]Asset, error) {
 	rows, err := s.db.Query(`
 		SELECT a.id, a.file_path, a.file_size, COALESCE(a.mime_type,''),
 		       COALESCE(a.original_name,''), a.taken_at, a.duration_ms,
-		       COALESCE(a.live_photo_video_id,''), a.is_live_photo_video,
+		       COALESCE(a.live_photo_video_id,''), a.is_live_photo_video, a.is_screenshot,
 		       a.indexed_at, a.status
 		FROM assets a
 		JOIN album_assets aa ON aa.asset_id = a.id
