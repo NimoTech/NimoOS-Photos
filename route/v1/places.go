@@ -36,6 +36,15 @@ func (h *PlacesHandler) List(c echo.Context) error {
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
 	}
+	// Surface the user's cover overrides on the list payload so rail/hover
+	// thumbnails match the detail hero (which already honors the override).
+	if ov := h.svc.Places().CoverOverrides(placeUserID(c)); len(ov) > 0 {
+		for i := range resp.Places {
+			if id, ok := ov[resp.Places[i].Key]; ok {
+				resp.Places[i].CoverAssetID = id
+			}
+		}
+	}
 	return c.JSON(http.StatusOK, resp)
 }
 

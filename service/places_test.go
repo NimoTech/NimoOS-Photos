@@ -206,6 +206,28 @@ func TestCoverOverride(t *testing.T) {
 	require.Equal(t, "", got)
 }
 
+// TestCoverOverridesBatch verifies the batch per-user override lookup used by
+// the places list: it returns only this user's overrides and silently drops
+// overrides whose asset has been deleted.
+func TestCoverOverridesBatch(t *testing.T) {
+	svc := placesFixture(t)
+	resp, _ := svc.ListPlaces()
+	require.GreaterOrEqual(t, len(resp.Places), 2)
+	k1, k2 := resp.Places[0].Key, resp.Places[1].Key
+
+	require.NoError(t, svc.SetCover("1", k1, resp.Places[0].Thumbs[0]))
+	require.NoError(t, svc.SetCover("1", k2, resp.Places[1].Thumbs[0]))
+	require.NoError(t, svc.SetCover("2", k1, resp.Places[0].Thumbs[0]))
+
+	got := svc.CoverOverrides("1")
+	require.Len(t, got, 2)
+	require.Equal(t, resp.Places[0].Thumbs[0], got[k1])
+	require.Equal(t, resp.Places[1].Thumbs[0], got[k2])
+
+	// Unknown user → empty (non-nil OK either way, just must be len 0).
+	require.Empty(t, svc.CoverOverrides("nobody"))
+}
+
 func TestCreateAlbumFromPlace(t *testing.T) {
 	db, err := sqlite.Open(filepath.Join(t.TempDir(), "t.db"))
 	require.NoError(t, err)

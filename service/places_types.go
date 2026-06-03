@@ -14,6 +14,9 @@ type Place struct {
 	Trips   int      `json:"trips"`
 	Home    bool     `json:"home"`
 	Thumbs  []string `json:"thumbs"`
+	// CoverAssetID is the user's cover override for this place ("" when unset).
+	// Populated per-user by the route layer via CoverOverrides.
+	CoverAssetID string `json:"coverAssetId,omitempty"`
 }
 
 // RegionCount is a region id + label + city count for the rail headers.

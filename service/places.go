@@ -540,6 +540,29 @@ func (s *PlacesService) GetCover(userID string, placeKey int32) (string, error) 
 	return id, nil
 }
 
+// CoverOverrides returns a user's place_key→asset_id cover map for the places
+// list, dropping overrides whose asset no longer exists (deleted/purged) so the
+// client never renders a dead thumbnail.
+func (s *PlacesService) CoverOverrides(userID string) map[int32]string {
+	rows, err := s.db.Query(`
+SELECT o.place_key, o.asset_id FROM place_cover_overrides o
+JOIN assets a ON a.id=o.asset_id AND a.deleted_at IS NULL
+WHERE o.user_id=?`, userID)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	out := map[int32]string{}
+	for rows.Next() {
+		var k int32
+		var id string
+		if rows.Scan(&k, &id) == nil {
+			out[k] = id
+		}
+	}
+	return out
+}
+
 // ResetCover removes a place's cover override.
 func (s *PlacesService) ResetCover(userID string, placeKey int32) error {
 	_, err := s.db.Exec(`DELETE FROM place_cover_overrides WHERE user_id=? AND place_key=?`, userID, placeKey)
