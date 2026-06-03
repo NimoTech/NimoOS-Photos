@@ -336,3 +336,52 @@ func TestCurrentTripIsLatestPhotoCityOnly(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, lv[0].Current, "London visit must not be flagged current")
 }
+
+// TestSpotMemberIDsAtPinsExactCluster guards the Places "view this spot" jump:
+// when two clusters fall in the same 0.01° grid cell they share a spot key, and
+// the key-based SpotMemberIDs resolves the tie to the largest cluster. Passing
+// the tapped spot's centroid must instead return that exact cluster's members,
+// so the library count equals the spot dialog count for BOTH colliding spots.
+func TestSpotMemberIDsAtPinsExactCluster(t *testing.T) {
+	db, err := sqlite.Open(filepath.Join(t.TempDir(), "t.db"))
+	require.NoError(t, err)
+	defer db.Close()
+	gaz, _ := geo.Load()
+	geoSvc := service.NewGeoService(db, gaz)
+	mk := func(id string, lat, lon float64) {
+		db.Exec(`INSERT INTO assets(id,file_path,status,taken_at,is_live_photo_video) VALUES(?,?, 'indexed', '2026-03-01 10:00:00', 0)`, id, "/x/"+id)
+		db.Exec(`INSERT INTO asset_exif(asset_id,latitude,longitude) VALUES(?,?,?)`, id, lat, lon)
+		geoSvc.GeocodeAsset(id)
+	}
+	// Two clusters in the SAME 0.01° grid cell (lat bucket 3565, lon bucket 13970)
+	// but ~1km apart, so radius clustering keeps them separate while their spot
+	// keys collide. Cluster A has 4 photos, B has 3 — the case where the old
+	// largest-wins resolution returned A's photos even when the user tapped B.
+	mk("a1", 35.6515, 139.7015)
+	mk("a2", 35.6512, 139.7018)
+	mk("a3", 35.6518, 139.7012)
+	mk("a4", 35.6514, 139.7016)
+	mk("b1", 35.6585, 139.7085)
+	mk("b2", 35.6582, 139.7088)
+	mk("b3", 35.6588, 139.7082)
+
+	svc := service.NewPlacesService(db, gaz, geoSvc)
+	resp, _ := svc.ListPlaces()
+	require.NotEmpty(t, resp.Places)
+	cityKey := resp.Places[0].Key
+	spots := svc.Spots(cityKey)
+	require.Len(t, spots, 2, "fixture must yield exactly two spots")
+	require.Equal(t, spots[0].Key, spots[1].Key, "fixture must produce a spot-key collision")
+
+	for _, sp := range spots {
+		ids, err := svc.SpotMemberIDsAt(sp.Key, sp.Lat, sp.Lon)
+		require.NoError(t, err)
+		require.Len(t, ids, sp.Count, "centroid match must return exactly the tapped cluster's members, not the largest")
+	}
+
+	// A far-away point matches no cluster → empty (non-nil) slice.
+	ids, err := svc.SpotMemberIDsAt(spots[0].Key, 0, 0)
+	require.NoError(t, err)
+	require.NotNil(t, ids)
+	require.Empty(t, ids)
+}

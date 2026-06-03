@@ -416,6 +416,32 @@ func (s *PlacesService) SpotMemberIDs(spotKey string) ([]string, error) {
 	return best.ids, nil
 }
 
+// SpotMemberIDsAt returns the asset IDs of the spot whose cluster centroid is
+// nearest to (lat, lon), newest-first. Unlike SpotMemberIDs — which resolves a
+// grid-cell key and breaks ties by largest cluster — this pins the exact cluster
+// the user tapped, so when two clusters share a spot key (grid cell ~1km vs
+// ~300m merge radius) the library shows the same photos and count the spot
+// dialog did. cityID still comes from spotKey. Returns a non-nil empty slice
+// when the nearest centroid is farther than the cluster radius (no real match).
+func (s *PlacesService) SpotMemberIDsAt(spotKey string, lat, lon float64) ([]string, error) {
+	cityID, _, _, err := ParseSpotKey(spotKey)
+	if err != nil {
+		return nil, err
+	}
+	var best *spotCluster
+	bestD := spotRadiusKm
+	for _, c := range s.clusterCity(cityID) {
+		if d := geo.HaversineKm(lat, lon, c.cLat, c.cLon); d <= bestD {
+			bestD = d
+			best = c
+		}
+	}
+	if best == nil {
+		return []string{}, nil
+	}
+	return best.ids, nil
+}
+
 // GetPlace returns the full detail payload for a city.
 func (s *PlacesService) GetPlace(cityID int32) (PlaceDetail, error) {
 	resp, err := s.ListPlaces()
