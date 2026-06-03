@@ -699,10 +699,10 @@ JOIN assets a ON a.id=g.asset_id AND a.deleted_at IS NULL AND a.is_live_photo_vi
 		recent = 12
 	}
 	return []CoverTab{
-		{ID: "recent", Label: "近期", Icon: "clock", Count: recent},
-		{ID: "top", Label: "最高分", Icon: "sparkles", Count: count(" LEFT JOIN asset_views v ON v.asset_id=a.id")},
-		{ID: "fav", Label: "已收藏", Icon: "star", Count: count(" JOIN asset_favorites f ON f.asset_id=a.id")},
-		{ID: "all", Label: "全部", Icon: "grid", Count: all},
+		{ID: "recent", Label: "Recent", Icon: "clock", Count: recent},
+		{ID: "top", Label: "Top rated", Icon: "sparkles", Count: count(" LEFT JOIN asset_views v ON v.asset_id=a.id")},
+		{ID: "fav", Label: "Favorited", Icon: "star", Count: count(" JOIN asset_favorites f ON f.asset_id=a.id")},
+		{ID: "all", Label: "All", Icon: "grid", Count: all},
 	}
 }
 
