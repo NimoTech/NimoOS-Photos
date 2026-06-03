@@ -385,3 +385,46 @@ func TestSpotMemberIDsAtPinsExactCluster(t *testing.T) {
 	require.NotNil(t, ids)
 	require.Empty(t, ids)
 }
+
+// TestSpotJumpSmallerClusterByCentroid is the end-to-end guard for the bug
+// report: tapping the SMALLER of two key-colliding spots must surface that
+// spot's own photos. (Mirrors how route/v1/assets.go calls SpotMemberIDsAt.)
+func TestSpotJumpSmallerClusterByCentroid(t *testing.T) {
+	db, err := sqlite.Open(filepath.Join(t.TempDir(), "t.db"))
+	require.NoError(t, err)
+	defer db.Close()
+	gaz, _ := geo.Load()
+	geoSvc := service.NewGeoService(db, gaz)
+	mk := func(id string, lat, lon float64) {
+		db.Exec(`INSERT INTO assets(id,file_path,status,taken_at,is_live_photo_video) VALUES(?,?, 'indexed', '2026-03-01 10:00:00', 0)`, id, "/x/"+id)
+		db.Exec(`INSERT INTO asset_exif(asset_id,latitude,longitude) VALUES(?,?,?)`, id, lat, lon)
+		geoSvc.GeocodeAsset(id)
+	}
+	mk("a1", 35.6515, 139.7015)
+	mk("a2", 35.6512, 139.7018)
+	mk("a3", 35.6518, 139.7012)
+	mk("a4", 35.6514, 139.7016)
+	mk("b1", 35.6585, 139.7085)
+	mk("b2", 35.6582, 139.7088)
+	mk("b3", 35.6588, 139.7082)
+
+	svc := service.NewPlacesService(db, gaz, geoSvc)
+	resp, _ := svc.ListPlaces()
+	cityKey := resp.Places[0].Key
+	spots := svc.Spots(cityKey)
+	require.Len(t, spots, 2)
+
+	// spots sorted by count desc → [0]=A(4), [1]=B(3). They share a key.
+	small := spots[1]
+	require.Equal(t, 3, small.Count)
+
+	// Key-only resolution wrongly returns the larger cluster (4).
+	idsKeyOnly, err := svc.SpotMemberIDs(small.Key)
+	require.NoError(t, err)
+	require.Len(t, idsKeyOnly, 4, "documents the old largest-wins divergence")
+
+	// Centroid resolution returns the tapped (smaller) cluster (3).
+	idsAt, err := svc.SpotMemberIDsAt(small.Key, small.Lat, small.Lon)
+	require.NoError(t, err)
+	require.Len(t, idsAt, 3, "centroid match returns the tapped cluster")
+}

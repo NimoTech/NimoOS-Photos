@@ -30,7 +30,8 @@ func NewAssetsHandler(svc service.Services, thumbDir string) *AssetsHandler {
 
 // List returns a paginated list of assets.
 // Query params: limit (default 50, max 200), offset (default 0),
-// place_key (city geonameid, int), spot_key ("cityID:gx:gy").
+// place_key (city geonameid, int), spot_key ("cityID:gx:gy"),
+// spot_lat/spot_lon (optional float; pins the exact spot cluster by centroid).
 func (h *AssetsHandler) List(c echo.Context) error {
 	limit, _ := strconv.Atoi(c.QueryParam("limit"))
 	offset, _ := strconv.Atoi(c.QueryParam("offset"))
@@ -54,10 +55,25 @@ func (h *AssetsHandler) List(c echo.Context) error {
 			return echo.NewHTTPError(http.StatusBadRequest, "invalid spot_key")
 		}
 		// Resolve the spot to its exact cluster membership so the library count
-		// equals the count shown on the spot dialog (a grid-cell WHERE would
-		// diverge from the radius clustering). AssetIDs takes precedence in
-		// ListAssets; a non-nil empty slice correctly yields zero photos.
-		ids, err := h.svc.Places().SpotMemberIDs(spotKey)
+		// equals the count shown on the spot dialog. When the caller supplies the
+		// tapped spot's centroid (spot_lat/spot_lon), match by centroid so two
+		// clusters sharing a grid-cell key don't collapse to the largest one;
+		// otherwise fall back to the key-only resolution. AssetIDs takes
+		// precedence in ListAssets; a non-nil empty slice yields zero photos.
+		var ids []string
+		var err error
+		latStr := c.QueryParam("spot_lat")
+		lonStr := c.QueryParam("spot_lon")
+		if latStr != "" && lonStr != "" {
+			lat, errLat := strconv.ParseFloat(latStr, 64)
+			lon, errLon := strconv.ParseFloat(lonStr, 64)
+			if errLat != nil || errLon != nil {
+				return echo.NewHTTPError(http.StatusBadRequest, "invalid spot_lat/spot_lon")
+			}
+			ids, err = h.svc.Places().SpotMemberIDsAt(spotKey, lat, lon)
+		} else {
+			ids, err = h.svc.Places().SpotMemberIDs(spotKey)
+		}
 		if err != nil {
 			return echo.NewHTTPError(http.StatusBadRequest, "invalid spot_key")
 		}
