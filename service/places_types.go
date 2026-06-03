@@ -70,14 +70,15 @@ type Visit struct {
 	Thumbs  []string `json:"thumbs"`
 }
 
-// PlaceDetail is the GET /places/{key} payload.
+// PlaceDetail is the GET /places/{key} payload. CoverAssetID comes from the
+// embedded Place (the route layer fills it per-user) — do not redeclare it
+// here, or the outer field would shadow the embedded one in the JSON output.
 type PlaceDetail struct {
 	Place
-	CoverAssetID string    `json:"coverAssetId,omitempty"`
-	Spots        []Spot    `json:"spots"`
-	Insights     []Insight `json:"insights"`
-	Visits       []Visit   `json:"visits"`
-	Recent       []string  `json:"recent"`
+	Spots    []Spot    `json:"spots"`
+	Insights []Insight `json:"insights"`
+	Visits   []Visit   `json:"visits"`
+	Recent   []string  `json:"recent"`
 }
 
 var regionLabels = map[string]string{

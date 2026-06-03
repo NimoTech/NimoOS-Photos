@@ -560,6 +560,9 @@ WHERE o.user_id=?`, userID)
 			out[k] = id
 		}
 	}
+	if rows.Err() != nil {
+		return nil
+	}
 	return out
 }
 
