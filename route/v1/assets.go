@@ -58,17 +58,24 @@ func (h *AssetsHandler) List(c echo.Context) error {
 		// equals the count shown on the spot dialog. When the caller supplies the
 		// tapped spot's centroid (spot_lat/spot_lon), match by centroid so two
 		// clusters sharing a grid-cell key don't collapse to the largest one;
-		// otherwise fall back to the key-only resolution. AssetIDs takes
-		// precedence in ListAssets; a non-nil empty slice yields zero photos.
+		// otherwise fall back to the key-only resolution. The pair must be
+		// supplied together; a lone half is a 400. AssetIDs takes precedence in
+		// ListAssets; a non-nil empty slice yields zero photos.
 		var ids []string
 		var err error
 		latStr := c.QueryParam("spot_lat")
 		lonStr := c.QueryParam("spot_lon")
-		if latStr != "" && lonStr != "" {
+		if (latStr == "") != (lonStr == "") {
+			return echo.NewHTTPError(http.StatusBadRequest, "spot_lat and spot_lon must be provided together")
+		}
+		if latStr != "" {
 			lat, errLat := strconv.ParseFloat(latStr, 64)
 			lon, errLon := strconv.ParseFloat(lonStr, 64)
 			if errLat != nil || errLon != nil {
 				return echo.NewHTTPError(http.StatusBadRequest, "invalid spot_lat/spot_lon")
+			}
+			if lat < -90 || lat > 90 || lon < -180 || lon > 180 {
+				return echo.NewHTTPError(http.StatusBadRequest, "spot_lat/spot_lon out of range")
 			}
 			ids, err = h.svc.Places().SpotMemberIDsAt(spotKey, lat, lon)
 		} else {
