@@ -144,6 +144,22 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 		watcher.PairLivePhotos() //nolint:errcheck
 	}()
 
+	// 启动时重评估一次 live Smart View：Evaluate 会从 conds_raw 现解析并重新打分，
+	// 解析器 / 分数标定升级后旧视图无需用户干预即可自愈。semantic 条件需要 ML
+	// 文本向量，所以最多等 2 分钟 ML 就绪；失败只告警，下个 batch 会再触发。
+	go func() {
+		for i := 0; i < 24 && !ml.IsReady(); i++ {
+			select {
+			case <-parentCtx.Done():
+				return
+			case <-time.After(5 * time.Second):
+			}
+		}
+		if err := smartViews.EvaluateAllLive(); err != nil {
+			zap.L().Warn("startup smart view evaluate failed", zap.Error(err))
+		}
+	}()
+
 	geoSvc.StartScheduler(parentCtx)
 
 	// 回收站自动清理：启动时跑一次，之后每 24 小时跑一次，到期项永久删除。

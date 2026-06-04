@@ -35,6 +35,9 @@ func (h *SearchHandler) Smart(c echo.Context) error {
 	if req.Limit <= 0 || req.Limit > 100 {
 		req.Limit = 20
 	}
+	// The search box always matches recognized text too; Smart View semantic
+	// conditions call SmartSearch directly and stay pure-CLIP.
+	req.Filters.IncludeOCR = true
 	results, err := h.svc.Search().SmartSearch(req.Query, req.Limit, req.Filters)
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())

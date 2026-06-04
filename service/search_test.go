@@ -48,6 +48,67 @@ func TestSmartSearch(t *testing.T) {
 	require.Equal(t, "a1", results[0].ID)
 }
 
+// TestSmartSearchIncludeOCR 验证 IncludeOCR 开启时 OCR 子串命中以 1.0 分置顶、
+// 与 CLIP 结果按 ID 去重，且默认（关闭）行为不变。
+func TestSmartSearchIncludeOCR(t *testing.T) {
+	db, err := sqlite.Open(filepath.Join(t.TempDir(), "ocr.db"))
+	require.NoError(t, err)
+	defer db.Close()
+
+	// a1: 只有 CLIP 向量；a2: 只有 OCR 文本；a3: 两者都有（去重场景）
+	for i, id := range []string{"a1", "a2", "a3"} {
+		db.Exec(`INSERT INTO assets(id,file_path,status,is_live_photo_video,taken_at)
+			VALUES(?,?,'indexed',0,?)`, id, "/p/"+id+".jpg", fmt.Sprintf("2025-07-%02d 10:00:00", i+1))
+	}
+	for _, id := range []string{"a1", "a3"} {
+		db.Exec(`INSERT INTO asset_clip_idx(asset_id) VALUES(?)`, id)
+		var rowid int64
+		db.QueryRow(`SELECT rowid FROM asset_clip_idx WHERE asset_id=?`, id).Scan(&rowid)
+		vec := make([]float32, 512)
+		vec[0] = 1.0
+		db.Exec(`INSERT INTO clip_embeddings(rowid,embedding) VALUES(?,?)`, rowid, sqlite.SerializeFloat32(vec))
+	}
+	db.Exec(`INSERT INTO asset_ocr(asset_id,text) VALUES('a2','SUPERMART Receipt TOTAL $42.00')`)
+	db.Exec(`INSERT INTO asset_ocr(asset_id,text) VALUES('a3','Invoice receipt 2024')`)
+
+	svc := service.NewSearchService(db, &mockTextML{})
+
+	// 默认关闭：纯 CLIP，OCR-only 的 a2 不出现
+	results, err := svc.SmartSearch("receipt", 10, service.SearchFilters{})
+	require.NoError(t, err)
+	for _, a := range results {
+		require.NotEqual(t, "a2", a.ID, "IncludeOCR=false 时不应返回 OCR-only 命中")
+	}
+
+	// 开启：a2、a3 以 1.0 分置顶（OCR 组内按拍摄时间倒序 → a3 在前），a1 仍在
+	results, err = svc.SmartSearch("receipt", 10, service.SearchFilters{IncludeOCR: true})
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, len(results), 3)
+	require.Equal(t, "a3", results[0].ID)
+	require.Equal(t, "a2", results[1].ID)
+	require.NotNil(t, results[0].MatchScore)
+	require.InDelta(t, 1.0, *results[0].MatchScore, 1e-9)
+	// OCR 命中带 matchedBy 标记（双路命中时保留 OCR 版本）；纯 CLIP 命中不带
+	require.Equal(t, "ocr", results[0].MatchedBy)
+	require.Equal(t, "ocr", results[1].MatchedBy)
+	for _, a := range results {
+		if a.ID == "a1" {
+			require.Empty(t, a.MatchedBy)
+		}
+	}
+	ids := map[string]int{}
+	for _, a := range results {
+		ids[a.ID]++
+	}
+	require.Equal(t, 1, ids["a3"], "双路命中必须去重")
+	require.Equal(t, 1, ids["a1"])
+
+	// 大小写不敏感
+	results, err = svc.SmartSearch("RECEIPT", 10, service.SearchFilters{IncludeOCR: true})
+	require.NoError(t, err)
+	require.Equal(t, "a3", results[0].ID)
+}
+
 func TestTimeline(t *testing.T) {
 	db, err := sqlite.Open(filepath.Join(t.TempDir(), "tl.db"))
 	require.NoError(t, err)

@@ -232,6 +232,18 @@ func migrate(db *sql.DB) error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_svm_sv_score ON smart_view_matches(smart_view_id, match_score)`,
 		`CREATE INDEX IF NOT EXISTS idx_svm_matched  ON smart_view_matches(smart_view_id, matched_at)`,
+		// ── OCR text per asset ────────────────────────────────────────────────
+		// One row per OCR'd asset. text='' means "OCR ran, nothing recognized",
+		// which lets the backfill distinguish done-but-empty from not-yet-done.
+		// Matching uses instr(lower(text), ...) — FTS5 is not compiled into the
+		// bundled mattn/go-sqlite3 build, and per-asset text is small enough
+		// that a LIKE-style scan is fine at gallery scale.
+		`CREATE TABLE IF NOT EXISTS asset_ocr (
+			asset_id TEXT PRIMARY KEY REFERENCES assets(id) ON DELETE CASCADE,
+			text     TEXT NOT NULL DEFAULT '',
+			ocr_at   DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+		)`,
+
 		`CREATE TABLE IF NOT EXISTS smart_view_activity (
 			id            TEXT PRIMARY KEY,
 			smart_view_id TEXT NOT NULL REFERENCES smart_views(id) ON DELETE CASCADE,
@@ -293,24 +305,6 @@ func migrate(db *sql.DB) error {
 		}
 	}
 
-	// ── is_screenshot: classification flag set at index time.
-	//    Added as its own ALTER so we can detect whether the column was *just*
-	//    created (err == nil) and, only then, run the one-time backfill over
-	//    pre-existing rows. On a fresh DB the column already exists from the
-	//    CREATE TABLE above is NOT the case (CREATE does not list it), so a fresh
-	//    DB also takes the "just created" path — harmless, the backfill simply
-	//    matches the not-yet-indexed (empty) table.
-	if _, err := db.Exec(`ALTER TABLE assets ADD COLUMN is_screenshot INTEGER NOT NULL DEFAULT 0`); err != nil {
-		if !strings.Contains(err.Error(), "duplicate column") {
-			return fmt.Errorf("migrate add is_screenshot: %w", err)
-		}
-	} else if err := backfillScreenshots(db); err != nil {
-		return fmt.Errorf("migrate backfill is_screenshot: %w", err)
-	}
-	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_assets_screenshot ON assets(is_screenshot)`); err != nil {
-		return fmt.Errorf("migrate index is_screenshot: %w", err)
-	}
-
 	// ── Idempotent column migration: legacy DBs created with CREATE TABLE IF NOT EXISTS
 	//    won't have new columns; ALTER TABLE ADD COLUMN fills them in.
 	//    SQLite raises "duplicate column" when the column already exists — ignore it.
@@ -327,6 +321,11 @@ func migrate(db *sql.DB) error {
 		`ALTER TABLE persons ADD COLUMN updated_at DATETIME`,
 		`ALTER TABLE album_assets ADD COLUMN position INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE face_detections ADD COLUMN excluded INTEGER NOT NULL DEFAULT 0`,
+		// OCR document-ness signals: coverage = text-box area / image area in
+		// [0,1] (NULL until the OCR backfill recomputes it from box geometry);
+		// line_count = recognized lines kept after the confidence filter.
+		`ALTER TABLE asset_ocr ADD COLUMN coverage REAL`,
+		`ALTER TABLE asset_ocr ADD COLUMN line_count INTEGER`,
 	}
 	for _, stmt := range alters {
 		if _, err := db.Exec(stmt); err != nil &&
@@ -336,6 +335,18 @@ func migrate(db *sql.DB) error {
 	}
 	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_assets_deleted_at ON assets(deleted_at)`); err != nil {
 		return fmt.Errorf("migrate index deleted_at: %w", err)
+	}
+
+	// Derive line_count for legacy asset_ocr rows from the stored text so the
+	// OCR-category line threshold applies immediately, before the coverage
+	// re-OCR backfill reaches them. Idempotent: only fills NULLs.
+	if _, err := db.Exec(`
+		UPDATE asset_ocr SET line_count = CASE
+			WHEN text = '' THEN 0
+			ELSE length(text) - length(replace(text, char(10), '')) + 1
+		END
+		WHERE line_count IS NULL`); err != nil {
+		return fmt.Errorf("migrate backfill asset_ocr.line_count: %w", err)
 	}
 
 	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_album_assets_position ON album_assets(album_id, position)`); err != nil {
@@ -377,40 +388,6 @@ func migrate(db *sql.DB) error {
 	}
 
 	return nil
-}
-
-// backfillScreenshots classifies all pre-existing image assets that have not yet
-// been flagged, using the same heuristic as service.detectScreenshot (filename
-// markers OR PNG-without-camera-EXIF). Run exactly once, right after the
-// is_screenshot column is first created. All inputs (original_name, mime_type,
-// and the joined asset_exif camera fields) are already in the DB, so no files
-// are re-read. Keep this SQL in sync with service.detectScreenshot /
-// screenshotNameMarkers.
-func backfillScreenshots(db *sql.DB) error {
-	_, err := db.Exec(`
-UPDATE assets
-SET is_screenshot = 1
-WHERE is_live_photo_video = 0
-  AND LOWER(COALESCE(mime_type,'')) NOT LIKE 'video/%'
-  AND (
-        LOWER(COALESCE(original_name,'')) LIKE '%screenshot%'
-     OR LOWER(COALESCE(original_name,'')) LIKE '%screen shot%'
-     OR LOWER(COALESCE(original_name,'')) LIKE '%screen\_shot%' ESCAPE '\'
-     OR COALESCE(original_name,'') LIKE '%截屏%'
-     OR COALESCE(original_name,'') LIKE '%截图%'
-     OR COALESCE(original_name,'') LIKE '%屏幕快照%'
-     OR (
-          LOWER(COALESCE(mime_type,'')) = 'image/png'
-          AND NOT EXISTS (
-            SELECT 1 FROM asset_exif e
-            WHERE e.asset_id = assets.id
-              AND (COALESCE(e.make,'') <> '' OR COALESCE(e.model,'') <> ''
-                   OR COALESCE(e.iso,0) <> 0 OR COALESCE(e.aperture,0) <> 0
-                   OR COALESCE(e.focal_length,0) <> 0)
-          )
-        )
-  )`)
-	return err
 }
 
 // geoGazVersion is bumped whenever the embedded gazetteer or the reverse-geocode

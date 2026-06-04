@@ -21,6 +21,7 @@ type Embedder struct {
 	reg          *TaskRegistry
 	lastReady    atomic.Bool
 	running      atomic.Bool
+	ocrRunning   atomic.Bool
 	pollInterval time.Duration
 }
 
@@ -147,6 +148,127 @@ func (e *Embedder) Backfill(ctx context.Context) error {
 	return nil
 }
 
+// queryMissingOCR 列出 status='indexed' 但 OCR 数据不完整的 asset：
+// 要么 asset_ocr 缺行（从未跑过 OCR——即使没识别到文字也会写 text='' 行），
+// 要么 coverage 为 NULL（旧版跑的 OCR 没存文字框面积，需要重跑补齐）。
+func (e *Embedder) queryMissingOCR(ctx context.Context) ([]ocrTarget, error) {
+	rows, err := e.db.QueryContext(ctx, `
+        SELECT a.id, a.file_path, COALESCE(a.mime_type,'') LIKE 'video/%'
+        FROM assets a
+        LEFT JOIN asset_ocr o ON o.asset_id = a.id
+        WHERE a.status = 'indexed' AND a.deleted_at IS NULL
+          AND (o.asset_id IS NULL OR o.coverage IS NULL)`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ocrTarget
+	for rows.Next() {
+		var t ocrTarget
+		if err := rows.Scan(&t.id, &t.path, &t.isVideo); err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+type ocrTarget struct {
+	id      string
+	path    string
+	isVideo bool
+}
+
+// BackfillOCR 对所有缺 OCR 文本的 asset 补跑 ML OCR。
+// 图片读原图（小票/文档的小字在缩略图分辨率下会丢失）；
+// 视频没有现成关键帧文件，退而用 large.jpg（1280px）缩略图。
+// 并发调用安全：第二次调用会立即返回 nil。
+func (e *Embedder) BackfillOCR(ctx context.Context) error {
+	if !e.ocrRunning.CompareAndSwap(false, true) {
+		return nil
+	}
+	defer e.ocrRunning.Store(false)
+
+	targets, err := e.queryMissingOCR(ctx)
+	if err != nil {
+		return err
+	}
+	if len(targets) == 0 {
+		return nil
+	}
+
+	taskID := fmt.Sprintf("ocr_%d", time.Now().UnixNano())
+	started := time.Now()
+	total := int64(len(targets))
+	pubRunning := func(processed int64) {
+		e.reg.Upsert(Task{
+			ID:        taskID,
+			Type:      "ocr",
+			Label:     "识别图片文字",
+			Total:     total,
+			Current:   processed,
+			Progress:  float64(processed) / float64(total),
+			Status:    "running",
+			StartedAt: started,
+		})
+	}
+	pubRunning(0)
+
+	var processed, failed int64
+	for _, t := range targets {
+		if ctx.Err() != nil {
+			break
+		}
+		src := t.path
+		if t.isVideo {
+			src = filepath.Join(e.indexer.thumbDir, t.id, "large.jpg")
+		}
+		data, rerr := os.ReadFile(src)
+		if rerr != nil || len(data) == 0 {
+			failed++
+			processed++
+			pubRunning(processed)
+			continue
+		}
+		if oerr := e.indexer.ocrAsset(t.id, data); oerr != nil {
+			failed++
+		}
+		processed++
+		pubRunning(processed)
+	}
+
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+
+	final := Task{
+		ID:        taskID,
+		Type:      "ocr",
+		Label:     "识别图片文字",
+		Total:     total,
+		Current:   processed - failed,
+		StartedAt: started,
+	}
+	if processed > 0 && failed == processed {
+		final.Status = "error"
+		final.Error = "ML 服务在补跑过程中失联，请检查服务状态"
+	} else {
+		final.Status = "done"
+		final.Progress = 1
+		if failed > 0 {
+			final.Label = fmt.Sprintf("识别图片文字（失败 %d 张）", failed)
+		}
+	}
+	e.reg.Upsert(final)
+	go func() {
+		time.Sleep(6 * time.Second)
+		if e.reg != nil {
+			e.reg.Remove(taskID)
+		}
+	}()
+	return nil
+}
+
 // Run 主循环：每隔 pollInterval 检查 ML ready 状态，
 // 检测到 false→true 跳变时触发一次 Backfill（goroutine 异步执行）。
 // 服务启动时如果 ML 已经就绪，第一次 tick 的 prev=false 也会触发——符合 spec §5.2。
@@ -175,9 +297,11 @@ func (e *Embedder) tick(ctx context.Context) {
 	if ready && !prev {
 		go func() {
 			// Backfill first (fills assets that never got an embedding), then the
-			// one-time re-embed of all existing assets from their thumbnails.
+			// one-time re-embed of all existing assets from their thumbnails,
+			// then OCR for assets indexed before OCR support existed.
 			_ = e.Backfill(ctx)
 			e.reembedThumbnailsOnce()
+			_ = e.BackfillOCR(ctx)
 		}()
 	}
 }

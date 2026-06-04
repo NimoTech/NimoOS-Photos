@@ -24,7 +24,6 @@ type SmartView struct {
 	Threshold     int        `json:"threshold"`
 	Live          bool       `json:"live"`
 	IncludeVideos bool       `json:"includeVideos"`
-	NotifyWeekly  bool       `json:"notifyWeekly"`
 	Count         int        `json:"count"`
 	AddedThisWeek int        `json:"addedThisWeek"`
 	Seeds         []string   `json:"seeds"`
@@ -42,7 +41,6 @@ type SmartViewInput struct {
 	Threshold     int      `json:"threshold"`
 	Live          bool     `json:"live"`
 	IncludeVideos bool     `json:"includeVideos"`
-	NotifyWeekly  bool     `json:"notifyWeekly"`
 }
 
 type SmartViewPatch struct {
@@ -52,7 +50,6 @@ type SmartViewPatch struct {
 	Threshold     *int      `json:"threshold,omitempty"`
 	Live          *bool     `json:"live,omitempty"`
 	IncludeVideos *bool     `json:"includeVideos,omitempty"`
-	NotifyWeekly  *bool     `json:"notifyWeekly,omitempty"`
 }
 
 type SmartViewService struct {
@@ -72,13 +69,13 @@ func (s *SmartViewService) Create(in SmartViewInput) (*SmartView, error) {
 		in.Threshold = 70
 	}
 	rawJSON, _ := json.Marshal(in.CondsRaw)
-	parsed := ParseConditions(s.db, in.CondsRaw)
+	parsed := parseWithDescFallback(s.db, in.CondsRaw, in.Description)
 	parsedJSON, _ := json.Marshal(parsed)
 	_, err := s.db.Exec(`INSERT INTO smart_views
-		(id,name,description,conds_raw,conds_parsed,threshold,live,include_videos,notify_weekly)
-		VALUES(?,?,?,?,?,?,?,?,?)`,
+		(id,name,description,conds_raw,conds_parsed,threshold,live,include_videos)
+		VALUES(?,?,?,?,?,?,?,?)`,
 		in.ID, in.Name, in.Description, string(rawJSON), string(parsedJSON),
-		in.Threshold, boolToInt(in.Live), boolToInt(in.IncludeVideos), boolToInt(in.NotifyWeekly))
+		in.Threshold, boolToInt(in.Live), boolToInt(in.IncludeVideos))
 	if err != nil {
 		return nil, err
 	}
@@ -116,15 +113,15 @@ func (s *SmartViewService) List() ([]SmartView, error) {
 
 func (s *SmartViewService) Get(id string) (*SmartView, error) {
 	var (
-		sv                SmartView
-		rawJSON           string
-		liveI, vidI, notI int
-		evaluatedAt       sql.NullTime
-		desc              sql.NullString
+		sv          SmartView
+		rawJSON     string
+		liveI, vidI int
+		evaluatedAt sql.NullTime
+		desc        sql.NullString
 	)
-	err := s.db.QueryRow(`SELECT id,name,description,conds_raw,threshold,live,include_videos,notify_weekly,evaluated_at
+	err := s.db.QueryRow(`SELECT id,name,description,conds_raw,threshold,live,include_videos,evaluated_at
 		FROM smart_views WHERE id=?`, id).Scan(
-		&sv.ID, &sv.Name, &desc, &rawJSON, &sv.Threshold, &liveI, &vidI, &notI, &evaluatedAt)
+		&sv.ID, &sv.Name, &desc, &rawJSON, &sv.Threshold, &liveI, &vidI, &evaluatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -134,7 +131,6 @@ func (s *SmartViewService) Get(id string) (*SmartView, error) {
 	sv.Description = desc.String
 	sv.Live = liveI == 1
 	sv.IncludeVideos = vidI == 1
-	sv.NotifyWeekly = notI == 1
 	if evaluatedAt.Valid {
 		sv.EvaluatedAt = &evaluatedAt.Time
 	}
@@ -172,16 +168,13 @@ func (s *SmartViewService) Update(id string, p SmartViewPatch) (*SmartView, erro
 		sets = append(sets, "include_videos=?")
 		args = append(args, boolToInt(*p.IncludeVideos))
 	}
-	if p.NotifyWeekly != nil {
-		sets = append(sets, "notify_weekly=?")
-		args = append(args, boolToInt(*p.NotifyWeekly))
-	}
+	// conds_parsed is NOT written here — Evaluate (triggered below for any
+	// match-affecting patch) re-parses from conds_raw + description and
+	// refreshes the snapshot itself.
 	if p.CondsRaw != nil {
 		rawJSON, _ := json.Marshal(*p.CondsRaw)
-		parsed := ParseConditions(s.db, *p.CondsRaw)
-		parsedJSON, _ := json.Marshal(parsed)
-		sets = append(sets, "conds_raw=?", "conds_parsed=?")
-		args = append(args, string(rawJSON), string(parsedJSON))
+		sets = append(sets, "conds_raw=?")
+		args = append(args, string(rawJSON))
 	}
 	sets = append(sets, "updated_at=CURRENT_TIMESTAMP")
 	if len(sets) > 0 {
@@ -192,7 +185,7 @@ func (s *SmartViewService) Update(id string, p SmartViewPatch) (*SmartView, erro
 		}
 	}
 	s.logActivity(id, "updated", "", nil)
-	if p.CondsRaw != nil || p.Threshold != nil || p.IncludeVideos != nil {
+	if p.CondsRaw != nil || p.Description != nil || p.Threshold != nil || p.IncludeVideos != nil {
 		if err := s.Evaluate(id); err != nil {
 			return nil, err
 		}
@@ -263,17 +256,23 @@ func (s *SmartViewService) fillStats(sv *SmartView) {
 
 // MatchedAssets returns paginated matched assets, optionally only those added
 // in the last 7 days (recent=true), ordered by score then recency.
-func (s *SmartViewService) MatchedAssets(id string, limit, offset int, recent bool) ([]Asset, error) {
+// IsNew is per-user: true until userID opens the asset after it matched
+// (asset_views row at/after matched_at) — drives the dismissible "New" tag.
+func (s *SmartViewService) MatchedAssets(id string, limit, offset int, recent bool, userID string) ([]Asset, error) {
 	where := `m.smart_view_id=?`
-	args := []any{id}
+	args := []any{userID, id}
 	if recent {
 		where += ` AND m.matched_at >= datetime('now','-7 days')`
 	}
+	// julianday() tolerates both "YYYY-MM-DD HH:MM:SS" (CURRENT_TIMESTAMP) and
+	// ISO "T...Z" / "+00:00" (driver-written time.Time) datetime encodings.
 	q := `SELECT a.id, a.file_path, a.file_size, COALESCE(a.mime_type,''),
 	       COALESCE(a.original_name,''), a.taken_at, a.duration_ms,
-	       COALESCE(a.live_photo_video_id,''), a.is_live_photo_video, a.is_screenshot,
-	       a.indexed_at, a.status, m.match_score
+	       COALESCE(a.live_photo_video_id,''), a.is_live_photo_video, EXISTS(SELECT 1 FROM asset_ocr ocr WHERE ocr.asset_id=a.id AND ocr.text<>'' AND COALESCE(ocr.coverage,1)>=0.05 AND COALESCE(ocr.line_count,0)>=8),
+	       a.indexed_at, a.status, m.match_score,
+	       (v.last_viewed_at IS NULL OR julianday(v.last_viewed_at) < julianday(m.matched_at))
 	FROM smart_view_matches m JOIN assets a ON a.id=m.asset_id
+	LEFT JOIN asset_views v ON v.user_id=? AND v.asset_id=a.id
 	WHERE ` + where + ` AND a.deleted_at IS NULL
 	ORDER BY m.match_score DESC, COALESCE(a.taken_at,a.indexed_at) DESC
 	LIMIT ? OFFSET ?`
@@ -287,10 +286,29 @@ func (s *SmartViewService) MatchedAssets(id string, limit, offset int, recent bo
 	for rows.Next() {
 		var a Asset
 		var score float64
-		if err := rows.Scan(&a.ID, &a.FilePath, &a.FileSize, &a.MimeType, &a.OriginalName,
-			&a.TakenAt, &a.DurationMs, &a.LivePhotoVideoID, &a.IsLivePhotoVideo, &a.IsScreenshot,
-			&a.IndexedAt, &a.Status, &score); err != nil {
+		// duration_ms / taken_at / file_size / indexed_at are nullable in the
+		// assets table — scan through sql.Null* like scanAssets does, or a single
+		// NULL (every photo's duration_ms) fails the whole query.
+		var takenAt, indexedAt sql.NullTime
+		var fileSize, durationMs sql.NullInt64
+		if err := rows.Scan(&a.ID, &a.FilePath, &fileSize, &a.MimeType, &a.OriginalName,
+			&takenAt, &durationMs, &a.LivePhotoVideoID, &a.IsLivePhotoVideo, &a.HasOCR,
+			&indexedAt, &a.Status, &score, &a.IsNew); err != nil {
 			return nil, err
+		}
+		if fileSize.Valid {
+			a.FileSize = fileSize.Int64
+		}
+		if takenAt.Valid {
+			t := takenAt.Time
+			a.TakenAt = &t
+		}
+		if durationMs.Valid {
+			a.DurationMs = durationMs.Int64
+		}
+		if indexedAt.Valid {
+			t := indexedAt.Time
+			a.IndexedAt = &t
 		}
 		a.MatchScore = &score
 		out = append(out, a)
@@ -322,19 +340,29 @@ func joinComma(parts []string) string {
 }
 
 // Evaluate runs a full match evaluation and reconciles smart_view_matches.
+// Conditions are re-parsed from conds_raw on every run (not read from the
+// conds_parsed snapshot): parser upgrades then apply to existing views, and
+// relative date windows like "last 30 days" stay anchored to now instead of
+// being frozen at creation time. conds_parsed is refreshed as a side effect
+// so API consumers keep seeing the current interpretation.
 func (s *SmartViewService) Evaluate(id string) error {
-	var parsedJSON string
+	var rawJSON string
+	var desc sql.NullString
 	var includeVideos, threshold int
-	err := s.db.QueryRow(`SELECT conds_parsed, include_videos, threshold FROM smart_views WHERE id=?`, id).
-		Scan(&parsedJSON, &includeVideos, &threshold)
+	err := s.db.QueryRow(`SELECT conds_raw, description, include_videos, threshold FROM smart_views WHERE id=?`, id).
+		Scan(&rawJSON, &desc, &includeVideos, &threshold)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ErrNotFound
 	}
 	if err != nil {
 		return err
 	}
-	var parsed []ParsedCond
-	_ = json.Unmarshal([]byte(parsedJSON), &parsed)
+	var raw []string
+	_ = json.Unmarshal([]byte(rawJSON), &raw)
+	parsed := parseWithDescFallback(s.db, raw, desc.String)
+	if parsedJSON, jerr := json.Marshal(parsed); jerr == nil {
+		_, _ = s.db.Exec(`UPDATE smart_views SET conds_parsed=? WHERE id=?`, string(parsedJSON), id)
+	}
 
 	includeVideosBool := includeVideos == 1
 	scoreMap, err := s.evalParsed(parsed, threshold, !includeVideosBool)
@@ -427,6 +455,30 @@ func (s *SmartViewService) assetsForDateRange(start, end time.Time) (map[string]
 	return scanIDSet(rows, err)
 }
 
+// assetsForOCR matches assets whose recognized text contains any of the
+// "|"-separated alternatives (case-insensitive substring). Like person/place/
+// date, this is a structural condition: hit or miss, score 1.0.
+func (s *SmartViewService) assetsForOCR(query string) (map[string]struct{}, error) {
+	var conds []string
+	var args []any
+	for _, term := range strings.Split(query, "|") {
+		term = strings.TrimSpace(term)
+		if term == "" {
+			continue
+		}
+		conds = append(conds, "instr(lower(o.text), lower(?)) > 0")
+		args = append(args, term)
+	}
+	if len(conds) == 0 {
+		return map[string]struct{}{}, nil
+	}
+	rows, err := s.db.Query(`SELECT o.asset_id FROM asset_ocr o
+		JOIN assets a ON a.id=o.asset_id
+		WHERE (`+strings.Join(conds, " OR ")+`)
+		  AND a.is_live_photo_video=0 AND a.deleted_at IS NULL`, args...)
+	return scanIDSet(rows, err)
+}
+
 func (s *SmartViewService) assetsForSemantic(query string) (map[string]float64, error) {
 	results, err := s.search.SmartSearch(query, 500, SearchFilters{})
 	if err != nil {
@@ -501,9 +553,9 @@ type SmartViewActivity struct {
 
 func (s *SmartViewService) Duplicate(id string) (*SmartView, error) {
 	var name, rawJSON, desc string
-	var threshold, live, vid, notify int
-	err := s.db.QueryRow(`SELECT name,description,conds_raw,threshold,live,include_videos,notify_weekly
-		FROM smart_views WHERE id=?`, id).Scan(&name, &desc, &rawJSON, &threshold, &live, &vid, &notify)
+	var threshold, live, vid int
+	err := s.db.QueryRow(`SELECT name,description,conds_raw,threshold,live,include_videos
+		FROM smart_views WHERE id=?`, id).Scan(&name, &desc, &rawJSON, &threshold, &live, &vid)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -520,7 +572,6 @@ func (s *SmartViewService) Duplicate(id string) (*SmartView, error) {
 		Threshold:     threshold,
 		Live:          live == 1,
 		IncludeVideos: vid == 1,
-		NotifyWeekly:  notify == 1,
 	})
 }
 
@@ -599,18 +650,47 @@ func intersect(sets []map[string]struct{}) map[string]struct{} {
 }
 
 // Preview evaluates condsRaw at threshold without persisting results.
-// Returns (totalMatched, topSeedIDs, error).
-func (s *SmartViewService) Preview(condsRaw []string, threshold int) (int, []string, error) {
+// description participates the same way as in Create (semantic fallback).
+// thresholdActive reports whether any semantic condition exists — without one
+// every match scores a flat 1.0 and the threshold slider has no effect, which
+// the UI uses to grey the slider out.
+// Returns (totalMatched, topSeedIDs, thresholdActive, error).
+func (s *SmartViewService) Preview(condsRaw []string, description string, threshold int, includeVideos bool) (int, []string, bool, error) {
 	if threshold < 50 || threshold > 99 {
 		threshold = 70
 	}
-	parsed := ParseConditions(s.db, condsRaw)
-	scored, err := s.evalParsed(parsed, threshold, true)
+	parsed := parseWithDescFallback(s.db, condsRaw, description)
+	thresholdActive := false
+	for _, c := range parsed {
+		if c.Kind == condSemantic {
+			thresholdActive = true
+			break
+		}
+	}
+	scored, err := s.evalParsed(parsed, threshold, !includeVideos)
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, false, err
 	}
 	ids := topNByScore(scored, 6)
-	return len(scored), ids, nil
+	return len(scored), ids, thresholdActive, nil
+}
+
+// parseWithDescFallback parses condsRaw; when nothing executable comes out and
+// the description is non-empty, the description itself is appended as a
+// semantic (CLIP) condition so "What should Nimo match?" actually drives
+// matching instead of being a stored-but-unread note.
+func parseWithDescFallback(db *sql.DB, condsRaw []string, description string) []ParsedCond {
+	parsed := ParseConditions(db, condsRaw)
+	desc := strings.TrimSpace(description)
+	if desc == "" {
+		return parsed
+	}
+	for _, c := range parsed {
+		if c.Kind != condUnsupported {
+			return parsed
+		}
+	}
+	return append(parsed, ParsedCond{Raw: desc, Kind: condSemantic, Value: desc})
 }
 
 // evalParsed is the shared matcher used by Evaluate (persisted) and Preview.
@@ -645,6 +725,13 @@ func (s *SmartViewService) evalParsed(parsed []ParsedCond, threshold int, exclud
 				sets = append(sets, ids)
 				hasExecutable = true
 			}
+		case condOCR:
+			ids, err := s.assetsForOCR(c.Value)
+			if err != nil {
+				return nil, err
+			}
+			sets = append(sets, ids)
+			hasExecutable = true
 		case condSemantic:
 			scored, err := s.assetsForSemantic(c.Value)
 			if err != nil {
@@ -675,13 +762,38 @@ func (s *SmartViewService) evalParsed(parsed []ParsedCond, threshold int, exclud
 			for _, v := range vs {
 				sum += v
 			}
-			score = sum / float64(len(vs))
+			// Raw CLIP text↔image cosine rarely exceeds ~0.32 (modality gap), so
+			// comparing it against the 50–99% slider directly would match nothing.
+			// Map through the same empirical band the search UI uses, so the
+			// slider, stored match_score, Median stat and the 50–100% distribution
+			// chart all live on one perceptual scale.
+			score = perceptualScore(sum / float64(len(vs)))
 		}
 		if score >= thr {
 			out[aid] = score
 		}
 	}
 	return out, nil
+}
+
+// clipScoreLo/Hi mirror SCORE_LO/SCORE_HI in PhotosSearchView.vue matchPct().
+// Keep the two in sync when recalibrating (empirical for CLIP ViT-B/32).
+const (
+	clipScoreLo = 0.14
+	clipScoreHi = 0.32
+)
+
+// perceptualScore rescales a raw CLIP cosine similarity into the intuitive
+// 0–1 band shown to users. Monotonic, so ordering is unaffected.
+func perceptualScore(sim float64) float64 {
+	t := (sim - clipScoreLo) / (clipScoreHi - clipScoreLo)
+	if t < 0 {
+		return 0
+	}
+	if t > 1 {
+		return 1
+	}
+	return t
 }
 
 // topNByScore returns the IDs of the top n entries in m by score (descending).
@@ -722,7 +834,7 @@ func (s *SmartViewService) ExportAsAlbum(id string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("ExportAsAlbum create album: %w", err)
 	}
-	assets, err := s.MatchedAssets(id, 100000, 0, false)
+	assets, err := s.MatchedAssets(id, 100000, 0, false, "")
 	if err != nil {
 		return "", err
 	}
@@ -741,7 +853,7 @@ func (s *SmartViewService) ExportAsAlbum(id string) (string, error) {
 
 // ExportZip streams all matched assets as a ZIP archive directly to w.
 func (s *SmartViewService) ExportZip(w http.ResponseWriter, id string) error {
-	assets, err := s.MatchedAssets(id, 100000, 0, false)
+	assets, err := s.MatchedAssets(id, 100000, 0, false, "")
 	if err != nil {
 		return err
 	}

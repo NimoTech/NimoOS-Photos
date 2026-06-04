@@ -56,6 +56,14 @@ type textEmbedder interface {
 type SearchFilters struct {
 	Year  int
 	Month int
+	// IncludeOCR additionally matches the query as a case-insensitive substring
+	// of each asset's recognized text (asset_ocr) and pins those exact hits to
+	// the top with MatchScore 1.0. Deliberately NOT client-controllable
+	// (json:"-"): the search route opts in server-side, while Smart View
+	// semantic conditions — which also call SmartSearch — must stay pure-CLIP,
+	// or photos containing the literal condition text would pollute the
+	// threshold semantics with 1.0 scores.
+	IncludeOCR bool `json:"-"`
 }
 
 // SearchService provides semantic search, timeline, person, and asset CRUD.
@@ -100,7 +108,7 @@ func (s *SearchService) SmartSearch(query string, limit int, filters SearchFilte
 	baseSQL := `
 SELECT a.id, a.file_path, a.file_size, COALESCE(a.mime_type,''),
        COALESCE(a.original_name,''), a.taken_at, a.duration_ms,
-       COALESCE(a.live_photo_video_id,''), a.is_live_photo_video, a.is_screenshot,
+       COALESCE(a.live_photo_video_id,''), a.is_live_photo_video, EXISTS(SELECT 1 FROM asset_ocr ocr WHERE ocr.asset_id=a.id AND ocr.text<>'' AND COALESCE(ocr.coverage,1)>=0.05 AND COALESCE(ocr.line_count,0)>=8),
        a.indexed_at, a.status, e.latitude, e.longitude, vec.distance
 FROM clip_embeddings AS vec
 JOIN asset_clip_idx AS idx ON idx.rowid = vec.rowid
@@ -147,12 +155,89 @@ WHERE vec.embedding MATCH ? AND k = ?
 		}
 		assets = kept
 	}
+
+	// Exact-text OCR hits outrank semantic guesses: prepend them at score 1.0
+	// and drop the CLIP duplicate when the same asset matched both ways.
+	if filters.IncludeOCR {
+		ocrHits, err := s.ocrSearch(query, limit, filters)
+		if err != nil {
+			return nil, err
+		}
+		assets = mergeOCRFirst(ocrHits, assets, limit)
+	}
+
 	// Attach named persons so the client can offer a People filter on results.
 	if err := s.attachNamedFaces(assets); err != nil {
 		return nil, err
 	}
 	enrichPlaceNames(s.db, assets)
 	return assets, nil
+}
+
+// ocrSearch returns assets whose recognized text (asset_ocr) contains query as
+// a case-insensitive substring, newest first. The constant 0.0 distance makes
+// scanSearchAssets derive MatchScore 1.0, marking these as exact hits.
+func (s *SearchService) ocrSearch(query string, limit int, filters SearchFilters) ([]Asset, error) {
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return nil, nil
+	}
+
+	q := `
+SELECT a.id, a.file_path, a.file_size, COALESCE(a.mime_type,''),
+       COALESCE(a.original_name,''), a.taken_at, a.duration_ms,
+       COALESCE(a.live_photo_video_id,''), a.is_live_photo_video, EXISTS(SELECT 1 FROM asset_ocr ocr WHERE ocr.asset_id=a.id AND ocr.text<>'' AND COALESCE(ocr.coverage,1)>=0.05 AND COALESCE(ocr.line_count,0)>=8),
+       a.indexed_at, a.status, e.latitude, e.longitude, 0.0 AS distance
+FROM asset_ocr o
+JOIN assets a ON a.id = o.asset_id
+LEFT JOIN asset_exif AS e ON e.asset_id = a.id
+WHERE instr(lower(o.text), lower(?)) > 0
+  AND a.is_live_photo_video = 0
+  AND a.deleted_at IS NULL`
+
+	args := []any{query}
+	if filters.Year > 0 {
+		q += "\n  AND strftime('%Y', a.taken_at) = ?"
+		args = append(args, fmt.Sprintf("%04d", filters.Year))
+	}
+	if filters.Month > 0 {
+		q += "\n  AND strftime('%m', a.taken_at) = ?"
+		args = append(args, fmt.Sprintf("%02d", filters.Month))
+	}
+	q += "\nORDER BY COALESCE(a.taken_at, a.indexed_at) DESC\nLIMIT ?"
+	args = append(args, limit)
+
+	rows, err := s.db.Query(q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("ocrSearch query: %w", err)
+	}
+	defer rows.Close()
+	assets, err := scanSearchAssets(rows)
+	if err != nil {
+		return nil, err
+	}
+	for i := range assets {
+		assets[i].MatchedBy = "ocr"
+	}
+	return assets, nil
+}
+
+// mergeOCRFirst concatenates ocr hits before clip results, dropping duplicate
+// asset IDs (the OCR entry wins) and trimming to limit.
+func mergeOCRFirst(ocr, clip []Asset, limit int) []Asset {
+	seen := make(map[string]struct{}, len(ocr)+len(clip))
+	out := make([]Asset, 0, len(ocr)+len(clip))
+	for _, a := range append(ocr, clip...) {
+		if _, dup := seen[a.ID]; dup {
+			continue
+		}
+		seen[a.ID] = struct{}{}
+		out = append(out, a)
+	}
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out
 }
 
 // attachNamedFaces fills each asset's Faces with the names of the named persons
@@ -213,7 +298,7 @@ func (s *SearchService) Timeline(userID string) ([]TimelineGroup, error) {
 	rows, err := s.db.Query(`
 SELECT a.id, a.file_path, a.file_size, COALESCE(a.mime_type,''),
        COALESCE(a.original_name,''), a.taken_at, a.duration_ms,
-       COALESCE(a.live_photo_video_id,''), a.is_live_photo_video, a.is_screenshot,
+       COALESCE(a.live_photo_video_id,''), a.is_live_photo_video, EXISTS(SELECT 1 FROM asset_ocr ocr WHERE ocr.asset_id=a.id AND ocr.text<>'' AND COALESCE(ocr.coverage,1)>=0.05 AND COALESCE(ocr.line_count,0)>=8),
        a.indexed_at, a.status,
        e.width, e.height, e.latitude, e.longitude, e.make, e.model,
        e.iso, e.shutter_speed, e.aperture, e.focal_length, e.orientation,
@@ -268,7 +353,7 @@ func (s *SearchService) PersonAssets(personID string, limit, offset int) ([]Asse
 	rows, err := s.db.Query(`
 SELECT DISTINCT a.id, a.file_path, a.file_size, COALESCE(a.mime_type,''),
        COALESCE(a.original_name,''), a.taken_at, a.duration_ms,
-       COALESCE(a.live_photo_video_id,''), a.is_live_photo_video, a.is_screenshot,
+       COALESCE(a.live_photo_video_id,''), a.is_live_photo_video, EXISTS(SELECT 1 FROM asset_ocr ocr WHERE ocr.asset_id=a.id AND ocr.text<>'' AND COALESCE(ocr.coverage,1)>=0.05 AND COALESCE(ocr.line_count,0)>=8),
        a.indexed_at, a.status
 FROM assets a
 JOIN face_detections fd ON fd.asset_id = a.id
@@ -399,7 +484,7 @@ func (s *SearchService) ListAssets(userID string, limit, offset int, filters ...
 	q := `
 SELECT a.id, a.file_path, a.file_size, COALESCE(a.mime_type,''),
        COALESCE(a.original_name,''), a.taken_at, a.duration_ms,
-       COALESCE(a.live_photo_video_id,''), a.is_live_photo_video, a.is_screenshot,
+       COALESCE(a.live_photo_video_id,''), a.is_live_photo_video, EXISTS(SELECT 1 FROM asset_ocr ocr WHERE ocr.asset_id=a.id AND ocr.text<>'' AND COALESCE(ocr.coverage,1)>=0.05 AND COALESCE(ocr.line_count,0)>=8),
        a.indexed_at, a.status,
        e.width, e.height, e.latitude, e.longitude, e.make, e.model,
        e.iso, e.shutter_speed, e.aperture, e.focal_length, e.orientation,
@@ -439,7 +524,7 @@ func (s *SearchService) listAssetsByIDs(userID string, ids []string) ([]Asset, e
 	q := `
 SELECT a.id, a.file_path, a.file_size, COALESCE(a.mime_type,''),
        COALESCE(a.original_name,''), a.taken_at, a.duration_ms,
-       COALESCE(a.live_photo_video_id,''), a.is_live_photo_video, a.is_screenshot,
+       COALESCE(a.live_photo_video_id,''), a.is_live_photo_video, EXISTS(SELECT 1 FROM asset_ocr ocr WHERE ocr.asset_id=a.id AND ocr.text<>'' AND COALESCE(ocr.coverage,1)>=0.05 AND COALESCE(ocr.line_count,0)>=8),
        a.indexed_at, a.status,
        e.width, e.height, e.latitude, e.longitude, e.make, e.model,
        e.iso, e.shutter_speed, e.aperture, e.focal_length, e.orientation,
@@ -477,7 +562,7 @@ func (s *SearchService) GetAsset(userID, id string) (*Asset, error) {
 	rows, err := s.db.Query(`
 SELECT a.id, a.file_path, a.file_size, COALESCE(a.mime_type,''),
        COALESCE(a.original_name,''), a.taken_at, a.duration_ms,
-       COALESCE(a.live_photo_video_id,''), a.is_live_photo_video, a.is_screenshot,
+       COALESCE(a.live_photo_video_id,''), a.is_live_photo_video, EXISTS(SELECT 1 FROM asset_ocr ocr WHERE ocr.asset_id=a.id AND ocr.text<>'' AND COALESCE(ocr.coverage,1)>=0.05 AND COALESCE(ocr.line_count,0)>=8),
        a.indexed_at, a.status,
        e.width, e.height, e.latitude, e.longitude, e.make, e.model,
        e.iso, e.shutter_speed, e.aperture, e.focal_length, e.orientation,

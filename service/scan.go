@@ -66,7 +66,7 @@ func enrichPlaceNames(db *sql.DB, assets []Asset) {
 // scanAssets reads a list of Asset from *sql.Rows.
 // Column order must be: id, file_path, file_size, mime_type, original_name,
 // taken_at, duration_ms, live_photo_video_id, is_live_photo_video,
-// is_screenshot, indexed_at, status
+// has_ocr (EXISTS over asset_ocr), indexed_at, status
 func scanAssets(rows *sql.Rows) ([]Asset, error) {
 	var assets []Asset
 	for rows.Next() {
@@ -75,7 +75,7 @@ func scanAssets(rows *sql.Rows) ([]Asset, error) {
 		var fileSize, durationMs sql.NullInt64
 		if err := rows.Scan(
 			&a.ID, &a.FilePath, &fileSize, &a.MimeType, &a.OriginalName,
-			&takenAt, &durationMs, &a.LivePhotoVideoID, &a.IsLivePhotoVideo, &a.IsScreenshot,
+			&takenAt, &durationMs, &a.LivePhotoVideoID, &a.IsLivePhotoVideo, &a.HasOCR,
 			&indexedAt, &a.Status,
 		); err != nil {
 			return nil, err
@@ -113,7 +113,7 @@ func scanSearchAssets(rows *sql.Rows) ([]Asset, error) {
 		var lat, lng, distance sql.NullFloat64
 		if err := rows.Scan(
 			&a.ID, &a.FilePath, &fileSize, &a.MimeType, &a.OriginalName,
-			&takenAt, &durationMs, &a.LivePhotoVideoID, &a.IsLivePhotoVideo, &a.IsScreenshot,
+			&takenAt, &durationMs, &a.LivePhotoVideoID, &a.IsLivePhotoVideo, &a.HasOCR,
 			&indexedAt, &a.Status, &lat, &lng, &distance,
 		); err != nil {
 			return nil, err
@@ -165,7 +165,7 @@ func scanAssetsDetailed(rows *sql.Rows) ([]Asset, error) {
 		var makeS, modelS, shutter, vcodec, acodec sql.NullString
 		if err := rows.Scan(
 			&a.ID, &a.FilePath, &fileSize, &a.MimeType, &a.OriginalName,
-			&takenAt, &durationMs, &a.LivePhotoVideoID, &a.IsLivePhotoVideo, &a.IsScreenshot,
+			&takenAt, &durationMs, &a.LivePhotoVideoID, &a.IsLivePhotoVideo, &a.HasOCR,
 			&indexedAt, &a.Status,
 			&width, &height, &latitude, &longitude, &makeS, &modelS,
 			&iso, &shutter, &aperture, &focalLength, &orientation,
@@ -254,7 +254,7 @@ func scanAssetsDetailedWithFav(rows *sql.Rows) ([]Asset, error) {
 		var makeS, modelS, shutter, vcodec, acodec sql.NullString
 		if err := rows.Scan(
 			&a.ID, &a.FilePath, &fileSize, &a.MimeType, &a.OriginalName,
-			&takenAt, &durationMs, &a.LivePhotoVideoID, &a.IsLivePhotoVideo, &a.IsScreenshot,
+			&takenAt, &durationMs, &a.LivePhotoVideoID, &a.IsLivePhotoVideo, &a.HasOCR,
 			&indexedAt, &a.Status,
 			&width, &height, &latitude, &longitude, &makeS, &modelS,
 			&iso, &shutter, &aperture, &focalLength, &orientation,

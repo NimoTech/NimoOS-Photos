@@ -37,6 +37,21 @@ func mockMLServer(t *testing.T) *httptest.Server {
 
 		if strings.Contains(entries, `"clip"`) {
 			_ = json.NewEncoder(w).Encode(map[string]string{"clip": embStr})
+		} else if strings.Contains(entries, `"ocr"`) {
+			// box is a flat array: 8 normalized floats per line (4 corner points).
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"ocr": map[string]interface{}{
+					"box": []float64{
+						0.1, 0.1, 0.5, 0.1, 0.5, 0.2, 0.1, 0.2, // line 1: 0.4 × 0.1 rect
+						0.1, 0.3, 0.3, 0.3, 0.3, 0.35, 0.1, 0.35, // line 2
+					},
+					"boxScore":  []float64{0.99, 0.98},
+					"text":      []string{"TOTAL $42.00", "Thank you"},
+					"textScore": []float64{0.97, 0.31},
+				},
+				"imageHeight": 100,
+				"imageWidth":  100,
+			})
 		} else if strings.Contains(entries, `"facial-recognition"`) {
 			face := map[string]interface{}{
 				"boundingBox": map[string]float64{"x1": 0.1, "y1": 0.1, "x2": 0.5, "y2": 0.9},
@@ -110,6 +125,35 @@ func TestDetectAndRecognizeFaces(t *testing.T) {
 	}
 	if len(faces[0].Embedding) != 512 {
 		t.Fatalf("expected Embedding length 512, got %d", len(faces[0].Embedding))
+	}
+}
+
+func TestOCR(t *testing.T) {
+	srv := mockMLServer(t)
+	defer srv.Close()
+
+	client := mlclient.New(srv.URL)
+	lines, err := client.OCR([]byte("fake-jpeg-bytes"))
+	if err != nil {
+		t.Fatalf("OCR error: %v", err)
+	}
+	if len(lines) != 2 {
+		t.Fatalf("expected 2 lines, got %d", len(lines))
+	}
+	if lines[0].Text != "TOTAL $42.00" {
+		t.Fatalf("expected first line 'TOTAL $42.00', got %q", lines[0].Text)
+	}
+	if lines[0].Score < 0.96 || lines[0].Score > 0.98 {
+		t.Fatalf("expected score ≈ 0.97, got %f", lines[0].Score)
+	}
+	if lines[1].Text != "Thank you" || lines[1].Score > 0.32 {
+		t.Fatalf("unexpected second line: %+v", lines[1])
+	}
+	if len(lines[0].Box) != 8 {
+		t.Fatalf("expected 8 box coords, got %d", len(lines[0].Box))
+	}
+	if lines[0].Box[2] != 0.5 || lines[1].Box[1] != 0.3 {
+		t.Fatalf("box coords mismatch: %v / %v", lines[0].Box, lines[1].Box)
 	}
 }
 

@@ -196,6 +196,57 @@ func (c *MLClient) DetectAndRecognizeFaces(imageData []byte) ([]FaceResult, erro
 	return results, nil
 }
 
+// OCRLine is one recognized text line with its recognition confidence.
+// Box holds the line's quadrilateral as 8 floats (x1,y1,…,x4,y4) normalized
+// to [0,1] of the image dimensions; nil when the service omits geometry.
+type OCRLine struct {
+	Text  string    `json:"text"`
+	Score float64   `json:"score"`
+	Box   []float64 `json:"box,omitempty"`
+}
+
+// OCR runs text detection + recognition (PP-OCRv5) on the given image bytes
+// and returns the recognized lines. An image without any text yields an
+// empty (non-nil) slice.
+func (c *MLClient) OCR(imageData []byte) ([]OCRLine, error) {
+	entries := `{"ocr":{"detection":{"modelName":"PP-OCRv5_mobile"},"recognition":{"modelName":"PP-OCRv5_mobile"}}}`
+	body, ct := buildImageForm(entries, imageData)
+
+	data, err := c.post(body, ct)
+	if err != nil {
+		return nil, err
+	}
+
+	// Response: {"ocr":{"box":[...],"boxScore":[...],"text":[...],"textScore":[...]},
+	//            "imageHeight":H,"imageWidth":W}
+	// "box" is a FLAT float array, 8 values per line (4 corner points,
+	// normalized to [0,1]) — verified against PP-OCRv5 on immich-ml.
+	var raw struct {
+		OCR struct {
+			Text      []string  `json:"text"`
+			TextScore []float64 `json:"textScore"`
+			Box       []float64 `json:"box"`
+		} `json:"ocr"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return nil, fmt.Errorf("mlclient: unmarshal ocr response: %w", err)
+	}
+
+	lines := make([]OCRLine, 0, len(raw.OCR.Text))
+	for i, txt := range raw.OCR.Text {
+		score := 0.0
+		if i < len(raw.OCR.TextScore) {
+			score = raw.OCR.TextScore[i]
+		}
+		var box []float64
+		if (i+1)*8 <= len(raw.OCR.Box) {
+			box = raw.OCR.Box[i*8 : (i+1)*8]
+		}
+		lines = append(lines, OCRLine{Text: txt, Score: score, Box: box})
+	}
+	return lines, nil
+}
+
 // IsReady returns true if the ml-service /ping endpoint responds with "pong".
 // Bounded to a short timeout (independent of the client's long /predict timeout)
 // so callers like the /status handler never block on a hung ML backend.

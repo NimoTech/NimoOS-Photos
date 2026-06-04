@@ -22,16 +22,19 @@ const (
 	condPlace       = "place"
 	condDate        = "date"
 	condSemantic    = "semantic"
+	condOCR         = "ocr"
 	condUnsupported = "unsupported"
 )
 
 var unsupportedPrefixes = []string{
-	"ocr:", "type:", "gps:", "group:", "faces:", "time:", "event:",
+	"type:", "gps:", "group:", "faces:", "time:", "event:",
 	"score ", "score≥", "score >=", "older than", "amount detected",
 }
 
 var (
-	reYear      = regexp.MustCompile(`(?i)^year:\s*(\d{4})$`)
+	// "year: 2024" 显式前缀，或裸年份 "2024"（与搜索链路的
+	// "Nimo understood: date" 行为一致——用户直接把年份当 chip 很常见）
+	reYear      = regexp.MustCompile(`(?i)^(?:year:\s*)?((?:19|20)\d{2})$`)
 	reLastNDays = regexp.MustCompile(`(?i)^(?:captured:\s*)?last\s+(\d+)\s+days$`)
 	reMonthSpan = regexp.MustCompile(`(?i)^([a-z]{3})\s+(\d{1,2})\s*[–\-]\s*(\d{1,2}),\s*(\d{4})$`)
 	reMonthYear = regexp.MustCompile(`(?i)^([a-z]{3})\s+(\d{4})\s*[–\-]\s*([a-z]{3})\s+(\d{4})$`)
@@ -69,6 +72,12 @@ func parseOne(db *sql.DB, r string, now time.Time) ParsedCond {
 	if strings.HasPrefix(low, "scene:") || strings.HasPrefix(low, "object:") {
 		q := strings.TrimSpace(r[strings.Index(r, ":")+1:])
 		return ParsedCond{Raw: r, Kind: condSemantic, Value: q}
+	}
+	// "ocr: receipt | invoice" — substring match against recognized text;
+	// "|" separates OR alternatives (split at evaluation time).
+	if strings.HasPrefix(low, "ocr:") {
+		q := strings.TrimSpace(r[strings.Index(r, ":")+1:])
+		return ParsedCond{Raw: r, Kind: condOCR, Value: q}
 	}
 	if strings.HasPrefix(low, "place:") {
 		v := strings.TrimSpace(r[strings.Index(r, ":")+1:])

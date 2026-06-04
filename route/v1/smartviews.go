@@ -106,7 +106,7 @@ func (h *SmartViewsHandler) Assets(c echo.Context) error {
 		limit = 60
 	}
 	recent := c.QueryParam("recent") == "true"
-	assets, err := h.svc.SmartViews().MatchedAssets(c.Param("id"), limit, offset, recent)
+	assets, err := h.svc.SmartViews().MatchedAssets(c.Param("id"), limit, offset, recent, JWTUserID(c))
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
 	}
@@ -124,17 +124,19 @@ func (h *SmartViewsHandler) Activity(c echo.Context) error {
 
 func (h *SmartViewsHandler) Preview(c echo.Context) error {
 	var req struct {
-		CondsRaw  []string `json:"condsRaw"`
-		Threshold int      `json:"threshold"`
+		CondsRaw      []string `json:"condsRaw"`
+		Description   string   `json:"description"`
+		Threshold     int      `json:"threshold"`
+		IncludeVideos bool     `json:"includeVideos"`
 	}
 	if err := c.Bind(&req); err != nil {
 		return echo.NewHTTPError(http.StatusBadRequest, "bad payload")
 	}
-	count, ids, err := h.svc.SmartViews().Preview(req.CondsRaw, req.Threshold)
+	count, ids, thresholdActive, err := h.svc.SmartViews().Preview(req.CondsRaw, req.Description, req.Threshold, req.IncludeVideos)
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
 	}
-	return c.JSON(http.StatusOK, map[string]any{"count": count, "seeds": ids})
+	return c.JSON(http.StatusOK, map[string]any{"count": count, "seeds": ids, "thresholdActive": thresholdActive})
 }
 
 func (h *SmartViewsHandler) Export(c echo.Context) error {

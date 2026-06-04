@@ -12,7 +12,10 @@ type Asset struct {
 	DurationMs       int64      `json:"durationMs,omitempty"`
 	LivePhotoVideoID string     `json:"livePhotoVideoId,omitempty"`
 	IsLivePhotoVideo bool       `json:"isLivePhotoVideo"`
-	IsScreenshot     bool       `json:"isScreenshot"`
+	// HasOCR reports whether OCR recognized any text in this asset (a row in
+	// asset_ocr with non-empty text). Replaces the old screenshot heuristic as
+	// the third media category: Photos / OCR / Videos.
+	HasOCR bool `json:"hasOcr"`
 	IndexedAt        *time.Time `json:"indexedAt,omitempty"`
 	Status           string     `json:"status"`
 	Checksum         string     `json:"checksum,omitempty"`
@@ -58,6 +61,18 @@ type Asset struct {
 	// SmartSearch (nil elsewhere). Derived from the CLIP embedding L2 distance
 	// over unit vectors: sim = 1 - d²/2.
 	MatchScore *float64 `json:"matchScore,omitempty"`
+
+	// IsNew is a per-user, per-smart-view annotation set only by
+	// SmartViewService.MatchedAssets: true until the requesting user opens the
+	// asset after it matched (no asset_views row at/after matched_at). Drives
+	// the "New" tag on the Recently-added grid; viewing dismisses it for good.
+	IsNew bool `json:"isNew,omitempty"`
+
+	// MatchedBy marks how a SmartSearch result matched: "ocr" when the query hit
+	// the asset's recognized text (asset_ocr). Empty for CLIP semantic matches
+	// and everywhere outside search. A search-time annotation, not a stored
+	// asset property — the client uses it for the OCR badge and file-type filter.
+	MatchedBy string `json:"matchedBy,omitempty"`
 }
 
 type AssetExif struct {

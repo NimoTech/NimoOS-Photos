@@ -37,6 +37,7 @@ type MLProvider interface {
 	CLIPImageEmbed(imageData []byte) ([]float32, error)
 	CLIPTextEmbed(text string) ([]float32, error)
 	DetectAndRecognizeFaces(imageData []byte) ([]mlclient.FaceResult, error)
+	OCR(imageData []byte) ([]mlclient.OCRLine, error)
 	IsReady() bool
 }
 
@@ -525,13 +526,10 @@ func (ix *Indexer) processFileInternal(path string, opts processOpts) (success b
 	}
 	originalName := filepath.Base(path)
 
-	// Classify screenshots (images only; videos/screen recordings never qualify).
-	isScreenshot := !isVideo && detectScreenshot(originalName, mime, exifResult)
-
 	_, err = ix.db.Exec(`
 		INSERT INTO assets(id, file_path, file_size, mime_type, original_name,
-		                   taken_at, duration_ms, is_live_photo_video, is_screenshot, status, checksum)
-		VALUES(?,?,?,?,?,?,?,0,?,'pending',?)
+		                   taken_at, duration_ms, is_live_photo_video, status, checksum)
+		VALUES(?,?,?,?,?,?,?,0,'pending',?)
 		ON CONFLICT(file_path) DO UPDATE SET
 		  checksum      = excluded.checksum,
 		  file_size     = excluded.file_size,
@@ -539,10 +537,9 @@ func (ix *Indexer) processFileInternal(path string, opts processOpts) (success b
 		  original_name = excluded.original_name,
 		  taken_at      = excluded.taken_at,
 		  duration_ms   = excluded.duration_ms,
-		  is_screenshot = excluded.is_screenshot,
 		  status        = 'pending'`,
 		assetID, path, fileSize, mime, originalName,
-		nullTime(takenAt), sqlNullInt64(durationMs), boolToInt(isScreenshot),
+		nullTime(takenAt), sqlNullInt64(durationMs),
 		checksum,
 	)
 	if err != nil {
@@ -671,6 +668,13 @@ func (ix *Indexer) processFileInternal(path string, opts processOpts) (success b
 					}
 				}
 			}
+
+			// OCR uses the same full-detail input as faces (original photo or
+			// full keyframe) — small text on receipts/documents is lost at
+			// thumbnail resolution.
+			if err := ix.ocrAsset(assetID, faceData); err != nil {
+				fmt.Fprintf(os.Stderr, "[indexer] OCR failed for %s: %v\n", assetID, err)
+			}
 		}
 	}
 
@@ -702,6 +706,61 @@ func (ix *Indexer) embedClip(assetID string, fallback []byte) error {
 		return err
 	}
 	return ix.writeClipEmbedding(assetID, vec)
+}
+
+// minOCRScore is the recognition-confidence floor below which OCR lines are
+// discarded as noise before being stored.
+const minOCRScore = 0.5
+
+// quadArea returns the area of a quadrilateral given as 8 normalized floats
+// (x1,y1,…,x4,y4) via the shoelace formula. Result is in [0,1] image-area
+// units since the coordinates are normalized.
+func quadArea(c []float64) float64 {
+	if len(c) != 8 {
+		return 0
+	}
+	s := 0.0
+	for i := 0; i < 4; i++ {
+		x1, y1 := c[i*2], c[i*2+1]
+		x2, y2 := c[((i+1)%4)*2], c[((i+1)%4)*2+1]
+		s += x1*y2 - x2*y1
+	}
+	if s < 0 {
+		s = -s
+	}
+	return s / 2
+}
+
+// ocrAsset runs OCR on imageData and upserts the recognized text into
+// asset_ocr, together with the document-ness signals used by the OCR media
+// category: line_count (kept lines) and coverage (total text-box area as a
+// fraction of the image). A row is written even when no text is found
+// (text=''), so the backfill can tell "OCR done, empty" apart from "not yet
+// OCR'd".
+func (ix *Indexer) ocrAsset(assetID string, imageData []byte) error {
+	lines, err := ix.ml.OCR(imageData)
+	if err != nil {
+		return err
+	}
+	kept := make([]string, 0, len(lines))
+	coverage := 0.0
+	for _, l := range lines {
+		if l.Score >= minOCRScore && strings.TrimSpace(l.Text) != "" {
+			kept = append(kept, l.Text)
+			coverage += quadArea(l.Box)
+		}
+	}
+	if coverage > 1 {
+		coverage = 1
+	}
+	_, err = ix.db.Exec(`
+		INSERT INTO asset_ocr(asset_id, text, coverage, line_count, ocr_at)
+		VALUES(?,?,?,?,CURRENT_TIMESTAMP)
+		ON CONFLICT(asset_id) DO UPDATE SET
+		  text=excluded.text, coverage=excluded.coverage,
+		  line_count=excluded.line_count, ocr_at=excluded.ocr_at`,
+		assetID, strings.Join(kept, "\n"), coverage, len(kept))
+	return err
 }
 
 // ReembedAllClip recomputes the CLIP embedding for every indexed asset from its

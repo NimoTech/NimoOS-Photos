@@ -29,6 +29,9 @@ func (m *mockML) CLIPTextEmbed(_ string) ([]float32, error) {
 func (m *mockML) DetectAndRecognizeFaces(_ []byte) ([]mlclient.FaceResult, error) {
 	return nil, nil
 }
+func (m *mockML) OCR(_ []byte) ([]mlclient.OCRLine, error) {
+	return []mlclient.OCRLine{}, nil
+}
 func (m *mockML) IsReady() bool { return true }
 
 // makeTestDB opens a fresh in-memory SQLite database (schema migrated).
@@ -56,6 +59,41 @@ func makeTestJPEG(t *testing.T, dir string) string {
 	defer f.Close()
 	require.NoError(t, jpeg.Encode(f, img, nil))
 	return path
+}
+
+// boxedML 返回带文字框的 OCR 结果，用于覆盖率计算测试。
+type boxedML struct{ mockML }
+
+func (m *boxedML) OCR(_ []byte) ([]mlclient.OCRLine, error) {
+	return []mlclient.OCRLine{
+		// 0.4 宽 × 0.1 高 = 4% 面积
+		{Text: "TOTAL $42.00", Score: 0.97, Box: []float64{0.1, 0.1, 0.5, 0.1, 0.5, 0.2, 0.1, 0.2}},
+		// 0.2 × 0.05 = 1% 面积
+		{Text: "Invoice #1", Score: 0.95, Box: []float64{0.1, 0.3, 0.3, 0.3, 0.3, 0.35, 0.1, 0.35}},
+		// 低置信度行：不计入文本、行数和覆盖率
+		{Text: "noise", Score: 0.2, Box: []float64{0, 0, 1, 0, 1, 1, 0, 1}},
+	}, nil
+}
+
+// TestOcrAssetStoresCoverageAndLines 验证 ocrAsset 把覆盖率（文字框面积合计）
+// 和保留行数一起入库，且低置信度行被过滤。
+func TestOcrAssetStoresCoverageAndLines(t *testing.T) {
+	db := makeTestDB(t)
+	_, err := db.Exec(`INSERT INTO assets(id,file_path,status) VALUES('a1','/p/a1.jpg','indexed')`)
+	require.NoError(t, err)
+
+	ix := NewIndexer(db, &boxedML{}, t.TempDir(), 1)
+	require.NoError(t, ix.ocrAsset("a1", []byte("img")))
+
+	var text string
+	var coverage float64
+	var lines int
+	require.NoError(t, db.QueryRow(
+		`SELECT text, coverage, line_count FROM asset_ocr WHERE asset_id='a1'`,
+	).Scan(&text, &coverage, &lines))
+	require.Equal(t, "TOTAL $42.00\nInvoice #1", text)
+	require.Equal(t, 2, lines)
+	require.InDelta(t, 0.05, coverage, 1e-9) // 4% + 1%
 }
 
 // TestIndexerProcessesImage tests the full pipeline for a single image.
