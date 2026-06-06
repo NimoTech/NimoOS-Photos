@@ -7,26 +7,44 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 APP_ID="nimoos-photos-ml"
 APP_DIR="/var/lib/nimoos/apps/${APP_ID}"
-ML_CACHE="/DATA/.system_data/photos/ml-cache"
+PHOTOS_DATA="/DATA/.system_data/photos"
+ML_CACHE="${PHOTOS_DATA}/ml-cache"
 IMAGE_TAR="${HERE}/immich-ml.tar"
+MODELS_TAR="${HERE}/ml-models.tar.gz"
 IMAGE_REF="localhost/nimoos-photos-ml:bundled"
 PING_URL="http://127.0.0.1:3003/ping"
 PING_TIMEOUT=120   # 秒
+FORCE_MODELS="${FORCE_MODELS:-}"   # =1 强制覆盖已存在的模型缓存
 
 [[ -f "${IMAGE_TAR}" ]] || { echo "✗ 找不到镜像包 ${IMAGE_TAR}" >&2; exit 1; }
 
-echo "==> [1/4] 载入离线镜像 ${IMAGE_REF} ..."
+echo "==> [1/5] 载入离线镜像 ${IMAGE_REF} ..."
 docker load -i "${IMAGE_TAR}"
 
-echo "==> [2/4] 部署 compose 到 ${APP_DIR} ..."
+echo "==> [2/5] 部署 compose 到 ${APP_DIR} ..."
 mkdir -p "${APP_DIR}" "${ML_CACHE}"
 cp "${HERE}/docker-compose.yml" "${APP_DIR}/docker-compose.yml"
 
+# 模型缓存：包内带 ml-models.tar.gz 则铺进 ml-cache，实现首跑零联网。
+# 已存在模型则跳过（幂等、再跑很快），FORCE_MODELS=1 可强制覆盖。
+echo "==> [3/5] 准备模型缓存 ..."
+if [[ -f "${MODELS_TAR}" ]]; then
+  if [[ -z "${FORCE_MODELS}" ]] && [[ -d "${ML_CACHE}/clip" ]]; then
+    echo "    模型已存在，跳过（FORCE_MODELS=1 可强制覆盖）。"
+  else
+    echo "    解压模型到 ${ML_CACHE} ..."
+    tar -xzf "${MODELS_TAR}" -C "${PHOTOS_DATA}"
+    echo "    模型就位（$(du -sh "${ML_CACHE}" 2>/dev/null | cut -f1)）。"
+  fi
+else
+  echo "    本包未带模型（轻量包），首跑将联网下载。"
+fi
+
 # 项目名固定用 APP_ID，容器名才与其它机器一致（nimoos-photos-ml-immich-machine-learning-1）。
-echo "==> [3/4] 启动 ${APP_ID} ..."
+echo "==> [4/5] 启动 ${APP_ID} ..."
 docker compose -p "${APP_ID}" -f "${APP_DIR}/docker-compose.yml" up -d
 
-echo "==> [4/4] 等待 ML 就绪（最多 ${PING_TIMEOUT}s，轮询 ${PING_URL}）..."
+echo "==> [5/5] 等待 ML 就绪（最多 ${PING_TIMEOUT}s，轮询 ${PING_URL}）..."
 deadline=$(( SECONDS + PING_TIMEOUT ))
 while (( SECONDS < deadline )); do
   if curl -fsS "${PING_URL}" 2>/dev/null | grep -q pong; then
