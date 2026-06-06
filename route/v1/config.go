@@ -23,18 +23,24 @@ func (h *ConfigHandler) GetConfig(c echo.Context) error {
 		retention = 30
 	}
 	return c.JSON(http.StatusOK, map[string]interface{}{
-		"watchDirs":     dirs,
-		"retentionDays": retention,
-		"facesEnabled":  config.Cfg.FacesEnabled,
+		"watchDirs":        dirs,
+		"retentionDays":    retention,
+		"facesEnabled":     config.Cfg.FacesEnabled,
+		"scenesEnabled":    config.Cfg.ScenesEnabled,
+		"ocrEnabled":       config.Cfg.OCREnabled,
+		"smartViewEnabled": config.Cfg.SmartViewEnabled,
 	})
 }
 
 // PUT /v1/photos/config
 func (h *ConfigHandler) UpdateConfig(c echo.Context) error {
 	var req struct {
-		WatchDirs     []string `json:"watchDirs"`
-		RetentionDays int      `json:"retentionDays"`
-		FacesEnabled  *bool    `json:"facesEnabled"`
+		WatchDirs        []string `json:"watchDirs"`
+		RetentionDays    int      `json:"retentionDays"`
+		FacesEnabled     *bool    `json:"facesEnabled"`
+		ScenesEnabled    *bool    `json:"scenesEnabled"`
+		OCREnabled       *bool    `json:"ocrEnabled"`
+		SmartViewEnabled *bool    `json:"smartViewEnabled"`
 	}
 	if err := c.Bind(&req); err != nil {
 		return echo.NewHTTPError(http.StatusBadRequest, "invalid request body")
@@ -49,20 +55,35 @@ func (h *ConfigHandler) UpdateConfig(c echo.Context) error {
 	if req.FacesEnabled != nil {
 		faces = *req.FacesEnabled
 	}
+	scenes := config.Cfg.ScenesEnabled
+	if req.ScenesEnabled != nil {
+		scenes = *req.ScenesEnabled
+	}
+	ocr := config.Cfg.OCREnabled
+	if req.OCREnabled != nil {
+		ocr = *req.OCREnabled
+	}
+	smartView := config.Cfg.SmartViewEnabled
+	if req.SmartViewEnabled != nil {
+		smartView = *req.SmartViewEnabled
+	}
 	if err := config.Save(config.Settings{
 		WatchDirs:        req.WatchDirs,
 		RetentionDays:    req.RetentionDays,
 		FacesEnabled:     faces,
-		ScenesEnabled:    config.Cfg.ScenesEnabled,
-		OCREnabled:       config.Cfg.OCREnabled,
-		SmartViewEnabled: config.Cfg.SmartViewEnabled,
+		ScenesEnabled:    scenes,
+		OCREnabled:       ocr,
+		SmartViewEnabled: smartView,
 	}); err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
 	}
 	h.svc.RestartWatcher(req.WatchDirs)
 	return c.JSON(http.StatusOK, map[string]interface{}{
-		"watchDirs":     req.WatchDirs,
-		"retentionDays": config.Cfg.RetentionDays,
-		"facesEnabled":  config.Cfg.FacesEnabled,
+		"watchDirs":        req.WatchDirs,
+		"retentionDays":    config.Cfg.RetentionDays,
+		"facesEnabled":     config.Cfg.FacesEnabled,
+		"scenesEnabled":    config.Cfg.ScenesEnabled,
+		"ocrEnabled":       config.Cfg.OCREnabled,
+		"smartViewEnabled": config.Cfg.SmartViewEnabled,
 	})
 }
