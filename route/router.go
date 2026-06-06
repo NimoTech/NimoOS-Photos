@@ -179,6 +179,9 @@ func InitRouter(ctx context.Context, svc service.Services, runtimePath string, t
 	rebuild := v1.NewRebuildHandler(svc)
 	g.POST("/index/rebuild", rebuild.Rebuild)
 
+	about := v1.NewAboutHandler(svc)
+	g.GET("/about", about.Get)
+
 	smartViews := v1.NewSmartViewsHandler(svc)
 	v1.RegisterSmartViewRoutes(g, smartViews)
 
