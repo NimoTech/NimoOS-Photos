@@ -252,6 +252,12 @@ func migrate(db *sql.DB) error {
 			asset_ids     TEXT,
 			occurred_at   DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 		)`,
+
+		// ── 键值元数据（如 index_last_rebuilt）──────────────────────────────
+		`CREATE TABLE IF NOT EXISTS photos_meta (
+			key   TEXT PRIMARY KEY,
+			value TEXT NOT NULL
+		)`,
 	}
 
 	for _, stmt := range statements {
