@@ -11,21 +11,28 @@ import (
 
 var Cfg *Config
 
+// configPath is the file Init loaded from; Save writes back to the same file.
+var configPath = "/etc/nimoos/photos.conf"
+
 type Config struct {
-	RuntimePath   string
-	LogPath       string
-	DataPath      string
-	MLEndpoint    string
-	Workers       int
-	WatchDirs     []string
-	RetentionDays int
-	FacesEnabled  bool
+	RuntimePath      string
+	LogPath          string
+	DataPath         string
+	MLEndpoint       string
+	Workers          int
+	WatchDirs        []string
+	RetentionDays    int
+	FacesEnabled     bool
+	ScenesEnabled    bool
+	OCREnabled       bool
+	SmartViewEnabled bool
 }
 
 func Init(configFile, confSample string) error {
 	if configFile == "" {
 		configFile = "/etc/nimoos/photos.conf"
 	}
+	configPath = configFile
 	if _, err := os.Stat(configFile); os.IsNotExist(err) {
 		if err := os.WriteFile(configFile, []byte(confSample), 0644); err != nil {
 			return fmt.Errorf("failed to write default config: %w", err)
@@ -55,7 +62,10 @@ func Init(configFile, confSample string) error {
 		Workers:       v.GetInt("photos.Workers"),
 		WatchDirs:     watchDirs,
 		RetentionDays: v.GetInt("photos.RetentionDays"),
-		FacesEnabled:  v.GetBool("photos.FacesEnabled"),
+		FacesEnabled:     v.GetBool("photos.FacesEnabled"),
+		ScenesEnabled:    v.GetBool("photos.ScenesEnabled"),
+		OCREnabled:       v.GetBool("photos.OCREnabled"),
+		SmartViewEnabled: v.GetBool("photos.SmartViewEnabled"),
 	}
 	if Cfg.RuntimePath == "" {
 		Cfg.RuntimePath = "/var/run/nimoos"
@@ -79,30 +89,68 @@ func Init(configFile, confSample string) error {
 	if !v.IsSet("photos.FacesEnabled") {
 		Cfg.FacesEnabled = true
 	}
+	// 新开关缺省（配置无此 key）时默认开启，与 FacesEnabled 同语义。
+	if !v.IsSet("photos.ScenesEnabled") {
+		Cfg.ScenesEnabled = true
+	}
+	if !v.IsSet("photos.OCREnabled") {
+		Cfg.OCREnabled = true
+	}
+	if !v.IsSet("photos.SmartViewEnabled") {
+		Cfg.SmartViewEnabled = true
+	}
 	return nil
 }
 
-// Save writes watchDirs, retentionDays and facesEnabled back to the config file and updates Cfg.
-func Save(watchDirs []string, retentionDays int, facesEnabled bool) error {
+// Settings is the subset of Config persisted via the settings API.
+type Settings struct {
+	WatchDirs        []string
+	RetentionDays    int
+	FacesEnabled     bool
+	ScenesEnabled    bool
+	OCREnabled       bool
+	SmartViewEnabled bool
+}
+
+// Save writes the settings back to the config file and updates Cfg.
+//
+// Viper's WriteConfig derives the encoder from the file extension, so files
+// ending in ".conf" (not in viper's SupportedExts) would fail.  We work
+// around this by writing to a sibling ".ini" temp file and then renaming it
+// atomically to the real path.
+func Save(s Settings) error {
 	if Cfg == nil {
 		return fmt.Errorf("config not initialized")
 	}
 	v := viper.New()
-	v.SetConfigFile("/etc/nimoos/photos.conf")
+	v.SetConfigFile(configPath)
 	v.SetConfigType("ini")
 	_ = v.ReadInConfig()
-	v.Set("photos.WatchDirs", strings.Join(watchDirs, ","))
-	if retentionDays > 0 {
-		v.Set("photos.RetentionDays", retentionDays)
+	v.Set("photos.WatchDirs", strings.Join(s.WatchDirs, ","))
+	if s.RetentionDays > 0 {
+		v.Set("photos.RetentionDays", s.RetentionDays)
 	}
-	v.Set("photos.FacesEnabled", facesEnabled)
-	if err := v.WriteConfig(); err != nil {
+	v.Set("photos.FacesEnabled", s.FacesEnabled)
+	v.Set("photos.ScenesEnabled", s.ScenesEnabled)
+	v.Set("photos.OCREnabled", s.OCREnabled)
+	v.Set("photos.SmartViewEnabled", s.SmartViewEnabled)
+	// WriteConfig uses the file extension to choose the encoder; ".conf" is not
+	// in viper's SupportedExts.  Write to a ".ini" temp file then rename.
+	tmpPath := configPath + ".ini"
+	if err := v.WriteConfigAs(tmpPath); err != nil {
 		return fmt.Errorf("config.Save: %w", err)
 	}
-	Cfg.WatchDirs = watchDirs
-	if retentionDays > 0 {
-		Cfg.RetentionDays = retentionDays
+	if err := os.Rename(tmpPath, configPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("config.Save rename: %w", err)
 	}
-	Cfg.FacesEnabled = facesEnabled
+	Cfg.WatchDirs = s.WatchDirs
+	if s.RetentionDays > 0 {
+		Cfg.RetentionDays = s.RetentionDays
+	}
+	Cfg.FacesEnabled = s.FacesEnabled
+	Cfg.ScenesEnabled = s.ScenesEnabled
+	Cfg.OCREnabled = s.OCREnabled
+	Cfg.SmartViewEnabled = s.SmartViewEnabled
 	return nil
 }

@@ -49,7 +49,14 @@ func (h *ConfigHandler) UpdateConfig(c echo.Context) error {
 	if req.FacesEnabled != nil {
 		faces = *req.FacesEnabled
 	}
-	if err := config.Save(req.WatchDirs, req.RetentionDays, faces); err != nil {
+	if err := config.Save(config.Settings{
+		WatchDirs:        req.WatchDirs,
+		RetentionDays:    req.RetentionDays,
+		FacesEnabled:     faces,
+		ScenesEnabled:    config.Cfg.ScenesEnabled,
+		OCREnabled:       config.Cfg.OCREnabled,
+		SmartViewEnabled: config.Cfg.SmartViewEnabled,
+	}); err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
 	}
 	h.svc.RestartWatcher(req.WatchDirs)

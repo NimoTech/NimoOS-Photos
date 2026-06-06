@@ -207,6 +207,9 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 }
 
 func (s *services) RestartWatcher(dirs []string) {
+	if s.watcher == nil {
+		return // NewTestServices 不接 watcher；handler 测试走到这里直接跳过
+	}
 	s.watcher.Restart(s.parentCtx, dirs)
 }
 
