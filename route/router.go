@@ -172,6 +172,9 @@ func InitRouter(ctx context.Context, svc service.Services, runtimePath string, t
 	g.GET("/config", cfg.GetConfig)
 	g.PUT("/config", cfg.UpdateConfig)
 
+	storage := v1.NewStorageHandler(svc)
+	g.GET("/storage", storage.Get)
+
 	smartViews := v1.NewSmartViewsHandler(svc)
 	v1.RegisterSmartViewRoutes(g, smartViews)
 

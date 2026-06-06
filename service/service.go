@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"database/sql"
+	"os"
 	"path/filepath"
 	"time"
 
@@ -31,6 +32,7 @@ type Services interface {
 	Geo() *GeoService
 	Places() *PlacesService
 	SmartViews() *SmartViewService
+	Storage() *StorageService
 	RestartWatcher(dirs []string)
 }
 
@@ -51,6 +53,7 @@ type services struct {
 	geo        *GeoService
 	places     *PlacesService
 	smartViews *SmartViewService
+	storage    *StorageService
 	parentCtx  context.Context
 }
 
@@ -69,6 +72,7 @@ func (s *services) Persons() *PersonService      { return s.persons }
 func (s *services) Geo() *GeoService              { return s.geo }
 func (s *services) Places() *PlacesService        { return s.places }
 func (s *services) SmartViews() *SmartViewService { return s.smartViews }
+func (s *services) Storage() *StorageService      { return s.storage }
 
 // NewService wires all service-layer components together from cfg and returns a
 // ready-to-use Services handle. It panics if the database cannot be opened.
@@ -162,6 +166,15 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 
 	geoSvc.StartScheduler(parentCtx)
 
+	// Storage stats for the settings page. statfs anchors on the first watch
+	// dir (the library volume); falls back to /DATA.
+	statfsDir := "/DATA"
+	if len(cfg.WatchDirs) > 0 {
+		statfsDir = cfg.WatchDirs[0]
+	}
+	faceThumbDir := filepath.Join(cfg.DataPath, "face-thumbs")
+	storageSvc := NewStorageService(db, dbPath, thumbDir, faceThumbDir, statfsDir)
+
 	// 回收站自动清理：启动时跑一次，之后每 24 小时跑一次，到期项永久删除。
 	go func() {
 		runPurge := func() {
@@ -202,6 +215,7 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 		geo:        geoSvc,
 		places:     placesSvc,
 		smartViews: smartViews,
+		storage:    storageSvc,
 		parentCtx:  parentCtx,
 	}
 }
@@ -223,6 +237,7 @@ func NewTestServices(db *sql.DB) Services {
 		search:     search,
 		albums:     albums,
 		smartViews: NewSmartViewService(db, search),
+		storage:    NewStorageService(db, "", os.TempDir(), os.TempDir(), os.TempDir()),
 	}
 }
 
