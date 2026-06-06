@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/NimoTech/NimoOS-Photos/pkg/config"
 	"github.com/NimoTech/NimoOS-Photos/pkg/mlclient"
 	"github.com/NimoTech/NimoOS-Photos/pkg/sqlite"
 	"github.com/stretchr/testify/require"
@@ -397,4 +398,46 @@ func TestRemoveByPathSkipsTrashedAsset(t *testing.T) {
 	var n int
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM assets WHERE id='t1'`).Scan(&n))
 	require.Equal(t, 1, n, "RemoveByPath must not delete a soft-deleted asset")
+}
+
+// recordingML 记录各 ML 能力被调用的次数，用于开关门控断言。
+type recordingML struct {
+	mockML
+	clipCalls, faceCalls, ocrCalls int
+}
+
+func (m *recordingML) CLIPImageEmbed(d []byte) ([]float32, error) {
+	m.clipCalls++
+	return m.mockML.CLIPImageEmbed(d)
+}
+func (m *recordingML) DetectAndRecognizeFaces(d []byte) ([]mlclient.FaceResult, error) {
+	m.faceCalls++
+	return m.mockML.DetectAndRecognizeFaces(d)
+}
+func (m *recordingML) OCR(d []byte) ([]mlclient.OCRLine, error) {
+	m.ocrCalls++
+	return m.mockML.OCR(d)
+}
+
+// TestIndexerHonorsFeatureFlags 验证 Scenes/OCR/Faces 关闭时索引器跳过对应 ML 调用。
+func TestIndexerHonorsFeatureFlags(t *testing.T) {
+	db := makeTestDB(t)
+	ml := &recordingML{}
+	ix := NewIndexer(db, ml, t.TempDir(), 1)
+	path := makeTestJPEG(t, t.TempDir())
+
+	prev := config.Cfg
+	t.Cleanup(func() { config.Cfg = prev })
+
+	config.Cfg = &config.Config{FacesEnabled: false, ScenesEnabled: false, OCREnabled: false}
+	require.True(t, ix.processFileInternal(path, processOpts{force: true}))
+	require.Zero(t, ml.clipCalls)
+	require.Zero(t, ml.faceCalls)
+	require.Zero(t, ml.ocrCalls)
+
+	config.Cfg = &config.Config{FacesEnabled: true, ScenesEnabled: true, OCREnabled: true}
+	require.True(t, ix.processFileInternal(path, processOpts{force: true}))
+	require.Equal(t, 1, ml.clipCalls)
+	require.Equal(t, 1, ml.faceCalls)
+	require.Equal(t, 1, ml.ocrCalls)
 }

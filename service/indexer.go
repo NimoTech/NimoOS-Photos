@@ -647,7 +647,11 @@ func (ix *Indexer) processFileInternal(path string, opts processOpts) (success b
 		// sees and photos/videos share one resize pipeline. Embedding the full-
 		// resolution source biased rankings: high-detail video keyframes could
 		// outrank better photo matches.
-		_ = ix.embedClip(assetID, faceData)
+		// CLIP embedding（ScenesEnabled 关闭时跳过——注意嵌入同时是语义搜索的基础，
+		// 关闭后新照片不参与语义搜索）。
+		if config.Cfg == nil || config.Cfg.ScenesEnabled {
+			_ = ix.embedClip(assetID, faceData)
+		}
 
 		if len(faceData) > 0 {
 			// Face detection + recognition（FacesEnabled 关闭时跳过）。
@@ -672,8 +676,11 @@ func (ix *Indexer) processFileInternal(path string, opts processOpts) (success b
 			// OCR uses the same full-detail input as faces (original photo or
 			// full keyframe) — small text on receipts/documents is lost at
 			// thumbnail resolution.
-			if err := ix.ocrAsset(assetID, faceData); err != nil {
-				fmt.Fprintf(os.Stderr, "[indexer] OCR failed for %s: %v\n", assetID, err)
+			// OCR（OCREnabled 关闭时跳过）。
+			if config.Cfg == nil || config.Cfg.OCREnabled {
+				if err := ix.ocrAsset(assetID, faceData); err != nil {
+					fmt.Fprintf(os.Stderr, "[indexer] OCR failed for %s: %v\n", assetID, err)
+				}
 			}
 		}
 	}
