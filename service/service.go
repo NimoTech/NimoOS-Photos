@@ -33,6 +33,7 @@ type Services interface {
 	Places() *PlacesService
 	SmartViews() *SmartViewService
 	Storage() *StorageService
+	Rebuilder() *Rebuilder
 	RestartWatcher(dirs []string)
 }
 
@@ -54,6 +55,7 @@ type services struct {
 	places     *PlacesService
 	smartViews *SmartViewService
 	storage    *StorageService
+	rebuilder  *Rebuilder
 	parentCtx  context.Context
 }
 
@@ -73,6 +75,7 @@ func (s *services) Geo() *GeoService              { return s.geo }
 func (s *services) Places() *PlacesService        { return s.places }
 func (s *services) SmartViews() *SmartViewService { return s.smartViews }
 func (s *services) Storage() *StorageService      { return s.storage }
+func (s *services) Rebuilder() *Rebuilder         { return s.rebuilder }
 
 // NewService wires all service-layer components together from cfg and returns a
 // ready-to-use Services handle. It panics if the database cannot be opened.
@@ -112,6 +115,7 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 	placesSvc := NewPlacesServiceWithAlbums(db, gaz, geoSvc, albums)
 	faces := NewFaceService(db)
 	faces.SetTaskRegistry(taskReg)
+	rebuilder := NewRebuilder(parentCtx, db, idx, faces, taskReg, cfg.Workers)
 	embedder := NewEmbedder(db, ml, idx, taskReg)
 
 	// batch 上传完成后主动触发人脸聚类，让前端能看到从 0% 涨到 100% 的"识别人物" task。
@@ -216,6 +220,7 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 		places:     placesSvc,
 		smartViews: smartViews,
 		storage:    storageSvc,
+		rebuilder:  rebuilder,
 		parentCtx:  parentCtx,
 	}
 }
