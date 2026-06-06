@@ -53,3 +53,15 @@ func TestRebuildRejectsConcurrentRuns(t *testing.T) {
 	_, err := rb.Start()
 	require.ErrorIs(t, err, ErrRebuildRunning)
 }
+
+// TestRebuildEmptyLibraryFinishesImmediately 空库重建直接完成且写入 meta。
+func TestRebuildEmptyLibraryFinishesImmediately(t *testing.T) {
+	db := makeTestDB(t)
+	rb := NewRebuilder(context.Background(), db, NewIndexer(db, &mockML{}, t.TempDir(), 1), NewFaceService(db), NewTaskRegistry(nil), 1)
+	_, err := rb.Start()
+	require.NoError(t, err)
+	require.Eventually(t, func() bool { return !rb.running.Load() }, 5*time.Second, 20*time.Millisecond)
+	var lastBuilt string
+	require.NoError(t, db.QueryRow(`SELECT value FROM photos_meta WHERE key='index_last_rebuilt'`).Scan(&lastBuilt))
+	require.NotEmpty(t, lastBuilt)
+}

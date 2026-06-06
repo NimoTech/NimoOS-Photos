@@ -57,23 +57,32 @@ type rebuildTarget struct {
 }
 
 func (r *Rebuilder) run(taskID string) {
+	started := time.Now()
+
 	rows, err := r.db.Query(`SELECT id, file_path FROM assets WHERE status='indexed' AND deleted_at IS NULL`)
 	if err != nil {
-		zap.L().Warn("rebuild: query assets failed", zap.Error(err))
+		r.failTask(taskID, started, "查询资产失败: "+err.Error())
 		return
 	}
 	var targets []rebuildTarget
 	for rows.Next() {
 		var t rebuildTarget
-		if err := rows.Scan(&t.id, &t.path); err == nil {
-			targets = append(targets, t)
+		if err := rows.Scan(&t.id, &t.path); err != nil {
+			rows.Close()
+			r.failTask(taskID, started, "读取资产列表失败: "+err.Error())
+			return
 		}
+		targets = append(targets, t)
 	}
 	rows.Close()
+	if err := rows.Err(); err != nil {
+		r.failTask(taskID, started, "读取资产列表失败: "+err.Error())
+		return
+	}
 
-	started := time.Now()
 	total := int64(len(targets))
-	var processed int64
+	var processed, failed int64
+
 	publish := func(status string) {
 		cur := atomic.LoadInt64(&processed)
 		prog := 1.0
@@ -86,6 +95,50 @@ func (r *Rebuilder) run(taskID string) {
 			Status: status, StartedAt: started,
 		})
 	}
+
+	// finalPublish emits the terminal "done" task with optional failure count.
+	finalPublish := func() {
+		label := "重建 AI 索引"
+		if f := atomic.LoadInt64(&failed); f > 0 {
+			label = fmt.Sprintf("重建 AI 索引（失败 %d 张）", f)
+		}
+		r.reg.Upsert(Task{
+			ID: taskID, Type: "rebuild", Label: label,
+			Total: total, Current: atomic.LoadInt64(&processed), Progress: 1,
+			Status: "done", StartedAt: started,
+		})
+	}
+
+	// 人脸重聚类 + meta 写入，由空库和正常路径共用。
+	finalize := func() {
+		if r.ctx.Err() != nil {
+			return // 服务关闭：不发 final，残留 running task 随服务消失
+		}
+		// 人脸重聚类（内部 CAS 防重入）。
+		if err := r.faces.RunClustering(r.ctx); err != nil {
+			zap.L().Warn("rebuild: face reclustering failed", zap.Error(err))
+		}
+		if _, err := r.db.Exec(`INSERT INTO photos_meta(key,value) VALUES('index_last_rebuilt',?)
+			ON CONFLICT(key) DO UPDATE SET value=excluded.value`,
+			time.Now().UTC().Format(time.RFC3339)); err != nil {
+			zap.L().Warn("rebuild: write meta failed", zap.Error(err))
+		}
+	}
+
+	// total=0：空库直接完成，跳过 worker pool，仍走 RunClustering + meta。
+	if total == 0 {
+		finalize()
+		if r.ctx.Err() != nil {
+			return
+		}
+		finalPublish()
+		go func() {
+			time.Sleep(taskCleanupDelay)
+			r.reg.Remove(taskID)
+		}()
+		return
+	}
+
 	publish("running")
 
 	// Worker pool sized by cfg.Workers — ML 调用是瓶颈，与索引器同档并发。
@@ -104,8 +157,11 @@ func (r *Rebuilder) run(taskID string) {
 				if _, err := r.db.Exec(`DELETE FROM face_detections WHERE asset_id=?`, t.id); err != nil {
 					zap.L().Warn("rebuild: clear faces failed", zap.String("asset", t.id), zap.Error(err))
 				}
-				r.indexer.ForceReprocess(t.path, processOpts{force: true, skipExif: true, skipThumb: true})
+				ok := r.indexer.ForceReprocess(t.path, processOpts{force: true, skipExif: true, skipThumb: true})
 				atomic.AddInt64(&processed, 1)
+				if !ok {
+					atomic.AddInt64(&failed, 1)
+				}
 				publish("running")
 			}
 		}()
@@ -116,22 +172,26 @@ func (r *Rebuilder) run(taskID string) {
 	close(queue)
 	wg.Wait()
 
+	finalize()
 	if r.ctx.Err() != nil {
-		return // 服务关闭：不发 final，残留 running task 随服务消失
+		return
 	}
 
-	// 人脸重聚类（内部 CAS 防重入）。
-	if err := r.faces.RunClustering(r.ctx); err != nil {
-		zap.L().Warn("rebuild: face reclustering failed", zap.Error(err))
-	}
+	finalPublish()
+	go func() {
+		time.Sleep(taskCleanupDelay)
+		r.reg.Remove(taskID)
+	}()
+}
 
-	if _, err := r.db.Exec(`INSERT INTO photos_meta(key,value) VALUES('index_last_rebuilt',?)
-		ON CONFLICT(key) DO UPDATE SET value=excluded.value`,
-		time.Now().UTC().Format(time.RFC3339)); err != nil {
-		zap.L().Warn("rebuild: write meta failed", zap.Error(err))
-	}
-
-	publish("done")
+// failTask publishes a terminal error state for the rebuild task and
+// schedules its removal, mirroring the Embedder error convention.
+func (r *Rebuilder) failTask(taskID string, started time.Time, msg string) {
+	zap.L().Error("rebuild failed", zap.String("task", taskID), zap.String("reason", msg))
+	r.reg.Upsert(Task{
+		ID: taskID, Type: "rebuild", Label: "重建 AI 索引",
+		Status: "error", Error: msg, StartedAt: started,
+	})
 	go func() {
 		time.Sleep(taskCleanupDelay)
 		r.reg.Remove(taskID)
