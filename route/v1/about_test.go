@@ -37,3 +37,20 @@ func TestAboutReturnsVersionAndStats(t *testing.T) {
 	require.Contains(t, body, `"librarySince":"2024-04-12`)
 	require.Contains(t, body, `"indexLastBuilt":"2026-06-01T00:00:00Z"`)
 }
+
+// TestAboutEmptyLibrary 空库时 librarySince/indexLastBuilt 为 null、coverage 为 0。
+func TestAboutEmptyLibrary(t *testing.T) {
+	db, err := sqlite.Open(filepath.Join(t.TempDir(), "empty.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { db.Close() })
+
+	h := NewAboutHandler(service.NewTestServices(db))
+	e := echo.New()
+	rec := httptest.NewRecorder()
+	require.NoError(t, h.Get(e.NewContext(httptest.NewRequest(http.MethodGet, "/", nil), rec)))
+
+	body := rec.Body.String()
+	require.Contains(t, body, `"librarySince":null`)
+	require.Contains(t, body, `"indexLastBuilt":null`)
+	require.Contains(t, body, `"indexCoverage":0`)
+}

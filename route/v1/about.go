@@ -21,7 +21,10 @@ func (h *AboutHandler) Get(c echo.Context) error {
 	db := h.svc.DB()
 
 	var librarySince, lastBuilt sql.NullString
-	_ = db.QueryRow(`SELECT MIN(indexed_at) FROM assets WHERE status='indexed'`).Scan(&librarySince)
+	// Errors are intentionally ignored; fields degrade to zero/null rather
+	// than returning 500 — this endpoint is informational and partial data
+	// is acceptable.
+	_ = db.QueryRow(`SELECT MIN(indexed_at) FROM assets WHERE status='indexed' AND deleted_at IS NULL`).Scan(&librarySince)
 	_ = db.QueryRow(`SELECT value FROM photos_meta WHERE key='index_last_rebuilt'`).Scan(&lastBuilt)
 
 	var coverage int
