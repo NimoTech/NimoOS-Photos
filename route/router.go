@@ -107,6 +107,7 @@ func InitRouter(ctx context.Context, svc service.Services, runtimePath string, t
 	g.GET("/albums", albums.List)
 	g.POST("/albums", albums.Create)
 	g.GET("/albums/:id", albums.Get)
+	g.GET("/albums/:id/summary", albums.Summary)
 	g.DELETE("/albums/:id", albums.Delete)
 	g.POST("/albums/:id/assets", albums.AddAsset)
 	g.DELETE("/albums/:id/assets/:asset", albums.RemoveAsset)
