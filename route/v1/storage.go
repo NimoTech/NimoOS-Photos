@@ -2,7 +2,9 @@ package v1
 
 import (
 	"net/http"
+	"time"
 
+	"github.com/NimoTech/NimoOS-Photos/common"
 	"github.com/NimoTech/NimoOS-Photos/service"
 	"github.com/labstack/echo/v4"
 )
@@ -20,4 +22,13 @@ func (h *StorageHandler) Get(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
 	}
 	return c.JSON(http.StatusOK, st)
+}
+
+// POST /v1/photos/cache/prune
+func (h *StorageHandler) Prune(c echo.Context) error {
+	res, err := h.svc.Storage().Prune(common.StagingDir, time.Duration(common.StagingMaxAge)*time.Hour)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	}
+	return c.JSON(http.StatusOK, res)
 }

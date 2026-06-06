@@ -121,7 +121,7 @@ func (s *StorageService) compute() (*StorageStats, error) {
 		return nil, err
 	}
 
-	// 3. Thumbnail cache + orphans.
+	// 3. Thumbnail cache + orphans (keep in sync with Prune()).
 	entries, _ := os.ReadDir(s.thumbDir)
 	for _, e := range entries {
 		size := dirSize(filepath.Join(s.thumbDir, e.Name()))
@@ -141,6 +141,66 @@ func (s *StorageService) compute() (*StorageStats, error) {
 		}
 	}
 	return st, nil
+}
+
+// PruneResult reports what Prune removed.
+type PruneResult struct {
+	FreedBytes   int64 `json:"freedBytes"`
+	RemovedCount int   `json:"removedCount"`
+}
+
+// Prune removes thumbnail directories whose asset no longer exists, plus
+// stale TUS staging files, then invalidates the stats cache. Pass an empty
+// stagingDir to skip the staging pass (tests).
+func (s *StorageService) Prune(stagingDir string, stagingMaxAge time.Duration) (*PruneResult, error) {
+	res := &PruneResult{}
+
+	ids := map[string]bool{}
+	rows, err := s.db.Query(`SELECT id FROM assets`)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		ids[id] = true
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	entries, _ := os.ReadDir(s.thumbDir)
+	for _, e := range entries {
+		if !e.IsDir() || ids[e.Name()] {
+			continue
+		}
+		p := filepath.Join(s.thumbDir, e.Name())
+		size := dirSize(p)
+		if err := os.RemoveAll(p); err == nil {
+			res.FreedBytes += size
+			res.RemovedCount++
+		}
+	}
+
+	// Stale TUS staging files (PruneStaging only reports count, so measure
+	// the directory before/after for freed bytes).
+	if stagingDir != "" {
+		before := dirSize(stagingDir)
+		if n, err := PruneStaging(stagingDir, stagingMaxAge); err == nil && n > 0 {
+			res.RemovedCount += n
+			// 清理期间可能有新上传写入 staging，差值取非负，宁可少报不报负。
+			if freed := before - dirSize(stagingDir); freed > 0 {
+				res.FreedBytes += freed
+			}
+		}
+	}
+
+	s.Invalidate()
+	return res, nil
 }
 
 // dirSize returns the total size of all regular files under root (0 if missing).

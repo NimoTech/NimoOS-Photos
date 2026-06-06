@@ -174,6 +174,7 @@ func InitRouter(ctx context.Context, svc service.Services, runtimePath string, t
 
 	storage := v1.NewStorageHandler(svc)
 	g.GET("/storage", storage.Get)
+	g.POST("/cache/prune", storage.Prune)
 
 	smartViews := v1.NewSmartViewsHandler(svc)
 	v1.RegisterSmartViewRoutes(g, smartViews)

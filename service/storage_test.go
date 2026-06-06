@@ -65,3 +65,32 @@ func TestStorageStatsCached(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, int64(1234), st3.PhotosBytes)
 }
+
+func TestStoragePruneRemovesOnlyOrphans(t *testing.T) {
+	db := makeTestDB(t)
+	_, err := db.Exec(`INSERT INTO assets(id, file_path, file_size, mime_type, status)
+		VALUES('a1','/x/a.jpg',1000,'image/jpeg','indexed')`)
+	require.NoError(t, err)
+
+	thumbDir := t.TempDir()
+	valid := writeFileOfSize(t, thumbDir, "a1/small.jpg", 100)
+	writeFileOfSize(t, thumbDir, "ghost/small.jpg", 300)
+
+	s := NewStorageService(db, filepath.Join(t.TempDir(), "photos.db"), thumbDir, t.TempDir(), t.TempDir())
+	_, err = s.Stats() // 填充缓存，验证 Prune 会失效它
+	require.NoError(t, err)
+
+	res, err := s.Prune("", 0) // 无 staging 目录场景
+	require.NoError(t, err)
+	require.Equal(t, int64(300), res.FreedBytes)
+	require.Equal(t, 1, res.RemovedCount)
+
+	_, statErr := os.Stat(valid)
+	require.NoError(t, statErr) // 有效缩略图保留
+	_, statErr = os.Stat(filepath.Join(thumbDir, "ghost"))
+	require.True(t, os.IsNotExist(statErr)) // 孤儿目录删除
+
+	st, err := s.Stats()
+	require.NoError(t, err)
+	require.Equal(t, int64(0), st.PrunableBytes) // 缓存已失效并重算
+}
