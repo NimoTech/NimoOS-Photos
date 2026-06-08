@@ -51,18 +51,65 @@ var supportedExts = map[string]bool{
 	".png":  true,
 	".heic": true,
 	".webp": true,
+	".gif":  true,
+	".bmp":  true,
+	".tiff": true,
+	".tif":  true,
+	".avif": true,
 	".mp4":  true,
 	".mov":  true,
 	".mkv":  true,
 	".avi":  true,
+	".webm": true,
+	".m4v":  true,
+	".3gp":  true,
 }
 
 // videoExts are extensions treated as video regardless of MIME detection.
 var videoExts = map[string]bool{
-	".mov": true,
-	".mp4": true,
-	".mkv": true,
-	".avi": true,
+	".mov":  true,
+	".mp4":  true,
+	".mkv":  true,
+	".avi":  true,
+	".webm": true,
+	".m4v":  true,
+	".3gp":  true,
+}
+
+// canonicalMime maps the media extensions we index to their authoritative MIME
+// type. http.DetectContentType cannot recognise some of the containers we
+// support — it returns application/octet-stream for QuickTime (.mov) and HEIC,
+// and the misleading video/webm for Matroska (.mkv). The whole system keys off
+// the stored mime_type (the frontend selects <video> vs <img> from it, and every
+// "mime_type LIKE 'video/%'" query depends on it), so we persist the canonical
+// type derived from the extension instead of trusting the content sniff.
+var canonicalMime = map[string]string{
+	".jpg":  "image/jpeg",
+	".jpeg": "image/jpeg",
+	".png":  "image/png",
+	".heic": "image/heic",
+	".webp": "image/webp",
+	".gif":  "image/gif",
+	".bmp":  "image/bmp",
+	".tiff": "image/tiff",
+	".tif":  "image/tiff",
+	".avif": "image/avif",
+	".mp4":  "video/mp4",
+	".mov":  "video/quicktime",
+	".mkv":  "video/x-matroska",
+	".avi":  "video/x-msvideo",
+	".webm": "video/webm",
+	".m4v":  "video/mp4",
+	".3gp":  "video/3gpp",
+}
+
+// resolveMimeType returns the canonical MIME type for a supported media
+// extension, falling back to content sniffing for anything not in the table.
+func resolveMimeType(data []byte, ext string) string {
+	if m, ok := canonicalMime[strings.ToLower(ext)]; ok {
+		return m
+	}
+	return http.DetectContentType(data)
 }
 
 // ingestQueueItem carries a file path and its optional batch association
@@ -460,8 +507,8 @@ func (ix *Indexer) processFileInternal(path string, opts processOpts) (success b
 	}
 
 	// 4. Detect MIME type and decide image vs. video.
-	mime := http.DetectContentType(data)
 	ext := strings.ToLower(filepath.Ext(path))
+	mime := resolveMimeType(data, ext)
 	isVideo := strings.HasPrefix(mime, "video/") || videoExts[ext]
 
 	// 5. Gather metadata.

@@ -441,3 +441,45 @@ func TestIndexerHonorsFeatureFlags(t *testing.T) {
 	require.Equal(t, 1, ml.faceCalls)
 	require.Equal(t, 1, ml.ocrCalls)
 }
+
+// TestResolveMimeType 验证我们为支持的媒体扩展名存储权威的 MIME 类型，而不是
+// http.DetectContentType 的内容嗅探结果——后者对 QuickTime(.mov) 与 HEIC 返回
+// application/octet-stream，对 Matroska(.mkv) 返回误导性的 video/webm。整个系统
+// （前端用 mime_type 选择 <video>/<img>，后端所有 "mime_type LIKE 'video/%'"
+// 查询）都依赖该字段，因此必须存对。
+func TestResolveMimeType(t *testing.T) {
+	cases := []struct {
+		ext  string
+		want string
+	}{
+		{".mov", "video/quicktime"},
+		{".mkv", "video/x-matroska"},
+		{".avi", "video/x-msvideo"},
+		{".mp4", "video/mp4"},
+		{".heic", "image/heic"},
+		{".webp", "image/webp"},
+		{".jpg", "image/jpeg"},
+		{".jpeg", "image/jpeg"},
+		{".png", "image/png"},
+		{".MOV", "video/quicktime"}, // 大小写不敏感
+		// 扩充的图片格式
+		{".gif", "image/gif"},
+		{".bmp", "image/bmp"},
+		{".tiff", "image/tiff"},
+		{".tif", "image/tiff"},
+		{".avif", "image/avif"},
+		// 扩充的视频格式（仅浏览器可原生内联播放的）
+		{".webm", "video/webm"},
+		{".m4v", "video/mp4"},
+		{".3gp", "video/3gpp"},
+	}
+	for _, c := range cases {
+		require.Equalf(t, c.want, resolveMimeType(nil, c.ext),
+			"resolveMimeType(%q) 应返回权威类型", c.ext)
+	}
+
+	// 未知扩展名回退到内容嗅探。
+	pngHeader := []byte{0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A}
+	require.Equal(t, "image/png", resolveMimeType(pngHeader, ".bin"),
+		"未知扩展名应回退到 http.DetectContentType")
+}

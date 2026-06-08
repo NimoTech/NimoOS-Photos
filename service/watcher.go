@@ -163,17 +163,8 @@ func (w *Watcher) PairLivePhotos() error {
 }
 
 // isSupportedMedia reports whether path has a supported media file extension.
+// It shares the single supportedExts table defined in indexer.go so the watcher
+// and the indexer can never drift out of sync.
 func isSupportedMedia(path string) bool {
-	supported := map[string]bool{
-		".jpg":  true,
-		".jpeg": true,
-		".png":  true,
-		".heic": true,
-		".webp": true,
-		".mp4":  true,
-		".mov":  true,
-		".mkv":  true,
-		".avi":  true,
-	}
-	return supported[strings.ToLower(filepath.Ext(path))]
+	return supportedExts[strings.ToLower(filepath.Ext(path))]
 }
