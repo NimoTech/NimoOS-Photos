@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/NimoTech/NimoOS-Photos/pkg/config"
@@ -35,6 +36,7 @@ type Services interface {
 	Storage() *StorageService
 	Rebuilder() *Rebuilder
 	RestartWatcher(dirs []string)
+	RestartScanTicker(minutes int)
 }
 
 // services is the unexported implementation of Services.
@@ -55,8 +57,10 @@ type services struct {
 	places     *PlacesService
 	smartViews *SmartViewService
 	storage    *StorageService
-	rebuilder  *Rebuilder
-	parentCtx  context.Context
+	rebuilder        *Rebuilder
+	parentCtx        context.Context
+	scanMu           sync.Mutex
+	scanTickerCancel context.CancelFunc
 }
 
 func (s *services) DB() *sql.DB                  { return s.db }
@@ -146,7 +150,7 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 	//    (e.g. unsupported format that now has a fallback decoder).
 	go func() {
 		idx.ScanPending()
-		for _, dir := range cfg.WatchDirs {
+		for _, dir := range EnumerateScanRoots() {
 			idx.ScanDirectory(dir) //nolint:errcheck
 		}
 		watcher.PairLivePhotos() //nolint:errcheck
@@ -203,7 +207,7 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 		}
 	}()
 
-	return &services{
+	svc := &services{
 		db:         db,
 		indexer:    idx,
 		watcher:    watcher,
@@ -223,6 +227,8 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 		rebuilder:  rebuilder,
 		parentCtx:  parentCtx,
 	}
+	svc.RestartScanTicker(cfg.ScanInterval)
+	return svc
 }
 
 func (s *services) RestartWatcher(dirs []string) {
@@ -230,6 +236,40 @@ func (s *services) RestartWatcher(dirs []string) {
 		return // NewTestServices 不接 watcher；handler 测试走到这里直接跳过
 	}
 	s.watcher.Restart(s.parentCtx, dirs)
+}
+
+// RestartScanTicker (re)starts the periodic full-disk scan loop. minutes<=0
+// disables it. Each tick scans every root from EnumerateScanRoots(). Safe to
+// call repeatedly (config changes); the previous loop is cancelled first.
+func (s *services) RestartScanTicker(minutes int) {
+	if s.indexer == nil {
+		return // test services without an indexer
+	}
+	s.scanMu.Lock()
+	defer s.scanMu.Unlock()
+	if s.scanTickerCancel != nil {
+		s.scanTickerCancel()
+		s.scanTickerCancel = nil
+	}
+	if minutes <= 0 {
+		return
+	}
+	ctx, cancel := context.WithCancel(s.parentCtx)
+	s.scanTickerCancel = cancel
+	go func() {
+		ticker := time.NewTicker(time.Duration(minutes) * time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				for _, dir := range EnumerateScanRoots() {
+					s.indexer.ScanDirectory(dir) //nolint:errcheck
+				}
+			}
+		}
+	}()
 }
 
 // NewTestServices builds a minimal Services backed by db, for handler tests.

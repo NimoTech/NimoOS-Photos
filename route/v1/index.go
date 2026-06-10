@@ -46,7 +46,7 @@ func (h *IndexHandler) Status(c echo.Context) error {
 // POST /v1/photos/scan
 func (h *IndexHandler) Scan(c echo.Context) error {
 	go func() {
-		for _, dir := range []string{"/DATA/Gallery", "/DATA/Documents", "/DATA/Downloads"} {
+		for _, dir := range service.EnumerateScanRoots() {
 			h.svc.Indexer().ScanDirectory(dir) //nolint:errcheck
 		}
 	}()
