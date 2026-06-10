@@ -148,3 +148,14 @@ func TestHandleDeletedPaths_NonMediaPathSkipped(t *testing.T) {
 	require.NoError(t, db.QueryRow(`SELECT count(*) FROM assets`).Scan(&count))
 	require.Equal(t, 1, count, "non-media asset must not be removed")
 }
+
+// busWsURL must produce the exact route the bus serves (verified by live 101
+// handshake): /v2/message_bus/event/{source_id} — "event" singular, no "/ws".
+func TestBusWsURL(t *testing.T) {
+	// GetMessageBusAddress returns "<content of message-bus.url>" + "/v2/message_bus".
+	got := busWsURL("http://127.0.0.1:36085/v2/message_bus")
+	want := "ws://127.0.0.1:36085/v2/message_bus/event/nimoos?names=nimoos:media:deleted"
+	if got != want {
+		t.Fatalf("busWsURL\n got=%s\nwant=%s", got, want)
+	}
+}

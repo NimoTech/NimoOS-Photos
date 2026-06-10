@@ -99,7 +99,10 @@ func busWsURL(busAddr string) string {
 		wsBase = "ws://" + busAddr
 	}
 
-	return wsBase + "/v2/message_bus/events/nimoos/ws?names=nimoos:media:deleted"
+	// Subscription route (verified against the bus router and a live 101
+	// handshake): GET /v2/message_bus/event/{source_id}?names=... upgrades to
+	// WebSocket. Note: it is "event" (singular), with no "/ws" suffix.
+	return wsBase + "/v2/message_bus/event/nimoos?names=nimoos:media:deleted"
 }
 
 // StartMediaDeletedSubscriber connects to the MessageBus via WebSocket and
