@@ -151,6 +151,7 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 	go func() {
 		idx.ScanPending()
 		idx.pruneSystemMountAssets()
+		pruneOrphanClipVectors(db) // sweep any vec0 rows left orphaned by past deletes
 		idx.ScanAllRoots()
 		watcher.PairLivePhotos() //nolint:errcheck
 	}()
@@ -192,6 +193,8 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 			if err := trash.PurgeExpired(days); err != nil {
 				zap.L().Warn("trash auto-purge failed", zap.Error(err))
 			}
+			// Cheap (no-ML) safety net: drop any orphan CLIP vectors left behind.
+			pruneOrphanClipVectors(db)
 		}
 		runPurge()
 		ticker := time.NewTicker(24 * time.Hour)

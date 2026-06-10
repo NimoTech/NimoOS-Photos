@@ -589,6 +589,7 @@ WHERE a.id = ?`, userID, id)
 
 // DeleteAsset removes an asset by ID; returns ErrNotFound when absent.
 func (s *SearchService) DeleteAsset(id string) error {
+	dropClipVector(s.db, id) // before the cascade drops asset_clip_idx
 	res, err := s.db.Exec(`DELETE FROM assets WHERE id=?`, id)
 	if err != nil {
 		return fmt.Errorf("DeleteAsset: %w", err)

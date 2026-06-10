@@ -158,9 +158,11 @@ func (s *TrashService) PurgeAsset(id string) error {
 		var lp string
 		if e := s.db.QueryRow(`SELECT file_path FROM assets WHERE id=?`, liveID).Scan(&lp); e == nil {
 			s.purgeFiles(liveID, lp)
+			dropClipVector(s.db, liveID) // before the cascade drops asset_clip_idx
 			s.db.Exec(`DELETE FROM assets WHERE id=?`, liveID) //nolint:errcheck
 		}
 	}
+	dropClipVector(s.db, id) // before the cascade drops asset_clip_idx
 	if _, err := s.db.Exec(`DELETE FROM assets WHERE id=?`, id); err != nil {
 		return fmt.Errorf("PurgeAsset delete: %w", err)
 	}

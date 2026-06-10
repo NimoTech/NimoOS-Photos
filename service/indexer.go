@@ -1056,13 +1056,24 @@ func (ix *Indexer) ScanDirectory(dir string) error {
 // table. It MUST run before the asset row is deleted: asset_clip_idx (the
 // asset_id->rowid map) is removed by FK cascade when the asset goes, and the
 // vec0 row cannot be reached afterwards (a foreign-key cascade cannot follow
-// into a virtual table). Without this, deleted assets leave orphan vectors that
-// stay in clip_embeddings and waste KNN top-k slots, degrading CLIP search.
-func (ix *Indexer) dropClipVector(assetID string) {
+// into a virtual table). Every permanent-delete path (RemoveByPath, scan prune,
+// trash purge, direct DeleteAsset) calls this so deleted assets never leave
+// orphan vectors that waste KNN top-k slots and degrade CLIP search. Free
+// function (takes *sql.DB) so non-Indexer services can reuse it.
+func dropClipVector(db *sql.DB, assetID string) {
 	var rowid int64
-	if ix.db.QueryRow(`SELECT rowid FROM asset_clip_idx WHERE asset_id=?`, assetID).Scan(&rowid) == nil {
-		_, _ = ix.db.Exec(`DELETE FROM clip_embeddings WHERE rowid=?`, rowid)
+	if db.QueryRow(`SELECT rowid FROM asset_clip_idx WHERE asset_id=?`, assetID).Scan(&rowid) == nil {
+		_, _ = db.Exec(`DELETE FROM clip_embeddings WHERE rowid=?`, rowid)
 	}
+}
+
+// pruneOrphanClipVectors deletes vec0 rows whose rowid no longer maps to any
+// asset_clip_idx entry. This is a cheap (pure-SQL, no ML) safety net against
+// orphan vectors left by any code path that deleted an asset without calling
+// dropClipVector; run it periodically and at startup. It is NOT a reindex — it
+// never re-embeds, it only sweeps dangling vectors.
+func pruneOrphanClipVectors(db *sql.DB) {
+	_, _ = db.Exec(`DELETE FROM clip_embeddings WHERE rowid NOT IN (SELECT rowid FROM asset_clip_idx)`)
 }
 
 func (ix *Indexer) RemoveByPath(path string) {
@@ -1076,7 +1087,7 @@ func (ix *Indexer) RemoveByPath(path string) {
 	if err != nil {
 		return
 	}
-	ix.dropClipVector(id) // before the cascade drops asset_clip_idx
+	dropClipVector(ix.db, id) // before the cascade drops asset_clip_idx
 	if _, err := ix.db.Exec(`DELETE FROM assets WHERE id = ?`, id); err != nil {
 		return
 	}
@@ -1114,7 +1125,7 @@ func (ix *Indexer) pruneMissingUnder(dir string) error {
 		return err
 	}
 	for _, r := range gone {
-		ix.dropClipVector(r.id) // before the cascade drops asset_clip_idx
+		dropClipVector(ix.db, r.id) // before the cascade drops asset_clip_idx
 		if _, err := ix.db.Exec(`DELETE FROM assets WHERE id = ?`, r.id); err != nil {
 			continue
 		}
