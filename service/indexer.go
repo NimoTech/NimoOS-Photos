@@ -1067,12 +1067,19 @@ func dropClipVector(db *sql.DB, assetID string) {
 	}
 }
 
-// pruneOrphanClipVectors deletes vec0 rows whose rowid no longer maps to any
-// asset_clip_idx entry. This is a cheap (pure-SQL, no ML) safety net against
-// orphan vectors left by any code path that deleted an asset without calling
-// dropClipVector; run it periodically and at startup. It is NOT a reindex — it
-// never re-embeds, it only sweeps dangling vectors.
+// pruneOrphanClipVectors sweeps orphaned CLIP vectors in two passes — a cheap
+// (pure-SQL, no ML) safety net run at startup and daily. It is NOT a reindex;
+// it never re-embeds, it only deletes dangling rows.
+//
+// Pass 1: asset_clip_idx rows whose asset no longer exists (seen in production:
+// historical deletes that bypassed the FK cascade left idx rows behind, and
+// their vectors kept occupying KNN top-k slots). Delete those vectors first
+// (the idx row is the only way to reach them), then the idx rows.
+// Pass 2: vec0 rows with no idx mapping at all.
 func pruneOrphanClipVectors(db *sql.DB) {
+	_, _ = db.Exec(`DELETE FROM clip_embeddings WHERE rowid IN
+		(SELECT rowid FROM asset_clip_idx WHERE asset_id NOT IN (SELECT id FROM assets))`)
+	_, _ = db.Exec(`DELETE FROM asset_clip_idx WHERE asset_id NOT IN (SELECT id FROM assets)`)
 	_, _ = db.Exec(`DELETE FROM clip_embeddings WHERE rowid NOT IN (SELECT rowid FROM asset_clip_idx)`)
 }
 

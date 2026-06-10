@@ -27,15 +27,31 @@ func TestPruneOrphanClipVectors(t *testing.T) {
 	_, err = db.Exec(`INSERT INTO clip_embeddings(rowid,embedding) VALUES(?,?)`, validRow, blob)
 	require.NoError(t, err)
 
-	// Orphan: vector with a rowid that has no asset_clip_idx entry.
+	// Orphan kind A: vector with a rowid that has no asset_clip_idx entry.
 	_, err = db.Exec(`INSERT INTO clip_embeddings(rowid,embedding) VALUES(999999,?)`, blob)
+	require.NoError(t, err)
+
+	// Orphan kind B (seen in production): an asset_clip_idx row whose asset is
+	// gone (historical delete that bypassed the FK cascade), vector still set.
+	// Insert with FK off to simulate the legacy state.
+	_, err = db.Exec(`PRAGMA foreign_keys=OFF`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO asset_clip_idx(rowid, asset_id) VALUES(888888,'ghost')`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO clip_embeddings(rowid,embedding) VALUES(888888,?)`, blob)
+	require.NoError(t, err)
+	_, err = db.Exec(`PRAGMA foreign_keys=ON`)
 	require.NoError(t, err)
 
 	pruneOrphanClipVectors(db)
 
-	var total, orphan int
+	var total, orphanA, orphanB, ghostIdx int
 	require.NoError(t, db.QueryRow(`SELECT count(*) FROM clip_embeddings`).Scan(&total))
-	require.NoError(t, db.QueryRow(`SELECT count(*) FROM clip_embeddings WHERE rowid=999999`).Scan(&orphan))
+	require.NoError(t, db.QueryRow(`SELECT count(*) FROM clip_embeddings WHERE rowid=999999`).Scan(&orphanA))
+	require.NoError(t, db.QueryRow(`SELECT count(*) FROM clip_embeddings WHERE rowid=888888`).Scan(&orphanB))
+	require.NoError(t, db.QueryRow(`SELECT count(*) FROM asset_clip_idx WHERE asset_id='ghost'`).Scan(&ghostIdx))
 	require.Equal(t, 1, total, "only the valid vector remains")
-	require.Equal(t, 0, orphan, "orphan vector swept")
+	require.Equal(t, 0, orphanA, "no-idx orphan vector swept")
+	require.Equal(t, 0, orphanB, "dead-asset orphan vector swept")
+	require.Equal(t, 0, ghostIdx, "dead-asset idx row swept")
 }
