@@ -14,19 +14,26 @@ tmpfs /run tmpfs rw,nosuid 0 0
 /dev/sdb1 /media/Storage_usb0 vfat rw 0 0
 /dev/sdc1 /mnt/Disk-1a2b3c4d ext4 rw 0 0
 /dev/sdd1 /media/RAID_With\040Space ext4 rw 0 0
+/dev/sde1 /media/MyOwnName ext4 rw 0 0
+/dev/sdf1 /mnt/merge fuse.mergerfs rw 0 0
 /dev/nvme0n1p3 /media/root-ro ext4 rw 0 0
 /dev/nvme0n1p4 /media/root-rw ext4 rw 0 0
 /dev/nvme0n1p7 /mnt/overlay ext4 rw 0 0
+/dev/nvme0n1p6 /mnt/metadata ext4 rw 0 0
 `
 	got := parseScanRoots(mounts)
-	// /media/root-ro, /media/root-rw and /mnt/overlay are system mounts and must
-	// be excluded; only user partitions (RAID_*, Storage_*, Disk-*) plus /DATA.
+	// Denylist, not whitelist: any /media//mnt mount is a user partition EXCEPT
+	// the known system mounts. So a custom-named drive (/media/MyOwnName) and a
+	// MergerFS mount (/mnt/merge) are included, while /media/root-ro,
+	// /media/root-rw, /mnt/overlay and /mnt/metadata are excluded.
 	want := []string{
 		"/DATA",
+		"/media/MyOwnName",
 		"/media/RAID_Photos",
 		"/media/RAID_With Space",
 		"/media/Storage_usb0",
 		"/mnt/Disk-1a2b3c4d",
+		"/mnt/merge",
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("parseScanRoots\n got=%v\nwant=%v", got, want)

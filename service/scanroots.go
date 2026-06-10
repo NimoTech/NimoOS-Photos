@@ -48,16 +48,28 @@ func parseScanRoots(mounts string) []string {
 	return roots
 }
 
+// systemMounts are OS mount points that sit under /media or /mnt (so they'd
+// otherwise pass the prefix test) but must never be scanned or indexed:
+// /media/root-ro & /media/root-rw are the overlayfs root layers, /mnt/overlay
+// is the merged root, /mnt/metadata is the system metadata partition.
+var systemMounts = map[string]bool{
+	"/media/root-ro": true,
+	"/media/root-rw": true,
+	"/mnt/overlay":   true,
+	"/mnt/metadata":  true,
+}
+
 // isUserPartition reports whether a mount point is a user-accessible data
-// partition Photos should scan. LocalStorage names user mounts predictably:
-// RAID arrays at /media/RAID_<name>, manually-mounted drives at
-// /media/Storage_<...>, and udev auto-mounted USB partitions at
-// /mnt/Disk-<uuid>. Everything else under /media (root-ro, root-rw) is a
-// system mount and is excluded.
+// partition Photos should scan. We do NOT whitelist naming prefixes: RAID
+// arrays (/media/RAID_*), manual mounts (/media/Storage_* or user-named
+// /media/<name>), MergerFS and custom mounts can all use arbitrary names, so a
+// prefix whitelist would miss real user data. Instead we accept any mount under
+// /media or /mnt and exclude the known system mounts above.
 func isUserPartition(mp string) bool {
-	return strings.HasPrefix(mp, "/media/RAID_") ||
-		strings.HasPrefix(mp, "/media/Storage_") ||
-		strings.HasPrefix(mp, "/mnt/Disk-")
+	if systemMounts[mp] {
+		return false
+	}
+	return strings.HasPrefix(mp, "/media/") || strings.HasPrefix(mp, "/mnt/")
 }
 
 // unescapeMount decodes the octal escapes (\040 space, \011 tab, \012 newline,
