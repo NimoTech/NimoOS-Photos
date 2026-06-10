@@ -159,6 +159,32 @@ func (ix *Indexer) ScanAllRoots() {
 	}
 }
 
+// pruneSystemMountAssets removes any indexed asset that lives under a known
+// system mount (see systemMounts). An earlier over-broad scan indexed OS files
+// (e.g. the /media/root-ro Adwaita icon themes); this runs at startup so that
+// pollution self-heals and can never linger once the scan scope is corrected.
+// It reuses RemoveByPath so the asset row, its cascaded rows and its thumbnails
+// are all cleaned the same way a normal deletion would.
+func (ix *Indexer) pruneSystemMountAssets() {
+	for mp := range systemMounts {
+		rows, err := ix.db.Query(`SELECT file_path FROM assets WHERE file_path = ? OR file_path LIKE ?`, mp, mp+"/%")
+		if err != nil {
+			continue
+		}
+		var paths []string
+		for rows.Next() {
+			var p string
+			if rows.Scan(&p) == nil {
+				paths = append(paths, p)
+			}
+		}
+		rows.Close()
+		for _, p := range paths {
+			ix.RemoveByPath(p)
+		}
+	}
+}
+
 // defaultIngestIdleTimeout is the quiet period after which ingestTracker
 // publishes the final "done" task and resets itself for the next batch.
 const defaultIngestIdleTimeout = 6 * time.Second

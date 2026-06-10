@@ -150,6 +150,7 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 	//    (e.g. unsupported format that now has a fallback decoder).
 	go func() {
 		idx.ScanPending()
+		idx.pruneSystemMountAssets()
 		idx.ScanAllRoots()
 		watcher.PairLivePhotos() //nolint:errcheck
 	}()
