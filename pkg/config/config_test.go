@@ -36,3 +36,27 @@ func TestSaveRoundTrip(t *testing.T) {
 	require.True(t, Cfg.OCREnabled)
 	require.False(t, Cfg.SmartViewEnabled)
 }
+
+func TestScanIntervalDefaultAndSave(t *testing.T) {
+	dir := t.TempDir()
+	cf := filepath.Join(dir, "photos.conf")
+	sample := "[photos]\nWatchDirs = /DATA/Gallery\n"
+	if err := Init(cf, sample); err != nil {
+		t.Fatal(err)
+	}
+	if Cfg.ScanInterval != 1440 {
+		t.Fatalf("default ScanInterval=1440, got %d", Cfg.ScanInterval)
+	}
+	if err := Save(Settings{WatchDirs: []string{"/DATA/Gallery"}, ScanInterval: 360}); err != nil {
+		t.Fatal(err)
+	}
+	if Cfg.ScanInterval != 360 {
+		t.Fatalf("after Save ScanInterval=360, got %d", Cfg.ScanInterval)
+	}
+	if err := Init(cf, sample); err != nil {
+		t.Fatal(err)
+	}
+	if Cfg.ScanInterval != 360 {
+		t.Fatalf("reloaded ScanInterval=360, got %d", Cfg.ScanInterval)
+	}
+}

@@ -22,6 +22,7 @@ type Config struct {
 	Workers          int
 	WatchDirs        []string
 	RetentionDays    int
+	ScanInterval     int
 	FacesEnabled     bool
 	ScenesEnabled    bool
 	OCREnabled       bool
@@ -62,6 +63,7 @@ func Init(configFile, confSample string) error {
 		Workers:       v.GetInt("photos.Workers"),
 		WatchDirs:     watchDirs,
 		RetentionDays: v.GetInt("photos.RetentionDays"),
+		ScanInterval:  v.GetInt("photos.ScanInterval"),
 		FacesEnabled:     v.GetBool("photos.FacesEnabled"),
 		ScenesEnabled:    v.GetBool("photos.ScenesEnabled"),
 		OCREnabled:       v.GetBool("photos.OCREnabled"),
@@ -99,6 +101,10 @@ func Init(configFile, confSample string) error {
 	if !v.IsSet("photos.SmartViewEnabled") {
 		Cfg.SmartViewEnabled = true
 	}
+	// 扫描间隔（分钟）；配置无此 key 时默认 1440（24h）。0 = 关闭周期重扫。
+	if !v.IsSet("photos.ScanInterval") {
+		Cfg.ScanInterval = 1440
+	}
 	return nil
 }
 
@@ -106,6 +112,7 @@ func Init(configFile, confSample string) error {
 type Settings struct {
 	WatchDirs        []string
 	RetentionDays    int
+	ScanInterval     int
 	FacesEnabled     bool
 	ScenesEnabled    bool
 	OCREnabled       bool
@@ -134,6 +141,7 @@ func Save(s Settings) error {
 	v.Set("photos.ScenesEnabled", s.ScenesEnabled)
 	v.Set("photos.OCREnabled", s.OCREnabled)
 	v.Set("photos.SmartViewEnabled", s.SmartViewEnabled)
+	v.Set("photos.ScanInterval", s.ScanInterval)
 	// WriteConfig uses the file extension to choose the encoder; ".conf" is not
 	// in viper's SupportedExts.  Write to a ".ini" temp file then rename.
 	tmpPath := configPath + ".ini"
@@ -152,5 +160,6 @@ func Save(s Settings) error {
 	Cfg.ScenesEnabled = s.ScenesEnabled
 	Cfg.OCREnabled = s.OCREnabled
 	Cfg.SmartViewEnabled = s.SmartViewEnabled
+	Cfg.ScanInterval = s.ScanInterval
 	return nil
 }
