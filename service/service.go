@@ -41,40 +41,40 @@ type Services interface {
 
 // services is the unexported implementation of Services.
 type services struct {
-	db        *sql.DB
-	indexer   *Indexer
-	watcher   *Watcher
-	albums    *AlbumService
-	search    *SearchService
-	faces     *FaceService
-	tasks     *TaskRegistry
-	embedder  *Embedder
-	favorites *FavoritesService
-	trash     *TrashService
-	views     *ViewsService
-	persons   *PersonService
-	geo        *GeoService
-	places     *PlacesService
-	smartViews *SmartViewService
-	storage    *StorageService
+	db               *sql.DB
+	indexer          *Indexer
+	watcher          *Watcher
+	albums           *AlbumService
+	search           *SearchService
+	faces            *FaceService
+	tasks            *TaskRegistry
+	embedder         *Embedder
+	favorites        *FavoritesService
+	trash            *TrashService
+	views            *ViewsService
+	persons          *PersonService
+	geo              *GeoService
+	places           *PlacesService
+	smartViews       *SmartViewService
+	storage          *StorageService
 	rebuilder        *Rebuilder
 	parentCtx        context.Context
 	scanMu           sync.Mutex
 	scanTickerCancel context.CancelFunc
 }
 
-func (s *services) DB() *sql.DB                  { return s.db }
-func (s *services) Indexer() *Indexer            { return s.indexer }
-func (s *services) Watcher() *Watcher            { return s.watcher }
-func (s *services) Albums() *AlbumService        { return s.albums }
-func (s *services) Search() *SearchService       { return s.search }
-func (s *services) Faces() *FaceService          { return s.faces }
-func (s *services) Tasks() *TaskRegistry         { return s.tasks }
-func (s *services) Embedder() *Embedder          { return s.embedder }
-func (s *services) Favorites() *FavoritesService { return s.favorites }
-func (s *services) Trash() *TrashService         { return s.trash }
-func (s *services) Views() *ViewsService         { return s.views }
-func (s *services) Persons() *PersonService      { return s.persons }
+func (s *services) DB() *sql.DB                   { return s.db }
+func (s *services) Indexer() *Indexer             { return s.indexer }
+func (s *services) Watcher() *Watcher             { return s.watcher }
+func (s *services) Albums() *AlbumService         { return s.albums }
+func (s *services) Search() *SearchService        { return s.search }
+func (s *services) Faces() *FaceService           { return s.faces }
+func (s *services) Tasks() *TaskRegistry          { return s.tasks }
+func (s *services) Embedder() *Embedder           { return s.embedder }
+func (s *services) Favorites() *FavoritesService  { return s.favorites }
+func (s *services) Trash() *TrashService          { return s.trash }
+func (s *services) Views() *ViewsService          { return s.views }
+func (s *services) Persons() *PersonService       { return s.persons }
 func (s *services) Geo() *GeoService              { return s.geo }
 func (s *services) Places() *PlacesService        { return s.places }
 func (s *services) SmartViews() *SmartViewService { return s.smartViews }
@@ -105,6 +105,15 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 	idx.SetTaskRegistry(taskReg)
 	watcher := NewWatcher(db, cfg.WatchDirs, idx, liveDir)
 	albums := NewAlbumService(db)
+	// Wire post-index album assignment: uploads carrying an albumId join the
+	// album as soon as their asset record exists. AddAsset is idempotent
+	// (album_assets uses INSERT OR IGNORE).
+	idx.SetAlbumAssigner(func(assetID, albumID string) {
+		if err := albums.AddAsset(albumID, assetID); err != nil {
+			zap.L().Warn("post-index album assign failed",
+				zap.String("albumId", albumID), zap.String("assetId", assetID), zap.Error(err))
+		}
+	})
 	favorites := NewFavoritesService(db)
 	trash := NewTrashService(db, "/DATA/Gallery", thumbDir)
 	views := NewViewsService(db)

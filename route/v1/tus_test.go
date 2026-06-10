@@ -118,10 +118,12 @@ func TestIngestStagedFile_Success(t *testing.T) {
 		submittedBatchID = bid
 	}
 
+	noopSetPending := func(path, albumID string) {}
 	err := ingestStagedFile(
 		stagedPath, "IMG_001.jpg", "",
 		wantBatchID, wantBatchTotal,
 		reserve, submit,
+		noopSetPending,
 		galleryDir,
 	)
 	if err != nil {
@@ -175,7 +177,7 @@ func TestIngestStagedFile_ReserveFailure(t *testing.T) {
 	reserve := func(path, bid string, total int64) bool { return false }
 	submit := func(path, bid string) { t.Error("submit must not be called when reserve fails") }
 
-	err := ingestStagedFile(stagedPath, "photo.jpg", "", "bid", 1, reserve, submit, galleryDir)
+	err := ingestStagedFile(stagedPath, "photo.jpg", "", "bid", 1, reserve, submit, func(_, _ string) {}, galleryDir)
 	if err == nil {
 		t.Fatal("expected error when reserve returns false, got nil")
 	}

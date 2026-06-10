@@ -131,15 +131,26 @@ type ingestQueueItem struct {
 
 // Indexer processes media files into the database with a worker pool.
 type Indexer struct {
-	db       *sql.DB
-	ml       MLProvider
-	thumbDir string
-	workers  int
-	queue    chan ingestQueueItem
-	seen     sync.Map // in-flight dedup: path -> struct{}
-	taskReg  *TaskRegistry
-	ingest   *ingestTracker // aggregates Enqueue/processFile into a single rolling task
-	scanActive int32        // CAS guard so only one full ScanAllRoots runs at a time
+	db         *sql.DB
+	ml         MLProvider
+	thumbDir   string
+	workers    int
+	queue      chan ingestQueueItem
+	seen       sync.Map // in-flight dedup: path -> struct{}
+	taskReg    *TaskRegistry
+	ingest     *ingestTracker // aggregates Enqueue/processFile into a single rolling task
+	scanActive int32          // CAS guard so only one full ScanAllRoots runs at a time
+
+	// pendingAlbum maps a gallery path to the album the upload requested.
+	// Registered before SubmitReserved (no race with workers) and taken
+	// (removed) when the worker starts processing the path, so failed files
+	// don't leak entries.
+	pendingAlbumMu sync.Mutex
+	pendingAlbum   map[string]string
+
+	// albumAssigner is called after an asset record is successfully written,
+	// with the asset's DB id and the album id from pendingAlbum.
+	albumAssigner func(assetID, albumID string)
 }
 
 // ScanAllRoots scans every user-accessible partition returned by
@@ -381,13 +392,43 @@ func (t *ingestTracker) onIdle(batchID string) {
 // NewIndexer creates a new Indexer. The queue channel is buffered to 1024 entries.
 func NewIndexer(db *sql.DB, ml MLProvider, thumbDir string, workers int) *Indexer {
 	return &Indexer{
-		db:       db,
-		ml:       ml,
-		thumbDir: thumbDir,
-		workers:  workers,
-		queue:    make(chan ingestQueueItem, 1024),
-		ingest:   newIngestTracker(),
+		db:           db,
+		ml:           ml,
+		thumbDir:     thumbDir,
+		workers:      workers,
+		queue:        make(chan ingestQueueItem, 1024),
+		ingest:       newIngestTracker(),
+		pendingAlbum: make(map[string]string),
 	}
+}
+
+// SetPendingAlbum registers that the file at path should be added to albumID
+// after it is indexed. A no-op when albumID is empty. Must be called before
+// SubmitReserved so the worker cannot pick up the item before the entry is set.
+func (ix *Indexer) SetPendingAlbum(path, albumID string) {
+	if albumID == "" {
+		return
+	}
+	ix.pendingAlbumMu.Lock()
+	ix.pendingAlbum[path] = albumID
+	ix.pendingAlbumMu.Unlock()
+}
+
+// takePendingAlbum reads and removes the pending album entry for path.
+// Returns "" when no entry is present.
+func (ix *Indexer) takePendingAlbum(path string) string {
+	ix.pendingAlbumMu.Lock()
+	albumID := ix.pendingAlbum[path]
+	delete(ix.pendingAlbum, path)
+	ix.pendingAlbumMu.Unlock()
+	return albumID
+}
+
+// SetAlbumAssigner registers a callback that is invoked after each asset record
+// is successfully written, when a pending album was registered for the file.
+// Same injection pattern as SetOnBatchDone and SetTaskRegistry.
+func (ix *Indexer) SetAlbumAssigner(fn func(assetID, albumID string)) {
+	ix.albumAssigner = fn
 }
 
 // SetTaskRegistry injects a TaskRegistry so ScanDirectory can report progress.
@@ -537,6 +578,10 @@ func (ix *Indexer) ForceReprocess(path string, opts processOpts) bool {
 
 // processFileInternal runs the full indexing pipeline for a single file.
 func (ix *Indexer) processFileInternal(path string, opts processOpts) (success bool) {
+	// Consume pending album entry immediately so that a failed file does not
+	// leave a stale entry in the map.
+	pendingAlbumID := ix.takePendingAlbum(path)
+
 	// 1. Read file content.
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -649,6 +694,13 @@ func (ix *Indexer) processFileInternal(path string, opts processOpts) (success b
 	if scanErr := ix.db.QueryRow(`SELECT id FROM assets WHERE file_path=?`, path).Scan(&assetID); scanErr != nil {
 		fmt.Fprintf(os.Stderr, "[indexer] assetID lookup failed for %s: %v\n", path, scanErr)
 		return false
+	}
+
+	// Wire pending album assignment: if the upload requested album membership,
+	// add the asset to the album now that its DB record exists.
+	// albumAssigner is nil-guarded; AddAsset uses INSERT OR IGNORE (idempotent).
+	if pendingAlbumID != "" && ix.albumAssigner != nil {
+		ix.albumAssigner(assetID, pendingAlbumID)
 	}
 
 	// 7. INSERT/UPDATE asset_exif — images and videos both write their metadata.
@@ -842,7 +894,7 @@ func quadArea(c []float64) float64 {
 // asset_ocr, together with the document-ness signals used by the OCR media
 // category: line_count (kept lines) and coverage (total text-box area as a
 // fraction of the image). A row is written even when no text is found
-// (text=''), so the backfill can tell "OCR done, empty" apart from "not yet
+// (text=”), so the backfill can tell "OCR done, empty" apart from "not yet
 // OCR'd".
 func (ix *Indexer) ocrAsset(assetID string, imageData []byte) error {
 	lines, err := ix.ml.OCR(imageData)

@@ -123,13 +123,16 @@ func validateMetadata(hook handler.HookEvent) (handler.HTTPResponse, handler.Fil
 // ingestStagedFile moves a completed TUS upload from staging to the gallery
 // and enqueues it for indexing. albumID may be empty.
 //
-// reserve and submit are injected callbacks that implement a two-step enqueue
-// protocol:
+// reserve, setPendingAlbum, and submit are injected callbacks that implement
+// a three-step enqueue protocol:
 //  1. reserve(dest, batchID, batchTotal) — pre-occupies the indexer's seen map
 //     and records batch metadata BEFORE the rename. This prevents the fsnotify
 //     watcher from racing ahead with a plain Enqueue call (no batchID) the
 //     moment the file appears in the gallery directory.
-//  2. submit(dest, batchID) — pushes the item into the worker queue AFTER the
+//  2. setPendingAlbum(dest, albumID) — registers the album to join AFTER
+//     reserve and BEFORE submit, so the worker cannot pick the item up before
+//     the album entry is stored.
+//  3. submit(dest, batchID) — pushes the item into the worker queue AFTER the
 //     rename has succeeded.
 func ingestStagedFile(
 	stagedPath string,
@@ -139,6 +142,7 @@ func ingestStagedFile(
 	batchTotal int64,
 	reserve func(path, batchID string, batchTotal int64) bool,
 	submit func(path, batchID string),
+	setPendingAlbum func(path, albumID string),
 	galleryDir string,
 ) error {
 	dest := filepath.Join(galleryDir, filename)
@@ -148,7 +152,13 @@ func ingestStagedFile(
 		return fmt.Errorf("path already pending: %s", dest)
 	}
 
-	// Step 2: rename / copy into gallery.
+	// Step 2: register album membership BEFORE submit so the worker cannot
+	// start processing the file before the pending entry is stored.
+	if albumID != "" {
+		setPendingAlbum(dest, albumID)
+	}
+
+	// Step 3: rename / copy into gallery.
 	if err := os.Rename(stagedPath, dest); err != nil {
 		// Fallback: copy + delete (cross-fs case)
 		if cerr := copyFile(stagedPath, dest); cerr != nil {
@@ -159,13 +169,8 @@ func ingestStagedFile(
 	// Remove .info sidecar
 	os.Remove(stagedPath + ".info") //nolint:errcheck
 
-	// Step 3: push into worker queue.
+	// Step 4: push into worker queue.
 	submit(dest, batchID)
-
-	// albumID handling — current Indexer doesn't carry album metadata;
-	// album assignment happens via a separate call after asset record exists.
-	// Deferred to wiring task (Task 6).
-	_ = albumID
 	return nil
 }
 
@@ -226,6 +231,7 @@ func NewTUSHandler(svc service.Services, galleryDir string) (http.Handler, error
 				batchID, batchTotal,
 				svc.Indexer().MarkAndReserve,
 				svc.Indexer().SubmitReserved,
+				svc.Indexer().SetPendingAlbum,
 				galleryDir,
 			); err != nil {
 				zap.L().Error("ingestStagedFile failed",
