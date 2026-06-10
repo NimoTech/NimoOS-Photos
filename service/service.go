@@ -150,9 +150,7 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 	//    (e.g. unsupported format that now has a fallback decoder).
 	go func() {
 		idx.ScanPending()
-		for _, dir := range EnumerateScanRoots() {
-			idx.ScanDirectory(dir) //nolint:errcheck
-		}
+		idx.ScanAllRoots()
 		watcher.PairLivePhotos() //nolint:errcheck
 	}()
 
@@ -264,9 +262,7 @@ func (s *services) RestartScanTicker(minutes int) {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				for _, dir := range EnumerateScanRoots() {
-					s.indexer.ScanDirectory(dir) //nolint:errcheck
-				}
+				s.indexer.ScanAllRoots()
 			}
 		}
 	}()

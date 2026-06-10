@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	_ "golang.org/x/image/webp"
@@ -138,6 +139,24 @@ type Indexer struct {
 	seen     sync.Map // in-flight dedup: path -> struct{}
 	taskReg  *TaskRegistry
 	ingest   *ingestTracker // aggregates Enqueue/processFile into a single rolling task
+	scanActive int32        // CAS guard so only one full ScanAllRoots runs at a time
+}
+
+// ScanAllRoots scans every user-accessible partition returned by
+// EnumerateScanRoots (the system disk plus mounted RAID/USB drives). A CAS
+// guard ensures only one full scan runs at a time: concurrent triggers
+// (startup, periodic ticker, manual rescan) arriving while a scan is already
+// in progress return immediately instead of spawning a duplicate scan — which
+// is what previously surfaced as two identical "索引照片" tasks at once.
+// Callers run this in their own goroutine; it blocks until all roots are done.
+func (ix *Indexer) ScanAllRoots() {
+	if !atomic.CompareAndSwapInt32(&ix.scanActive, 0, 1) {
+		return
+	}
+	defer atomic.StoreInt32(&ix.scanActive, 0)
+	for _, dir := range EnumerateScanRoots() {
+		_ = ix.ScanDirectory(dir)
+	}
 }
 
 // defaultIngestIdleTimeout is the quiet period after which ingestTracker

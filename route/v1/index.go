@@ -46,9 +46,7 @@ func (h *IndexHandler) Status(c echo.Context) error {
 // POST /v1/photos/scan
 func (h *IndexHandler) Scan(c echo.Context) error {
 	go func() {
-		for _, dir := range service.EnumerateScanRoots() {
-			h.svc.Indexer().ScanDirectory(dir) //nolint:errcheck
-		}
+		h.svc.Indexer().ScanAllRoots()
 	}()
 	return c.JSON(http.StatusAccepted, map[string]string{"status": "scanning"})
 }
