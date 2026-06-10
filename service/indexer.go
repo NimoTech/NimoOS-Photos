@@ -1052,6 +1052,19 @@ func (ix *Indexer) ScanDirectory(dir string) error {
 
 // RemoveByPath deletes the asset row for path (if any) and removes its
 // thumbnail directory from disk. Safe to call for paths that are not indexed.
+// dropClipVector removes an asset's CLIP embedding from the sqlite-vec vec0
+// table. It MUST run before the asset row is deleted: asset_clip_idx (the
+// asset_id->rowid map) is removed by FK cascade when the asset goes, and the
+// vec0 row cannot be reached afterwards (a foreign-key cascade cannot follow
+// into a virtual table). Without this, deleted assets leave orphan vectors that
+// stay in clip_embeddings and waste KNN top-k slots, degrading CLIP search.
+func (ix *Indexer) dropClipVector(assetID string) {
+	var rowid int64
+	if ix.db.QueryRow(`SELECT rowid FROM asset_clip_idx WHERE asset_id=?`, assetID).Scan(&rowid) == nil {
+		_, _ = ix.db.Exec(`DELETE FROM clip_embeddings WHERE rowid=?`, rowid)
+	}
+}
+
 func (ix *Indexer) RemoveByPath(path string) {
 	var id string
 	// Never remove a soft-deleted (trashed) asset: its file legitimately lives
@@ -1063,6 +1076,7 @@ func (ix *Indexer) RemoveByPath(path string) {
 	if err != nil {
 		return
 	}
+	ix.dropClipVector(id) // before the cascade drops asset_clip_idx
 	if _, err := ix.db.Exec(`DELETE FROM assets WHERE id = ?`, id); err != nil {
 		return
 	}
@@ -1100,6 +1114,7 @@ func (ix *Indexer) pruneMissingUnder(dir string) error {
 		return err
 	}
 	for _, r := range gone {
+		ix.dropClipVector(r.id) // before the cascade drops asset_clip_idx
 		if _, err := ix.db.Exec(`DELETE FROM assets WHERE id = ?`, r.id); err != nil {
 			continue
 		}
