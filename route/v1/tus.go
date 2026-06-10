@@ -124,7 +124,7 @@ func validateMetadata(hook handler.HookEvent) (handler.HTTPResponse, handler.Fil
 // and enqueues it for indexing. albumID may be empty.
 //
 // reserve, setPendingAlbum, and submit are injected callbacks that implement
-// a three-step enqueue protocol:
+// a four-step enqueue protocol:
 //  1. reserve(dest, batchID, batchTotal) — pre-occupies the indexer's seen map
 //     and records batch metadata BEFORE the rename. This prevents the fsnotify
 //     watcher from racing ahead with a plain Enqueue call (no batchID) the
@@ -132,7 +132,8 @@ func validateMetadata(hook handler.HookEvent) (handler.HTTPResponse, handler.Fil
 //  2. setPendingAlbum(dest, albumID) — registers the album to join AFTER
 //     reserve and BEFORE submit, so the worker cannot pick the item up before
 //     the album entry is stored.
-//  3. submit(dest, batchID) — pushes the item into the worker queue AFTER the
+//  3. rename/copy the staged file into the gallery directory.
+//  4. submit(dest, batchID) — pushes the item into the worker queue AFTER the
 //     rename has succeeded.
 func ingestStagedFile(
 	stagedPath string,

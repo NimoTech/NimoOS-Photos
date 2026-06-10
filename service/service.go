@@ -111,7 +111,7 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 	idx.SetAlbumAssigner(func(assetID, albumID string) {
 		if err := albums.AddAsset(albumID, assetID); err != nil {
 			zap.L().Warn("post-index album assign failed",
-				zap.String("albumId", albumID), zap.String("assetId", assetID), zap.Error(err))
+				zap.String("album_id", albumID), zap.String("asset_id", assetID), zap.Error(err))
 		}
 	})
 	favorites := NewFavoritesService(db)

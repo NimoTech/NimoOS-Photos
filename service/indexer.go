@@ -426,6 +426,7 @@ func (ix *Indexer) takePendingAlbum(path string) string {
 
 // SetAlbumAssigner registers a callback that is invoked after each asset record
 // is successfully written, when a pending album was registered for the file.
+// Call this after construction (e.g. from NewService) before any scans begin.
 // Same injection pattern as SetOnBatchDone and SetTaskRegistry.
 func (ix *Indexer) SetAlbumAssigner(fn func(assetID, albumID string)) {
 	ix.albumAssigner = fn
@@ -599,7 +600,10 @@ func (ix *Indexer) processFileInternal(path string, opts processOpts) (success b
 		var existingID string
 		err = ix.db.QueryRow(`SELECT id FROM assets WHERE checksum=? AND status='indexed'`, checksum).Scan(&existingID)
 		if err == nil {
-			// already fully indexed — nothing to do
+			// already fully indexed — assign to album if requested, then short-circuit
+			if pendingAlbumID != "" && ix.albumAssigner != nil {
+				ix.albumAssigner(existingID, pendingAlbumID)
+			}
 			return true
 		}
 	}

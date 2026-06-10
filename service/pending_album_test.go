@@ -79,6 +79,65 @@ func TestIndexer_AlbumAssigner_CalledAfterProcessing(t *testing.T) {
 	require.Equal(t, dbID, got.assetID, "assigner must receive the actual DB asset ID")
 }
 
+// TestIndexer_AlbumAssigner_DeduplicatedFile verifies that when a file whose
+// checksum already exists in the DB (status='indexed') is re-submitted with a
+// pending album, the albumAssigner is still called with the EXISTING asset id
+// and the new albumID (dedup short-circuit must not silently drop the
+// album assignment).
+func TestIndexer_AlbumAssigner_DeduplicatedFile(t *testing.T) {
+	db := makeTestDB(t)
+	thumbDir := t.TempDir()
+	imgDir := t.TempDir()
+	imgPath := makeTestJPEG(t, imgDir)
+
+	const wantAlbumID = "al_dup"
+
+	type call struct{ assetID, albumID string }
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// First pass: index without album to get the asset into DB as 'indexed'.
+	calls1 := make(chan call, 1)
+	idx1 := NewIndexer(db, &mockML{}, thumbDir, 1)
+	idx1.SetAlbumAssigner(func(assetID, albumID string) {
+		calls1 <- call{assetID, albumID}
+	})
+	go idx1.Start(ctx)
+	idx1.Enqueue(imgPath)
+	// Wait until the asset is indexed.
+	require.Eventually(t, func() bool {
+		var s string
+		_ = db.QueryRow(`SELECT status FROM assets WHERE file_path=?`, imgPath).Scan(&s)
+		return s == "indexed"
+	}, 5*time.Second, 50*time.Millisecond, "first index must complete")
+
+	// Retrieve the existing asset id for later assertions.
+	var existingAssetID string
+	require.NoError(t, db.QueryRow(`SELECT id FROM assets WHERE file_path=?`, imgPath).Scan(&existingAssetID))
+
+	// Second pass: same file (identical checksum) submitted with a pending album.
+	// The dedup short-circuit fires — but albumAssigner MUST still be called.
+	calls2 := make(chan call, 1)
+	idx2 := NewIndexer(db, &mockML{}, thumbDir, 1)
+	idx2.SetAlbumAssigner(func(assetID, albumID string) {
+		calls2 <- call{assetID, albumID}
+	})
+	go idx2.Start(ctx)
+	idx2.SetPendingAlbum(imgPath, wantAlbumID)
+	idx2.Enqueue(imgPath)
+
+	var got call
+	select {
+	case got = <-calls2:
+	case <-time.After(5 * time.Second):
+		t.Fatal("albumAssigner was not called after dedup short-circuit — album assignment silently dropped")
+	}
+
+	require.Equal(t, wantAlbumID, got.albumID, "albumID must match the pending album")
+	require.Equal(t, existingAssetID, got.assetID, "assetID must be the existing DB record's id")
+}
+
 // TestIndexer_AlbumAssigner_NilSafe verifies that a nil albumAssigner does not
 // panic even when a pending album is registered.
 func TestIndexer_AlbumAssigner_NilSafe(t *testing.T) {
