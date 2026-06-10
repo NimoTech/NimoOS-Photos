@@ -11,9 +11,14 @@ import (
 const procMountsPath = "/proc/mounts"
 
 // EnumerateScanRoots returns every directory Photos should scan: the system
-// disk (/DATA) plus every currently-mounted user partition under /media/*
-// (RAID arrays, manually-mounted drives) and /mnt/Disk-* (udev auto-mounted
-// USB). On read failure it degrades to just /DATA.
+// disk (/DATA) plus every currently-mounted *user* partition — RAID arrays
+// (/media/RAID_*), manually-mounted drives (/media/Storage_*) and udev
+// auto-mounted USB (/mnt/Disk-*). On read failure it degrades to just /DATA.
+//
+// It deliberately does NOT match every /media/* mount: the OS keeps its own
+// root filesystem mounted at /media/root-ro and /media/root-rw, which are
+// system partitions, not user data — scanning them would index OS files and
+// spawn spurious "indexing" tasks.
 func EnumerateScanRoots() []string {
 	data, err := os.ReadFile(procMountsPath)
 	if err != nil {
@@ -31,7 +36,7 @@ func parseScanRoots(mounts string) []string {
 			continue
 		}
 		mp := unescapeMount(fields[1])
-		if strings.HasPrefix(mp, "/media/") || strings.HasPrefix(mp, "/mnt/Disk-") {
+		if isUserPartition(mp) {
 			set[mp] = true
 		}
 	}
@@ -41,6 +46,18 @@ func parseScanRoots(mounts string) []string {
 	}
 	sort.Strings(roots)
 	return roots
+}
+
+// isUserPartition reports whether a mount point is a user-accessible data
+// partition Photos should scan. LocalStorage names user mounts predictably:
+// RAID arrays at /media/RAID_<name>, manually-mounted drives at
+// /media/Storage_<...>, and udev auto-mounted USB partitions at
+// /mnt/Disk-<uuid>. Everything else under /media (root-ro, root-rw) is a
+// system mount and is excluded.
+func isUserPartition(mp string) bool {
+	return strings.HasPrefix(mp, "/media/RAID_") ||
+		strings.HasPrefix(mp, "/media/Storage_") ||
+		strings.HasPrefix(mp, "/mnt/Disk-")
 }
 
 // unescapeMount decodes the octal escapes (\040 space, \011 tab, \012 newline,

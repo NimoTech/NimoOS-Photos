@@ -14,8 +14,13 @@ tmpfs /run tmpfs rw,nosuid 0 0
 /dev/sdb1 /media/Storage_usb0 vfat rw 0 0
 /dev/sdc1 /mnt/Disk-1a2b3c4d ext4 rw 0 0
 /dev/sdd1 /media/RAID_With\040Space ext4 rw 0 0
+/dev/nvme0n1p3 /media/root-ro ext4 rw 0 0
+/dev/nvme0n1p4 /media/root-rw ext4 rw 0 0
+/dev/nvme0n1p7 /mnt/overlay ext4 rw 0 0
 `
 	got := parseScanRoots(mounts)
+	// /media/root-ro, /media/root-rw and /mnt/overlay are system mounts and must
+	// be excluded; only user partitions (RAID_*, Storage_*, Disk-*) plus /DATA.
 	want := []string{
 		"/DATA",
 		"/media/RAID_Photos",
