@@ -80,6 +80,18 @@ func (r *Rebuilder) run(taskID string) {
 		return
 	}
 
+	// Wipe the CLIP vector index so the rebuild starts from a clean slate: this
+	// drops orphan vectors left behind by previously deleted assets (vec0 rows
+	// the FK cascade can't reach) and guarantees no stale/duplicate embeddings
+	// survive. writeClipEmbedding re-creates asset_clip_idx rows and vectors as
+	// it re-embeds each asset below.
+	if _, err := r.db.Exec(`DELETE FROM clip_embeddings`); err != nil {
+		zap.L().Warn("rebuild: clear clip_embeddings failed", zap.Error(err))
+	}
+	if _, err := r.db.Exec(`DELETE FROM asset_clip_idx`); err != nil {
+		zap.L().Warn("rebuild: clear asset_clip_idx failed", zap.Error(err))
+	}
+
 	total := int64(len(targets))
 	var processed, failed int64
 
