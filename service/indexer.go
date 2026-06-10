@@ -65,6 +65,14 @@ var supportedExts = map[string]bool{
 	".3gp":  true,
 }
 
+// scanExcludeDirs are absolute directory paths excluded from scanning even
+// though their names don't start with ".". They hold app/system data, not
+// user media. (.system_data is already skipped by the dot-prefix rule.)
+var scanExcludeDirs = map[string]bool{
+	"/DATA/AppData":    true,
+	"/DATA/lost+found": true,
+}
+
 // videoExts are extensions treated as video regardless of MIME detection.
 var videoExts = map[string]bool{
 	".mov":  true,
@@ -893,6 +901,9 @@ func walkSupported(dir string, fn func(path string)) error {
 		}
 		if d.IsDir() {
 			if path != dir && strings.HasPrefix(d.Name(), ".") {
+				return filepath.SkipDir
+			}
+			if scanExcludeDirs[path] {
 				return filepath.SkipDir
 			}
 			return nil
