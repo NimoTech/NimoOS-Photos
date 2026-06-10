@@ -29,6 +29,7 @@ func (h *ConfigHandler) GetConfig(c echo.Context) error {
 		"scenesEnabled":    config.Cfg.ScenesEnabled,
 		"ocrEnabled":       config.Cfg.OCREnabled,
 		"smartViewEnabled": config.Cfg.SmartViewEnabled,
+		"scanInterval":     config.Cfg.ScanInterval,
 	})
 }
 
@@ -37,10 +38,11 @@ func (h *ConfigHandler) UpdateConfig(c echo.Context) error {
 	var req struct {
 		WatchDirs        []string `json:"watchDirs"`
 		RetentionDays    int      `json:"retentionDays"`
-		FacesEnabled     *bool    `json:"facesEnabled"`
-		ScenesEnabled    *bool    `json:"scenesEnabled"`
-		OCREnabled       *bool    `json:"ocrEnabled"`
-		SmartViewEnabled *bool    `json:"smartViewEnabled"`
+		FacesEnabled     *bool `json:"facesEnabled"`
+		ScenesEnabled    *bool `json:"scenesEnabled"`
+		OCREnabled       *bool `json:"ocrEnabled"`
+		SmartViewEnabled *bool `json:"smartViewEnabled"`
+		ScanInterval     *int  `json:"scanInterval"`
 	}
 	if err := c.Bind(&req); err != nil {
 		return echo.NewHTTPError(http.StatusBadRequest, "invalid request body")
@@ -50,6 +52,15 @@ func (h *ConfigHandler) UpdateConfig(c echo.Context) error {
 	}
 	if req.RetentionDays != 0 && (req.RetentionDays < 1 || req.RetentionDays > 365) {
 		return echo.NewHTTPError(http.StatusBadRequest, "retentionDays must be between 1 and 365")
+	}
+	scanInterval := config.Cfg.ScanInterval
+	if req.ScanInterval != nil {
+		switch *req.ScanInterval {
+		case 0, 360, 720, 1440, 10080:
+			scanInterval = *req.ScanInterval
+		default:
+			return echo.NewHTTPError(http.StatusBadRequest, "scanInterval must be one of 0,360,720,1440,10080")
+		}
 	}
 	faces := config.Cfg.FacesEnabled
 	if req.FacesEnabled != nil {
@@ -74,10 +85,12 @@ func (h *ConfigHandler) UpdateConfig(c echo.Context) error {
 		ScenesEnabled:    scenes,
 		OCREnabled:       ocr,
 		SmartViewEnabled: smartView,
+		ScanInterval:     scanInterval,
 	}); err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
 	}
 	h.svc.RestartWatcher(req.WatchDirs)
+	h.svc.RestartScanTicker(scanInterval)
 	return c.JSON(http.StatusOK, map[string]interface{}{
 		"watchDirs":        req.WatchDirs,
 		"retentionDays":    config.Cfg.RetentionDays,
@@ -85,5 +98,6 @@ func (h *ConfigHandler) UpdateConfig(c echo.Context) error {
 		"scenesEnabled":    config.Cfg.ScenesEnabled,
 		"ocrEnabled":       config.Cfg.OCREnabled,
 		"smartViewEnabled": config.Cfg.SmartViewEnabled,
+		"scanInterval":     config.Cfg.ScanInterval,
 	})
 }
