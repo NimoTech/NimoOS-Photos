@@ -169,6 +169,56 @@ func (s *PersonService) UpdatePerson(id string, patch PersonPatch) error {
 	return nil
 }
 
+// PurgePerson permanently deletes a person group in a single transaction:
+//  1. Mark all face_detections that belonged to the person as excluded=1 so they
+//     never participate in future clustering or attachment.
+//  2. Remove all face_person bindings for the person.
+//  3. Delete the persons row itself.
+//
+// Assets are never touched. The operation is intentionally unrestricted —
+// anchored (named/favorited) persons can be purged because this is an explicit
+// user action. Returns ErrNotFound if no person with the given id exists.
+func (s *PersonService) PurgePerson(id string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("PurgePerson begin: %w", err)
+	}
+	defer tx.Rollback()
+
+	// Verify the person exists (mirrors HidePerson's not-found semantics via
+	// setHidden which checks RowsAffected; here we pre-check with a SELECT so
+	// all three subsequent statements can assume existence).
+	var exists int
+	if err := tx.QueryRow(`SELECT 1 FROM persons WHERE id=?`, id).Scan(&exists); err != nil {
+		if err == sql.ErrNoRows {
+			return ErrNotFound
+		}
+		return fmt.Errorf("PurgePerson check: %w", err)
+	}
+
+	// Step 1: mark all face_detections that belong to this person as excluded=1.
+	if _, err := tx.Exec(`
+		UPDATE face_detections SET excluded=1
+		WHERE id IN (SELECT face_id FROM face_person WHERE person_id=?)`, id); err != nil {
+		return fmt.Errorf("PurgePerson exclude faces: %w", err)
+	}
+
+	// Step 2: delete face_person bindings.
+	if _, err := tx.Exec(`DELETE FROM face_person WHERE person_id=?`, id); err != nil {
+		return fmt.Errorf("PurgePerson delete face_person: %w", err)
+	}
+
+	// Step 3: delete the person row.
+	if _, err := tx.Exec(`DELETE FROM persons WHERE id=?`, id); err != nil {
+		return fmt.Errorf("PurgePerson delete person: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("PurgePerson commit: %w", err)
+	}
+	return nil
+}
+
 // HidePerson 软删除（hidden=1）。
 func (s *PersonService) HidePerson(id string) error { return s.setHidden(id, true) }
 

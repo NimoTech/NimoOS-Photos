@@ -72,9 +72,23 @@ func (h *PersonsHandler) Update(c echo.Context) error {
 	return c.JSON(http.StatusOK, map[string]string{"status": "updated"})
 }
 
-// DELETE /v1/photos/persons/:id  (soft hide)
+// DELETE /v1/photos/persons/:id
+//
+// ?purge=true  → permanently delete: exclude faces, drop bindings, delete person row.
+// (default)    → soft hide: sets hidden=1, backward-compatible.
 func (h *PersonsHandler) Delete(c echo.Context) error {
-	err := h.svc.Persons().HidePerson(c.Param("id"))
+	id := c.Param("id")
+	if c.QueryParam("purge") == "true" {
+		err := h.svc.Persons().PurgePerson(id)
+		if errors.Is(err, service.ErrNotFound) {
+			return echo.NewHTTPError(http.StatusNotFound)
+		}
+		if err != nil {
+			return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+		}
+		return c.JSON(http.StatusOK, map[string]string{"status": "purged"})
+	}
+	err := h.svc.Persons().HidePerson(id)
 	if errors.Is(err, service.ErrNotFound) {
 		return echo.NewHTTPError(http.StatusNotFound)
 	}

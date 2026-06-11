@@ -519,3 +519,108 @@ func TestMergePersons_RecomputesCentroid(t *testing.T) {
 	require.Greater(t, conf, 0.0)
 	require.Less(t, conf, 1.0, "confidence 应已重算（两个正交脸合并后 <1.0），若仍为 1.0 说明未重算")
 }
+
+// ---------------------------------------------------------------------------
+// PurgePerson tests
+// ---------------------------------------------------------------------------
+
+func TestPurgePerson_DeletesPersonAndExcludesFaces(t *testing.T) {
+	db := makeTestFaceDB(t)
+	dim := 512
+	a := make([]float32, dim)
+	a[0] = 1.0
+	// Two faces on two different assets grouped into one person.
+	insertAssetFace(t, db, "pur-a1", normalize(a))
+	insertAssetFace(t, db, "pur-a2", normalize(a))
+	require.NoError(t, service.NewFaceService(db).RunClustering(context.Background()))
+
+	list, _ := service.NewPersonService(db).ListPersons()
+	require.Len(t, list, 1)
+	personID := list[0].ID
+
+	ps := service.NewPersonService(db)
+	require.NoError(t, ps.PurgePerson(personID))
+
+	// persons row must be gone.
+	var n int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM persons WHERE id=?`, personID).Scan(&n))
+	require.Equal(t, 0, n, "persons row must be deleted after purge")
+
+	// face_person binding must be gone.
+	var fp int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM face_person WHERE person_id=?`, personID).Scan(&fp))
+	require.Equal(t, 0, fp, "face_person rows must be deleted after purge")
+
+	// All face_detections that belonged to this person must be excluded=1.
+	var notExcluded int
+	require.NoError(t, db.QueryRow(`
+		SELECT COUNT(*) FROM face_detections
+		WHERE asset_id IN ('pur-a1','pur-a2') AND excluded=0`).Scan(&notExcluded))
+	require.Equal(t, 0, notExcluded, "all face_detections for purged person must be excluded")
+
+	// Assets must be untouched.
+	var assets int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM assets WHERE id IN ('pur-a1','pur-a2')`).Scan(&assets))
+	require.Equal(t, 2, assets, "assets must not be affected by purge")
+}
+
+func TestPurgePerson_AnchoredPersonCanBePurged(t *testing.T) {
+	db := makeTestFaceDB(t)
+	dim := 512
+	a := make([]float32, dim)
+	a[0] = 1.0
+	insertAssetFace(t, db, "anc-a1", normalize(a))
+	require.NoError(t, service.NewFaceService(db).RunClustering(context.Background()))
+
+	personID := mustFirstPersonID(t, db)
+
+	// Anchor the person with a name and mark as favorite.
+	_, err := db.Exec(`UPDATE persons SET name='Alice', favorite=1 WHERE id=?`, personID)
+	require.NoError(t, err)
+
+	ps := service.NewPersonService(db)
+	// purge is an explicit user action — anchoring must not protect against it.
+	require.NoError(t, ps.PurgePerson(personID))
+
+	var n int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM persons WHERE id=?`, personID).Scan(&n))
+	require.Equal(t, 0, n, "anchored person must still be purged")
+}
+
+func TestPurgePerson_NotFound(t *testing.T) {
+	db := makeTestFaceDB(t)
+	ps := service.NewPersonService(db)
+	err := ps.PurgePerson("nonexistent-id")
+	require.ErrorIs(t, err, service.ErrNotFound)
+}
+
+func TestPurgePerson_RecluterDoesNotResurrect(t *testing.T) {
+	db := makeTestFaceDB(t)
+	dim := 512
+	a := make([]float32, dim)
+	a[0] = 1.0
+	insertAssetFace(t, db, "res-a1", normalize(a))
+	insertAssetFace(t, db, "res-a2", normalize(a))
+	require.NoError(t, service.NewFaceService(db).RunClustering(context.Background()))
+
+	list, _ := service.NewPersonService(db).ListPersons()
+	require.Len(t, list, 1)
+	personID := list[0].ID
+
+	ps := service.NewPersonService(db)
+	require.NoError(t, ps.PurgePerson(personID))
+
+	// Re-run clustering: excluded faces must not form a new person.
+	require.NoError(t, service.NewFaceService(db).RunClustering(context.Background()))
+	list2, _ := ps.ListPersons()
+	for _, p := range list2 {
+		require.NotEqual(t, personID, p.ID, "purged person must not be resurrected")
+	}
+	// All faces remain excluded — they must not be bound to any new person.
+	var bound int
+	require.NoError(t, db.QueryRow(`
+		SELECT COUNT(*) FROM face_person fp
+		JOIN face_detections fd ON fd.id=fp.face_id
+		WHERE fd.asset_id IN ('res-a1','res-a2')`).Scan(&bound))
+	require.Equal(t, 0, bound, "excluded faces must not be re-bound after recluster")
+}
