@@ -485,13 +485,15 @@ func TestAlbumBatchAddAssetsConcurrentNoPositionConflict(t *testing.T) {
 	}
 }
 
-// --- Default cover resolution (falls back to newest asset when none set) ---
+// --- Default cover resolution (falls back to first-position asset when none set) ---
 
-func TestAlbumListResolvesNewestAssetAsDefaultCover(t *testing.T) {
+func TestAlbumListResolvesFirstPositionAsDefaultCover(t *testing.T) {
 	db, err := sqlite.Open(filepath.Join(t.TempDir(), "test.db"))
 	require.NoError(t, err)
 	defer db.Close()
 
+	// Assets inserted with taken_at desc so the "newest" heuristic would pick 'new',
+	// but position order (old=0, mid=1, new=2) means 'old' is the first item.
 	_, err = db.Exec(`INSERT INTO assets(id, file_path, taken_at, status) VALUES
 		('old','/g/1.jpg','2026-01-01','indexed'),
 		('mid','/g/2.jpg','2026-02-01','indexed'),
@@ -506,10 +508,10 @@ func TestAlbumListResolvesNewestAssetAsDefaultCover(t *testing.T) {
 	albums, err := svc.List()
 	require.NoError(t, err)
 	require.Len(t, albums, 1)
-	require.Equal(t, "new", albums[0].CoverAssetID, "default cover should be newest by taken_at")
+	require.Equal(t, "old", albums[0].CoverAssetID, "default cover should be the first-position asset, not newest")
 }
 
-func TestAlbumListExplicitCoverWinsOverNewest(t *testing.T) {
+func TestAlbumListExplicitCoverWinsOverFirst(t *testing.T) {
 	db, err := sqlite.Open(filepath.Join(t.TempDir(), "test.db"))
 	require.NoError(t, err)
 	defer db.Close()
@@ -520,14 +522,16 @@ func TestAlbumListExplicitCoverWinsOverNewest(t *testing.T) {
 	require.NoError(t, err)
 	svc := service.NewAlbumService(db)
 	a, _ := svc.Create("Explicit Cover")
+	// old=pos0, new=pos1; implicit cover would be 'old'
 	require.NoError(t, svc.AddAsset(a.ID, "old"))
 	require.NoError(t, svc.AddAsset(a.ID, "new"))
-	require.NoError(t, svc.UpdateCover(a.ID, "old"))
+	// explicitly pin 'new' as cover — must override the implicit first-item fallback
+	require.NoError(t, svc.UpdateCover(a.ID, "new"))
 
 	albums, err := svc.List()
 	require.NoError(t, err)
 	require.Len(t, albums, 1)
-	require.Equal(t, "old", albums[0].CoverAssetID, "explicit cover must win over newest fallback")
+	require.Equal(t, "new", albums[0].CoverAssetID, "explicit cover must win over first-position fallback")
 }
 
 func TestAlbumListEmptyAlbumHasNoCover(t *testing.T) {
@@ -543,11 +547,13 @@ func TestAlbumListEmptyAlbumHasNoCover(t *testing.T) {
 	require.Empty(t, albums[0].CoverAssetID, "empty album must have no cover")
 }
 
-func TestAlbumGetResolvesNewestAssetAsDefaultCover(t *testing.T) {
+func TestAlbumGetResolvesFirstPositionAsDefaultCover(t *testing.T) {
 	db, err := sqlite.Open(filepath.Join(t.TempDir(), "test.db"))
 	require.NoError(t, err)
 	defer db.Close()
 
+	// 'new' has a later taken_at; 'old' is added first so position=0.
+	// Implicit cover must be 'old' (first by position), not 'new'.
 	_, err = db.Exec(`INSERT INTO assets(id, file_path, taken_at, status) VALUES
 		('old','/g/1.jpg','2026-01-01','indexed'),
 		('new','/g/2.jpg','2026-03-01','indexed')`)
@@ -559,7 +565,142 @@ func TestAlbumGetResolvesNewestAssetAsDefaultCover(t *testing.T) {
 
 	got, err := svc.Get(a.ID)
 	require.NoError(t, err)
-	require.Equal(t, "new", got.CoverAssetID, "Get should resolve newest as default cover")
+	require.Equal(t, "old", got.CoverAssetID, "Get should resolve first-position asset as default cover")
+}
+
+// --- Cover stability: adding photos must not change an implicit cover ---
+
+// TestAlbumImplicitCoverIsStableWhenAddingPhotos verifies that the implicit
+// cover is always the first-position item; subsequent additions never change it.
+func TestAlbumImplicitCoverIsStableWhenAddingPhotos(t *testing.T) {
+	db, err := sqlite.Open(filepath.Join(t.TempDir(), "test.db"))
+	require.NoError(t, err)
+	defer db.Close()
+
+	_, err = db.Exec(`INSERT INTO assets(id, file_path, taken_at, status) VALUES
+		('a','/g/a.jpg','2026-01-01','indexed'),
+		('b','/g/b.jpg','2026-02-01','indexed'),
+		('c','/g/c.jpg','2026-03-01','indexed')`)
+	require.NoError(t, err)
+	svc := service.NewAlbumService(db)
+	al, _ := svc.Create("Stability")
+
+	// Add A first — it becomes position=0 (the first item).
+	require.NoError(t, svc.AddAsset(al.ID, "a"))
+
+	got, err := svc.Get(al.ID)
+	require.NoError(t, err)
+	require.Equal(t, "a", got.CoverAssetID, "after adding A, cover should be A")
+
+	// Add B (newer taken_at, position=1) — cover must remain A.
+	require.NoError(t, svc.AddAsset(al.ID, "b"))
+	got, err = svc.Get(al.ID)
+	require.NoError(t, err)
+	require.Equal(t, "a", got.CoverAssetID, "after adding B, implicit cover must still be A")
+
+	// Add C (newest taken_at, position=2) — cover must still be A.
+	require.NoError(t, svc.AddAsset(al.ID, "c"))
+	got, err = svc.Get(al.ID)
+	require.NoError(t, err)
+	require.Equal(t, "a", got.CoverAssetID, "after adding C, implicit cover must still be A")
+
+	// Confirm via List() as well.
+	albums, err := svc.List()
+	require.NoError(t, err)
+	require.Len(t, albums, 1)
+	require.Equal(t, "a", albums[0].CoverAssetID, "List cover must also be A")
+}
+
+// --- Bug 2: removing the explicit cover falls back correctly ---
+
+// TestAlbumRemoveExplicitCoverFallsBackToFirst verifies that when the asset
+// pinned as cover is removed from the album, the cover falls back to the next
+// first-position item and the dangling cover_asset_id is cleared in the DB.
+func TestAlbumRemoveExplicitCoverFallsBackToFirst(t *testing.T) {
+	db, err := sqlite.Open(filepath.Join(t.TempDir(), "test.db"))
+	require.NoError(t, err)
+	defer db.Close()
+
+	_, err = db.Exec(`INSERT INTO assets(id, file_path, status) VALUES
+		('a','/g/a.jpg','indexed'),('b','/g/b.jpg','indexed')`)
+	require.NoError(t, err)
+	svc := service.NewAlbumService(db)
+	al, _ := svc.Create("ExplicitCoverRemove")
+	require.NoError(t, svc.AddAsset(al.ID, "a")) // pos=0
+	require.NoError(t, svc.AddAsset(al.ID, "b")) // pos=1
+	require.NoError(t, svc.UpdateCover(al.ID, "b"))
+
+	// Remove the pinned cover; cover must fall back to 'a'.
+	require.NoError(t, svc.RemoveAsset(al.ID, "b"))
+
+	got, err := svc.Get(al.ID)
+	require.NoError(t, err)
+	require.Equal(t, "a", got.CoverAssetID, "after removing explicit cover B, cover should fall back to A")
+
+	// Write-side hygiene: cover_asset_id must be cleared in the DB (not a dangling pointer).
+	var rawCover string
+	require.NoError(t, db.QueryRow(`SELECT COALESCE(cover_asset_id,'') FROM albums WHERE id=?`, al.ID).Scan(&rawCover))
+	require.Empty(t, rawCover, "cover_asset_id must be cleared in albums row after removing the pinned cover")
+}
+
+// TestAlbumRemoveNonCoverKeepsExplicitCover verifies that removing an asset
+// that is NOT the pinned cover leaves the explicit cover intact.
+func TestAlbumRemoveNonCoverKeepsExplicitCover(t *testing.T) {
+	db, err := sqlite.Open(filepath.Join(t.TempDir(), "test.db"))
+	require.NoError(t, err)
+	defer db.Close()
+
+	_, err = db.Exec(`INSERT INTO assets(id, file_path, status) VALUES
+		('a','/g/a.jpg','indexed'),('b','/g/b.jpg','indexed')`)
+	require.NoError(t, err)
+	svc := service.NewAlbumService(db)
+	al, _ := svc.Create("NonCoverRemove")
+	require.NoError(t, svc.AddAsset(al.ID, "a")) // pos=0, cover pinned to a
+	require.NoError(t, svc.AddAsset(al.ID, "b")) // pos=1
+	require.NoError(t, svc.UpdateCover(al.ID, "a"))
+
+	// Remove B (not the cover) — cover must remain A.
+	require.NoError(t, svc.RemoveAsset(al.ID, "b"))
+
+	got, err := svc.Get(al.ID)
+	require.NoError(t, err)
+	require.Equal(t, "a", got.CoverAssetID, "removing non-cover B must not change explicit cover A")
+}
+
+// TestAlbumDanglingCoverFallsBackToFirstMember simulates a dangling cover_asset_id
+// (asset removed from album_assets by external means, bypassing RemoveAsset).
+// The read-side membership guard must ignore the dangling id and return the first member.
+func TestAlbumDanglingCoverFallsBackToFirstMember(t *testing.T) {
+	db, err := sqlite.Open(filepath.Join(t.TempDir(), "test.db"))
+	require.NoError(t, err)
+	defer db.Close()
+
+	_, err = db.Exec(`INSERT INTO assets(id, file_path, status) VALUES
+		('a','/g/a.jpg','indexed'),('b','/g/b.jpg','indexed')`)
+	require.NoError(t, err)
+	svc := service.NewAlbumService(db)
+	al, _ := svc.Create("DanglingCover")
+	require.NoError(t, svc.AddAsset(al.ID, "a")) // pos=0
+	require.NoError(t, svc.AddAsset(al.ID, "b")) // pos=1
+	require.NoError(t, svc.UpdateCover(al.ID, "b"))
+
+	// Simulate purge / external removal: delete album_assets row directly,
+	// bypassing RemoveAsset so cover_asset_id in albums still points to 'b'.
+	_, err = db.Exec(`DELETE FROM album_assets WHERE album_id=? AND asset_id='b'`, al.ID)
+	require.NoError(t, err)
+
+	// Read-side guard must detect 'b' is no longer a member and fall back to 'a'.
+	got, err := svc.Get(al.ID)
+	require.NoError(t, err)
+	require.Equal(t, "a", got.CoverAssetID,
+		"dangling cover_asset_id must be ignored; cover should fall back to first member")
+
+	// Also verify via List().
+	albums, err := svc.List()
+	require.NoError(t, err)
+	require.Len(t, albums, 1)
+	require.Equal(t, "a", albums[0].CoverAssetID,
+		"List must also apply the membership guard and return the first member")
 }
 
 // --- Taken-at span (min/max of album assets' taken_at) ---

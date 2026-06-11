@@ -45,19 +45,21 @@ func (s *AlbumService) Create(name string) (*Album, error) {
 }
 
 func (s *AlbumService) List() ([]Album, error) {
-	// Cover resolves to the explicit cover_asset_id when set; otherwise it falls
-	// back to the newest asset in the album (by taken_at, then indexed_at). NULL
-	// taken_at values sort last so dated photos win.
+	// Cover resolution uses two layers:
+	// 1. Membership guard: only honour cover_asset_id when the asset is still a
+	//    member of the album (guards against dangling pointers after removal).
+	// 2. Stable implicit fallback: when no valid explicit cover exists, fall back
+	//    to the first item by position (then rowid as tiebreaker), so adding new
+	//    photos never changes an implicit cover.
 	rows, err := s.db.Query(`
 		SELECT a.id, a.name, a.created_at,
-		       COALESCE(NULLIF(a.cover_asset_id,''), (
-		           SELECT aa2.asset_id
-		           FROM album_assets aa2
-		           JOIN assets s ON s.id = aa2.asset_id
-		           WHERE aa2.album_id = a.id
-		           ORDER BY s.taken_at IS NULL, s.taken_at DESC, s.indexed_at DESC
-		           LIMIT 1
-		       ), '') AS cover,
+		       COALESCE(
+		           (SELECT aa3.asset_id FROM album_assets aa3
+		               WHERE aa3.album_id = a.id AND aa3.asset_id = NULLIF(a.cover_asset_id,'')),
+		           (SELECT aa2.asset_id FROM album_assets aa2
+		               WHERE aa2.album_id = a.id
+		               ORDER BY aa2.position ASC, aa2.rowid ASC LIMIT 1),
+		           '') AS cover,
 		       COUNT(aa.asset_id) AS cnt,
 		       MIN(sp.taken_at) AS date_start,
 		       MAX(sp.taken_at) AS date_end,
@@ -92,16 +94,19 @@ func (s *AlbumService) List() ([]Album, error) {
 func (s *AlbumService) Get(id string) (*Album, error) {
 	var a Album
 	var dateStart, dateEnd sql.NullString
+	// Cover resolution (same two-layer logic as List):
+	// - Membership guard: only honour cover_asset_id when it is still a member.
+	// - Stable implicit fallback: first item by position/rowid, so adding photos
+	//   never changes an implicit cover.
 	err := s.db.QueryRow(`
 		SELECT id, name, created_at,
-		       COALESCE(NULLIF(cover_asset_id,''), (
-		           SELECT aa2.asset_id
-		           FROM album_assets aa2
-		           JOIN assets s ON s.id = aa2.asset_id
-		           WHERE aa2.album_id = albums.id
-		           ORDER BY s.taken_at IS NULL, s.taken_at DESC, s.indexed_at DESC
-		           LIMIT 1
-		       ), ''),
+		       COALESCE(
+		           (SELECT aa3.asset_id FROM album_assets aa3
+		               WHERE aa3.album_id = albums.id AND aa3.asset_id = NULLIF(albums.cover_asset_id,'')),
+		           (SELECT aa2.asset_id FROM album_assets aa2
+		               WHERE aa2.album_id = albums.id
+		               ORDER BY aa2.position ASC, aa2.rowid ASC LIMIT 1),
+		           ''),
 		       (SELECT MIN(s.taken_at) FROM album_assets aa
 		          JOIN assets s ON s.id = aa.asset_id WHERE aa.album_id = albums.id),
 		       (SELECT MAX(s.taken_at) FROM album_assets aa
@@ -208,8 +213,22 @@ func (s *AlbumService) AddAsset(albumID, assetID string) error {
 }
 
 func (s *AlbumService) RemoveAsset(albumID, assetID string) error {
-	_, err := s.db.Exec(`DELETE FROM album_assets WHERE album_id=? AND asset_id=?`, albumID, assetID)
-	return err
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	if _, err := tx.Exec(`DELETE FROM album_assets WHERE album_id=? AND asset_id=?`, albumID, assetID); err != nil {
+		return err
+	}
+	// Write-side hygiene: clear cover_asset_id when it points at the removed asset
+	// so the DB doesn't keep a dangling pointer. The read-side membership guard in
+	// List/Get handles any remaining dangling covers (e.g. from external deletions).
+	if _, err := tx.Exec(`UPDATE albums SET cover_asset_id=NULL WHERE id=? AND cover_asset_id=?`, albumID, assetID); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // BatchAddAssets adds multiple assets to an album in a single transaction.
