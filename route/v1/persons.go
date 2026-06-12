@@ -51,18 +51,19 @@ func (h *PersonsHandler) Get(c echo.Context) error {
 	return c.JSON(http.StatusOK, map[string]any{"person": p, "relations": rels})
 }
 
-// PUT /v1/photos/persons/:id  { name?, favorite?, relation? }
+// PUT /v1/photos/persons/:id  { name?, favorite?, relation?, heroAssetId? }
 func (h *PersonsHandler) Update(c echo.Context) error {
 	var req struct {
-		Name     *string `json:"name"`
-		Favorite *bool   `json:"favorite"`
-		Relation *string `json:"relation"`
+		Name        *string `json:"name"`
+		Favorite    *bool   `json:"favorite"`
+		Relation    *string `json:"relation"`
+		HeroAssetID *string `json:"heroAssetId"`
 	}
 	if err := c.Bind(&req); err != nil {
 		return echo.NewHTTPError(http.StatusBadRequest, "invalid request body")
 	}
 	err := h.svc.Persons().UpdatePerson(c.Param("id"),
-		service.PersonPatch{Name: req.Name, Favorite: req.Favorite, Relation: req.Relation})
+		service.PersonPatch{Name: req.Name, Favorite: req.Favorite, Relation: req.Relation, HeroAssetID: req.HeroAssetID})
 	if errors.Is(err, service.ErrNotFound) {
 		return echo.NewHTTPError(http.StatusNotFound)
 	}
@@ -70,6 +71,38 @@ func (h *PersonsHandler) Update(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
 	}
 	return c.JSON(http.StatusOK, map[string]string{"status": "updated"})
+}
+
+// PUT /v1/photos/persons/:id/cover  { assetId: "..." }
+// Pins the cover face to the best face found on the given asset and sets cover_locked=1.
+func (h *PersonsHandler) SetCover(c echo.Context) error {
+	var req struct {
+		AssetID string `json:"assetId"`
+	}
+	if err := c.Bind(&req); err != nil || req.AssetID == "" {
+		return echo.NewHTTPError(http.StatusBadRequest, "assetId required")
+	}
+	faceID, err := h.svc.Persons().SetPersonCover(c.Param("id"), req.AssetID)
+	if errors.Is(err, service.ErrNotFound) {
+		return echo.NewHTTPError(http.StatusNotFound)
+	}
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	}
+	return c.JSON(http.StatusOK, map[string]string{"status": "ok", "coverFaceId": faceID})
+}
+
+// DELETE /v1/photos/persons/:id/cover
+// Clears cover_locked and recomputes cover by centroid distance.
+func (h *PersonsHandler) DeleteCover(c echo.Context) error {
+	faceID, err := h.svc.Persons().UnlockPersonCover(c.Param("id"))
+	if errors.Is(err, service.ErrNotFound) {
+		return echo.NewHTTPError(http.StatusNotFound)
+	}
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	}
+	return c.JSON(http.StatusOK, map[string]string{"status": "ok", "coverFaceId": faceID})
 }
 
 // DELETE /v1/photos/persons/:id

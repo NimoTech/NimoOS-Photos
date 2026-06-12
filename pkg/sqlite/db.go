@@ -332,6 +332,10 @@ func migrate(db *sql.DB) error {
 		// line_count = recognized lines kept after the confidence filter.
 		`ALTER TABLE asset_ocr ADD COLUMN coverage REAL`,
 		`ALTER TABLE asset_ocr ADD COLUMN line_count INTEGER`,
+		// cover_locked=1 means the user has pinned a specific cover face; auto-recompute skips cover update.
+		`ALTER TABLE persons ADD COLUMN cover_locked INTEGER NOT NULL DEFAULT 0`,
+		// hero_asset_id: user-chosen hero/background photo for this person (must have a valid face).
+		`ALTER TABLE persons ADD COLUMN hero_asset_id TEXT`,
 	}
 	for _, stmt := range alters {
 		if _, err := db.Exec(stmt); err != nil &&

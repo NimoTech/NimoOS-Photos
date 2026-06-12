@@ -97,6 +97,9 @@ type Person struct {
 	Name         string     `json:"name"`
 	CoverAssetID string     `json:"coverAssetId,omitempty"`
 	CoverFaceID  string     `json:"coverFaceId,omitempty"`
+	// HeroAssetID is the user-chosen background/hero photo for this person.
+	// Empty when not set or when the referenced asset has been soft-deleted.
+	HeroAssetID string     `json:"heroAssetId,omitempty"`
 	Favorite     bool       `json:"favorite"`
 	Relation     string     `json:"relation"`
 	Confidence   float64    `json:"confidence"`

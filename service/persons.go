@@ -45,7 +45,8 @@ SELECT p.id, p.name, COALESCE(p.cover_asset_id,''), COALESCE(p.cover_face_id,'')
           JOIN asset_exif e ON e.asset_id=fd.asset_id
           WHERE fp.person_id=p.id AND a.deleted_at IS NULL AND a.is_live_photo_video=0
             AND e.latitude IS NOT NULL AND e.longitude IS NOT NULL
-            AND NOT (e.latitude=0 AND e.longitude=0)) AS places
+            AND NOT (e.latitude=0 AND e.longitude=0)) AS places,
+       COALESCE((SELECT a.id FROM assets a WHERE a.id=p.hero_asset_id AND a.deleted_at IS NULL),'') AS hero
 FROM persons p
 WHERE p.hidden=0
 ORDER BY cnt DESC, p.rowid`)
@@ -59,7 +60,7 @@ ORDER BY cnt DESC, p.rowid`)
 		var fav int
 		var first, last sql.NullString
 		var places int
-		if err := rows.Scan(&p.ID, &p.Name, &p.CoverAssetID, &p.CoverFaceID, &fav, &p.Relation, &p.Confidence, &p.Count, &first, &last, &places); err != nil {
+		if err := rows.Scan(&p.ID, &p.Name, &p.CoverAssetID, &p.CoverFaceID, &fav, &p.Relation, &p.Confidence, &p.Count, &first, &last, &places, &p.HeroAssetID); err != nil {
 			return nil, err
 		}
 		p.Favorite = fav != 0
@@ -81,9 +82,10 @@ func (s *PersonService) GetPerson(id string) (*Person, error) {
 	var fav int
 	err := s.db.QueryRow(`
 SELECT p.id, p.name, COALESCE(p.cover_asset_id,''), COALESCE(p.cover_face_id,''),
-       p.favorite, COALESCE(p.relation,''), p.confidence
+       p.favorite, COALESCE(p.relation,''), p.confidence,
+       COALESCE((SELECT a.id FROM assets a WHERE a.id=p.hero_asset_id AND a.deleted_at IS NULL),'') AS hero
 FROM persons p WHERE p.id=? AND p.hidden=0`, id).Scan(
-		&p.ID, &p.Name, &p.CoverAssetID, &p.CoverFaceID, &fav, &p.Relation, &p.Confidence)
+		&p.ID, &p.Name, &p.CoverAssetID, &p.CoverFaceID, &fav, &p.Relation, &p.Confidence, &p.HeroAssetID)
 	if err == sql.ErrNoRows {
 		return nil, ErrNotFound
 	}
@@ -127,14 +129,21 @@ WHERE fp.person_id=? AND a.deleted_at IS NULL AND a.is_live_photo_video=0
 	return &p, nil
 }
 
-// PersonPatch 局部更新字段，nil 表示不改。
+// PersonPatch holds the fields that may be partially updated on a person.
+// A nil pointer means "leave unchanged". HeroAssetID uses a pointer-to-string
+// so that empty string can be used to clear the field (set to NULL).
 type PersonPatch struct {
-	Name     *string
-	Favorite *bool
-	Relation *string
+	Name        *string
+	Favorite    *bool
+	Relation    *string
+	// HeroAssetID: non-nil means update; empty string clears the field.
+	// The asset must contain at least one excluded=0 face for this person;
+	// otherwise UpdatePerson returns ErrNotFound.
+	HeroAssetID *string
 }
 
-// UpdatePerson 局部更新 name/favorite/relation。person 不存在返回 ErrNotFound。
+// UpdatePerson partially updates name/favorite/relation/heroAssetId.
+// Returns ErrNotFound when the person does not exist or heroAssetId validation fails.
 func (s *PersonService) UpdatePerson(id string, patch PersonPatch) error {
 	sets := []string{}
 	args := []any{}
@@ -154,7 +163,36 @@ func (s *PersonService) UpdatePerson(id string, patch PersonPatch) error {
 		sets = append(sets, "relation=?")
 		args = append(args, *patch.Relation)
 	}
+	if patch.HeroAssetID != nil {
+		heroVal := *patch.HeroAssetID
+		if heroVal == "" {
+			// Clear hero.
+			sets = append(sets, "hero_asset_id=NULL")
+		} else {
+			// Validate: the asset must have at least one excluded=0 face for this person.
+			var faceCount int
+			if err := s.db.QueryRow(`
+SELECT COUNT(*) FROM face_person fp
+JOIN face_detections fd ON fd.id=fp.face_id
+WHERE fp.person_id=? AND fd.asset_id=? AND fd.excluded=0`, id, heroVal).Scan(&faceCount); err != nil {
+				return fmt.Errorf("UpdatePerson hero validate: %w", err)
+			}
+			if faceCount == 0 {
+				return ErrNotFound
+			}
+			sets = append(sets, "hero_asset_id=?")
+			args = append(args, heroVal)
+		}
+	}
 	if len(sets) == 0 {
+		// No-op: still verify the person exists.
+		var exists int
+		if err := s.db.QueryRow(`SELECT 1 FROM persons WHERE id=?`, id).Scan(&exists); err != nil {
+			if err == sql.ErrNoRows {
+				return ErrNotFound
+			}
+			return fmt.Errorf("UpdatePerson: %w", err)
+		}
 		return nil
 	}
 	sets = append(sets, "updated_at=CURRENT_TIMESTAMP")
@@ -167,6 +205,118 @@ func (s *PersonService) UpdatePerson(id string, patch PersonPatch) error {
 		return ErrNotFound
 	}
 	return nil
+}
+
+// SetPersonCover pins the cover face/asset for a person to the best face found
+// on the given asset, and sets cover_locked=1. The "best" face is the one with
+// the largest bounding-box area among the person's excluded=0 faces on that asset.
+// Returns the new cover face ID. Returns ErrNotFound if the person does not exist
+// or if no valid face for that person is found on the asset.
+func (s *PersonService) SetPersonCover(personID, assetID string) (string, error) {
+	// Load all excluded=0 faces for this person on the specified asset, ordered by bbox area DESC.
+	rows, err := s.db.Query(`
+SELECT fd.id, fd.bbox
+FROM face_person fp
+JOIN face_detections fd ON fd.id=fp.face_id
+WHERE fp.person_id=? AND fd.asset_id=? AND fd.excluded=0`, personID, assetID)
+	if err != nil {
+		return "", fmt.Errorf("SetPersonCover query: %w", err)
+	}
+	defer rows.Close()
+
+	type faceCandidate struct {
+		id   string
+		area float64
+	}
+	var candidates []faceCandidate
+	for rows.Next() {
+		var fid, bboxStr string
+		if err := rows.Scan(&fid, &bboxStr); err != nil {
+			return "", fmt.Errorf("SetPersonCover scan: %w", err)
+		}
+		var bb struct {
+			X1 float64 `json:"x1"`
+			Y1 float64 `json:"y1"`
+			X2 float64 `json:"x2"`
+			Y2 float64 `json:"y2"`
+		}
+		if jsonErr := json.Unmarshal([]byte(bboxStr), &bb); jsonErr == nil {
+			area := (bb.X2 - bb.X1) * (bb.Y2 - bb.Y1)
+			candidates = append(candidates, faceCandidate{id: fid, area: area})
+		} else {
+			// Unparseable bbox: still a candidate, area=0.
+			candidates = append(candidates, faceCandidate{id: fid, area: 0})
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return "", fmt.Errorf("SetPersonCover iter: %w", err)
+	}
+
+	if len(candidates) == 0 {
+		return "", ErrNotFound
+	}
+
+	// Select the face with the largest bbox area.
+	best := candidates[0]
+	for _, c := range candidates[1:] {
+		if c.area > best.area {
+			best = c
+		}
+	}
+
+	// Write cover_face_id, cover_asset_id, cover_locked=1.
+	res, err := s.db.Exec(`
+UPDATE persons SET cover_face_id=?, cover_asset_id=?, cover_locked=1, updated_at=CURRENT_TIMESTAMP
+WHERE id=?`, best.id, assetID, personID)
+	if err != nil {
+		return "", fmt.Errorf("SetPersonCover update: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return "", ErrNotFound
+	}
+	return best.id, nil
+}
+
+// UnlockPersonCover clears cover_locked=0 and immediately recomputes the cover
+// face/asset using the centroid-nearest-face algorithm (same as recomputeOneCentroidTx).
+// Returns the new cover face ID after recomputation. Returns ErrNotFound if the
+// person does not exist.
+func (s *PersonService) UnlockPersonCover(personID string) (string, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return "", fmt.Errorf("UnlockPersonCover begin: %w", err)
+	}
+	defer tx.Rollback()
+
+	// Verify person exists.
+	var exists int
+	if err := tx.QueryRow(`SELECT 1 FROM persons WHERE id=?`, personID).Scan(&exists); err != nil {
+		if err == sql.ErrNoRows {
+			return "", ErrNotFound
+		}
+		return "", fmt.Errorf("UnlockPersonCover check: %w", err)
+	}
+
+	// Clear the lock.
+	if _, err := tx.Exec(`UPDATE persons SET cover_locked=0, updated_at=CURRENT_TIMESTAMP WHERE id=?`, personID); err != nil {
+		return "", fmt.Errorf("UnlockPersonCover unlock: %w", err)
+	}
+
+	// Recompute cover (now that lock=0, recomputeOneCentroidTx will update it).
+	if err := recomputeOneCentroidTx(tx, personID); err != nil {
+		return "", fmt.Errorf("UnlockPersonCover recompute: %w", err)
+	}
+
+	// Read back the new cover_face_id.
+	var coverFaceID sql.NullString
+	if err := tx.QueryRow(`SELECT cover_face_id FROM persons WHERE id=?`, personID).Scan(&coverFaceID); err != nil {
+		return "", fmt.Errorf("UnlockPersonCover read: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return "", fmt.Errorf("UnlockPersonCover commit: %w", err)
+	}
+	return coverFaceID.String, nil
 }
 
 // PurgePerson permanently deletes a person group in a single transaction:
@@ -523,12 +673,27 @@ WHERE fp.person_id = ? AND fd.excluded = 0 AND fd.asset_id IN (%s)`, strings.Joi
 		return 0, fmt.Errorf("DetachAssetsFromPerson unbind: %w", err)
 	}
 
-	// 重算质心 / cover / confidence（vecs=0 时 recomputeOneCentroidTx 直接 return，不会清空字段）
+	// Clear hero_asset_id when the hero asset is among the detached assets.
+	assetSet := make(map[string]bool, len(assetIDs))
+	for _, aid := range assetIDs {
+		assetSet[aid] = true
+	}
+	var currentHero sql.NullString
+	if err := tx.QueryRow(`SELECT hero_asset_id FROM persons WHERE id=?`, personID).Scan(&currentHero); err != nil {
+		return 0, fmt.Errorf("DetachAssetsFromPerson load hero: %w", err)
+	}
+	if currentHero.Valid && currentHero.String != "" && assetSet[currentHero.String] {
+		if _, err := tx.Exec(`UPDATE persons SET hero_asset_id=NULL WHERE id=?`, personID); err != nil {
+			return 0, fmt.Errorf("DetachAssetsFromPerson clear hero: %w", err)
+		}
+	}
+
+	// Recompute centroid / cover / confidence (recomputeOneCentroidTx returns early when vecs=0).
 	if err := recomputeOneCentroidTx(tx, personID); err != nil {
 		return 0, fmt.Errorf("DetachAssetsFromPerson recompute: %w", err)
 	}
 
-	// 若剩余 0 脸且 person 非锚定，删除该 person
+	// If 0 faces remain and person is not anchored, delete it.
 	var remaining int
 	if err := tx.QueryRow(`SELECT COUNT(*) FROM face_person WHERE person_id=?`, personID).Scan(&remaining); err != nil {
 		return 0, fmt.Errorf("DetachAssetsFromPerson count: %w", err)
@@ -547,9 +712,10 @@ WHERE fp.person_id = ? AND fd.excluded = 0 AND fd.asset_id IN (%s)`, strings.Joi
 				return 0, fmt.Errorf("DetachAssetsFromPerson delete empty: %w", err)
 			}
 		} else {
-			// 锚定 person 保留，但清空 cover_*（recomputeOneCentroidTx 在 vecs=0 时已 return，未更新）
+			// Anchored person is kept but cover/centroid/lock/hero are all cleared
+			// (recomputeOneCentroidTx returned early with vecs=0, so we do it here).
 			if _, err := tx.Exec(
-				`UPDATE persons SET cover_face_id=NULL, cover_asset_id=NULL, centroid=NULL, confidence=0, updated_at=CURRENT_TIMESTAMP WHERE id=?`,
+				`UPDATE persons SET cover_face_id=NULL, cover_asset_id=NULL, cover_locked=0, hero_asset_id=NULL, centroid=NULL, confidence=0, updated_at=CURRENT_TIMESTAMP WHERE id=?`,
 				personID,
 			); err != nil {
 				return 0, fmt.Errorf("DetachAssetsFromPerson clear cover: %w", err)
@@ -581,12 +747,18 @@ func suggestionReason(name string, conf float64) string {
 	return fmt.Sprintf("两个集群的人脸高度相似（%.0f%%），可能是同一个人。", conf*100)
 }
 
-// recomputeOneCentroidTx 在事务内重算单个 person 的 centroid/confidence/cover_face_id。
+// recomputeOneCentroidTx recomputes centroid and confidence for a person within a
+// transaction. Cover face/asset are only updated when cover_locked=0.
+//
+// Lock-invalidation rule: if cover_locked=1 but the currently stored cover_face_id
+// is no longer in the person's excluded=0 face set (e.g. it was detached), the lock
+// is cleared and cover is reselected by centroid distance.
 func recomputeOneCentroidTx(tx *sql.Tx, personID string) error {
+	// Load all active (excluded=0) faces for centroid computation.
 	rows, err := tx.Query(`
 SELECT fd.id, fd.asset_id, fd.embedding
 FROM face_person fp JOIN face_detections fd ON fd.id=fp.face_id
-WHERE fp.person_id=?`, personID)
+WHERE fp.person_id=? AND fd.excluded=0`, personID)
 	if err != nil {
 		return err
 	}
@@ -613,6 +785,40 @@ WHERE fp.person_id=?`, personID)
 	}
 	centroid := ComputeCentroid(vecs)
 	conf := ClusterConfidence(vecs, centroid)
+
+	// Check whether cover is locked and whether the locked face is still valid.
+	var locked int
+	var lockedFaceID sql.NullString
+	if err := tx.QueryRow(`SELECT cover_locked, cover_face_id FROM persons WHERE id=?`, personID).
+		Scan(&locked, &lockedFaceID); err != nil {
+		return err
+	}
+
+	updateCover := true
+	if locked == 1 && lockedFaceID.Valid && lockedFaceID.String != "" {
+		// Check if the locked face is still in the active face set.
+		lockedFaceStillValid := false
+		for _, fid := range faceIDs {
+			if fid == lockedFaceID.String {
+				lockedFaceStillValid = true
+				break
+			}
+		}
+		if lockedFaceStillValid {
+			// Locked face is valid: keep cover, only update centroid/confidence.
+			_, err = tx.Exec(
+				`UPDATE persons SET centroid=?, confidence=?, updated_at=CURRENT_TIMESTAMP WHERE id=?`,
+				sqlite.SerializeFloat32(centroid), conf, personID)
+			return err
+		}
+		// Locked face is gone: clear the lock and fall through to reselect.
+		if _, err := tx.Exec(`UPDATE persons SET cover_locked=0 WHERE id=?`, personID); err != nil {
+			return err
+		}
+	}
+	_ = updateCover // always true at this point
+
+	// Select cover by centroid distance.
 	best, bestDist := 0, 2.0
 	for i, v := range vecs {
 		if d := cosDist(v, centroid); d < bestDist {
@@ -620,7 +826,8 @@ WHERE fp.person_id=?`, personID)
 			best = i
 		}
 	}
-	_, err = tx.Exec(`UPDATE persons SET centroid=?, confidence=?, cover_face_id=?, cover_asset_id=?, updated_at=CURRENT_TIMESTAMP WHERE id=?`,
+	_, err = tx.Exec(
+		`UPDATE persons SET centroid=?, confidence=?, cover_face_id=?, cover_asset_id=?, updated_at=CURRENT_TIMESTAMP WHERE id=?`,
 		sqlite.SerializeFloat32(centroid), conf, faceIDs[best], assetIDs[best], personID)
 	return err
 }

@@ -624,3 +624,319 @@ func TestPurgePerson_RecluterDoesNotResurrect(t *testing.T) {
 		WHERE fd.asset_id IN ('res-a1','res-a2')`).Scan(&bound))
 	require.Equal(t, 0, bound, "excluded faces must not be re-bound after recluster")
 }
+
+// ---------------------------------------------------------------------------
+// SetPersonCover / UnlockPersonCover tests
+// ---------------------------------------------------------------------------
+
+// insertFaceWithBBox inserts a face detection with the given bbox and returns its ID.
+func insertFaceWithBBox(t *testing.T, db *sql.DB, assetID, faceID, bbox string, vec []float32) {
+	t.Helper()
+	_, err := db.Exec(
+		`INSERT INTO face_detections(id, asset_id, bbox, embedding) VALUES(?,?,?,?)`,
+		faceID, assetID, bbox, sqlite.SerializeFloat32(vec))
+	require.NoError(t, err)
+}
+
+func TestSetPersonCover_SuccessSelectsLargestBBox(t *testing.T) {
+	db := makeTestFaceDB(t)
+	dim := 512
+	v := make([]float32, dim)
+	v[0] = 1.0
+	// Two faces on the same asset with different bbox sizes.
+	insertAssetFace(t, db, "sc-a1", normalize(v)) // small bbox (inserted via insertAssetFace, bbox={})
+	// Insert a second face on sc-a1 with a larger explicit bbox.
+	insertFaceWithBBox(t, db, "sc-a1", "sc-face-big",
+		`{"x1":0,"y1":0,"x2":200,"y2":200}`, normalize(v))
+	// Insert a third face on a different asset to give the person >1 asset.
+	insertAssetFace(t, db, "sc-a2", normalize(v))
+
+	require.NoError(t, service.NewFaceService(db).RunClustering(context.Background()))
+	personID := mustFirstPersonID(t, db)
+
+	ps := service.NewPersonService(db)
+	gotFaceID, err := ps.SetPersonCover(personID, "sc-a1")
+	require.NoError(t, err)
+	// The face with the bigger bbox (sc-face-big) should be chosen.
+	require.Equal(t, "sc-face-big", gotFaceID)
+
+	// Verify DB state.
+	var coverFace, coverAsset string
+	var locked int
+	require.NoError(t, db.QueryRow(
+		`SELECT COALESCE(cover_face_id,''), COALESCE(cover_asset_id,''), cover_locked FROM persons WHERE id=?`, personID,
+	).Scan(&coverFace, &coverAsset, &locked))
+	require.Equal(t, "sc-face-big", coverFace)
+	require.Equal(t, "sc-a1", coverAsset)
+	require.Equal(t, 1, locked, "cover_locked must be 1 after SetPersonCover")
+}
+
+func TestSetPersonCover_NoFaceOnAsset_ReturnsNotFound(t *testing.T) {
+	db := makeTestFaceDB(t)
+	dim := 512
+	v := make([]float32, dim)
+	v[0] = 1.0
+	insertAssetFace(t, db, "scnf-a1", normalize(v))
+	require.NoError(t, service.NewFaceService(db).RunClustering(context.Background()))
+	personID := mustFirstPersonID(t, db)
+
+	ps := service.NewPersonService(db)
+	// Try to set cover using an asset that has no face for this person.
+	_, err := ps.SetPersonCover(personID, "nonexistent-asset")
+	require.ErrorIs(t, err, service.ErrNotFound)
+}
+
+func TestSetPersonCover_PersonNotFound_ReturnsNotFound(t *testing.T) {
+	db := makeTestFaceDB(t)
+	ps := service.NewPersonService(db)
+	_, err := ps.SetPersonCover("no-person", "some-asset")
+	require.ErrorIs(t, err, service.ErrNotFound)
+}
+
+func TestRecomputeOneCentroid_LockedCoverNotOverwritten(t *testing.T) {
+	// After SetPersonCover, a recompute triggered by (e.g.) DetachAssetsFromPerson
+	// must NOT overwrite the locked cover face.
+	db := makeTestFaceDB(t)
+	dim := 512
+	v := make([]float32, dim)
+	v[0] = 1.0
+	insertAssetFace(t, db, "lk-a1", normalize(v))
+	insertAssetFace(t, db, "lk-a2", normalize(v))
+	insertAssetFace(t, db, "lk-a3", normalize(v))
+	require.NoError(t, service.NewFaceService(db).RunClustering(context.Background()))
+	personID := mustFirstPersonID(t, db)
+
+	ps := service.NewPersonService(db)
+	// Lock cover to lk-a1.
+	_, err := ps.SetPersonCover(personID, "lk-a1")
+	require.NoError(t, err)
+
+	// Detach lk-a3; this triggers recomputeOneCentroidTx internally.
+	_, err = ps.DetachAssetsFromPerson(personID, []string{"lk-a3"})
+	require.NoError(t, err)
+
+	// Cover should still be on lk-a1.
+	var coverAsset string
+	var locked int
+	require.NoError(t, db.QueryRow(
+		`SELECT COALESCE(cover_asset_id,''), cover_locked FROM persons WHERE id=?`, personID,
+	).Scan(&coverAsset, &locked))
+	require.Equal(t, "lk-a1", coverAsset, "locked cover must survive recompute")
+	require.Equal(t, 1, locked)
+}
+
+func TestRecomputeOneCentroid_LockedCoverFaceDetached_LockCleared(t *testing.T) {
+	// When the locked cover face is itself detached, the lock should be cleared
+	// and cover reselected automatically.
+	db := makeTestFaceDB(t)
+	dim := 512
+	v := make([]float32, dim)
+	v[0] = 1.0
+	insertAssetFace(t, db, "lkd-a1", normalize(v))
+	insertAssetFace(t, db, "lkd-a2", normalize(v))
+	require.NoError(t, service.NewFaceService(db).RunClustering(context.Background()))
+	personID := mustFirstPersonID(t, db)
+
+	ps := service.NewPersonService(db)
+	// Lock cover to lkd-a1.
+	_, err := ps.SetPersonCover(personID, "lkd-a1")
+	require.NoError(t, err)
+
+	// Detach the locked asset (lkd-a1); lock must be cleared and cover reselected.
+	_, err = ps.DetachAssetsFromPerson(personID, []string{"lkd-a1"})
+	require.NoError(t, err)
+
+	var coverAsset string
+	var locked int
+	require.NoError(t, db.QueryRow(
+		`SELECT COALESCE(cover_asset_id,''), cover_locked FROM persons WHERE id=?`, personID,
+	).Scan(&coverAsset, &locked))
+	require.Equal(t, 0, locked, "lock must be cleared when locked face is detached")
+	// The remaining face (lkd-a2) should now be the cover.
+	require.Equal(t, "lkd-a2", coverAsset)
+}
+
+func TestUnlockPersonCover_RecomputesAndReturnsNewFaceID(t *testing.T) {
+	db := makeTestFaceDB(t)
+	dim := 512
+	v := make([]float32, dim)
+	v[0] = 1.0
+	insertAssetFace(t, db, "ul-a1", normalize(v))
+	insertAssetFace(t, db, "ul-a2", normalize(v))
+	require.NoError(t, service.NewFaceService(db).RunClustering(context.Background()))
+	personID := mustFirstPersonID(t, db)
+
+	ps := service.NewPersonService(db)
+	// Lock to ul-a1.
+	_, err := ps.SetPersonCover(personID, "ul-a1")
+	require.NoError(t, err)
+
+	// Unlock: should clear the lock and recompute.
+	newFaceID, err := ps.UnlockPersonCover(personID)
+	require.NoError(t, err)
+	require.NotEmpty(t, newFaceID)
+
+	var locked int
+	require.NoError(t, db.QueryRow(`SELECT cover_locked FROM persons WHERE id=?`, personID).Scan(&locked))
+	require.Equal(t, 0, locked, "lock must be 0 after UnlockPersonCover")
+}
+
+func TestUnlockPersonCover_PersonNotFound(t *testing.T) {
+	db := makeTestFaceDB(t)
+	ps := service.NewPersonService(db)
+	_, err := ps.UnlockPersonCover("no-such")
+	require.ErrorIs(t, err, service.ErrNotFound)
+}
+
+// ---------------------------------------------------------------------------
+// heroAssetId patch tests
+// ---------------------------------------------------------------------------
+
+func TestUpdatePerson_HeroAssetID_SetAndClear(t *testing.T) {
+	db := makeTestFaceDB(t)
+	dim := 512
+	v := make([]float32, dim)
+	v[0] = 1.0
+	insertAssetFace(t, db, "ha-a1", normalize(v))
+	require.NoError(t, service.NewFaceService(db).RunClustering(context.Background()))
+	personID := mustFirstPersonID(t, db)
+
+	ps := service.NewPersonService(db)
+
+	// Set hero to ha-a1 (has a face for this person).
+	heroVal := "ha-a1"
+	require.NoError(t, ps.UpdatePerson(personID, service.PersonPatch{HeroAssetID: &heroVal}))
+
+	// GetPerson and ListPersons must return heroAssetId.
+	p, err := ps.GetPerson(personID)
+	require.NoError(t, err)
+	require.Equal(t, "ha-a1", p.HeroAssetID)
+
+	list, err := ps.ListPersons()
+	require.NoError(t, err)
+	require.Len(t, list, 1)
+	require.Equal(t, "ha-a1", list[0].HeroAssetID)
+
+	// Clear hero with empty string.
+	empty := ""
+	require.NoError(t, ps.UpdatePerson(personID, service.PersonPatch{HeroAssetID: &empty}))
+	p2, err := ps.GetPerson(personID)
+	require.NoError(t, err)
+	require.Empty(t, p2.HeroAssetID)
+}
+
+func TestUpdatePerson_HeroAssetID_NoFaceValidationFails(t *testing.T) {
+	db := makeTestFaceDB(t)
+	dim := 512
+	v := make([]float32, dim)
+	v[0] = 1.0
+	insertAssetFace(t, db, "hav-a1", normalize(v))
+	require.NoError(t, service.NewFaceService(db).RunClustering(context.Background()))
+	personID := mustFirstPersonID(t, db)
+
+	ps := service.NewPersonService(db)
+	// Try to set hero to an asset that has no face for this person.
+	badAsset := "nonexistent-asset"
+	err := ps.UpdatePerson(personID, service.PersonPatch{HeroAssetID: &badAsset})
+	require.ErrorIs(t, err, service.ErrNotFound)
+}
+
+func TestUpdatePerson_HeroAssetID_SoftDeletedAssetReturnsEmpty(t *testing.T) {
+	// If the hero asset is soft-deleted, GetPerson/ListPersons must return empty heroAssetId.
+	db := makeTestFaceDB(t)
+	dim := 512
+	v := make([]float32, dim)
+	v[0] = 1.0
+	insertAssetFace(t, db, "hsd-a1", normalize(v))
+	require.NoError(t, service.NewFaceService(db).RunClustering(context.Background()))
+	personID := mustFirstPersonID(t, db)
+
+	ps := service.NewPersonService(db)
+	heroVal := "hsd-a1"
+	require.NoError(t, ps.UpdatePerson(personID, service.PersonPatch{HeroAssetID: &heroVal}))
+
+	// Soft-delete the asset.
+	_, err := db.Exec(`UPDATE assets SET deleted_at='2026-01-01 00:00:00' WHERE id='hsd-a1'`)
+	require.NoError(t, err)
+
+	p, err := ps.GetPerson(personID)
+	require.NoError(t, err)
+	require.Empty(t, p.HeroAssetID, "soft-deleted hero asset must not be returned")
+
+	list, err := ps.ListPersons()
+	require.NoError(t, err)
+	require.Len(t, list, 1)
+	require.Empty(t, list[0].HeroAssetID, "soft-deleted hero asset must not appear in list")
+}
+
+func TestDetachAssetsFromPerson_ClearsHeroWhenDetached(t *testing.T) {
+	db := makeTestFaceDB(t)
+	dim := 512
+	v := make([]float32, dim)
+	v[0] = 1.0
+	insertAssetFace(t, db, "dh-a1", normalize(v))
+	insertAssetFace(t, db, "dh-a2", normalize(v))
+	require.NoError(t, service.NewFaceService(db).RunClustering(context.Background()))
+	personID := mustFirstPersonID(t, db)
+
+	ps := service.NewPersonService(db)
+	heroVal := "dh-a1"
+	require.NoError(t, ps.UpdatePerson(personID, service.PersonPatch{HeroAssetID: &heroVal}))
+
+	// Detach dh-a1; hero_asset_id must be cleared.
+	_, err := ps.DetachAssetsFromPerson(personID, []string{"dh-a1"})
+	require.NoError(t, err)
+
+	var heroAsset sql.NullString
+	require.NoError(t, db.QueryRow(`SELECT hero_asset_id FROM persons WHERE id=?`, personID).Scan(&heroAsset))
+	require.False(t, heroAsset.Valid || heroAsset.String != "", "hero_asset_id must be cleared when its asset is detached")
+}
+
+func TestMergePersons_LockedCoverPreserved(t *testing.T) {
+	// After merging, into's locked cover must not be overwritten by recompute.
+	db := makeTestFaceDB(t)
+	dim := 512
+	a := make([]float32, dim)
+	a[0] = 1.0
+	b := make([]float32, dim)
+	b[1] = 1.0
+	insertAssetFace(t, db, "mlk-a", normalize(a))
+	insertAssetFace(t, db, "mlk-b", normalize(b))
+	require.NoError(t, service.NewFaceService(db).RunClustering(context.Background()))
+
+	rows, err := db.Query(`SELECT id FROM persons ORDER BY rowid`)
+	require.NoError(t, err)
+	var pids []string
+	for rows.Next() {
+		var id string
+		require.NoError(t, rows.Scan(&id))
+		pids = append(pids, id)
+	}
+	rows.Close()
+	require.Len(t, pids, 2)
+
+	from, into := pids[0], pids[1]
+
+	ps := service.NewPersonService(db)
+
+	// Find which asset belongs to into before merging.
+	var intoCoverAsset string
+	require.NoError(t, db.QueryRow(`SELECT COALESCE(cover_asset_id,'') FROM persons WHERE id=?`, into).Scan(&intoCoverAsset))
+	require.NotEmpty(t, intoCoverAsset)
+
+	// Lock the cover for into.
+	_, err = ps.SetPersonCover(into, intoCoverAsset)
+	require.NoError(t, err)
+
+	// Merge from → into.
+	require.NoError(t, service.NewSearchService(db, nil).MergePersons(from, into))
+
+	// into's cover_asset_id must still be intoCoverAsset (lock preserved).
+	var coverAsset string
+	var locked int
+	require.NoError(t, db.QueryRow(
+		`SELECT COALESCE(cover_asset_id,''), cover_locked FROM persons WHERE id=?`, into,
+	).Scan(&coverAsset, &locked))
+	require.Equal(t, intoCoverAsset, coverAsset, "locked cover must be preserved after merge")
+	require.Equal(t, 1, locked, "cover_locked must remain 1 after merge")
+}

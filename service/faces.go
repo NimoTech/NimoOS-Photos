@@ -564,21 +564,31 @@ func (s *FaceService) rebuildPersonsWithProgress(ctx context.Context, faces []fa
 	return err
 }
 
-// recomputePersonStatsTx 在事务内为每个 person 重算 centroid、confidence、cover_face_id。
-// cover_face_id 取该 person 名下「最接近质心」的脸；cover_asset_id 同步为该脸所属 asset。
+// recomputePersonStatsTx recomputes centroid and confidence for every person in
+// the transaction. Cover face/asset respect the cover_locked flag: when locked
+// and the stored cover face is still in the active face set, only centroid and
+// confidence are updated; if the locked face has been detached (excluded), the
+// lock is cleared and cover is reselected by centroid distance.
 func (s *FaceService) recomputePersonStatsTx(ctx context.Context, tx *sql.Tx) error {
-	prows, err := tx.QueryContext(ctx, `SELECT id FROM persons`)
+	// Load all person IDs along with their lock state and current cover face.
+	prows, err := tx.QueryContext(ctx,
+		`SELECT id, cover_locked, COALESCE(cover_face_id,'') FROM persons`)
 	if err != nil {
 		return err
 	}
-	var ids []string
+	type personMeta struct {
+		id          string
+		locked      int
+		coverFaceID string
+	}
+	var metas []personMeta
 	for prows.Next() {
-		var id string
-		if err = prows.Scan(&id); err != nil {
+		var m personMeta
+		if err = prows.Scan(&m.id, &m.locked, &m.coverFaceID); err != nil {
 			prows.Close()
 			return err
 		}
-		ids = append(ids, id)
+		metas = append(metas, m)
 	}
 	if cerr := prows.Err(); cerr != nil {
 		prows.Close()
@@ -586,21 +596,30 @@ func (s *FaceService) recomputePersonStatsTx(ctx context.Context, tx *sql.Tx) er
 	}
 	prows.Close()
 
-	// 预编译 UPDATE，避免在循环内重复解析 SQL。
-	updateStmt, err := tx.PrepareContext(ctx,
+	// Prepare two UPDATE variants to avoid repeated SQL parsing in the loop.
+	// coverStmt: update centroid + confidence + cover face/asset (cover not locked).
+	coverStmt, err := tx.PrepareContext(ctx,
 		`UPDATE persons SET centroid=?, confidence=?, cover_face_id=?, cover_asset_id=?, updated_at=? WHERE id=?`)
 	if err != nil {
 		return err
 	}
-	defer updateStmt.Close()
+	defer coverStmt.Close()
+
+	// statsOnlyStmt: update centroid + confidence only (cover locked and still valid).
+	statsOnlyStmt, err := tx.PrepareContext(ctx,
+		`UPDATE persons SET centroid=?, confidence=?, updated_at=? WHERE id=?`)
+	if err != nil {
+		return err
+	}
+	defer statsOnlyStmt.Close()
 
 	now := time.Now()
-	for _, pid := range ids {
+	for _, meta := range metas {
 		fr, ferr := tx.QueryContext(ctx, `
 			SELECT fd.id, fd.asset_id, fd.embedding
 			FROM face_person fp
 			JOIN face_detections fd ON fd.id = fp.face_id
-			WHERE fp.person_id = ? AND fd.excluded = 0`, pid)
+			WHERE fp.person_id = ? AND fd.excluded = 0`, meta.id)
 		if ferr != nil {
 			return ferr
 		}
@@ -628,7 +647,32 @@ func (s *FaceService) recomputePersonStatsTx(ctx context.Context, tx *sql.Tx) er
 		}
 		centroid := ComputeCentroid(vecs)
 		conf := ClusterConfidence(vecs, centroid)
-		// 选最接近质心的脸做封面
+
+		// Determine whether to preserve the locked cover face.
+		if meta.locked == 1 && meta.coverFaceID != "" {
+			lockedFaceValid := false
+			for _, fid := range faceIDs {
+				if fid == meta.coverFaceID {
+					lockedFaceValid = true
+					break
+				}
+			}
+			if lockedFaceValid {
+				// Cover is locked and the face is still active: only update stats.
+				if _, err = statsOnlyStmt.ExecContext(ctx,
+					sqlite.SerializeFloat32(centroid), conf, now, meta.id); err != nil {
+					return err
+				}
+				continue
+			}
+			// Locked face was detached: clear the lock so cover gets reselected below.
+			if _, err = tx.ExecContext(ctx,
+				`UPDATE persons SET cover_locked=0 WHERE id=?`, meta.id); err != nil {
+				return err
+			}
+		}
+
+		// Select the face nearest to the centroid as cover.
 		bestIdx, bestDist := 0, math.MaxFloat64
 		for i, v := range vecs {
 			if d := cosDist(v, centroid); d < bestDist {
@@ -636,8 +680,8 @@ func (s *FaceService) recomputePersonStatsTx(ctx context.Context, tx *sql.Tx) er
 				bestIdx = i
 			}
 		}
-		if _, err = updateStmt.ExecContext(ctx,
-			sqlite.SerializeFloat32(centroid), conf, faceIDs[bestIdx], assetIDs[bestIdx], now, pid); err != nil {
+		if _, err = coverStmt.ExecContext(ctx,
+			sqlite.SerializeFloat32(centroid), conf, faceIDs[bestIdx], assetIDs[bestIdx], now, meta.id); err != nil {
 			return err
 		}
 	}

@@ -161,6 +161,8 @@ func InitRouter(ctx context.Context, svc service.Services, runtimePath string, t
 	g.GET("/persons/:id/places", persons.Places)
 	g.GET("/persons/:id/face-thumbnail", persons.FaceThumbnail)
 	g.POST("/persons/:id/detach", persons.Detach)
+	g.PUT("/persons/:id/cover", persons.SetCover)
+	g.DELETE("/persons/:id/cover", persons.DeleteCover)
 
 	// Indexer status/control
 	g.GET("/status", index.Status)
