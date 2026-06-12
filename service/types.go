@@ -134,6 +134,10 @@ type PersonPlace struct {
 	Latitude  float64    `json:"latitude"`
 	Longitude float64    `json:"longitude"`
 	TakenAt   *time.Time `json:"takenAt,omitempty"`
+	// PlaceName is the human-readable location derived from asset_geo,
+	// assembled as "City, Country" when both are known, "City" when only city
+	// is available, or empty when no geo data exists for the asset.
+	PlaceName string `json:"placeName,omitempty"`
 }
 
 type Album struct {

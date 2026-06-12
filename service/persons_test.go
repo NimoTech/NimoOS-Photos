@@ -224,6 +224,55 @@ func TestPersonPlaces(t *testing.T) {
 	require.True(t, hasTime)
 }
 
+// TestPersonPlaces_PlaceName verifies that PersonPlaces enriches each GPS point
+// with the correct human-readable place name derived from asset_geo.
+func TestPersonPlaces_PlaceName(t *testing.T) {
+	db := makeTestFaceDB(t)
+	dim := 512
+	a := make([]float32, dim)
+	a[0] = 1.0
+
+	// Three assets for the same person, each with a different geo scenario:
+	//   pg-a1: city + country → "Tokyo, Japan"
+	//   pg-a2: city only     → "Paris"
+	//   pg-a3: no geo row    → ""
+	insertAssetFace(t, db, "pg-a1", normalize(a))
+	insertAssetFace(t, db, "pg-a2", normalize(a))
+	insertAssetFace(t, db, "pg-a3", normalize(a))
+
+	_, err := db.Exec(`INSERT INTO asset_exif(asset_id, latitude, longitude) VALUES('pg-a1', 35.6, 139.6)`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO asset_exif(asset_id, latitude, longitude) VALUES('pg-a2', 48.8, 2.3)`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO asset_exif(asset_id, latitude, longitude) VALUES('pg-a3', 51.5, -0.1)`)
+	require.NoError(t, err)
+
+	// Insert asset_geo rows for pg-a1 (city+country) and pg-a2 (city only).
+	_, err = db.Exec(`INSERT INTO asset_geo(asset_id, city, country) VALUES('pg-a1', 'Tokyo', 'Japan')`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO asset_geo(asset_id, city, country) VALUES('pg-a2', 'Paris', '')`)
+	require.NoError(t, err)
+	// pg-a3 intentionally has no asset_geo row.
+
+	require.NoError(t, service.NewFaceService(db).RunClustering(context.Background()))
+
+	ps := service.NewPersonService(db)
+	id := mustFirstPersonID(t, db)
+	pts, err := ps.PersonPlaces(id)
+	require.NoError(t, err)
+	require.Len(t, pts, 3)
+
+	// Build a map from lat→PlaceName for deterministic lookup.
+	byLat := map[float64]string{}
+	for _, p := range pts {
+		byLat[p.Latitude] = p.PlaceName
+	}
+
+	require.Equal(t, "Tokyo, Japan", byLat[35.6], "city+country should produce 'City, Country'")
+	require.Equal(t, "Paris", byLat[48.8], "city-only should produce just the city name")
+	require.Equal(t, "", byLat[51.5], "no geo row should produce empty string")
+}
+
 func TestMergeSuggestions_StableOrder(t *testing.T) {
 	db := makeTestFaceDB(t)
 	dim := 512

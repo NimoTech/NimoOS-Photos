@@ -437,13 +437,18 @@ SELECT MAX(a.indexed_at) FROM face_detections fd JOIN assets a ON a.id=fd.asset_
 }
 
 // PersonPlaces 返回该 person 照片的 GPS 点（前端做国家/城市级聚合）。
+// Each point is enriched with a human-readable PlaceName from asset_geo using
+// the same rule as enrichPlaceNames: "City, Country" when both are available,
+// "City" when only city is known, or empty string otherwise.
 func (s *PersonService) PersonPlaces(id string) ([]PersonPlace, error) {
 	rows, err := s.db.Query(`
-SELECT e.latitude, e.longitude, a.taken_at
+SELECT e.latitude, e.longitude, a.taken_at,
+       COALESCE(g.city, ''), COALESCE(g.country, '')
 FROM face_person fp
 JOIN face_detections fd ON fd.id=fp.face_id
 JOIN assets a ON a.id=fd.asset_id AND a.deleted_at IS NULL AND a.is_live_photo_video=0
 JOIN asset_exif e ON e.asset_id=a.id
+LEFT JOIN asset_geo g ON g.asset_id=a.id
 WHERE fp.person_id=? AND e.latitude IS NOT NULL AND e.longitude IS NOT NULL
   AND NOT (e.latitude=0 AND e.longitude=0)`, id)
 	if err != nil {
@@ -454,11 +459,19 @@ WHERE fp.person_id=? AND e.latitude IS NOT NULL AND e.longitude IS NOT NULL
 	for rows.Next() {
 		var pl PersonPlace
 		var taken sql.NullString
-		if err := rows.Scan(&pl.Latitude, &pl.Longitude, &taken); err != nil {
+		var city, country string
+		if err := rows.Scan(&pl.Latitude, &pl.Longitude, &taken, &city, &country); err != nil {
 			return nil, fmt.Errorf("PersonPlaces scan: %w", err)
 		}
 		if tt := parseSQLiteTime(taken); tt != nil {
 			pl.TakenAt = tt
+		}
+		// Assemble place name following the same rule as enrichPlaceNames:
+		// "City, Country" > "City" > "".
+		if city != "" && country != "" {
+			pl.PlaceName = city + ", " + country
+		} else if city != "" {
+			pl.PlaceName = city
 		}
 		out = append(out, pl)
 	}
