@@ -794,7 +794,6 @@ WHERE fp.person_id=? AND fd.excluded=0`, personID)
 		return err
 	}
 
-	updateCover := true
 	if locked == 1 && lockedFaceID.Valid && lockedFaceID.String != "" {
 		// Check if the locked face is still in the active face set.
 		lockedFaceStillValid := false
@@ -816,8 +815,6 @@ WHERE fp.person_id=? AND fd.excluded=0`, personID)
 			return err
 		}
 	}
-	_ = updateCover // always true at this point
-
 	// Select cover by centroid distance.
 	best, bestDist := 0, 2.0
 	for i, v := range vecs {
