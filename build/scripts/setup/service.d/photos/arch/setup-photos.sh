@@ -42,6 +42,12 @@ install_photos_ml() {
         echo "🟨 docker not found, skipping Photos AI ML setup."
         return 0
     fi
+    # Idempotent: if the bundled ML image is already loaded, skip the (~443MB)
+    # download + load. Prevents re-pulling on every update / repeated setup runs.
+    if docker image inspect localhost/nimoos-photos-ml:bundled >/dev/null 2>&1; then
+        echo "🟩 Photos AI ML image already present, skipping download."
+        return 0
+    fi
     local tmp
     tmp="$(mktemp -d)"
     echo "  -> Downloading ${BUNDLE} ..."
