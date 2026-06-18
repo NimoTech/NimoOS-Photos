@@ -8,11 +8,13 @@ import (
 	"strconv"
 	"strings"
 
+	commonUpload "github.com/NimoTech/NimoOS-Common/upload"
 	"github.com/NimoTech/NimoOS-Common/external"
 	"github.com/NimoTech/NimoOS-Common/utils/jwt"
 	"github.com/NimoTech/NimoOS-Photos/common"
 	v1 "github.com/NimoTech/NimoOS-Photos/route/v1"
 	"github.com/NimoTech/NimoOS-Photos/service"
+	"github.com/NimoTech/NimoOS-Photos/service/uploadstore"
 	"github.com/labstack/echo/v4"
 	echo_middleware "github.com/labstack/echo/v4/middleware"
 	"go.uber.org/zap"
@@ -188,9 +190,27 @@ func InitRouter(ctx context.Context, svc service.Services, runtimePath string, t
 	smartViews := v1.NewSmartViewsHandler(svc)
 	v1.RegisterSmartViewRoutes(g, smartViews)
 
+	// 构造 upload Store(连接 photos.db),供 TUS handler 与 uploads API 共用。
+	uploadStore := uploadstore.NewStore(svc.DB())
+
+	// 注册 uploads 列出/详情/取消接口。
+	uploadTasks := v1.NewUploadTasksHandler(uploadStore)
+	g.GET("/uploads", uploadTasks.ListUploads)
+	g.GET("/uploads/:id", uploadTasks.GetUpload)
+	g.POST("/uploads/:id/cancel", uploadTasks.CancelUpload)
+
+	// 启动分级 GC(后台 goroutine)。
+	commonUpload.StartGC(uploadStore, commonUpload.GCConfig{
+		StagingDir:     common.StagingDir,
+		IdleTimeout:    commonUpload.DefaultIdleTimeoutSeconds,
+		PausedTTL:      commonUpload.DefaultPausedTTLSeconds,
+		CanceledTTL:    commonUpload.DefaultCanceledTTLSeconds,
+		GCIntervalSecs: commonUpload.DefaultGCIntervalSeconds,
+	})
+
 	// TUS resumable upload endpoints — register outside the v1 group so the
 	// path is exactly /v1/upload-tus (matching the frontend tusClient base URL).
-	tusH, err := v1.NewTUSHandler(svc, "/DATA/Gallery")
+	tusH, err := v1.NewTUSHandler(svc, "/DATA/Gallery", uploadStore)
 	if err != nil {
 		zap.L().Fatal("failed to init TUS handler", zap.Error(err))
 	}
