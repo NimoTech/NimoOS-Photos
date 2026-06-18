@@ -202,9 +202,7 @@ func InitRouter(ctx context.Context, svc service.Services, runtimePath string, t
 	// 启动分级 GC(后台 goroutine)。
 	commonUpload.StartGC(uploadStore, commonUpload.GCConfig{
 		StagingDir:     common.StagingDir,
-		IdleTimeout:    commonUpload.DefaultIdleTimeoutSeconds,
 		PausedTTL:      commonUpload.DefaultPausedTTLSeconds,
-		CanceledTTL:    commonUpload.DefaultCanceledTTLSeconds,
 		GCIntervalSecs: commonUpload.DefaultGCIntervalSeconds,
 	})
 

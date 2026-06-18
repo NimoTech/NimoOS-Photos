@@ -15,18 +15,6 @@ import (
 	"github.com/labstack/echo/v4"
 )
 
-// openUploadTestDB 在临时目录开一个带 migrate 的 SQLite db。
-func openUploadTestDB(t *testing.T) interface{ Close() error } {
-	t.Helper()
-	dir := t.TempDir()
-	db, err := sqlite.Open(filepath.Join(dir, "test.db"))
-	if err != nil {
-		t.Fatalf("sqlite.Open: %v", err)
-	}
-	t.Cleanup(func() { db.Close() })
-	return db
-}
-
 // makeTask 创建最小有效任务记录。
 func makeTask(id, owner, status string) *upload.UploadTask {
 	now := time.Now().Unix()

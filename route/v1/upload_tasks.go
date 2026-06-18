@@ -28,8 +28,8 @@ func NewUploadTasksHandlerWithStaging(store commonUpload.Store, stagingDir strin
 	return &UploadTasksHandler{store: store, stagingDir: stagingDir}
 }
 
-// ListUploads GET /v1/photos/uploads?status=active
-// 返回当前登录用户的所有活跃上传任务。
+// ListUploads GET /v1/photos/uploads
+// 返回当前用户活跃任务(uploading/paused/failed),硬编码调用 ListActiveByOwner,不读 status 参数。
 func (h *UploadTasksHandler) ListUploads(c echo.Context) error {
 	owner := JWTUserID(c)
 	tasks, err := h.store.ListActiveByOwner(owner)

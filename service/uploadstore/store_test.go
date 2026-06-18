@@ -11,18 +11,6 @@ import (
 	"github.com/NimoTech/NimoOS-Photos/service/uploadstore"
 )
 
-// openTestDB 在临时目录开一个带 migrate 的 SQLite db。
-func openTestDB(t *testing.T) interface{ Close() error } {
-	t.Helper()
-	dir := t.TempDir()
-	db, err := sqlite.Open(filepath.Join(dir, "test.db"))
-	if err != nil {
-		t.Fatalf("sqlite.Open: %v", err)
-	}
-	t.Cleanup(func() { db.Close() })
-	return db
-}
-
 // newTask 返回一个最小有效的 UploadTask。
 func newTask(id, owner string) *upload.UploadTask {
 	now := time.Now().Unix()
