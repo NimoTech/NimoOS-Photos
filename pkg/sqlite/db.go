@@ -258,6 +258,24 @@ func migrate(db *sql.DB) error {
 			key   TEXT PRIMARY KEY,
 			value TEXT NOT NULL
 		)`,
+
+		// ── 可恢复上传任务表（与 Common upload.UploadTask gorm column 对应）────
+		`CREATE TABLE IF NOT EXISTS o_upload_tasks (
+			id TEXT PRIMARY KEY,
+			owner_user_id TEXT,
+			filename TEXT, target_path TEXT, relative_path TEXT,
+			size INTEGER, mime TEXT,
+			fingerprint TEXT, content_hash TEXT,
+			upload_url TEXT, uploaded_offset INTEGER DEFAULT 0,
+			status TEXT, retry_count INTEGER DEFAULT 0,
+			error TEXT, last_error_at INTEGER DEFAULT 0,
+			batch_id TEXT, client_id TEXT, client_meta TEXT,
+			created_at INTEGER DEFAULT 0, updated_at INTEGER DEFAULT 0,
+			expires_at INTEGER DEFAULT 0
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_upload_owner   ON o_upload_tasks(owner_user_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_upload_status  ON o_upload_tasks(status)`,
+		`CREATE INDEX IF NOT EXISTS idx_upload_expires ON o_upload_tasks(expires_at)`,
 	}
 
 	for _, stmt := range statements {
