@@ -10,7 +10,10 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
+	commonUpload "github.com/NimoTech/NimoOS-Common/upload"
+	"github.com/NimoTech/NimoOS-Common/utils/logger"
 	"github.com/NimoTech/NimoOS-Photos/common"
 	"github.com/NimoTech/NimoOS-Photos/service"
 	"github.com/tus/tusd/v2/pkg/filestore"
@@ -193,20 +196,23 @@ func copyFile(src, dst string) error {
 }
 
 // NewTUSHandler creates the tusd handler wired to the staging dir,
-// metadata validator, and complete-hook → Indexer.
+// metadata validator, upload.Store lifecycle tracking, and complete-hook → Indexer.
 // Returns an http.Handler that Echo can wrap via echo.WrapHandler.
-func NewTUSHandler(svc service.Services, galleryDir string) (http.Handler, error) {
+func NewTUSHandler(svc service.Services, galleryDir string, uploadStore commonUpload.Store) (http.Handler, error) {
 	if err := os.MkdirAll(common.StagingDir, 0700); err != nil {
 		return nil, fmt.Errorf("mkdir staging: %w", err)
 	}
-	store := filestore.New(common.StagingDir)
+	fileStore := filestore.New(common.StagingDir)
 	composer := handler.NewStoreComposer()
-	store.UseIn(composer)
+	fileStore.UseIn(composer)
 
 	tusH, err := handler.NewHandler(handler.Config{
 		BasePath:                "/v1/upload-tus/",
 		StoreComposer:           composer,
 		NotifyCompleteUploads:   true,
+		NotifyCreatedUploads:    true,
+		NotifyUploadProgress:    true,
+		NotifyTerminatedUploads: true,
 		MaxSize:                 common.MaxUploadSize,
 		PreUploadCreateCallback: validateMetadata,
 	})
@@ -214,10 +220,51 @@ func NewTUSHandler(svc service.Services, galleryDir string) (http.Handler, error
 		return nil, err
 	}
 
-	// Run complete-hook drain in a goroutine.
+	// 创建:写任务行。
+	go func() {
+		for ev := range tusH.CreatedUploads {
+			ownerID := ev.HTTPRequest.Header.Get("X-NimoOS-User-ID")
+			ua := ev.HTTPRequest.Header.Get("User-Agent")
+			addr := ev.HTTPRequest.RemoteAddr
+			task := commonUpload.NewTask(
+				ev.Upload.ID,
+				ownerID,
+				ev.Upload.MetaData,
+				ev.Upload.Size,
+				ua,
+				addr,
+				commonUpload.DefaultIdleTimeoutSeconds,
+				time.Now(),
+			)
+			if cerr := uploadStore.Create(task); cerr != nil {
+				logger.Error("photos upload task create failed",
+					zap.String("id", ev.Upload.ID), zap.Error(cerr))
+			}
+		}
+	}()
+
+	// 进度:更新 offset 并续期。
+	go func() {
+		for ev := range tusH.UploadProgress {
+			_ = uploadStore.UpdateOffset(ev.Upload.ID, ev.Upload.Offset,
+				time.Now().Unix()+commonUpload.DefaultIdleTimeoutSeconds)
+		}
+	}()
+
+	// 终止(协议 DELETE):标记 canceled。
+	go func() {
+		for ev := range tusH.TerminatedUploads {
+			_ = uploadStore.SetStatus(ev.Upload.ID, commonUpload.UploadStatusCanceled,
+				time.Now().Unix()+commonUpload.DefaultCanceledTTLSeconds)
+		}
+	}()
+
+	// 完成:ingest(现有 MarkAndReserve/SetPendingAlbum/rename/SubmitReserved 四步)
+	// 成功后置 completed,失败置 failed。
 	go func() {
 		for event := range tusH.CompleteUploads {
-			stagedPath := filepath.Join(common.StagingDir, event.Upload.ID)
+			uploadID := event.Upload.ID
+			stagedPath := filepath.Join(common.StagingDir, uploadID)
 			filename := event.Upload.MetaData["filename"]
 			albumID := event.Upload.MetaData["albumId"]
 			batchID := event.Upload.MetaData["batch_id"]
@@ -227,18 +274,22 @@ func NewTUSHandler(svc service.Services, galleryDir string) (http.Handler, error
 					batchTotal = n
 				}
 			}
-			if err := ingestStagedFile(
+			if ierr := ingestStagedFile(
 				stagedPath, filename, albumID,
 				batchID, batchTotal,
 				svc.Indexer().MarkAndReserve,
 				svc.Indexer().SubmitReserved,
 				svc.Indexer().SetPendingAlbum,
 				galleryDir,
-			); err != nil {
+			); ierr != nil {
 				zap.L().Error("ingestStagedFile failed",
-					zap.String("id", event.Upload.ID),
-					zap.Error(err))
+					zap.String("id", uploadID), zap.Error(ierr))
+				_ = uploadStore.SetFailed(uploadID, ierr.Error(),
+					time.Now().Unix(),
+					time.Now().Unix()+commonUpload.DefaultCanceledTTLSeconds)
+				continue
 			}
+			_ = uploadStore.SetStatus(uploadID, commonUpload.UploadStatusCompleted, 0)
 		}
 	}()
 

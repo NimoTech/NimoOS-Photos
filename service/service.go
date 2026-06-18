@@ -198,6 +198,7 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 	storageSvc := NewStorageService(db, dbPath, thumbDir, faceThumbDir, statfsDir)
 
 	// 回收站自动清理：启动时跑一次，之后每 24 小时跑一次，到期项永久删除。
+	// CLIP 向量孤儿清理也在同一个每日 ticker 内独立运行，与回收站 purge 解耦。
 	go func() {
 		runPurge := func() {
 			days := 30
@@ -207,8 +208,6 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 			if err := trash.PurgeExpired(days); err != nil {
 				zap.L().Warn("trash auto-purge failed", zap.Error(err))
 			}
-			// Cheap (no-ML) safety net: drop any orphan CLIP vectors left behind.
-			pruneOrphanClipVectors(db)
 		}
 		runPurge()
 		ticker := time.NewTicker(24 * time.Hour)
@@ -219,6 +218,9 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 				return
 			case <-ticker.C:
 				runPurge()
+				// Daily safety net: drop any vec0 rows whose parent asset was deleted
+				// since the last startup or purge sweep.
+				pruneOrphanClipVectors(db)
 			}
 		}
 	}()
