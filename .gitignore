@@ -1,3 +1,6 @@
 nimoos-photos
 *.test
 coverage.txt
+
+# Claude Code local guidance — not for upload
+CLAUDE.md
