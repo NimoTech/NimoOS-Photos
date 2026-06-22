@@ -323,3 +323,19 @@ func TestListAssetsByPlaceAndSpotKey(t *testing.T) {
 	require.Len(t, assets, 1)
 	require.Equal(t, "nyc1", assets[0].ID)
 }
+
+func TestUpdateDurationMs(t *testing.T) {
+	db, err := sqlite.Open(filepath.Join(t.TempDir(), "t.db"))
+	require.NoError(t, err)
+	defer db.Close()
+	_, err = db.Exec(`INSERT INTO assets(id, file_path, mime_type, duration_ms, status)
+		VALUES('v1','/v/v1.mp4','video/mp4',0,'indexed')`)
+	require.NoError(t, err)
+
+	s := service.NewSearchService(db, nil) // ml 可为 nil（仅用非 CLIP 方法）
+	require.NoError(t, s.UpdateDurationMs("v1", 62000))
+
+	var got int64
+	require.NoError(t, db.QueryRow(`SELECT duration_ms FROM assets WHERE id='v1'`).Scan(&got))
+	require.Equal(t, int64(62000), got)
+}
