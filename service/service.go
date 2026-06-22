@@ -101,6 +101,9 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 
 	// 4. Assemble individual services.
 	taskReg := NewTaskRegistry(pub)
+	// A:停滞清扫器兜底——任何 running 任务长时间无更新即强制收尾,杜绝永久僵尸任务
+	//（尤其覆盖人脸聚类这类没有 DB 真值、前端无法对账的任务)。
+	go taskReg.StartStaleSweeper(parentCtx, taskStaleTimeout, taskSweepInterval)
 	idx := NewIndexer(db, ml, thumbDir, cfg.Workers)
 	idx.SetTaskRegistry(taskReg)
 	watcher := NewWatcher(db, cfg.WatchDirs, idx, liveDir)
@@ -128,6 +131,7 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 	placesSvc := NewPlacesServiceWithAlbums(db, gaz, geoSvc, albums)
 	faces := NewFaceService(db)
 	faces.SetTaskRegistry(taskReg)
+	faces.SetIndexIdleSource(idx.IdleFor) // 安全网聚类去抖:索引活动安静够久才触发
 	rebuilder := NewRebuilder(parentCtx, db, idx, faces, taskReg, cfg.Workers)
 	embedder := NewEmbedder(db, ml, idx, taskReg)
 

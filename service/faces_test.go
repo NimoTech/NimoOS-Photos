@@ -336,3 +336,64 @@ func TestRunClustering_PreservesNamedAcrossReruns(t *testing.T) {
 	require.Greater(t, conf, 0.0)
 	require.NotEmpty(t, centroid)
 }
+
+// 删光照片(0 人脸)后再聚类,应清掉自动产生的孤儿 person,而不是早退留残留。
+func TestRunClustering_ZeroFaces_PurgesOrphanPersons(t *testing.T) {
+	db := makeTestFaceDB(t)
+	dim := 512
+	a := make([]float32, dim)
+	a[0] = 1.0
+	insertAssetFace(t, db, "z-a1", normalize(a))
+	insertAssetFace(t, db, "z-a2", normalize(a))
+	svc := service.NewFaceService(db)
+	require.NoError(t, svc.RunClustering(context.Background()))
+
+	var before int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM persons`).Scan(&before))
+	require.Greater(t, before, 0, "聚类后应有 person")
+
+	// 模拟“照片被全部删除”:清空 face_detections 与 assets。
+	_, err := db.Exec(`DELETE FROM face_person`)
+	require.NoError(t, err)
+	_, err = db.Exec(`DELETE FROM face_detections`)
+	require.NoError(t, err)
+	_, err = db.Exec(`DELETE FROM assets`)
+	require.NoError(t, err)
+
+	// 再次聚类:0 人脸路径应清掉孤儿 person。
+	require.NoError(t, svc.RunClustering(context.Background()))
+
+	var after int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM persons`).Scan(&after))
+	require.Equal(t, 0, after, "0 人脸时自动孤儿 person 应被清空")
+}
+
+// 0 人脸清理只删非锚定 person;用户命名的人物应保留。
+func TestRunClustering_ZeroFaces_KeepsNamedPerson(t *testing.T) {
+	db := makeTestFaceDB(t)
+	dim := 512
+	a := make([]float32, dim)
+	a[0] = 1.0
+	insertAssetFace(t, db, "k-a1", normalize(a))
+	svc := service.NewFaceService(db)
+	require.NoError(t, svc.RunClustering(context.Background()))
+
+	// 给唯一 person 命名(锚定)。
+	var pid string
+	require.NoError(t, db.QueryRow(`SELECT id FROM persons`).Scan(&pid))
+	_, err := db.Exec(`UPDATE persons SET name='Alice' WHERE id=?`, pid)
+	require.NoError(t, err)
+
+	// 删光照片/人脸后再聚类。
+	_, err = db.Exec(`DELETE FROM face_person`)
+	require.NoError(t, err)
+	_, err = db.Exec(`DELETE FROM face_detections`)
+	require.NoError(t, err)
+	_, err = db.Exec(`DELETE FROM assets`)
+	require.NoError(t, err)
+	require.NoError(t, svc.RunClustering(context.Background()))
+
+	var cnt int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM persons WHERE name='Alice'`).Scan(&cnt))
+	require.Equal(t, 1, cnt, "命名(锚定)人物应保留")
+}

@@ -248,10 +248,19 @@ type FaceService struct {
 	// 失败 backoff：RunClustering 出错后短期内不再触发，避免每分钟重试风暴。
 	failMu      sync.Mutex
 	nextAttempt time.Time
+
+	// indexIdleFor 返回「距上次索引活动多久」。安全网触发(scheduler)据此去抖,
+	// 避免大上传途中索引队列空档(pending==0 瞬间)被误判为上传结束而提前聚类。
+	// 为 nil 时(测试 / 未接入)视为始终空闲。
+	indexIdleFor func() time.Duration
 }
 
 // clusterFailBackoff 是 RunClustering 失败后的最短再次尝试间隔。
 const clusterFailBackoff = 30 * time.Minute
+
+// clusterQuietPeriod 是安全网触发前要求的「索引活动安静时长」:索引活动停止超过这段
+// 时间才认为整批上传/索引真正结束。需大于活动中典型的逐张处理间隔(ML 每张约数秒)。
+const clusterQuietPeriod = 12 * time.Second
 
 // NewFaceService creates a new FaceService backed by the given database.
 func NewFaceService(db *sql.DB) *FaceService {
@@ -260,6 +269,10 @@ func NewFaceService(db *sql.DB) *FaceService {
 
 // SetTaskRegistry injects a TaskRegistry so RunClustering can report progress.
 func (s *FaceService) SetTaskRegistry(reg *TaskRegistry) { s.reg = reg }
+
+// SetIndexIdleSource injects a callback returning the time since the last index
+// activity, used to debounce the safety-net clustering trigger.
+func (s *FaceService) SetIndexIdleSource(fn func() time.Duration) { s.indexIdleFor = fn }
 
 // RunClustering reads all face embeddings, runs DBSCAN, and rebuilds the
 // persons and face_person tables from scratch.
@@ -279,8 +292,21 @@ func (s *FaceService) RunClustering(ctx context.Context) error {
 		return err
 	}
 	if total == 0 {
-		return nil
+		// 没有人脸了(例如照片被全部删除):自动聚类产生的非锚定 person 已无任何成员,
+		// 必须在这里清掉,否则人物表会残留孤儿——清理 persons 的唯一路径
+		// rebuildPersonsWithProgress 正好被这个早退跳过了。
+		return s.purgeAutoPersons(ctx)
 	}
+
+	// 本次「新增人脸」= 聚类前仍未分配到任何 person 的人脸数(即新上传照片里新检测到、
+	// 尚未聚类的人脸)。供前端「有新增才弹提示、且显示新增数而非总数」。
+	// 没有新增(如上传的是无人脸的文档/OCR 图)时为 0,前端据此不弹人脸提示。
+	var newFaces int64
+	_ = s.db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM face_detections fd
+		JOIN assets a ON a.id = fd.asset_id
+		WHERE fd.excluded = 0
+		  AND NOT EXISTS (SELECT 1 FROM face_person fp WHERE fp.face_id = fd.id)`).Scan(&newFaces)
 
 	taskID := fmt.Sprintf("face_%d", time.Now().UnixNano())
 	started := time.Now()
@@ -297,11 +323,12 @@ func (s *FaceService) RunClustering(ctx context.Context) error {
 			Error:     errMsg,
 			StartedAt: started,
 		}
-		// 终态填入 current/total，前端 done 时拼 "已识别 N 个人脸" toast 文案需要。
+		// 终态填入 current/total（总人脸数）与 added（本次新增数）。
 		// running 中间态不填，避免节流 publish 把 0 错带到前端造成数字闪。
 		if status == "done" || status == "error" {
 			t.Current = total
 			t.Total = total
+			t.Added = newFaces
 		}
 		s.reg.Upsert(t)
 	}
@@ -347,6 +374,81 @@ func (s *FaceService) RunClustering(ctx context.Context) error {
 		}
 	}()
 	return nil
+}
+
+// purgeAutoPersons 删除所有自动聚类产生的(非锚定:无名字/收藏/关系/隐藏)person
+// 及其 face_person 行。锚定人物(用户命名/收藏/关系/隐藏)保留。
+// 用于 0 人脸场景下清理孤儿人物;删除顺序与 rebuildPersonsWithProgress 一致。
+func (s *FaceService) purgeAutoPersons(ctx context.Context) (err error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			tx.Rollback()
+		}
+	}()
+	if _, err = tx.ExecContext(ctx, `
+		DELETE FROM face_person
+		WHERE person_id IN (SELECT id FROM persons WHERE NOT (name!='' OR favorite=1 OR relation!='' OR hidden=1))`); err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `
+		DELETE FROM persons
+		WHERE NOT (name!='' OR favorite=1 OR relation!='' OR hidden=1)`); err != nil {
+		return err
+	}
+	err = tx.Commit()
+	return err
+}
+
+// purgeEmptyAutoPersons 删除「非锚定(无名字/收藏/关系/隐藏)且已无任何成员脸」的 person。
+//
+// 用于删照片后的孤儿自愈:删 asset 会经 FK 级联删掉 face_detections 和 face_person,
+// 但 persons 不在级联链上,会遗留空壳孤儿。而清 persons 的常规路径(rebuildPersons)
+// 只在 RunClustering 跑起来时才执行,删除本身不触发聚类,故需独立的周期性自愈。
+//
+// 安全性:正常聚类后的非锚定 person 都在同一事务里带着 face_person 成员,EXISTS 子查询
+// 会判定其非空而保留;此处只清理「已无成员」的空壳,可在任意时刻反复调用。
+// shouldClusterUnassigned 判断是否应触发一次聚类(不含每日 03:xx 定时那条):
+//   - 未分配人脸 > 0 且已无 pending 资产(索引彻底结束)时,才聚类一次。
+//
+// 设计:聚类只在「索引彻底安静」后跑一次,不在索引进行中提前触发。
+// 早先有「未分配人脸 ≥ clusterBatchSize 就立即聚类」的提前触发,会导致一次上传里
+// 索引途中先聚一次、settle 后又聚一次(双跑:用户会看到两条「识别人物」),故移除。
+// 代价:超大上传也要等索引全部结束才聚类一次(完成提示稍晚几秒),换来「合并成单条」。
+//
+// 依赖 pending==0 而非上传批次回调(SetOnBatchDone 基于 ingestTracker 的 current>=total,
+// 声明总数>实际处理数时永不归零),否则少量人脸会一直不聚类、persons 始终为 0、
+// 「识别人物」任务从不出现。
+func (s *FaceService) shouldClusterUnassigned(ctx context.Context) bool {
+	// 去抖:索引活动还没安静够久(整批上传/索引可能仍在进行,只是出现了瞬时空档)→ 不触发。
+	if s.indexIdleFor != nil && s.indexIdleFor() < clusterQuietPeriod {
+		return false
+	}
+	var unassigned int
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM face_detections fd
+		 WHERE fd.excluded = 0
+		   AND NOT EXISTS (SELECT 1 FROM face_person fp WHERE fp.face_id = fd.id)`,
+	).Scan(&unassigned); err != nil || unassigned == 0 {
+		return false
+	}
+	var pending int
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM assets WHERE status='pending'`).Scan(&pending); err == nil && pending == 0 {
+		return true
+	}
+	return false
+}
+
+func (s *FaceService) purgeEmptyAutoPersons(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, `
+		DELETE FROM persons
+		WHERE NOT (name!='' OR favorite=1 OR relation!='' OR hidden=1)
+		  AND NOT EXISTS (SELECT 1 FROM face_person fp WHERE fp.person_id = persons.id)`)
+	return err
 }
 
 func (s *FaceService) loadFacesWithProgress(ctx context.Context, total int64,
@@ -701,6 +803,12 @@ func (s *FaceService) StartScheduler(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			case t := <-ticker.C:
+				// 孤儿人物自愈(独立于聚类节流/开关):删照片会级联删脸但不删 persons,
+				// 这里每分钟清理已无成员的非锚定 person,覆盖所有删除路径。
+				if err := s.purgeEmptyAutoPersons(ctx); err != nil {
+					zap.L().Warn("purge empty auto-persons failed", zap.Error(err))
+				}
+
 				// 失败 backoff：上次失败后短期内不再尝试。
 				s.failMu.Lock()
 				nextOK := s.nextAttempt
@@ -718,18 +826,7 @@ func (s *FaceService) StartScheduler(ctx context.Context) {
 				if t.Hour() == 3 && t.Minute() < 5 {
 					shouldRun = true
 				} else {
-					// Count faces not yet associated with a person.
-					var unassigned int
-					err := s.db.QueryRowContext(ctx,
-						`SELECT COUNT(*) FROM face_detections fd
-						 WHERE fd.excluded = 0
-						   AND NOT EXISTS (
-							SELECT 1 FROM face_person fp WHERE fp.face_id = fd.id
-						 )`,
-					).Scan(&unassigned)
-					if err == nil && unassigned >= clusterBatchSize {
-						shouldRun = true
-					}
+					shouldRun = s.shouldClusterUnassigned(ctx)
 				}
 
 				if shouldRun {

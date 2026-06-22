@@ -14,6 +14,10 @@ import (
 
 const defaultEmbedderPollInterval = 30 * time.Second
 
+// ocrBackfillRetryDelay 是 OCR 补跑「首遍因 ML 全失败」后重试前的等待,给重启瞬间
+// 尚未热好的 ML OCR 模型一点时间,避免把暂时性失败当成真失败弹给用户。
+var ocrBackfillRetryDelay = 8 * time.Second
+
 type Embedder struct {
 	db           *sql.DB
 	ml           MLProvider
@@ -214,27 +218,52 @@ func (e *Embedder) BackfillOCR(ctx context.Context) error {
 	}
 	pubRunning(0)
 
-	var processed, failed int64
-	for _, t := range targets {
-		if ctx.Err() != nil {
-			break
-		}
-		src := t.path
-		if t.isVideo {
-			src = filepath.Join(e.indexer.thumbDir, t.id, "large.jpg")
-		}
-		data, rerr := os.ReadFile(src)
-		if rerr != nil || len(data) == 0 {
-			failed++
+	// pass 跑一遍给定目标,返回处理/失败计数(readFail=源文件读不到,ocrFail=ML 调用失败)。
+	pass := func(ts []ocrTarget) (processed, failed, readFail, ocrFail int64) {
+		for _, t := range ts {
+			if ctx.Err() != nil {
+				break
+			}
+			src := t.path
+			if t.isVideo {
+				src = filepath.Join(e.indexer.thumbDir, t.id, "large.jpg")
+			}
+			data, rerr := os.ReadFile(src)
+			if rerr != nil || len(data) == 0 {
+				// 源图/缩略图读不到(文件被删、缩略图缺失等),与 ML 无关。
+				readFail++
+				failed++
+				processed++
+				pubRunning(processed)
+				continue
+			}
+			if oerr := e.indexer.ocrAsset(t.id, data); oerr != nil {
+				ocrFail++
+				failed++
+			}
 			processed++
 			pubRunning(processed)
-			continue
 		}
-		if oerr := e.indexer.ocrAsset(t.id, data); oerr != nil {
-			failed++
+		return
+	}
+
+	processed, failed, readFail, ocrFail := pass(targets)
+
+	// 首遍因 ML 全失败(疑似重启瞬间 OCR 模型还没热好):等一会、对仍缺 OCR 的目标重试一次,
+	// 仍失败才报错。避免每次重部署都弹一个其实是「ML 未热好」的假失败。
+	if processed > 0 && failed == processed && ocrFail > 0 && ctx.Err() == nil {
+		zap.L().Info("OCR 补跑首遍全失败(疑似 ML 未就绪),稍后重试一次",
+			zap.Int64("ml_fail", ocrFail))
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(ocrBackfillRetryDelay):
 		}
-		processed++
-		pubRunning(processed)
+		if ts2, qerr := e.queryMissingOCR(ctx); qerr == nil && len(ts2) > 0 {
+			total = int64(len(ts2))
+			pubRunning(0)
+			processed, failed, readFail, ocrFail = pass(ts2)
+		}
 	}
 
 	if ctx.Err() != nil {
@@ -250,14 +279,28 @@ func (e *Embedder) BackfillOCR(ctx context.Context) error {
 		StartedAt: started,
 	}
 	if processed > 0 && failed == processed {
+		// 全部失败才报 error，并按真实原因给出准确信息(此前一律写「ML 失联」是误报)。
 		final.Status = "error"
-		final.Error = "ML 服务在补跑过程中失联，请检查服务状态"
+		switch {
+		case ocrFail == 0 && readFail > 0:
+			final.Error = fmt.Sprintf("%d 张照片的源文件无法读取，已跳过文字识别", readFail)
+		case ocrFail > 0 && readFail == 0:
+			final.Error = "ML 服务在补跑过程中失联，请检查服务状态"
+		default:
+			final.Error = fmt.Sprintf("文字识别补跑失败(源文件读取失败 %d 张、ML 失败 %d 张)", readFail, ocrFail)
+		}
 	} else {
 		final.Status = "done"
 		final.Progress = 1
 		if failed > 0 {
 			final.Label = fmt.Sprintf("识别图片文字（失败 %d 张）", failed)
 		}
+	}
+	if failed > 0 {
+		zap.L().Warn("OCR 补跑存在失败",
+			zap.Int64("total", total), zap.Int64("processed", processed),
+			zap.Int64("read_fail", readFail), zap.Int64("ml_fail", ocrFail),
+			zap.String("status", final.Status))
 	}
 	e.reg.Upsert(final)
 	go func() {

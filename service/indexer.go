@@ -141,6 +141,11 @@ type Indexer struct {
 	ingest     *ingestTracker // aggregates Enqueue/processFile into a single rolling task
 	scanActive int32          // CAS guard so only one full ScanAllRoots runs at a time
 
+	// lastActivity 记录最近一次入队/处理完成的时刻(UnixNano)。人脸聚类的「安全网」
+	// 触发(scheduler 每分钟那条)据此去抖:仅在索引活动安静一段时间后才触发,
+	// 避免大上传途中索引队列出现 pending==0 空档时被误判为「上传结束」而提前聚类。
+	lastActivity atomic.Int64
+
 	// pendingAlbum maps a gallery path to the album the upload requested.
 	// Registered before SubmitReserved (no race with workers) and taken
 	// (removed) when the worker starts processing the path, so failed files
@@ -151,6 +156,19 @@ type Indexer struct {
 	// albumAssigner is called after an asset record is successfully written,
 	// with the asset's DB id and the album id from pendingAlbum.
 	albumAssigner func(assetID, albumID string)
+}
+
+// touch marks index activity (enqueue or a processed result) at the current time.
+func (ix *Indexer) touch() { ix.lastActivity.Store(time.Now().UnixNano()) }
+
+// IdleFor reports how long since the last enqueue/processed result. Returns a
+// very large duration if there has been no activity yet (treated as "idle").
+func (ix *Indexer) IdleFor() time.Duration {
+	last := ix.lastActivity.Load()
+	if last == 0 {
+		return time.Duration(1<<62 - 1)
+	}
+	return time.Since(time.Unix(0, last))
 }
 
 // ScanAllRoots scans every user-accessible partition returned by
@@ -204,6 +222,12 @@ const defaultIngestIdleTimeout = 6 * time.Second
 // being removed. Shared by ingestTracker, ScanDirectory, and FaceService so
 // the UI has a consistent window to display the done state.
 const taskCleanupDelay = 6 * time.Second
+
+// tusEchoSuppress is how long a TUS-ingested file's seen reservation is held
+// after the worker finishes, to swallow the watcher's late fsnotify Create echo
+// of the just-renamed file (which would otherwise spawn a stray batches[""]
+// "索引照片" task). Generous enough to cover inotify delivery backlog under load.
+const tusEchoSuppress = 30 * time.Second
 
 // ingestBatch tracks the progress of a single logical batch of files.
 // The empty-string batchID ("") is the legacy singleton slot used by watcher
@@ -461,6 +485,7 @@ func (ix *Indexer) Enqueue(path string) {
 	select {
 	case ix.queue <- ingestQueueItem{path: path}:
 		ix.ingest.noteEnqueue()
+		ix.touch()
 	default:
 		// queue full — release the seen lock so it can be retried later
 		ix.seen.Delete(path)
@@ -484,6 +509,7 @@ func (ix *Indexer) EnqueueWithBatch(path, batchID string, batchTotal int64) {
 	select {
 	case ix.queue <- ingestQueueItem{path: path, batchID: batchID}:
 		ix.ingest.noteEnqueueWithBatch(batchID, batchTotal)
+		ix.touch()
 	default:
 		ix.seen.Delete(path)
 	}
@@ -503,6 +529,7 @@ func (ix *Indexer) MarkAndReserve(path, batchID string, batchTotal int64) bool {
 		return false
 	}
 	ix.ingest.noteEnqueueWithBatch(batchID, batchTotal)
+	ix.touch()
 	return true
 }
 
@@ -545,7 +572,20 @@ func (ix *Indexer) Start(ctx context.Context) {
 					}
 					success := ix.processFile(item.path)
 					ix.ingest.noteResultWithBatch(item.batchID, success)
-					ix.seen.Delete(item.path)
+					ix.touch()
+					if item.batchID != "" {
+						// TUS 上传的文件:rename 落地会让 watcher 迟发一个 Create 事件。
+						// 大批量 + inotify 压力下,该事件常常晚于 worker 处理完成才到达,
+						// 此时若立即释放 seen,watcher 的 Enqueue 会把这个「已索引」文件
+						// 当成 legacy "" 累积批次重新入队 → 冒出第二个「索引照片」任务(dedup
+						// 秒完→闪 100%),并连带在下一次 settle 触发又一次聚类。
+						// 延迟释放 seen 以吸收这个回声;普通 watcher 新文件(batchID="")
+						// 维持立即释放,不影响正常落盘检测。
+						p := item.path
+						time.AfterFunc(tusEchoSuppress, func() { ix.seen.Delete(p) })
+					} else {
+						ix.seen.Delete(item.path)
+					}
 				}
 			}
 		}()
