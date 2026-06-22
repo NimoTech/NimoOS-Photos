@@ -1,7 +1,11 @@
 package ffmpeg_test
 
 import (
+	"image"
+	_ "image/jpeg"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"testing"
 
 	"github.com/NimoTech/NimoOS-Photos/pkg/ffmpeg"
@@ -45,6 +49,33 @@ func TestProbeNonexistent(t *testing.T) {
 	}
 	_, err := ffmpeg.Probe("/nonexistent/path/video.mp4")
 	require.Error(t, err)
+}
+
+func TestGenerateSpriteProducesTile(t *testing.T) {
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		t.Skip("ffmpeg not found in PATH")
+	}
+	dir := t.TempDir()
+	// 造一个 6 秒测试视频
+	src := filepath.Join(dir, "src.mp4")
+	mk := exec.Command("ffmpeg", "-hide_banner", "-loglevel", "error",
+		"-f", "lavfi", "-i", "testsrc=duration=6:size=320x240:rate=25", "-y", src)
+	require.NoError(t, mk.Run())
+
+	out := filepath.Join(dir, "sub", "sprite.jpg") // 子目录不存在，验证自动建目录
+	require.NoError(t, ffmpeg.GenerateSprite(src, out, 10, 6.0))
+
+	f, err := os.Open(out)
+	require.NoError(t, err)
+	defer f.Close()
+	cfg, _, err := image.DecodeConfig(f)
+	require.NoError(t, err)
+	require.Equal(t, 10*120, cfg.Width) // tile=10x1 → 宽恒为 N*120
+	require.Equal(t, 68, cfg.Height)
+}
+
+func TestGenerateSpriteRejectsZeroDuration(t *testing.T) {
+	require.Error(t, ffmpeg.GenerateSprite("/any.mp4", "/tmp/x.jpg", 10, 0))
 }
 
 func TestParseISO6709(t *testing.T) {

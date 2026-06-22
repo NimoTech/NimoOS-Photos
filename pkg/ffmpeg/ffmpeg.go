@@ -57,6 +57,55 @@ func runExtract(videoPath, outPath, seekSec string) error {
 	return nil
 }
 
+// GenerateSprite extracts frameCount evenly-spaced frames from videoPath and
+// writes them as a single horizontal sprite JPEG (each cell 120x68) to outPath.
+// durationS must be > 0. It oversamples by one frame (fps=(N+1)/D) so the tile
+// is always full — never use -vframes to bound the count (it is an output
+// option and cannot live inside -vf). The image is written to a temp file and
+// atomically renamed, so concurrent generations and crashes never leave a
+// partial sprite.
+func GenerateSprite(videoPath, outPath string, frameCount int, durationS float64) error {
+	if durationS <= 0 {
+		return fmt.Errorf("GenerateSprite: durationS must be > 0, got %v", durationS)
+	}
+	if frameCount < 1 {
+		return fmt.Errorf("GenerateSprite: frameCount must be >= 1, got %d", frameCount)
+	}
+	if err := os.MkdirAll(filepath.Dir(outPath), 0o755); err != nil {
+		return fmt.Errorf("GenerateSprite: mkdir: %w", err)
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(outPath), ".sprite-*.jpg")
+	if err != nil {
+		return fmt.Errorf("GenerateSprite: temp: %w", err)
+	}
+	tmpPath := tmp.Name()
+	tmp.Close()
+	defer os.Remove(tmpPath) // no-op after a successful rename
+
+	fps := float64(frameCount+1) / durationS
+	vf := fmt.Sprintf(
+		"fps=%.6f,scale=120:68:force_original_aspect_ratio=decrease,pad=120:68:-1:-1,tile=%dx1",
+		fps, frameCount,
+	)
+	// 不传 -noautorotate：ffmpeg 默认依据显示矩阵在滤镜前自动转正，竖屏手机
+	// 视频因此是正立的，再由 scale+pad 居中补黑边塞进固定的 120×68。
+	cmd := exec.Command("ffmpeg",
+		"-hide_banner", "-loglevel", "error",
+		"-i", videoPath,
+		"-vf", vf,
+		"-frames:v", "1",
+		"-q:v", "6",
+		"-y", tmpPath,
+	)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("ffmpeg GenerateSprite: %w — %s", err, string(out))
+	}
+	if fi, err := os.Stat(tmpPath); err != nil || fi.Size() == 0 {
+		return fmt.Errorf("ffmpeg GenerateSprite: empty output")
+	}
+	return os.Rename(tmpPath, outPath)
+}
+
 // ffprobeFormat mirrors the JSON structure returned by:
 //
 //	ffprobe -v quiet -print_format json -show_format <path>
