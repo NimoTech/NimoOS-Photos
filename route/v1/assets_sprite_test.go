@@ -74,6 +74,6 @@ func TestSpriteGeneratesAndServes(t *testing.T) {
 	c.SetParamValues("v1")
 	require.NoError(t, h.Sprite(c))
 	require.Equal(t, http.StatusOK, rec.Code)
-	require.Equal(t, "10", rec.Header().Get("X-Sprite-Frames"))
+	require.Equal(t, "5", rec.Header().Get("X-Sprite-Frames"))
 	require.Equal(t, "6000", rec.Header().Get("X-Sprite-Duration-Ms"))
 }

@@ -15,7 +15,7 @@ const (
 	SpriteFrameW = 120
 	SpriteFrameH = 68
 
-	spriteMinFrames     = 10
+	spriteMinFrames     = 5
 	spriteMaxFrames     = 20
 	spriteSecsPerFrm    = 30
 	spriteMaxConcurrent = 2
