@@ -70,8 +70,9 @@ func TestGenerateSpriteProducesTile(t *testing.T) {
 	defer f.Close()
 	cfg, _, err := image.DecodeConfig(f)
 	require.NoError(t, err)
-	require.Equal(t, 10*120, cfg.Width) // tile=10x1 → 宽恒为 N*120
-	require.Equal(t, 68, cfg.Height)
+	// scale=240:-2 保留原始比例不补黑边：320×240(4:3) 源 → 单帧 240×180。
+	require.Equal(t, 10*240, cfg.Width) // tile=10x1 → 宽恒为 N*240
+	require.Equal(t, 180, cfg.Height)   // 240 * 240/320 = 180（按原比例）
 }
 
 func TestGenerateSpriteRejectsZeroDuration(t *testing.T) {

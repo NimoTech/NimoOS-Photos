@@ -3,15 +3,22 @@
 package ffmpeg
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"image"
+	"image/draw"
+	"image/jpeg"
+	"image/png"
 	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -58,12 +65,13 @@ func runExtract(videoPath, outPath, seekSec string) error {
 }
 
 // GenerateSprite extracts frameCount evenly-spaced frames from videoPath and
-// writes them as a single horizontal sprite JPEG (each cell 120x68) to outPath.
-// durationS must be > 0. It oversamples by one frame (fps=(N+1)/D) so the tile
-// is always full — never use -vframes to bound the count (it is an output
-// option and cannot live inside -vf). The image is written to a temp file and
-// atomically renamed, so concurrent generations and crashes never leave a
-// partial sprite.
+// writes them as a single horizontal sprite JPEG to outPath. Each cell is 240px
+// wide; height preserves the video's native aspect ratio (no padding), so the
+// frontend can letterbox/pillarbox it however it likes. durationS must be > 0.
+// It oversamples by one frame (fps=(N+1)/D) so the tile is always full — never
+// use -vframes to bound the count (it is an output option and cannot live inside
+// -vf). The image is written to a temp file and atomically renamed, so
+// concurrent generations and crashes never leave a partial sprite.
 func GenerateSprite(videoPath, outPath string, frameCount int, durationS float64) error {
 	if durationS <= 0 {
 		return fmt.Errorf("GenerateSprite: durationS must be > 0, got %v", durationS)
@@ -82,28 +90,95 @@ func GenerateSprite(videoPath, outPath string, frameCount int, durationS float64
 	tmp.Close()
 	defer os.Remove(tmpPath) // no-op after a successful rename
 
-	fps := float64(frameCount+1) / durationS
-	vf := fmt.Sprintf(
-		"fps=%.6f,scale=120:68:force_original_aspect_ratio=decrease,pad=120:68:-1:-1,tile=%dx1",
-		fps, frameCount,
-	)
-	// 不传 -noautorotate：ffmpeg 默认依据显示矩阵在滤镜前自动转正，竖屏手机
-	// 视频因此是正立的，再由 scale+pad 居中补黑边塞进固定的 120×68。
-	cmd := exec.Command("ffmpeg",
-		"-hide_banner", "-loglevel", "error",
-		"-i", videoPath,
-		"-vf", vf,
-		"-frames:v", "1",
-		"-q:v", "6",
-		"-y", tmpPath,
-	)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("ffmpeg GenerateSprite: %w — %s", err, string(out))
+	// Extract each frame with input-side fast seek (-ss before -i) so ffmpeg
+	// only decodes one GOP per frame instead of the whole stream. The old
+	// single-pass `fps=N/D` filter decoded the *entire* video (minutes for a
+	// 40-min clip); cost here is N keyframe seeks, independent of duration.
+	// Frames are sampled at centers ts_i = (i+0.5)*D/N (matches the frame↔time
+	// mapping), composited horizontally in-memory, and encoded once to JPEG.
+	imgs := make([]image.Image, frameCount)
+	errs := make([]error, frameCount)
+	workers := runtime.NumCPU()
+	if workers > spriteExtractWorkers {
+		workers = spriteExtractWorkers
 	}
-	if fi, err := os.Stat(tmpPath); err != nil || fi.Size() == 0 {
-		return fmt.Errorf("ffmpeg GenerateSprite: empty output")
+	if workers < 1 {
+		workers = 1
+	}
+	sem := make(chan struct{}, workers)
+	var wg sync.WaitGroup
+	for i := 0; i < frameCount; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			ts := (float64(i) + 0.5) * durationS / float64(frameCount)
+			imgs[i], errs[i] = extractFrameAt(videoPath, ts)
+		}(i)
+	}
+	wg.Wait()
+	for i, e := range errs {
+		if e != nil {
+			return fmt.Errorf("GenerateSprite: extract frame %d: %w", i, e)
+		}
+	}
+
+	// Composite the N frames into one horizontal row. All frames share the same
+	// scaled dimensions (same source), so width = N*frameW, height = frameH.
+	fw := imgs[0].Bounds().Dx()
+	fh := imgs[0].Bounds().Dy()
+	canvas := image.NewRGBA(image.Rect(0, 0, fw*frameCount, fh))
+	for i, im := range imgs {
+		draw.Draw(canvas, image.Rect(i*fw, 0, i*fw+fw, fh), im, im.Bounds().Min, draw.Src)
+	}
+
+	out, err := os.Create(tmpPath)
+	if err != nil {
+		return fmt.Errorf("GenerateSprite: create temp: %w", err)
+	}
+	if err := jpeg.Encode(out, canvas, &jpeg.Options{Quality: spriteJPEGQuality}); err != nil {
+		out.Close()
+		return fmt.Errorf("GenerateSprite: encode: %w", err)
+	}
+	if err := out.Close(); err != nil {
+		return fmt.Errorf("GenerateSprite: close: %w", err)
 	}
 	return os.Rename(tmpPath, outPath)
+}
+
+const (
+	// spriteExtractWorkers bounds per-sprite concurrent frame extraction. Kept
+	// small because SpriteGenerator already caps concurrent generations at 2;
+	// peak ffmpeg processes ≈ 2 × this.
+	spriteExtractWorkers = 4
+	// spriteJPEGQuality ≈ the old ffmpeg `-q:v 4` (high quality).
+	spriteJPEGQuality = 90
+)
+
+// extractFrameAt fast-seeks to ts seconds and returns one frame scaled to
+// width 240 (height auto, native aspect, autorotated). It pipes a PNG out of
+// ffmpeg (lossless, so the only lossy step is the final sprite JPEG encode).
+func extractFrameAt(videoPath string, ts float64) (image.Image, error) {
+	cmd := exec.Command("ffmpeg",
+		"-hide_banner", "-loglevel", "error",
+		"-ss", strconv.FormatFloat(ts, 'f', 3, 64), // input seek = fast (decode ~1 GOP)
+		"-i", videoPath,
+		"-frames:v", "1",
+		"-an",
+		"-vf", "scale=240:-2", // native aspect, even height, no pad; autorotate on by default
+		"-f", "image2pipe", "-vcodec", "png", "-",
+	)
+	var buf bytes.Buffer
+	cmd.Stdout = &buf
+	if err := cmd.Run(); err != nil {
+		return nil, err // wraps exec.ErrNotFound when ffmpeg is missing
+	}
+	img, err := png.Decode(&buf)
+	if err != nil {
+		return nil, fmt.Errorf("decode frame: %w", err)
+	}
+	return img, nil
 }
 
 // ffprobeFormat mirrors the JSON structure returned by:

@@ -70,7 +70,7 @@ func (h *AssetsHandler) Sprite(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusServiceUnavailable, gerr.Error())
 	}
 
-	frames, ferr := service.SpriteFrameCountFromFile(spritePath)
+	frames, frameH, ferr := service.SpriteInfoFromFile(spritePath)
 	if ferr != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, ferr.Error())
 	}
@@ -78,7 +78,7 @@ func (h *AssetsHandler) Sprite(c echo.Context) error {
 	hdr := c.Response().Header()
 	hdr.Set("X-Sprite-Frames", strconv.Itoa(frames))
 	hdr.Set("X-Sprite-Frame-W", strconv.Itoa(service.SpriteFrameW))
-	hdr.Set("X-Sprite-Frame-H", strconv.Itoa(service.SpriteFrameH))
+	hdr.Set("X-Sprite-Frame-H", strconv.Itoa(frameH)) // 实际帧高（按原始比例，从文件读）
 	hdr.Set("X-Sprite-Duration-Ms", strconv.FormatInt(durationMs, 10))
 	hdr.Set("Cache-Control", "max-age=604800")
 	return c.File(spritePath)
