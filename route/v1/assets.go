@@ -5,9 +5,12 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 
+	"github.com/NimoTech/NimoOS-Photos/pkg/ffmpeg"
 	"github.com/NimoTech/NimoOS-Photos/service"
 	"github.com/labstack/echo/v4"
 	"go.uber.org/zap"
@@ -17,6 +20,7 @@ import (
 type AssetsHandler struct {
 	svc      service.Services
 	thumbDir string
+	sprites  *service.SpriteGenerator
 }
 
 // NewAssetsHandler constructs an AssetsHandler.
@@ -25,7 +29,59 @@ func NewAssetsHandler(svc service.Services, thumbDir string) *AssetsHandler {
 	return &AssetsHandler{
 		svc:      svc,
 		thumbDir: thumbDir,
+		sprites:  service.NewSpriteGenerator(),
 	}
+}
+
+// Sprite serves (and lazily generates) the hover-preview sprite for a video.
+func (h *AssetsHandler) Sprite(c echo.Context) error {
+	asset, err := h.svc.Search().GetAsset(JWTUserID(c), c.Param("id"))
+	if errors.Is(err, service.ErrNotFound) {
+		return echo.NewHTTPError(http.StatusNotFound)
+	}
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	}
+	if !strings.HasPrefix(asset.MimeType, "video/") {
+		return echo.NewHTTPError(http.StatusNotFound, "not a video")
+	}
+
+	// Resolve effective duration; never feed 0 into the fps expression.
+	durationMs := asset.DurationMs
+	if durationMs <= 0 {
+		if ms, perr := ffmpeg.GetDurationMs(asset.FilePath); perr == nil && ms > 0 {
+			durationMs = ms
+			_ = h.svc.Search().UpdateDurationMs(asset.ID, ms) // best-effort write-back
+		}
+	}
+	if durationMs <= 0 {
+		return echo.NewHTTPError(http.StatusNotFound, "duration unknown")
+	}
+
+	if _, serr := os.Stat(asset.FilePath); serr != nil {
+		return echo.NewHTTPError(http.StatusNotFound, "source missing")
+	}
+
+	spritePath := filepath.Join(h.thumbDir, asset.ID, "sprite.jpg")
+	if _, gerr := h.sprites.Ensure(asset.FilePath, spritePath, durationMs); gerr != nil {
+		if errors.Is(gerr, exec.ErrNotFound) {
+			return echo.NewHTTPError(http.StatusServiceUnavailable, "ffmpeg unavailable")
+		}
+		return echo.NewHTTPError(http.StatusServiceUnavailable, gerr.Error())
+	}
+
+	frames, frameH, ferr := service.SpriteInfoFromFile(spritePath)
+	if ferr != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, ferr.Error())
+	}
+
+	hdr := c.Response().Header()
+	hdr.Set("X-Sprite-Frames", strconv.Itoa(frames))
+	hdr.Set("X-Sprite-Frame-W", strconv.Itoa(service.SpriteFrameW))
+	hdr.Set("X-Sprite-Frame-H", strconv.Itoa(frameH)) // 实际帧高（按原始比例，从文件读）
+	hdr.Set("X-Sprite-Duration-Ms", strconv.FormatInt(durationMs, 10))
+	hdr.Set("Cache-Control", "max-age=604800")
+	return c.File(spritePath)
 }
 
 // List returns a paginated list of assets.

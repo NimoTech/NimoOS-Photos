@@ -587,6 +587,13 @@ WHERE a.id = ?`, userID, id)
 	return &assets[0], nil
 }
 
+// UpdateDurationMs persists a (re-probed) duration back onto the asset row,
+// repairing historical rows whose duration_ms was 0/missing at ingest time.
+func (s *SearchService) UpdateDurationMs(id string, ms int64) error {
+	_, err := s.db.Exec(`UPDATE assets SET duration_ms=? WHERE id=?`, ms, id)
+	return err
+}
+
 // DeleteAsset removes an asset by ID; returns ErrNotFound when absent.
 func (s *SearchService) DeleteAsset(id string) error {
 	dropClipVector(s.db, id) // before the cascade drops asset_clip_idx
