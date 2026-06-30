@@ -20,6 +20,26 @@ import (
 	"go.uber.org/zap"
 )
 
+// mcpReadSkip reports whether a localhost caller may skip JWT on the read-only
+// photos endpoints the NimoOS-AI MCP server uses. Fail-closed + exact-match:
+//   - realIP must be 127.* (use c.RealIP(); the Gateway strips spoofed XFF, so
+//     external traffic never appears as 127, and RemoteAddr would be wrong here);
+//   - userID (X-NimoOS-User-ID) must be non-empty, else NOT skipped → JWT → 401
+//     (never fall back to the "default" user on the MCP path);
+//   - path is matched EXACTLY against the full route (never HasSuffix).
+func mcpReadSkip(method, path, realIP, userID string) bool {
+	if !strings.HasPrefix(realIP, "127.") || userID == "" {
+		return false
+	}
+	if method == http.MethodPost && path == common.V1APIPath+"/search/smart" {
+		return true
+	}
+	if method == http.MethodGet && path == common.V1APIPath+"/albums" {
+		return true
+	}
+	return false
+}
+
 // InitRouter sets up the Echo router with JWT middleware and all v1 routes.
 func InitRouter(ctx context.Context, svc service.Services, runtimePath string, thumbDir string) http.Handler {
 	e := echo.New()
@@ -49,10 +69,10 @@ func InitRouter(ctx context.Context, svc service.Services, runtimePath string, t
 				strings.HasSuffix(p, "/favorites/export") {
 				return true
 			}
-			// Allow internal service calls from localhost (e.g. NimoOS-AI agent)
-			// to POST /search/smart without a JWT.
-			return strings.HasSuffix(p, "/search/smart") &&
-				strings.HasPrefix(c.RealIP(), "127.")
+			// Allow localhost internal callers (NimoOS-AI MCP server) to skip JWT on
+			// the read-only photos endpoints; fail-closed + exact-match (mcpReadSkip).
+			return mcpReadSkip(c.Request().Method, c.Path(), c.RealIP(),
+				c.Request().Header.Get("X-NimoOS-User-ID"))
 		},
 		ParseTokenFunc: func(token string, c echo.Context) (interface{}, error) {
 			valid, claims, err := jwt.Validate(token, func() (*ecdsa.PublicKey, error) {
