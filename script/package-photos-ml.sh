@@ -42,6 +42,7 @@ docker save -o "${STAGE}/immich-ml.tar" "${REF}"
 
 echo "==> [2/4] 预热模型缓存(临时容器联网下载,CPU 模式即可)..."
 mkdir -p "${WARM}/ml-cache"
+docker rm -f photos-ml-warm >/dev/null 2>&1 || true
 docker run -d --name photos-ml-warm \
   -p "127.0.0.1:${WARM_PORT}:3003" \
   -v "${WARM}/ml-cache":/cache \
@@ -77,7 +78,7 @@ warm_predict "CLIP 文本塔" "{\"clip\":{\"textual\":{\"modelName\":\"${CLIP_MO
 warm_predict "人脸"        "{\"facial-recognition\":{\"detection\":{\"modelName\":\"${FACE_MODEL}\"},\"recognition\":{\"modelName\":\"${FACE_MODEL}\"}}}" -F "image=@${TEST_JPG}"
 warm_predict "OCR"         "{\"ocr\":{\"detection\":{\"modelName\":\"${OCR_MODEL}\"},\"recognition\":{\"modelName\":\"${OCR_MODEL}\"}}}" -F "image=@${TEST_JPG}"
 
-docker rm -f photos-ml-warm
+docker rm -f photos-ml-warm || true
 echo "    模型缓存 $(du -sh "${WARM}/ml-cache" | cut -f1)"
 
 echo "==> [3/4] 打模型缓存包 ..."
