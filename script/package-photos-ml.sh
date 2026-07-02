@@ -57,7 +57,12 @@ docker run -d --name photos-ml-warm \
   -v "${WARM}/ml-cache":/cache \
   -e MACHINE_LEARNING_CACHE_FOLDER=/cache \
   ${HF_ENDPOINT:+-e HF_ENDPOINT="${HF_ENDPOINT}"} \
+  -e HF_HUB_ETAG_TIMEOUT="${HF_HUB_ETAG_TIMEOUT:-60}" \
+  -e HF_HUB_DOWNLOAD_TIMEOUT="${HF_HUB_DOWNLOAD_TIMEOUT:-60}" \
   "${REF}"
+# 注意:hf-mirror.com 的 HEAD 响应缺 HF 元数据头,huggingface_hub 会报
+# FileMetadataError 拒绝下载;直连 huggingface.co(不设 HF_ENDPOINT)反而最稳,
+# 仅在直连确实不通的网络里才设 HF_ENDPOINT 换镜像站。
 
 echo "    等待 ML 服务就绪..."
 for _ in $(seq 1 60); do
