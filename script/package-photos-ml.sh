@@ -57,12 +57,16 @@ for _ in $(seq 1 60); do
 done
 curl -fsS "http://127.0.0.1:${WARM_PORT}/ping" | grep -q pong || { echo "✗ 预热容器未就绪"; docker logs photos-ml-warm | tail -20; exit 1; }
 
-# 1x1 白色 JPEG,用来触发模型下载(内容不重要,能过解码即可)
+# 64x64 白色 JPEG(ffmpeg 生成并验证过可被 PIL 解码),用来触发模型下载。
+# 注意:此前的手写 1x1 base64 是截断的,immich-ml 侧 PIL 会报
+# "image file is truncated" 并返回 500,预热必挂。
 TEST_JPG="${WARM}/t.jpg"
 base64 -d > "${TEST_JPG}" <<'EOF'
-/9j/4AAQSkZJRgABAQEASABIAAD/2wBDAP//////////////////////////////////////////
-////////////////////////////////////////////////wgALCAABAAEBAREA/8QAFBABAAAA
-AAAAAAAAAAAAAAAAAP/aAAgBAQABPxA=
+/9j/4AAQSkZJRgABAgAAAQABAAD//gAQTGF2YzYxLjE5LjEwMQD/2wBDAAgEBAQEBAUFBQUFBQYG
+BgYGBgYGBgYGBgYHBwcICAgHBwcGBgcHCAgICAkJCQgICAgJCQoKCgwMCwsODg4RERT/xABLAAEB
+AAAAAAAAAAAAAAAAAAAABwEBAAAAAAAAAAAAAAAAAAAAABABAAAAAAAAAAAAAAAAAAAAABEBAAAA
+AAAAAAAAAAAAAAAAAP/AABEIAEAAQAMBIgACEQADEQD/2gAMAwEAAhEDEQA/AL+AAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAD/2Q==
 EOF
 
 warm_predict() {  # $1=描述 $2=entries $3...=额外 -F 参数
