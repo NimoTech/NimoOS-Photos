@@ -476,3 +476,79 @@ func TestMigrateClipDimUpgrade(t *testing.T) {
 		t.Errorf("asset_clip_idx not cleared, %d rows left", n)
 	}
 }
+
+// TestMigrateClipDimIdempotent verifies that migrateClipDim is a no-op when the
+// existing clip_embeddings table already matches common.CLIPDim: reopening must
+// NOT drop the vec0 table or clear asset_clip_idx / clip_embeddings rows.
+func TestMigrateClipDimIdempotent(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "photos.db")
+
+	db, err := sqlite.Open(path)
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+
+	if _, err := db.Exec(`INSERT INTO assets (id, file_path, status) VALUES (?, ?, ?)`,
+		"asset-001", "/photos/idempotent.jpg", "indexed"); err != nil {
+		t.Fatalf("insert asset failed: %v", err)
+	}
+
+	dim := common.CLIPDim
+	vec := make([]float32, dim)
+	val := float32(1.0 / math.Sqrt(float64(dim)))
+	for i := range vec {
+		vec[i] = val
+	}
+	blob := sqlite.SerializeFloat32(vec)
+
+	if _, err := db.Exec(`INSERT INTO asset_clip_idx (rowid, asset_id) VALUES (1, ?)`, "asset-001"); err != nil {
+		t.Fatalf("insert asset_clip_idx failed: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO clip_embeddings (rowid, embedding) VALUES (1, ?)`, blob); err != nil {
+		t.Fatalf("insert clip_embeddings failed: %v", err)
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatalf("close failed: %v", err)
+	}
+
+	// Reopen: dimension already matches common.CLIPDim, migrateClipDim must
+	// take the no-op branch and leave the vec0 table + mapping untouched.
+	db2, err := sqlite.Open(path)
+	if err != nil {
+		t.Fatalf("reopen failed: %v", err)
+	}
+	defer db2.Close()
+
+	var idxCount int
+	if err := db2.QueryRow(`SELECT COUNT(*) FROM asset_clip_idx`).Scan(&idxCount); err != nil {
+		t.Fatalf("count asset_clip_idx failed: %v", err)
+	}
+	if idxCount != 1 {
+		t.Errorf("expected 1 asset_clip_idx row to survive reopen, got %d", idxCount)
+	}
+
+	var vecCount int
+	if err := db2.QueryRow(`SELECT COUNT(*) FROM clip_embeddings`).Scan(&vecCount); err != nil {
+		t.Fatalf("count clip_embeddings failed: %v", err)
+	}
+	if vecCount != 1 {
+		t.Errorf("expected 1 clip_embeddings row to survive reopen, got %d", vecCount)
+	}
+
+	var gotBlob []byte
+	if err := db2.QueryRow(`SELECT embedding FROM clip_embeddings WHERE rowid = 1`).Scan(&gotBlob); err != nil {
+		t.Fatalf("read back embedding failed: %v", err)
+	}
+	gotVec := sqlite.DeserializeFloat32(gotBlob)
+	if len(gotVec) != dim {
+		t.Fatalf("expected %d-dim vector, got %d", dim, len(gotVec))
+	}
+	for i, f := range gotVec {
+		if math.Abs(float64(f-val)) > 1e-6 {
+			t.Errorf("vector element %d mismatch: got %f want %f", i, f, val)
+			break
+		}
+	}
+}
