@@ -2,11 +2,14 @@ package sqlite_test
 
 import (
 	"database/sql"
+	"fmt"
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
+	"github.com/NimoTech/NimoOS-Photos/common"
 	"github.com/NimoTech/NimoOS-Photos/pkg/sqlite"
 	"github.com/stretchr/testify/require"
 )
@@ -62,8 +65,8 @@ func TestSQLiteVec(t *testing.T) {
 		t.Fatalf("insert asset failed: %v", err)
 	}
 
-	// Build a 512-dim unit vector (all 1/sqrt(512))
-	dim := 512
+	// Build a common.CLIPDim-dim unit vector (all 1/sqrt(dim))
+	dim := common.CLIPDim
 	vec := make([]float32, dim)
 	val := float32(1.0 / math.Sqrt(float64(dim)))
 	for i := range vec {
@@ -428,4 +431,48 @@ func TestMigrateCreatesGeoTables(t *testing.T) {
 	db2, err := sqlite.Open(filepath.Join(t.TempDir(), "t2.db"))
 	require.NoError(t, err)
 	db2.Close()
+}
+
+func TestMigrateClipDimUpgrade(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "photos.db")
+
+	// 手工造一个旧版 512 维库(sqlite_vec.Auto() 已在包 init 注册)
+	raw, err := sql.Open("sqlite3", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(`CREATE VIRTUAL TABLE clip_embeddings USING vec0(embedding float[512])`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(`CREATE TABLE asset_clip_idx (rowid INTEGER PRIMARY KEY, asset_id TEXT UNIQUE NOT NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(`INSERT INTO asset_clip_idx(rowid, asset_id) VALUES (1, 'a1')`); err != nil {
+		t.Fatal(err)
+	}
+	raw.Close()
+
+	// Open 应识别维度不符,DROP 重建 + 清空映射表
+	db, err := sqlite.Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	var ddl string
+	if err := db.QueryRow(`SELECT sql FROM sqlite_master WHERE name='clip_embeddings'`).Scan(&ddl); err != nil {
+		t.Fatalf("read ddl: %v", err)
+	}
+	want := fmt.Sprintf("float[%d]", common.CLIPDim)
+	if !strings.Contains(ddl, want) {
+		t.Errorf("ddl %q missing %q", ddl, want)
+	}
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM asset_clip_idx`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Errorf("asset_clip_idx not cleared, %d rows left", n)
+	}
 }
