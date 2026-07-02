@@ -1,0 +1,5 @@
+# Intel 核显(OpenVINO)设备映射;由 install.sh 按检测结果部署为 docker-compose.override.yml
+services:
+  immich-machine-learning:
+    devices:
+      - /dev/dri:/dev/dri

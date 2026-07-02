@@ -27,3 +27,8 @@ services:
       MACHINE_LEARNING_WORKERS: "1"
       MACHINE_LEARNING_WORKER_TIMEOUT: "120"
       MACHINE_LEARNING_CACHE_FOLDER: "/cache"
+      # 闲置 5 分钟自动卸载模型释放内存(nllb-large + PP-OCRv5_server 常驻很吃内存)
+      MACHINE_LEARNING_MODEL_TTL: "300"
+      MACHINE_LEARNING_MODEL_TTL_POLL_S: "10"
+      # 模型缓存随包预置,禁止运行时联网查 HuggingFace(离线/内网机器上会卡超时)
+      HF_HUB_OFFLINE: "1"
