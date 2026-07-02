@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/NimoTech/NimoOS-Photos/common"
 	"github.com/NimoTech/NimoOS-Photos/pkg/sqlite"
 	"github.com/NimoTech/NimoOS-Photos/service"
 	"github.com/google/uuid"
@@ -330,7 +331,7 @@ func TestFaceThumbnail_CropsAndCaches(t *testing.T) {
 	require.NoError(t, err)
 	// bbox 是基于 ML 输入图的绝对像素坐标（400×300 测试图上的人脸框）。
 	_, err = db.Exec(`INSERT INTO face_detections(id, asset_id, bbox, embedding) VALUES('face1','fa',?,?)`,
-		`{"x1":100,"y1":75,"x2":240,"y2":210}`, sqlite.SerializeFloat32(make([]float32, 512)))
+		`{"x1":100,"y1":75,"x2":240,"y2":210}`, sqlite.SerializeFloat32(make([]float32, common.FaceDim)))
 	require.NoError(t, err)
 	_, err = db.Exec(`INSERT INTO persons(id, name, cover_asset_id, cover_face_id) VALUES('pp','','fa','face1')`)
 	require.NoError(t, err)
@@ -364,7 +365,7 @@ func TestFaceThumbnail_HiddenReturnsNotFound(t *testing.T) {
 	_, err := db.Exec(`INSERT INTO assets(id, file_path, status) VALUES('fh', ?, 'indexed')`, srcPath)
 	require.NoError(t, err)
 	_, err = db.Exec(`INSERT INTO face_detections(id, asset_id, bbox, embedding) VALUES('face-h','fh',?,?)`,
-		`{"x1":100,"y1":75,"x2":240,"y2":210}`, sqlite.SerializeFloat32(make([]float32, 512)))
+		`{"x1":100,"y1":75,"x2":240,"y2":210}`, sqlite.SerializeFloat32(make([]float32, common.FaceDim)))
 	require.NoError(t, err)
 	_, err = db.Exec(`INSERT INTO persons(id, name, cover_asset_id, cover_face_id, hidden) VALUES('ph','','fh','face-h',1)`)
 	require.NoError(t, err)
@@ -391,9 +392,9 @@ func TestFaceThumbnail_VideoScalesBBoxToThumb(t *testing.T) {
 	_, err = db.Exec(`INSERT INTO asset_exif(asset_id, width, height) VALUES(?, 1920, 1080)`, assetID)
 	require.NoError(t, err)
 	_, err = db.Exec(`INSERT INTO face_detections(id, asset_id, bbox, embedding) VALUES('fv-face',?,?,?)`,
-		assetID, `{"x1":480,"y1":270,"x2":960,"y2":810}`, sqlite.SerializeFloat32(make([]float32, 512)))
+		assetID, `{"x1":480,"y1":270,"x2":960,"y2":810}`, sqlite.SerializeFloat32(make([]float32, common.FaceDim)))
 	require.NoError(t, err)
-	_, err = db.Exec(`INSERT INTO persons(id, name, cover_asset_id, cover_face_id) VALUES('pv','','`+assetID+`','fv-face')`)
+	_, err = db.Exec(`INSERT INTO persons(id, name, cover_asset_id, cover_face_id) VALUES('pv','','` + assetID + `','fv-face')`)
 	require.NoError(t, err)
 
 	ps := service.NewPersonService(db)

@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/NimoTech/NimoOS-Photos/common"
 	"github.com/NimoTech/NimoOS-Photos/pkg/geo"
 	"github.com/NimoTech/NimoOS-Photos/pkg/sqlite"
 	"github.com/NimoTech/NimoOS-Photos/service"
@@ -14,7 +15,7 @@ import (
 type mockTextML struct{}
 
 func (m *mockTextML) CLIPTextEmbed(_ string) ([]float32, error) {
-	v := make([]float32, 512)
+	v := make([]float32, common.CLIPDim)
 	v[0] = 1.0
 	return v, nil
 }
@@ -37,7 +38,7 @@ func TestSmartSearch(t *testing.T) {
 	var rowid int64
 	db.QueryRow(`SELECT rowid FROM asset_clip_idx WHERE asset_id='a1'`).Scan(&rowid)
 
-	vec := make([]float32, 512)
+	vec := make([]float32, common.CLIPDim)
 	vec[0] = 1.0
 	db.Exec(`INSERT INTO clip_embeddings(rowid, embedding) VALUES(?,?)`, rowid, sqlite.SerializeFloat32(vec))
 
@@ -64,7 +65,7 @@ func TestSmartSearchIncludeOCR(t *testing.T) {
 		db.Exec(`INSERT INTO asset_clip_idx(asset_id) VALUES(?)`, id)
 		var rowid int64
 		db.QueryRow(`SELECT rowid FROM asset_clip_idx WHERE asset_id=?`, id).Scan(&rowid)
-		vec := make([]float32, 512)
+		vec := make([]float32, common.CLIPDim)
 		vec[0] = 1.0
 		db.Exec(`INSERT INTO clip_embeddings(rowid,embedding) VALUES(?,?)`, rowid, sqlite.SerializeFloat32(vec))
 	}

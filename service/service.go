@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/NimoTech/NimoOS-Photos/common"
 	"github.com/NimoTech/NimoOS-Photos/pkg/config"
 	"github.com/NimoTech/NimoOS-Photos/pkg/geo"
 	"github.com/NimoTech/NimoOS-Photos/pkg/mlclient"
@@ -310,4 +311,4 @@ func NewTestServices(db *sql.DB) Services {
 // It is used only in tests where actual ML inference is not needed.
 type zeroML struct{}
 
-func (zeroML) CLIPTextEmbed(string) ([]float32, error) { return make([]float32, 512), nil }
+func (zeroML) CLIPTextEmbed(string) ([]float32, error) { return make([]float32, common.CLIPDim), nil }

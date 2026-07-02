@@ -23,6 +23,7 @@ import (
 
 	_ "golang.org/x/image/webp"
 
+	"github.com/NimoTech/NimoOS-Photos/common"
 	"github.com/NimoTech/NimoOS-Photos/pkg/config"
 	"github.com/NimoTech/NimoOS-Photos/pkg/exif"
 	"github.com/NimoTech/NimoOS-Photos/pkg/ffmpeg"
@@ -854,7 +855,7 @@ func (ix *Indexer) processFileInternal(path string, opts processOpts) (success b
 			if config.Cfg == nil || config.Cfg.FacesEnabled {
 				if faces, faceErr := ix.ml.DetectAndRecognizeFaces(faceData); faceErr == nil {
 					for _, face := range faces {
-						if len(face.Embedding) != 512 {
+						if len(face.Embedding) != common.FaceDim {
 							continue
 						}
 						bboxJSON, _ := json.Marshal(face.BBox)

@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/NimoTech/NimoOS-Photos/common"
 	"github.com/NimoTech/NimoOS-Photos/pkg/config"
 	"github.com/NimoTech/NimoOS-Photos/pkg/mlclient"
 	"github.com/NimoTech/NimoOS-Photos/pkg/sqlite"
@@ -22,10 +23,10 @@ import (
 type mockML struct{}
 
 func (m *mockML) CLIPImageEmbed(_ []byte) ([]float32, error) {
-	return make([]float32, 512), nil
+	return make([]float32, common.CLIPDim), nil
 }
 func (m *mockML) CLIPTextEmbed(_ string) ([]float32, error) {
-	return make([]float32, 512), nil
+	return make([]float32, common.CLIPDim), nil
 }
 func (m *mockML) DetectAndRecognizeFaces(_ []byte) ([]mlclient.FaceResult, error) {
 	return nil, nil

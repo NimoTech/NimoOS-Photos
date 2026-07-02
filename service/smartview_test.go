@@ -6,14 +6,15 @@ import (
 	"testing"
 	"time"
 
-	"github.com/stretchr/testify/require"
+	"github.com/NimoTech/NimoOS-Photos/common"
 	"github.com/NimoTech/NimoOS-Photos/pkg/sqlite"
+	"github.com/stretchr/testify/require"
 )
 
 type mockTextMLSV struct{}
 
 func (m *mockTextMLSV) CLIPTextEmbed(_ string) ([]float32, error) {
-	v := make([]float32, 512)
+	v := make([]float32, common.CLIPDim)
 	v[0] = 1.0
 	return v, nil
 }
@@ -66,7 +67,7 @@ func TestEvaluateIntersectionAndScore(t *testing.T) {
 		require.NoError(t, err)
 		var rowid int64
 		require.NoError(t, db.QueryRow(`SELECT rowid FROM asset_clip_idx WHERE asset_id=?`, id).Scan(&rowid))
-		vec := make([]float32, 512)
+		vec := make([]float32, common.CLIPDim)
 		vec[0] = 1.0
 		_, err = db.Exec(`INSERT INTO clip_embeddings(rowid,embedding) VALUES(?,?)`, rowid, sqlite.SerializeFloat32(vec))
 		require.NoError(t, err)
@@ -156,7 +157,7 @@ func seedClipAsset(t *testing.T, s *SmartViewService, id string) {
 	require.NoError(t, err)
 	var rowid int64
 	require.NoError(t, db.QueryRow(`SELECT rowid FROM asset_clip_idx WHERE asset_id=?`, id).Scan(&rowid))
-	vec := make([]float32, 512)
+	vec := make([]float32, common.CLIPDim)
 	vec[0] = 1.0
 	_, err = db.Exec(`INSERT INTO clip_embeddings(rowid,embedding) VALUES(?,?)`, rowid, sqlite.SerializeFloat32(vec))
 	require.NoError(t, err)
@@ -174,7 +175,7 @@ func seedClipAssetWithSim(t *testing.T, s *SmartViewService, id string, sim floa
 	require.NoError(t, err)
 	var rowid int64
 	require.NoError(t, db.QueryRow(`SELECT rowid FROM asset_clip_idx WHERE asset_id=?`, id).Scan(&rowid))
-	vec := make([]float32, 512)
+	vec := make([]float32, common.CLIPDim)
 	vec[0] = float32(sim)
 	vec[1] = float32(math.Sqrt(1 - sim*sim))
 	_, err = db.Exec(`INSERT INTO clip_embeddings(rowid,embedding) VALUES(?,?)`, rowid, sqlite.SerializeFloat32(vec))
@@ -423,7 +424,13 @@ func TestSmartViewStats(t *testing.T) {
 	require.Len(t, sv.Seeds, 5)
 }
 
-func sumInts(a []int) int { s := 0; for _, v := range a { s += v }; return s }
+func sumInts(a []int) int {
+	s := 0
+	for _, v := range a {
+		s += v
+	}
+	return s
+}
 
 func recentOrOld(i int) string {
 	if i < 3 {
