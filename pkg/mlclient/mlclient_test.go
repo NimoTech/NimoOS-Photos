@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/NimoTech/NimoOS-Photos/common"
 	"github.com/NimoTech/NimoOS-Photos/pkg/mlclient"
 )
 
@@ -164,5 +165,74 @@ func TestIsReady(t *testing.T) {
 	client := mlclient.New(srv.URL)
 	if !client.IsReady() {
 		t.Fatal("expected IsReady() = true")
+	}
+}
+
+// captureEntries 起一个假 ML 服务,把收到的 multipart entries 字段抓出来,
+// 并按任务类型返回合法响应体。
+func captureEntries(t *testing.T, respBody string, got *string) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseMultipartForm(32 << 20); err != nil {
+			t.Fatalf("parse multipart: %v", err)
+		}
+		*got = r.FormValue("entries")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(respBody))
+	}))
+}
+
+func TestEntriesUseConfiguredModelNames(t *testing.T) {
+	cases := []struct {
+		name     string
+		resp     string
+		call     func(c *mlclient.MLClient) error
+		wantSubs []string
+	}{
+		{
+			name:     "clip visual",
+			resp:     `{"clip":"[0.1]"}`,
+			call:     func(c *mlclient.MLClient) error { _, err := c.CLIPImageEmbed([]byte("img")); return err },
+			wantSubs: []string{`"visual"`, common.CLIPModelName},
+		},
+		{
+			name:     "clip textual",
+			resp:     `{"clip":"[0.1]"}`,
+			call:     func(c *mlclient.MLClient) error { _, err := c.CLIPTextEmbed("hi"); return err },
+			wantSubs: []string{`"textual"`, common.CLIPModelName},
+		},
+		{
+			name:     "faces",
+			resp:     `{"facial-recognition":[]}`,
+			call:     func(c *mlclient.MLClient) error { _, err := c.DetectAndRecognizeFaces([]byte("img")); return err },
+			wantSubs: []string{`"detection"`, `"recognition"`, common.FaceModelName},
+		},
+		{
+			name:     "ocr",
+			resp:     `{"ocr":{"text":[],"textScore":[],"box":[]}}`,
+			call:     func(c *mlclient.MLClient) error { _, err := c.OCR([]byte("img")); return err },
+			wantSubs: []string{`"ocr"`, common.OCRModelName},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var entries string
+			srv := captureEntries(t, tc.resp, &entries)
+			defer srv.Close()
+			if err := tc.call(mlclient.New(srv.URL)); err != nil {
+				t.Fatalf("call: %v", err)
+			}
+			for _, sub := range tc.wantSubs {
+				if !strings.Contains(entries, sub) {
+					t.Errorf("entries %q missing %q", entries, sub)
+				}
+			}
+			// 旧模型名绝不能再出现
+			for _, old := range []string{"ViT-B-32__openai", "buffalo_l", "PP-OCRv5_mobile"} {
+				if strings.Contains(entries, old) {
+					t.Errorf("entries %q still references old model %q", entries, old)
+				}
+			}
+		})
 	}
 }
