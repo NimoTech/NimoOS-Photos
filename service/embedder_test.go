@@ -51,6 +51,38 @@ func TestEmbedder_QueryMissing(t *testing.T) {
 	_ = missing
 }
 
+// 视频不参与 OCR:既不进补跑目标,历史遗留的视频 OCR 行也被 pruneVideoOCR 清掉。
+func TestVideoOCRExcludedAndPruned(t *testing.T) {
+	db := makeTestDB(t)
+	img := insertAsset(t, db, "/photo.jpg", "indexed") // 图片:缺 OCR → 应是补跑目标
+	vid := uuid.NewString()
+	_, err := db.Exec(`INSERT INTO assets(id,file_path,file_size,mime_type,original_name,is_live_photo_video,status,checksum)
+		VALUES(?, '/clip.mp4', 1, 'video/mp4', 'clip.mp4', 0, 'indexed', ?)`, vid, uuid.NewString())
+	require.NoError(t, err)
+
+	e := NewEmbedder(db, &mockML{}, nil, nil)
+	targets, err := e.queryMissingOCR(context.Background())
+	require.NoError(t, err)
+	ids := map[string]bool{}
+	for _, tg := range targets {
+		ids[tg.id] = true
+	}
+	require.True(t, ids[img], "图片应是缺 OCR 补跑目标")
+	require.False(t, ids[vid], "视频必须被排除出 OCR 补跑")
+
+	// pruneVideoOCR 删视频 OCR 行、保留图片 OCR 行。
+	_, err = db.Exec(`INSERT INTO asset_ocr(asset_id, text) VALUES(?, ?)`, vid, "spreadsheet text")
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO asset_ocr(asset_id, text) VALUES(?, ?)`, img, "receipt")
+	require.NoError(t, err)
+	pruneVideoOCR(db)
+	var vidRows, imgRows int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM asset_ocr WHERE asset_id=?`, vid).Scan(&vidRows))
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM asset_ocr WHERE asset_id=?`, img).Scan(&imgRows))
+	require.Equal(t, 0, vidRows, "视频 OCR 行应被清掉")
+	require.Equal(t, 1, imgRows, "图片 OCR 行应保留")
+}
+
 // TestEmbedder_HasEmbeddingForPath
 func TestEmbedder_HasEmbeddingForPath(t *testing.T) {
 	db := makeTestDB(t)

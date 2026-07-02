@@ -161,6 +161,7 @@ func (e *Embedder) queryMissingOCR(ctx context.Context) ([]ocrTarget, error) {
         FROM assets a
         LEFT JOIN asset_ocr o ON o.asset_id = a.id
         WHERE a.status = 'indexed' AND a.deleted_at IS NULL
+          AND COALESCE(a.mime_type,'') NOT LIKE 'video/%'
           AND (o.asset_id IS NULL OR o.coverage IS NULL)`)
 	if err != nil {
 		return nil, err

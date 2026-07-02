@@ -873,8 +873,11 @@ func (ix *Indexer) processFileInternal(path string, opts processOpts) (success b
 			// OCR uses the same full-detail input as faces (original photo or
 			// full keyframe) — small text on receipts/documents is lost at
 			// thumbnail resolution.
-			// OCR（OCREnabled 关闭时跳过）。
-			if config.Cfg == nil || config.Cfg.OCREnabled {
+			// 视频不跑 OCR:对视频关键帧做 OCR 没有实际意义,还会把「录屏/含文字画面」的
+			// 视频误判进「OCR/文档」分类(asset_ocr 命中即归类)。视频只保留 CLIP 用于
+			// 视觉检索;真正的视频理解(分段 embedding)是后续工作。
+			// OCR（OCREnabled 关闭或视频时跳过）。
+			if !isVideo && (config.Cfg == nil || config.Cfg.OCREnabled) {
 				if err := ix.ocrAsset(assetID, faceData); err != nil {
 					fmt.Fprintf(os.Stderr, "[indexer] OCR failed for %s: %v\n", assetID, err)
 				}
@@ -1178,6 +1181,14 @@ func pruneOrphanClipVectors(db *sql.DB) {
 		(SELECT rowid FROM asset_clip_idx WHERE asset_id NOT IN (SELECT id FROM assets))`)
 	_, _ = db.Exec(`DELETE FROM asset_clip_idx WHERE asset_id NOT IN (SELECT id FROM assets)`)
 	_, _ = db.Exec(`DELETE FROM clip_embeddings WHERE rowid NOT IN (SELECT rowid FROM asset_clip_idx)`)
+}
+
+// pruneVideoOCR 删除视频的 OCR 行。视频不再跑 OCR(关键帧 OCR 无意义,还会把含文字
+// 画面的视频误判进「OCR/文档」分类);这里在启动时清掉历史遗留的视频 OCR 行,使已索引
+// 的视频也立即退出 OCR 分类。幂等:之后视频不再产生 asset_ocr 行。
+func pruneVideoOCR(db *sql.DB) {
+	_, _ = db.Exec(`DELETE FROM asset_ocr WHERE asset_id IN
+		(SELECT id FROM assets WHERE mime_type LIKE 'video/%')`)
 }
 
 func (ix *Indexer) RemoveByPath(path string) {
