@@ -32,8 +32,17 @@ OCR_MODEL="$(grep -oP 'OCRModelName  = "\K[^"]+' "${HERE}/common/constants.go")"
 echo "==> 模型: clip=${CLIP_MODEL} face=${FACE_MODEL} ocr=${OCR_MODEL}"
 
 STAGE="$(mktemp -d)"
-WARM="$(mktemp -d)"
-trap 'docker rm -f photos-ml-warm >/dev/null 2>&1 || true; rm -rf "${STAGE}" "${WARM}"' EXIT
+# 预热缓存目录:默认临时目录用完即删;设 PHOTOS_ML_WARM_DIR 可指定持久目录,
+# 失败重跑时 HF 缓存续传、不必从零重新下载几个 GB 的模型。
+if [[ -n "${PHOTOS_ML_WARM_DIR:-}" ]]; then
+  WARM="${PHOTOS_ML_WARM_DIR}"
+  mkdir -p "${WARM}"
+  KEEP_WARM=1
+else
+  WARM="$(mktemp -d)"
+  KEEP_WARM=""
+fi
+trap 'docker rm -f photos-ml-warm >/dev/null 2>&1 || true; rm -rf "${STAGE}"; [[ -z "${KEEP_WARM}" ]] && rm -rf "${WARM}"' EXIT
 
 echo "==> [1/4] 拉取并重打标签 ${SRC} ..."
 docker pull "${SRC}"
@@ -70,11 +79,22 @@ AAAAAAAAAAAAAAAAAAD/2Q==
 EOF
 
 warm_predict() {  # $1=描述 $2=entries $3...=额外 -F 参数
+  # 模型下载走公网(HF 镜像/modelscope),偶发 HEAD 失败或断流是常态;
+  # 同一容器内重试即可续传(已下载文件在 HF 缓存中),重试 5 次仍失败才退出。
   local desc="$1" entries="$2"; shift 2
-  echo "    预热 ${desc} ...(首次会下载模型,耐心等)"
-  curl -fsS --max-time 1800 -X POST "http://127.0.0.1:${WARM_PORT}/predict" \
-    -F "entries=${entries}" "$@" > /dev/null \
-    || { echo "✗ ${desc} 预热失败"; docker logs photos-ml-warm | tail -30; exit 1; }
+  local attempt
+  for attempt in 1 2 3 4 5; do
+    echo "    预热 ${desc} ...(第 ${attempt}/5 次;首次会下载模型,耐心等)"
+    if curl -fsS --max-time 1800 -X POST "http://127.0.0.1:${WARM_PORT}/predict" \
+      -F "entries=${entries}" "$@" > /dev/null; then
+      return 0
+    fi
+    echo "    ${desc} 第 ${attempt} 次失败,30s 后重试(已下载部分续传)"
+    sleep 30
+  done
+  echo "✗ ${desc} 预热失败(重试 5 次)"
+  docker logs photos-ml-warm 2>&1 | tail -30
+  exit 1
 }
 
 warm_predict "CLIP 图像塔" "{\"clip\":{\"visual\":{\"modelName\":\"${CLIP_MODEL}\"}}}" -F "image=@${TEST_JPG}"
