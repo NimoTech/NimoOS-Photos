@@ -75,6 +75,7 @@ func main() {
 	go svc.Indexer().Start(ctx)
 	go svc.Faces().StartScheduler(ctx)
 	go svc.Embedder().Run(ctx)
+	go svc.Rebuilder().MaybeAutoRebuild(svc.Indexer().MLReady)
 
 	// Prune orphaned TUS staging files at startup (one-shot) and then daily.
 	go func() {

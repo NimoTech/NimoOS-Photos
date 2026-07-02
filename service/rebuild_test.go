@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/NimoTech/NimoOS-Photos/common"
 	"github.com/NimoTech/NimoOS-Photos/pkg/config"
 	"github.com/stretchr/testify/require"
 )
@@ -43,6 +44,26 @@ func TestRebuildReprocessesAssetsWithoutDuplicatingFaces(t *testing.T) {
 	var lastBuilt string
 	require.NoError(t, db.QueryRow(`SELECT value FROM photos_meta WHERE key='index_last_rebuilt'`).Scan(&lastBuilt))
 	require.NotEmpty(t, lastBuilt)
+}
+
+// TestModelGenStale 验证 modelGenStale 对代次键缺失/匹配/落后三种情况的判断。
+func TestModelGenStale(t *testing.T) {
+	db := makeTestDB(t)
+	if !modelGenStale(db) {
+		t.Fatal("fresh db should be stale (no ml_model_gen key)")
+	}
+	if _, err := db.Exec(`INSERT INTO photos_meta(key,value) VALUES('ml_model_gen',?)`, common.MLModelGen); err != nil {
+		t.Fatal(err)
+	}
+	if modelGenStale(db) {
+		t.Fatal("db with current gen should not be stale")
+	}
+	if _, err := db.Exec(`UPDATE photos_meta SET value='1' WHERE key='ml_model_gen'`); err != nil {
+		t.Fatal(err)
+	}
+	if !modelGenStale(db) {
+		t.Fatal("db with old gen should be stale")
+	}
 }
 
 // TestRebuildRejectsConcurrentRuns 验证重复触发返回 ErrRebuildRunning。

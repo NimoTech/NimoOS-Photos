@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/NimoTech/NimoOS-Photos/common"
 	"go.uber.org/zap"
 )
 
@@ -130,10 +131,20 @@ func (r *Rebuilder) run(taskID string) {
 		if err := r.faces.RunClustering(r.ctx); err != nil {
 			zap.L().Warn("rebuild: face reclustering failed", zap.Error(err))
 		}
+		// 换模型重聚类后，旧的空 persons（含用户命名）已无意义，清掉。
+		if _, err := r.db.Exec(`DELETE FROM persons WHERE id NOT IN
+			(SELECT person_id FROM face_person WHERE person_id IS NOT NULL)`); err != nil {
+			zap.L().Warn("rebuild: prune empty persons failed", zap.Error(err))
+		}
 		if _, err := r.db.Exec(`INSERT INTO photos_meta(key,value) VALUES('index_last_rebuilt',?)
 			ON CONFLICT(key) DO UPDATE SET value=excluded.value`,
 			time.Now().UTC().Format(time.RFC3339)); err != nil {
 			zap.L().Warn("rebuild: write meta failed", zap.Error(err))
+		}
+		if _, err := r.db.Exec(`INSERT INTO photos_meta(key,value) VALUES(?,?)
+			ON CONFLICT(key) DO UPDATE SET value=excluded.value`,
+			mlModelGenKey, common.MLModelGen); err != nil {
+			zap.L().Warn("rebuild: write ml_model_gen failed", zap.Error(err))
 		}
 	}
 
@@ -194,6 +205,40 @@ func (r *Rebuilder) run(taskID string) {
 		time.Sleep(taskCleanupDelay)
 		r.reg.Remove(taskID)
 	}()
+}
+
+const mlModelGenKey = "ml_model_gen"
+
+// modelGenStale 返回 photos_meta 里记录的模型代次是否落后于当前二进制。
+// 键不存在(老库 / 首次启动)视为落后。
+func modelGenStale(db *sql.DB) bool {
+	var gen string
+	_ = db.QueryRow(`SELECT value FROM photos_meta WHERE key=?`, mlModelGenKey).Scan(&gen)
+	return gen != common.MLModelGen
+}
+
+// MaybeAutoRebuild 在模型代次变化时自动触发一次全量重建：等 ML 后端就绪
+// (新模型缓存就位)后调 Start()。代次在 finalize() 成功后写入,所以重建
+// 中途失败/断电会在下次启动重试。由 main.go 以 goroutine 启动。
+func (r *Rebuilder) MaybeAutoRebuild(ready func() bool) {
+	if !modelGenStale(r.db) {
+		return
+	}
+	zap.L().Info("ML 模型代次变化，等待 ML 就绪后自动全量重建",
+		zap.String("target_gen", common.MLModelGen))
+	for r.ctx.Err() == nil && !ready() {
+		select {
+		case <-r.ctx.Done():
+			return
+		case <-time.After(30 * time.Second):
+		}
+	}
+	if r.ctx.Err() != nil {
+		return
+	}
+	if _, err := r.Start(); err != nil && err != ErrRebuildRunning {
+		zap.L().Warn("自动重建启动失败", zap.Error(err))
+	}
 }
 
 // failTask publishes a terminal error state for the rebuild task and
