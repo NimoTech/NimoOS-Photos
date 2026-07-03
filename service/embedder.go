@@ -27,6 +27,14 @@ type Embedder struct {
 	running      atomic.Bool
 	ocrRunning   atomic.Bool
 	pollInterval time.Duration
+
+	// rerunPending / ocrRerunPending 记录「补跑运行中又收到了一次触发」。
+	// 不能像以前那样让撞上 CAS 的第二次调用静默返回 nil:进行中的那轮可能早已
+	// 查过目标列表,查不到调用方刚变成可补的资产(典型:MountGuard 刚把插回的
+	// 盘上的资产标回 offline=0),吞掉触发等于治愈永远不发生。置位后,当前轮
+	// 结束时重新查询、再跑一轮。
+	rerunPending    atomic.Bool
+	ocrRerunPending atomic.Bool
 }
 
 func NewEmbedder(db *sql.DB, ml MLProvider, idx *Indexer, reg *TaskRegistry) *Embedder {
@@ -76,13 +84,32 @@ func (e *Embedder) hasEmbeddingForPath(path string) bool {
 }
 
 // Backfill 对所有 status='indexed' 但缺 CLIP 向量的 asset 补跑 ML。
-// 并发调用安全：第二次调用会立即返回 nil。
+// 并发调用安全：第二次调用立即返回 nil,但会置 rerunPending,由进行中的那轮
+// 结束后自动再跑一轮(重新查询目标),保证触发不被吞掉。
+//
+// 已知的微小窗口:若置位恰好发生在当前轮最后一次 pending 检查之后、running
+// 释放之前,这次触发要等到下一次 Backfill 调用(ML ready 跳变 / 挂载恢复 /
+// 手动触发)才被消费。窗口极窄且这些触发源都会周期性出现,不做双重检查。
 func (e *Embedder) Backfill(ctx context.Context) error {
 	if !e.running.CompareAndSwap(false, true) {
+		e.rerunPending.Store(true)
 		return nil
 	}
 	defer e.running.Store(false)
 
+	for {
+		if err := e.backfillOnce(ctx); err != nil {
+			return err
+		}
+		if !e.rerunPending.CompareAndSwap(true, false) {
+			return nil
+		}
+	}
+}
+
+// backfillOnce 是 Backfill 的单轮主体(查询目标 + 逐个补跑 + 任务上报),
+// 不含并发防重与 rerun 循环。
+func (e *Embedder) backfillOnce(ctx context.Context) error {
 	paths, err := e.queryMissing(ctx)
 	if err != nil {
 		return err
@@ -194,13 +221,27 @@ type ocrTarget struct {
 // BackfillOCR 对所有缺 OCR 文本的 asset 补跑 ML OCR。
 // 图片读原图（小票/文档的小字在缩略图分辨率下会丢失）；
 // 视频没有现成关键帧文件，退而用 large.jpg（1280px）缩略图。
-// 并发调用安全：第二次调用会立即返回 nil。
+// 并发调用安全：第二次调用立即返回 nil,但会置 ocrRerunPending,由进行中的
+// 那轮结束后自动再跑一轮——理由与窗口说明同 Backfill。
 func (e *Embedder) BackfillOCR(ctx context.Context) error {
 	if !e.ocrRunning.CompareAndSwap(false, true) {
+		e.ocrRerunPending.Store(true)
 		return nil
 	}
 	defer e.ocrRunning.Store(false)
 
+	for {
+		if err := e.backfillOCROnce(ctx); err != nil {
+			return err
+		}
+		if !e.ocrRerunPending.CompareAndSwap(true, false) {
+			return nil
+		}
+	}
+}
+
+// backfillOCROnce 是 BackfillOCR 的单轮主体,不含并发防重与 rerun 循环。
+func (e *Embedder) backfillOCROnce(ctx context.Context) error {
 	targets, err := e.queryMissingOCR(ctx)
 	if err != nil {
 		return err
