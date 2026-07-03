@@ -6,8 +6,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"unicode"
-	"unicode/utf8"
 
 	"github.com/NimoTech/NimoOS-Photos/pkg/sqlite"
 )
@@ -103,60 +101,10 @@ func NewSearchService(db *sql.DB, ml textEmbedder) *SearchService {
 // unchanged by this recalibration. Bump it here to enable a relevance floor.
 const minMatchSimilarity = 0.0
 
-// containsCJK reports whether s contains any CJK-Han rune, used to decide
-// between the Chinese and English caption templates in expandQuery (a mixed
-// CJK/Latin query is treated as Chinese).
-func containsCJK(s string) bool {
-	for _, r := range s {
-		if unicode.Is(unicode.Han, r) {
-			return true
-		}
-	}
-	return false
-}
-
-// looksLikeSentence reports whether trimmed already reads as a sentence
-// rather than a bare word/short phrase, so expandQuery leaves it untouched.
-func looksLikeSentence(trimmed string) bool {
-	lower := strings.ToLower(trimmed)
-	if strings.Contains(lower, "photo of") || strings.Contains(lower, "picture of") || strings.Contains(lower, "image of") {
-		return true
-	}
-	if strings.Contains(trimmed, "照片") || strings.Contains(trimmed, "图片") || strings.Contains(trimmed, "一张") {
-		return true
-	}
-	if containsCJK(trimmed) {
-		return utf8.RuneCountInString(trimmed) >= 5
-	}
-	return len(strings.Fields(trimmed)) >= 4
-}
-
-// expandQuery wraps a short/word-style query in a caption template before it
-// is embedded by CLIP. The nllb-clip-large-siglip text encoder is
-// sentence-oriented: bare-word queries ("kid", "小孩") land in a noisy region
-// of its embedding space with poor discriminative power, while a full
-// caption ("a photo of a kid" / "一张小孩的照片") ranks and scores far better
-// against the same photos. Queries that already read as a sentence are
-// passed through unchanged to avoid double-wrapping or diluting an
-// intentionally detailed query.
-func expandQuery(q string) string {
-	trimmed := strings.TrimSpace(q)
-	if trimmed == "" {
-		return q
-	}
-	if looksLikeSentence(trimmed) {
-		return q
-	}
-	if containsCJK(trimmed) {
-		return "一张" + q + "的照片"
-	}
-	return "a photo of " + q
-}
-
 // SmartSearch performs KNN vector search on CLIP embeddings filtered by optional
 // year/month, returning at most limit results.
 func (s *SearchService) SmartSearch(query string, limit int, filters SearchFilters) ([]Asset, error) {
-	queryVec, err := s.ml.CLIPTextEmbed(expandQuery(query))
+	queryVec, err := s.ml.CLIPTextEmbed(query)
 	if err != nil {
 		return nil, fmt.Errorf("SmartSearch embed: %w", err)
 	}
