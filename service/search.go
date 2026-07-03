@@ -81,16 +81,24 @@ func NewSearchService(db *sql.DB, ml textEmbedder) *SearchService {
 // ─── Smart (CLIP) search ─────────────────────────────────────────────────────
 
 // minMatchSimilarity, when > 0, drops SmartSearch results whose cosine similarity
-// (1 - d²/2 over unit-length CLIP vectors, i.e. Asset.MatchScore) is below it.
+// is below it. It is compared against Asset.MatchScore, which since scan.go's
+// displayScore is the *recalibrated* [0,1] display score — not the raw CLIP
+// cosine — so this threshold's semantics are display-scale, not raw-cosine-scale.
 //
 // Why this knob exists: KNN always returns the k nearest neighbours regardless of
 // absolute similarity, so on a small library every query returns a long tail of
-// barely-related fillers. Empirically for this corpus the distribution is:
-// noise ~0.16–0.19, mediocre ~0.20–0.23, confident matches ≥0.24. Setting this to
-// ~0.22 cuts the irrelevant tail (and the "irrelevant videos at high %" symptom).
+// barely-related fillers.
 //
-// Left at 0 (no filtering) by default — current behaviour is unchanged. Bump it
-// here to enable a relevance floor.
+// The empirical band below (noise ~0.16–0.19, mediocre ~0.20–0.23, confident
+// ≥0.24) was measured against openai CLIP's raw cosine and is now STALE: the
+// model has since moved to nllb-clip-large-siglip__v1, whose raw cosine
+// distribution sits an order of magnitude lower (see simDisplayFloor/Ceil in
+// scan.go) and, post-recalibration, no longer lines up with these numbers.
+// A fresh empirical pass against the recalibrated MatchScore is needed after a
+// full library re-embed before reusing this knob.
+//
+// Left at 0 (no filtering) by default — current behaviour (and value) is
+// unchanged by this recalibration. Bump it here to enable a relevance floor.
 const minMatchSimilarity = 0.0
 
 // SmartSearch performs KNN vector search on CLIP embeddings filtered by optional
