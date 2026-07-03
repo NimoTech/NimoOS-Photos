@@ -491,11 +491,14 @@ func TestResolveMimeType(t *testing.T) {
 // 物理删光。互锁 ①:目录对应挂载点不在当前挂载表时必须跳过 prune。
 func TestPruneMissingUnderSkipsWhenMountVanished(t *testing.T) {
 	db := makeTestDB(t)
-	id := insertAsset(t, db, "/media/devmon/X/gone.jpg", "indexed") // 文件在磁盘上不存在
+	// 夹具必须用真实机器上不存在的挂载名(见 TestPruneMissingUnderKeepsOfflineAssets
+	// 的说明):/media/devmon 在本机是 0700,stat 报 EACCES 而非 ENOENT,会把
+	// 本用例架空(资产无论互锁存在与否都会保留,断言恒真)。
+	id := insertAsset(t, db, "/media/nimoos-test-V/gone.jpg", "indexed") // 文件在磁盘上不存在
 	ix := NewIndexer(db, &mockML{}, t.TempDir(), 1)
-	ix.mountRoots = func() []string { return []string{"/DATA"} } // /media/devmon/X 已从挂载表消失
+	ix.mountRoots = func() []string { return []string{"/DATA"} } // /media/nimoos-test-V 已从挂载表消失
 
-	require.NoError(t, ix.pruneMissingUnder("/media/devmon/X"))
+	require.NoError(t, ix.pruneMissingUnder("/media/nimoos-test-V"))
 
 	var n int
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM assets WHERE id=?`, id).Scan(&n))
@@ -527,18 +530,19 @@ func TestPruneMissingUnderKeepsOfflineAssets(t *testing.T) {
 }
 
 // TestPruneMissingUnderLikeMetacharSiblings:`_` 是 LIKE 通配符,真实 U 盘卷标
-// 就含下划线(Kingston_DataTra)。对 /media/devmon/disk_A 的 prune 不得波及仅
-// `_` 位不同的兄弟挂载 /media/devmon/diskXA——旧的 `LIKE 'disk_A/%'` 会连带
-// 匹配并把兄弟盘上"暂时读不到"的资产物理删掉。
+// 就含下划线(Kingston_DataTra)。对 …/disk_A 的 prune 不得波及仅 `_` 位不同的
+// 兄弟挂载 …/diskXA——旧的 `LIKE 'disk_A/%'` 会连带匹配并把兄弟盘上
+// "暂时读不到"的资产物理删掉。
 func TestPruneMissingUnderLikeMetacharSiblings(t *testing.T) {
 	db := makeTestDB(t)
-	siblingID := insertAsset(t, db, "/media/devmon/diskXA/photo.jpg", "indexed") // 文件不存在
+	// 夹具用真实机器上不存在的挂载名,理由同上(EACCES 会架空断言)。
+	siblingID := insertAsset(t, db, "/media/nimoos-test-diskXA/photo.jpg", "indexed") // 文件不存在
 	ix := NewIndexer(db, &mockML{}, t.TempDir(), 1)
 	ix.mountRoots = func() []string {
-		return []string{"/DATA", "/media/devmon/disk_A", "/media/devmon/diskXA"}
+		return []string{"/DATA", "/media/nimoos-test-disk_A", "/media/nimoos-test-diskXA"}
 	}
 
-	require.NoError(t, ix.pruneMissingUnder("/media/devmon/disk_A"))
+	require.NoError(t, ix.pruneMissingUnder("/media/nimoos-test-disk_A"))
 
 	var n int
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM assets WHERE id=?`, siblingID).Scan(&n))
