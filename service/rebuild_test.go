@@ -199,3 +199,28 @@ func TestRebuildEmptyLibraryFinishesImmediately(t *testing.T) {
 	require.NoError(t, db.QueryRow(`SELECT value FROM photos_meta WHERE key='index_last_rebuilt'`).Scan(&lastBuilt))
 	require.NotEmpty(t, lastBuilt)
 }
+
+// TestRebuildExcludesOfflineAssets 验证:资产所在的移动盘已拔出(offline=1)
+// 时,rebuild 的目标查询必须跳过它——它的源文件读不到,处理只会白白计一次失败;
+// MountGuard 会在插回时主动触发一次 Backfill/BackfillOCR 来补齐期间的缺口。
+func TestRebuildExcludesOfflineAssets(t *testing.T) {
+	db := makeTestDB(t)
+	onlineID := insertAsset(t, db, "/DATA/Gallery/online.jpg", "indexed")
+	offlineID := insertAsset(t, db, "/media/X/offline.jpg", "indexed")
+	_, err := db.Exec(`UPDATE assets SET offline=1 WHERE id=?`, offlineID)
+	require.NoError(t, err)
+
+	rb := NewRebuilder(context.Background(), db, NewIndexer(db, &mockML{}, t.TempDir(), 1), NewFaceService(db), NewTaskRegistry(nil), 1)
+	taskID, err := rb.Start()
+	require.NoError(t, err)
+	require.Eventually(t, func() bool { return !rb.running.Load() }, 5*time.Second, 20*time.Millisecond)
+
+	var total int64 = -1
+	for _, task := range rb.reg.List() {
+		if task.ID == taskID {
+			total = task.Total
+		}
+	}
+	require.Equal(t, int64(1), total, "offline 资产不应计入 rebuild 目标")
+	_ = onlineID
+}

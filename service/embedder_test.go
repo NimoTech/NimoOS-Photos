@@ -51,6 +51,42 @@ func TestEmbedder_QueryMissing(t *testing.T) {
 	_ = missing
 }
 
+// TestEmbedder_QueryMissingExcludesOffline 验证:资产的移动盘已拔出
+// (offline=1)时,即使 asset_clip_idx 缺行也不应进入 CLIP 补跑目标——
+// 源文件读不到,补跑只会一直失败;插回后 MountGuard 会主动重新触发 Backfill。
+func TestEmbedder_QueryMissingExcludesOffline(t *testing.T) {
+	db := makeTestDB(t)
+	online := insertAsset(t, db, "/a.jpg", "indexed")
+	offline := insertAsset(t, db, "/media/X/b.jpg", "indexed")
+	_, err := db.Exec(`UPDATE assets SET offline=1 WHERE id=?`, offline)
+	require.NoError(t, err)
+
+	e := NewEmbedder(db, &mockML{}, nil, nil)
+	paths, err := e.queryMissing(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, []string{"/a.jpg"}, paths)
+	_ = online
+}
+
+// TestEmbedder_QueryMissingOCRExcludesOffline 同上,针对 OCR 补跑目标查询。
+func TestEmbedder_QueryMissingOCRExcludesOffline(t *testing.T) {
+	db := makeTestDB(t)
+	online := insertAsset(t, db, "/photo-online.jpg", "indexed")
+	offline := insertAsset(t, db, "/media/X/photo-offline.jpg", "indexed")
+	_, err := db.Exec(`UPDATE assets SET offline=1 WHERE id=?`, offline)
+	require.NoError(t, err)
+
+	e := NewEmbedder(db, &mockML{}, nil, nil)
+	targets, err := e.queryMissingOCR(context.Background())
+	require.NoError(t, err)
+	ids := map[string]bool{}
+	for _, tg := range targets {
+		ids[tg.id] = true
+	}
+	require.True(t, ids[online], "在线资产应是 OCR 补跑目标")
+	require.False(t, ids[offline], "offline 资产必须被排除出 OCR 补跑")
+}
+
 // 视频不参与 OCR:既不进补跑目标,历史遗留的视频 OCR 行也被 pruneVideoOCR 清掉。
 func TestVideoOCRExcludedAndPruned(t *testing.T) {
 	db := makeTestDB(t)

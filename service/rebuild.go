@@ -61,7 +61,12 @@ type rebuildTarget struct {
 func (r *Rebuilder) run(taskID string) {
 	started := time.Now()
 
-	rows, err := r.db.Query(`SELECT id, file_path FROM assets WHERE status='indexed' AND deleted_at IS NULL`)
+	// offline=0: exclude assets currently living on an unplugged removable
+	// drive. Their source file can't be read anyway (every worker would just
+	// count them as a Stat failure below), and once the drive comes back
+	// MountGuard's post-remount Backfill/BackfillOCR heals any CLIP/OCR gap
+	// left over from a model-generation rebuild that ran while they were away.
+	rows, err := r.db.Query(`SELECT id, file_path FROM assets WHERE status='indexed' AND deleted_at IS NULL AND offline=0`)
 	if err != nil {
 		r.failTask(taskID, started, "查询资产失败: "+err.Error())
 		return

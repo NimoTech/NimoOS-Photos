@@ -338,6 +338,47 @@ func migrate(db *sql.DB) error {
 		}
 	}
 
+	// Idempotent column expansion: assets.offline tracks whether the asset's
+	// source file currently lives on a removable drive that's unplugged (see
+	// MountGuard in service/mountguard.go). Same PRAGMA-based idempotent-add
+	// pattern as the asset_exif columns above (kept separate from the
+	// duplicate-column-error `alters` slice below, per design).
+	assetsNewCols := []struct {
+		name string
+		decl string
+	}{
+		{"offline", "INTEGER NOT NULL DEFAULT 0"},
+	}
+	assetsExisting := map[string]bool{}
+	aRows, err := db.Query(`PRAGMA table_info(assets)`)
+	if err != nil {
+		return fmt.Errorf("migrate pragma assets: %w", err)
+	}
+	for aRows.Next() {
+		var cid int
+		var name, ctype string
+		var notnull, pk int
+		var dflt sql.NullString
+		if err := aRows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			aRows.Close()
+			return fmt.Errorf("migrate pragma scan assets: %w", err)
+		}
+		assetsExisting[name] = true
+	}
+	aRows.Close()
+	for _, col := range assetsNewCols {
+		if assetsExisting[col.name] {
+			continue
+		}
+		stmt := fmt.Sprintf("ALTER TABLE assets ADD COLUMN %s %s", col.name, col.decl)
+		if _, err := db.Exec(stmt); err != nil {
+			return fmt.Errorf("migrate add column assets.%s: %w", col.name, err)
+		}
+	}
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_assets_offline ON assets(offline)`); err != nil {
+		return fmt.Errorf("migrate index assets_offline: %w", err)
+	}
+
 	// ── Idempotent column migration: legacy DBs created with CREATE TABLE IF NOT EXISTS
 	//    won't have new columns; ALTER TABLE ADD COLUMN fills them in.
 	//    SQLite raises "duplicate column" when the column already exists — ignore it.

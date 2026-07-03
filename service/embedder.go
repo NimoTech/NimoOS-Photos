@@ -40,10 +40,15 @@ func (e *Embedder) SetPollInterval(d time.Duration) { e.pollInterval = d }
 
 // queryMissing 列出 status='indexed' 但 asset_clip_idx 缺行的 asset 路径。
 func (e *Embedder) queryMissing(ctx context.Context) ([]string, error) {
+	// a.offline=0: an asset on a currently-unplugged removable drive can't be
+	// read, so retrying it here would just burn CPU on a guaranteed failure
+	// every poll interval. MountGuard re-triggers Backfill right after the
+	// drive is reinserted, so the gap is closed the moment the file is
+	// reachable again.
 	rows, err := e.db.QueryContext(ctx, `
         SELECT a.file_path FROM assets a
         LEFT JOIN asset_clip_idx i ON i.asset_id = a.id
-        WHERE a.status = 'indexed' AND i.asset_id IS NULL`)
+        WHERE a.status = 'indexed' AND a.offline = 0 AND i.asset_id IS NULL`)
 	if err != nil {
 		return nil, err
 	}
@@ -156,11 +161,13 @@ func (e *Embedder) Backfill(ctx context.Context) error {
 // 要么 asset_ocr 缺行（从未跑过 OCR——即使没识别到文字也会写 text='' 行），
 // 要么 coverage 为 NULL（旧版跑的 OCR 没存文字框面积，需要重跑补齐）。
 func (e *Embedder) queryMissingOCR(ctx context.Context) ([]ocrTarget, error) {
+	// a.offline=0: same reasoning as queryMissing above — skip assets whose
+	// source is unreachable because their removable drive is unplugged.
 	rows, err := e.db.QueryContext(ctx, `
         SELECT a.id, a.file_path, COALESCE(a.mime_type,'') LIKE 'video/%'
         FROM assets a
         LEFT JOIN asset_ocr o ON o.asset_id = a.id
-        WHERE a.status = 'indexed' AND a.deleted_at IS NULL
+        WHERE a.status = 'indexed' AND a.deleted_at IS NULL AND a.offline = 0
           AND COALESCE(a.mime_type,'') NOT LIKE 'video/%'
           AND (o.asset_id IS NULL OR o.coverage IS NULL)`)
 	if err != nil {
