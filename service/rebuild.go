@@ -197,9 +197,12 @@ func (r *Rebuilder) run(taskID string) {
 				// ForceReprocess fails at its first os.ReadFile and we'd be left
 				// with neither the old data nor new data (permanent, silent
 				// loss). os.Stat instead of a full ReadFile is enough here; the
-				// remaining stat→read TOCTOU window (file vanishes/changes in
-				// between) is an acceptable, vanishingly rare risk — worst case
-				// it's caught as a normal ForceReprocess failure next time.
+				// remaining stat→read TOCTOU window (file vanishes in between)
+				// still loses that ONE asset's old data — the guard narrows the
+				// blast radius from "every asset processed after unplug" down to
+				// a single asset in a millisecond window, it does not eliminate
+				// it. Fully closing it would require processFileInternal to
+				// accept pre-read bytes; not worth the churn.
 				if _, err := os.Stat(t.path); err != nil {
 					zap.L().Warn("rebuild: source file unreadable, keeping existing ML data",
 						zap.String("path", t.path), zap.Error(err))
