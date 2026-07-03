@@ -2,13 +2,126 @@ package service
 
 import (
 	"context"
+	"database/sql"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/NimoTech/NimoOS-Photos/common"
 	"github.com/NimoTech/NimoOS-Photos/pkg/config"
+	"github.com/NimoTech/NimoOS-Photos/pkg/sqlite"
 	"github.com/stretchr/testify/require"
 )
+
+// seedFaceAndClip 给已存在的 asset 写入一行 face_detections 和一条 CLIP 向量，
+// 用于验证 rebuild 对“源文件不可读”的资产是否保留旧 ML 数据。
+func seedFaceAndClip(t *testing.T, db *sql.DB, assetID string) {
+	t.Helper()
+	_, err := db.Exec(`INSERT INTO face_detections(id, asset_id, bbox, embedding) VALUES(?,?,?,?)`,
+		"face-"+assetID, assetID, "[0,0,1,1]", sqlite.SerializeFloat32(make([]float32, common.FaceDim)))
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO asset_clip_idx(asset_id) VALUES(?)`, assetID)
+	require.NoError(t, err)
+	var rowid int64
+	require.NoError(t, db.QueryRow(`SELECT rowid FROM asset_clip_idx WHERE asset_id=?`, assetID).Scan(&rowid))
+	_, err = db.Exec(`INSERT INTO clip_embeddings(rowid, embedding) VALUES(?,?)`, rowid, sqlite.SerializeFloat32(make([]float32, common.CLIPDim)))
+	require.NoError(t, err)
+}
+
+// TestRebuildKeepsExistingMLDataForUnreadableSource 验证:当资产的源文件在重建时
+// 不可读(例如放在已拔出的移动盘上), rebuild 绝不能删除它现有的 face_detections /
+// CLIP 向量——processFileInternal 会在第一步 os.ReadFile 就失败并返回，之前若已经
+// 删了旧数据，就永久静默丢失、无法恢复。可正常读取的资产应照常被重新处理。
+func TestRebuildKeepsExistingMLDataForUnreadableSource(t *testing.T) {
+	prev := config.Cfg
+	t.Cleanup(func() { config.Cfg = prev })
+	config.Cfg = &config.Config{FacesEnabled: true, ScenesEnabled: true, OCREnabled: true}
+
+	db := makeTestDB(t)
+	dir := t.TempDir()
+	okPath := makeTestJPEG(t, dir)
+	missingPath := filepath.Join(dir, "gone-missing.jpg") // 从不创建：模拟不可读源
+
+	const okID = "asset-ok"
+	const missingID = "asset-missing"
+	_, err := db.Exec(`INSERT INTO assets(id,file_path,status,is_live_photo_video) VALUES(?,?,'indexed',0)`, okID, okPath)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO assets(id,file_path,status,is_live_photo_video) VALUES(?,?,'indexed',0)`, missingID, missingPath)
+	require.NoError(t, err)
+
+	seedFaceAndClip(t, db, okID)
+	seedFaceAndClip(t, db, missingID)
+
+	var missingRowidBefore int64
+	require.NoError(t, db.QueryRow(`SELECT rowid FROM asset_clip_idx WHERE asset_id=?`, missingID).Scan(&missingRowidBefore))
+
+	ml := &recordingML{}
+	ix := NewIndexer(db, ml, t.TempDir(), 1)
+	faces := NewFaceService(db)
+	reg := NewTaskRegistry(nil)
+	rb := NewRebuilder(context.Background(), db, ix, faces, reg, 2)
+
+	taskID, err := rb.Start()
+	require.NoError(t, err)
+	require.Eventually(t, func() bool { return !rb.running.Load() }, 10*time.Second, 50*time.Millisecond)
+
+	// 不可读资产：旧 face_detections 行必须原样保留。
+	var faceCount int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM face_detections WHERE asset_id=?`, missingID).Scan(&faceCount))
+	require.Equal(t, 1, faceCount, "源文件不可读时必须保留旧的人脸行")
+
+	// 不可读资产：旧 CLIP 向量（同一 rowid）必须原样保留。
+	var missingRowidAfter int64
+	require.NoError(t, db.QueryRow(`SELECT rowid FROM asset_clip_idx WHERE asset_id=?`, missingID).Scan(&missingRowidAfter))
+	require.Equal(t, missingRowidBefore, missingRowidAfter)
+	var vecCount int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM clip_embeddings WHERE rowid=?`, missingRowidAfter).Scan(&vecCount))
+	require.Equal(t, 1, vecCount, "源文件不可读时必须保留旧的 CLIP 向量")
+
+	// 可读资产：正常重跑（mockML 记录了 CLIP 调用；重跑后 0 张脸，旧行已被替换）。
+	require.Greater(t, ml.clipCalls, 0)
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM face_detections WHERE asset_id=?`, okID).Scan(&faceCount))
+	require.Equal(t, 0, faceCount, "可读资产应重新处理，旧人脸行被清空后由 mockML(0 张脸)的结果替代")
+
+	// 任务 label 计入 1 张失败。
+	var label string
+	for _, task := range reg.List() {
+		if task.ID == taskID {
+			label = task.Label
+		}
+	}
+	require.Contains(t, label, "失败 1 张")
+}
+
+// TestRebuildPrunesOrphanClipVectors 验证:去掉全库清空之后，孤儿 CLIP 向量
+// （asset 已不存在的 asset_clip_idx / clip_embeddings 行）仍会被 rebuild 的
+// finalize() 阶段通过 pruneOrphanClipVectors 清理掉。
+func TestRebuildPrunesOrphanClipVectors(t *testing.T) {
+	db := makeTestDB(t)
+	// asset_clip_idx.asset_id 有 FK(ON DELETE CASCADE)，正常路径下孤儿只会由
+	// “绕过级联的历史删除”产生（参考 clipvec_internal_test.go）；这里同样临时关闭
+	// FK 约束来模拟这种遗留孤儿状态，而不是真的破坏级联本身。
+	const rowid = 888888
+	_, err := db.Exec(`PRAGMA foreign_keys=OFF`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO asset_clip_idx(rowid, asset_id) VALUES(?,?)`, rowid, "ghost")
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO clip_embeddings(rowid, embedding) VALUES(?,?)`, rowid, sqlite.SerializeFloat32(make([]float32, common.CLIPDim)))
+	require.NoError(t, err)
+	_, err = db.Exec(`PRAGMA foreign_keys=ON`)
+	require.NoError(t, err)
+
+	rb := NewRebuilder(context.Background(), db, NewIndexer(db, &mockML{}, t.TempDir(), 1), NewFaceService(db), NewTaskRegistry(nil), 1)
+	_, err = rb.Start()
+	require.NoError(t, err)
+	require.Eventually(t, func() bool { return !rb.running.Load() }, 5*time.Second, 20*time.Millisecond)
+
+	var n int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM asset_clip_idx WHERE asset_id=?`, "ghost").Scan(&n))
+	require.Equal(t, 0, n, "孤儿 asset_clip_idx 行必须被清理")
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM clip_embeddings WHERE rowid=?`, rowid).Scan(&n))
+	require.Equal(t, 0, n, "孤儿 CLIP 向量必须被清理")
+}
 
 // TestRebuildReprocessesAssetsWithoutDuplicatingFaces 验证重建重算了 ML、
 // 不会让 face_detections 翻倍，并写入 photos_meta 时间戳。

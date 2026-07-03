@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -81,17 +82,30 @@ func (r *Rebuilder) run(taskID string) {
 		return
 	}
 
-	// Wipe the CLIP vector index so the rebuild starts from a clean slate: this
-	// drops orphan vectors left behind by previously deleted assets (vec0 rows
-	// the FK cascade can't reach) and guarantees no stale/duplicate embeddings
-	// survive. writeClipEmbedding re-creates asset_clip_idx rows and vectors as
-	// it re-embeds each asset below.
-	if _, err := r.db.Exec(`DELETE FROM clip_embeddings`); err != nil {
-		zap.L().Warn("rebuild: clear clip_embeddings failed", zap.Error(err))
-	}
-	if _, err := r.db.Exec(`DELETE FROM asset_clip_idx`); err != nil {
-		zap.L().Warn("rebuild: clear asset_clip_idx failed", zap.Error(err))
-	}
+	// NOTE: we intentionally do NOT wipe clip_embeddings/asset_clip_idx here
+	// anymore. Wiping upfront meant an asset whose source file is unreadable
+	// at rebuild time (e.g. it lives on a removable drive that's currently
+	// unplugged) would permanently lose its vector — ForceReprocess bails out
+	// of processFileInternal at the very first os.ReadFile and never gets a
+	// chance to re-embed it, so the asset would silently drop out of semantic
+	// search forever (only "失败 N 张" in the task label hinted at it, with
+	// no way to recover). The old goals of that wipe are now handled without
+	// destroying data that can't be recomputed:
+	//   - orphan vectors (assets that no longer exist) are swept by
+	//     pruneOrphanClipVectors in finalize(), below;
+	//   - stale/duplicate vectors for assets that DO get reprocessed are
+	//     handled per-asset in the worker loop via dropClipVector, right
+	//     before ForceReprocess — and writeClipEmbedding's UPDATE-then-INSERT
+	//     upsert (indexer.go) is safe either way since asset_clip_idx has a
+	//     UNIQUE(asset_id) constraint, so there's never more than one vector
+	//     row per asset.
+	// Semantics this creates: within the same ML model generation, a manual
+	// rebuild over an asset whose file is temporarily unreadable keeps its
+	// existing faces/vector (still searchable with old-but-valid data) and
+	// just counts it as failed for retry next time. This does NOT weaken the
+	// model-upgrade path: when the CLIP dimension changes, migrateClipDim
+	// already DROPs the whole clip_embeddings table at startup, before any
+	// rebuild worker runs.
 
 	total := int64(len(targets))
 	var processed, failed int64
@@ -127,6 +141,9 @@ func (r *Rebuilder) run(taskID string) {
 		if r.ctx.Err() != nil {
 			return // 服务关闭：不发 final，残留 running task 随服务消失
 		}
+		// 清理孤儿 CLIP 向量（asset 已不存在的 asset_clip_idx/clip_embeddings
+		// 行）：承接以前全库清空里“清孤儿”的目的，见 run() 开头的说明。
+		pruneOrphanClipVectors(r.db)
 		// 人脸重聚类（内部 CAS 防重入）。
 		if err := r.faces.RunClustering(r.ctx); err != nil {
 			zap.L().Warn("rebuild: face reclustering failed", zap.Error(err))
@@ -175,11 +192,29 @@ func (r *Rebuilder) run(taskID string) {
 				if r.ctx.Err() != nil {
 					continue // drain
 				}
+				// Guard: only destroy the existing face/vector rows once we know
+				// the source file can actually be read back — otherwise
+				// ForceReprocess fails at its first os.ReadFile and we'd be left
+				// with neither the old data nor new data (permanent, silent
+				// loss). os.Stat instead of a full ReadFile is enough here; the
+				// remaining stat→read TOCTOU window (file vanishes/changes in
+				// between) is an acceptable, vanishingly rare risk — worst case
+				// it's caught as a normal ForceReprocess failure next time.
+				if _, err := os.Stat(t.path); err != nil {
+					zap.L().Warn("rebuild: source file unreadable, keeping existing ML data",
+						zap.String("path", t.path), zap.Error(err))
+					atomic.AddInt64(&processed, 1)
+					atomic.AddInt64(&failed, 1)
+					publish("running")
+					continue
+				}
 				// 旧人脸行先删（face_detections 是 INSERT 而非 upsert，
 				// 不删会翻倍；face_person 经 FK CASCADE 一并清理）。
 				if _, err := r.db.Exec(`DELETE FROM face_detections WHERE asset_id=?`, t.id); err != nil {
 					zap.L().Warn("rebuild: clear faces failed", zap.String("asset", t.id), zap.Error(err))
 				}
+				// 旧 CLIP 向量先删：见上方“不再全库清空”的说明 a)。
+				dropClipVector(r.db, t.id)
 				ok := r.indexer.ForceReprocess(t.path, processOpts{force: true, skipExif: true, skipThumb: true})
 				atomic.AddInt64(&processed, 1)
 				if !ok {
