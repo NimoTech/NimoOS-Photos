@@ -375,8 +375,12 @@ func migrate(db *sql.DB) error {
 			return fmt.Errorf("migrate add column assets.%s: %w", col.name, err)
 		}
 	}
-	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_assets_offline ON assets(offline)`); err != nil {
-		return fmt.Errorf("migrate index assets_offline: %w", err)
+	// No index on assets.offline: it's a low-cardinality boolean, and its
+	// consumers filter by prefix UPDATE/SELECT where the planner wouldn't use
+	// it anyway. DROP cleans up any DB migrated by an intermediate build that
+	// briefly created one.
+	if _, err := db.Exec(`DROP INDEX IF EXISTS idx_assets_offline`); err != nil {
+		return fmt.Errorf("migrate drop index assets_offline: %w", err)
 	}
 
 	// ── Idempotent column migration: legacy DBs created with CREATE TABLE IF NOT EXISTS
