@@ -762,38 +762,18 @@ func (s *SmartViewService) evalParsed(parsed []ParsedCond, threshold int, exclud
 			for _, v := range vs {
 				sum += v
 			}
-			// Raw CLIP text↔image cosine rarely exceeds ~0.32 (modality gap), so
-			// comparing it against the 50–99% slider directly would match nothing.
-			// Map through the same empirical band the search UI uses, so the
-			// slider, stored match_score, Median stat and the 50–100% distribution
-			// chart all live on one perceptual scale.
-			score = perceptualScore(sum / float64(len(vs)))
+			// SmartSearch's MatchScore is already the recalibrated [0,1] display
+			// score (see displayScore in scan.go) — the single calibration layer
+			// shared with the search UI's percentage. Use it as-is so the slider,
+			// the stored match_score, the Median stat and the 50–100% distribution
+			// chart all live on that one scale, with no second remapping here.
+			score = sum / float64(len(vs))
 		}
 		if score >= thr {
 			out[aid] = score
 		}
 	}
 	return out, nil
-}
-
-// clipScoreLo/Hi mirror SCORE_LO/SCORE_HI in PhotosSearchView.vue matchPct().
-// Keep the two in sync when recalibrating (empirical for CLIP ViT-B/32).
-const (
-	clipScoreLo = 0.14
-	clipScoreHi = 0.32
-)
-
-// perceptualScore rescales a raw CLIP cosine similarity into the intuitive
-// 0–1 band shown to users. Monotonic, so ordering is unaffected.
-func perceptualScore(sim float64) float64 {
-	t := (sim - clipScoreLo) / (clipScoreHi - clipScoreLo)
-	if t < 0 {
-		return 0
-	}
-	if t > 1 {
-		return 1
-	}
-	return t
 }
 
 // topNByScore returns the IDs of the top n entries in m by score (descending).

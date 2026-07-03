@@ -182,17 +182,17 @@ func seedClipAssetWithSim(t *testing.T, s *SmartViewService, id string, sim floa
 	require.NoError(t, err)
 }
 
-// CLIP 原始余弦因 modality gap 极少超过 ~0.32，阈值滑块（50-99%）必须先经过
-// 与搜索 UI matchPct() 同一条标定曲线（[0.14,0.32]→0-100%）再比较，
-// 否则任何 semantic 条件在任何阈值下都是 0 匹配。
+// 语义条件的阈值滑块（50-99%）比较的是 SmartSearch 已重标定的展示分
+// （scan.go displayScore：[simDisplayFloor,simDisplayCeil]→0-100%，唯一标定层），
+// evalParsed 不得再做第二次映射——否则滑块语义与搜索页百分比脱钩。
 func TestSemanticScoreCalibration(t *testing.T) {
 	s := svTestService(t)
-	seedClipAssetWithSim(t, s, "good", 0.28, "2024-06-01T00:00:00Z") // 感知分 ≈78%
-	seedClipAssetWithSim(t, s, "bad", 0.10, "2024-06-01T00:00:00Z")  // 低于下界 → 0%
+	seedClipAssetWithSim(t, s, "good", 0.20, "2024-06-01T00:00:00Z") // 展示分 (0.20-0.02)/0.23 ≈ 78%
+	seedClipAssetWithSim(t, s, "bad", 0.10, "2024-06-01T00:00:00Z")  // 展示分 (0.10-0.02)/0.23 ≈ 35%
 
 	count, _, _, err := s.Preview([]string{"scene: bike"}, "", 50, false)
 	require.NoError(t, err)
-	require.Equal(t, 1, count, "raw 0.28 → ~78% must pass a 50% threshold; raw 0.10 must not")
+	require.Equal(t, 1, count, "raw 0.20 → ~78% must pass a 50% threshold; raw 0.10 → ~35% must not")
 
 	count, _, _, err = s.Preview([]string{"scene: bike"}, "", 70, false)
 	require.NoError(t, err)
@@ -207,8 +207,8 @@ func TestSemanticScoreCalibration(t *testing.T) {
 // 2024 年的高分照片必须匹配，2023 年的不匹配。
 func TestBareYearPlusSemantic(t *testing.T) {
 	s := svTestService(t)
-	seedClipAssetWithSim(t, s, "a24", 0.30, "2024-06-01T00:00:00Z")
-	seedClipAssetWithSim(t, s, "a23", 0.30, "2023-06-01T00:00:00Z")
+	seedClipAssetWithSim(t, s, "a24", 0.20, "2024-06-01T00:00:00Z")
+	seedClipAssetWithSim(t, s, "a23", 0.20, "2023-06-01T00:00:00Z")
 
 	_, err := s.Create(SmartViewInput{ID: "sv-bike", Name: "2024 bike",
 		CondsRaw: []string{"2024", "bike"}, Threshold: 50, Live: true})
@@ -224,10 +224,11 @@ func TestBareYearPlusSemantic(t *testing.T) {
 	rows.Close()
 	require.Equal(t, []string{"a24"}, ids)
 
-	// 存库分数也应是感知分数（与滑块/统计同量纲），而非原始余弦
+	// 存库分数就是 SmartSearch 的展示分（与滑块/搜索页百分比同量纲），
+	// 不允许再有第二层映射改写它
 	var score float64
 	require.NoError(t, s.db.QueryRow(`SELECT match_score FROM smart_view_matches WHERE smart_view_id='sv-bike'`).Scan(&score))
-	require.InDelta(t, 0.89, score, 0.03) // (0.30-0.14)/0.18 ≈ 0.89
+	require.InDelta(t, 0.783, score, 0.01) // displayScore(0.20) = (0.20-0.02)/0.23 ≈ 0.783
 }
 
 // Evaluate 必须从 conds_raw 现解析，而不是用建库时固化的 conds_parsed 快照：
