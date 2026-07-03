@@ -99,13 +99,13 @@ func scanAssets(rows *sql.Rows) ([]Asset, error) {
 	return assets, rows.Err()
 }
 
-// nllb-siglip 系模型的图文余弦相似度远低于 openai CLIP:噪声 ≤0.02,
-// 强相关 ~0.15-0.25(本库实测首版标定,换 CLIP 模型或全量重建后需重标)。
-// 展示层把 [simDisplayFloor, simDisplayCeil] 线性映射到 [0,1],
-// OCR 精确命中(sim=1.0)钳到 1 不受影响。
+// SigLIP2(SO400M)的图文余弦相似度分布比 openai CLIP 低一个量级:
+// 噪声 ≤0.03,强相关 ~0.09-0.13(本库 7 图 × 8 查询 A/B 实测标定,
+// 换 CLIP 模型后需重标)。展示层把 [simDisplayFloor, simDisplayCeil]
+// 线性映射到 [0,1],OCR 精确命中(sim=1.0)钳到 1 不受影响。
 const (
-	simDisplayFloor = 0.02
-	simDisplayCeil  = 0.25
+	simDisplayFloor = 0.03
+	simDisplayCeil  = 0.13
 )
 
 // displayScore linearly rescales a raw cosine similarity (as produced from the
