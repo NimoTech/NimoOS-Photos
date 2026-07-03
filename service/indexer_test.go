@@ -484,3 +484,63 @@ func TestResolveMimeType(t *testing.T) {
 	require.Equal(t, "image/png", resolveMimeType(pngHeader, ".bin"),
 		"未知扩展名应回退到 http.DetectContentType")
 }
+
+// TestPruneMissingUnderSkipsWhenMountVanished:恢复扫描(插回 → ScanDirectory)
+// 末尾的 prune 与「扫描期间盘又被拔出、挂载点残留空目录」相撞时,该目录下所有
+// 文件都会 stat 成"不存在"——若照常 prune,整块盘的资产连行带向量、缩略图会被
+// 物理删光。互锁 ①:目录对应挂载点不在当前挂载表时必须跳过 prune。
+func TestPruneMissingUnderSkipsWhenMountVanished(t *testing.T) {
+	db := makeTestDB(t)
+	id := insertAsset(t, db, "/media/devmon/X/gone.jpg", "indexed") // 文件在磁盘上不存在
+	ix := NewIndexer(db, &mockML{}, t.TempDir(), 1)
+	ix.mountRoots = func() []string { return []string{"/DATA"} } // /media/devmon/X 已从挂载表消失
+
+	require.NoError(t, ix.pruneMissingUnder("/media/devmon/X"))
+
+	var n int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM assets WHERE id=?`, id).Scan(&n))
+	require.Equal(t, 1, n, "挂载点已消失时禁止 prune,资产必须原样保留")
+}
+
+// TestPruneMissingUnderKeepsOfflineAssets:互锁 ②——offline=1 资产的文件读不到
+// 恰恰是 offline 标记本身记录的状态,不是"文件被删"的证据,prune 必须排除它们;
+// offline=0 且文件确实消失的资产照常清理。
+func TestPruneMissingUnderKeepsOfflineAssets(t *testing.T) {
+	db := makeTestDB(t)
+	// 挂载名刻意用真实机器上不存在的目录:prune 只在 stat 报 ENOENT 时删行,
+	// 而本机真实存在的 /media/devmon 是 0700,stat 会报 EACCES 而非 ENOENT。
+	offID := insertAsset(t, db, "/media/nimoos-test-X/offline.jpg", "indexed")
+	onID := insertAsset(t, db, "/media/nimoos-test-X/deleted.jpg", "indexed")
+	_, err := db.Exec(`UPDATE assets SET offline=1 WHERE id=?`, offID)
+	require.NoError(t, err)
+
+	ix := NewIndexer(db, &mockML{}, t.TempDir(), 1)
+	ix.mountRoots = func() []string { return []string{"/DATA", "/media/nimoos-test-X"} }
+
+	require.NoError(t, ix.pruneMissingUnder("/media/nimoos-test-X"))
+
+	var n int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM assets WHERE id=?`, offID).Scan(&n))
+	require.Equal(t, 1, n, "offline=1 资产必须被 prune 排除")
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM assets WHERE id=?`, onID).Scan(&n))
+	require.Equal(t, 0, n, "offline=0 且文件确实消失的资产应照常清理")
+}
+
+// TestPruneMissingUnderLikeMetacharSiblings:`_` 是 LIKE 通配符,真实 U 盘卷标
+// 就含下划线(Kingston_DataTra)。对 /media/devmon/disk_A 的 prune 不得波及仅
+// `_` 位不同的兄弟挂载 /media/devmon/diskXA——旧的 `LIKE 'disk_A/%'` 会连带
+// 匹配并把兄弟盘上"暂时读不到"的资产物理删掉。
+func TestPruneMissingUnderLikeMetacharSiblings(t *testing.T) {
+	db := makeTestDB(t)
+	siblingID := insertAsset(t, db, "/media/devmon/diskXA/photo.jpg", "indexed") // 文件不存在
+	ix := NewIndexer(db, &mockML{}, t.TempDir(), 1)
+	ix.mountRoots = func() []string {
+		return []string{"/DATA", "/media/devmon/disk_A", "/media/devmon/diskXA"}
+	}
+
+	require.NoError(t, ix.pruneMissingUnder("/media/devmon/disk_A"))
+
+	var n int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM assets WHERE id=?`, siblingID).Scan(&n))
+	require.Equal(t, 1, n, "prune disk_A 不得误删兄弟挂载 diskXA 的资产")
+}
