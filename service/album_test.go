@@ -792,6 +792,38 @@ func TestAlbumListReturnsPhotoVideoCounts(t *testing.T) {
 	require.Equal(t, 1, albums[0].VideoCount)
 }
 
+// TestAlbumListAssetsExcludesOffline verifies that AlbumService.ListAssets hides
+// assets whose removable drive is currently unplugged (offline=1), while
+// PhotoCount/VideoCount from List() also stop counting them.
+func TestAlbumListAssetsExcludesOffline(t *testing.T) {
+	db, err := sqlite.Open(filepath.Join(t.TempDir(), "test.db"))
+	require.NoError(t, err)
+	defer db.Close()
+
+	_, err = db.Exec(`INSERT INTO assets(id, file_path, mime_type, is_live_photo_video, status) VALUES
+		('online','/g/1.jpg','image/jpeg',0,'indexed'),
+		('offline','/media/X/2.jpg','image/jpeg',0,'indexed')`)
+	require.NoError(t, err)
+	_, err = db.Exec(`UPDATE assets SET offline=1 WHERE id='offline'`)
+	require.NoError(t, err)
+
+	svc := service.NewAlbumService(db)
+	a, err := svc.Create("Offline Test")
+	require.NoError(t, err)
+	require.NoError(t, svc.AddAsset(a.ID, "online"))
+	require.NoError(t, svc.AddAsset(a.ID, "offline"))
+
+	assets, err := svc.ListAssets(a.ID)
+	require.NoError(t, err)
+	require.Len(t, assets, 1, "offline 资产必须从相册内容中隐藏")
+	require.Equal(t, "online", assets[0].ID)
+
+	albums, err := svc.List()
+	require.NoError(t, err)
+	require.Len(t, albums, 1)
+	require.Equal(t, 1, albums[0].PhotoCount, "photo_cnt 不应计入 offline 资产")
+}
+
 func TestAlbumListPhotoVideoCountsExcludeLiveAndTrashed(t *testing.T) {
 	db, err := sqlite.Open(filepath.Join(t.TempDir(), "test.db"))
 	require.NoError(t, err)

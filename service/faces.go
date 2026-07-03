@@ -457,6 +457,13 @@ func (s *FaceService) loadFacesWithProgress(ctx context.Context, total int64,
 	// JOIN assets 过滤孤儿 face_detections（asset_id 指向已删除 asset 的行）。
 	// 不 JOIN 的话，rebuildPersons 拿着孤儿的 asset_id 做 cover 会触发
 	// persons.cover_asset_id REFERENCES assets(id) 的外键违反。
+	//
+	// 有意不过滤 offline=1：人脸向量数据本来就完整保留在磁盘上（不依赖原图文件),
+	// 聚类结果与 offline 状态无关。若在这里排除 offline 资产，插回移动盘后
+	// (MountGuard 标回 offline=0) 会触发一轮重新聚类，导致 person 分组抖动
+	// （同一批脸先被踢出聚类、插回后又被重新分配，可能落到不同的 person）。
+	// 展示层的过滤已经在 persons.go / search.go 等查询里通过 offline=0 完成，
+	// 聚类引擎本身保持"数据在就参与聚类"的稳定语义。
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT fd.id, fd.asset_id, fd.embedding
 		FROM face_detections fd

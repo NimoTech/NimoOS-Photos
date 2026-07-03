@@ -124,7 +124,7 @@ JOIN assets a ON a.id = idx.asset_id
 LEFT JOIN asset_exif AS e ON e.asset_id = a.id
 WHERE vec.embedding MATCH ? AND k = ?
   AND a.is_live_photo_video = 0
-  AND a.deleted_at IS NULL`
+  AND a.deleted_at IS NULL AND a.offline = 0`
 
 	args := []any{blob, limit}
 
@@ -201,7 +201,7 @@ JOIN assets a ON a.id = o.asset_id
 LEFT JOIN asset_exif AS e ON e.asset_id = a.id
 WHERE instr(lower(o.text), lower(?)) > 0
   AND a.is_live_photo_video = 0
-  AND a.deleted_at IS NULL`
+  AND a.deleted_at IS NULL AND a.offline = 0`
 
 	args := []any{query}
 	if filters.Year > 0 {
@@ -315,7 +315,7 @@ SELECT a.id, a.file_path, a.file_size, COALESCE(a.mime_type,''),
 FROM assets a
 LEFT JOIN asset_exif e ON e.asset_id = a.id
 LEFT JOIN asset_favorites f ON f.asset_id = a.id AND f.user_id = ?
-WHERE a.is_live_photo_video = 0 AND a.deleted_at IS NULL
+WHERE a.is_live_photo_video = 0 AND a.deleted_at IS NULL AND a.offline = 0
 ORDER BY COALESCE(a.taken_at, a.indexed_at) DESC`, userID)
 	if err != nil {
 		return nil, fmt.Errorf("Timeline query: %w", err)
@@ -366,7 +366,7 @@ SELECT DISTINCT a.id, a.file_path, a.file_size, COALESCE(a.mime_type,''),
 FROM assets a
 JOIN face_detections fd ON fd.asset_id = a.id
 JOIN face_person fp ON fp.face_id = fd.id
-WHERE fp.person_id = ? AND a.is_live_photo_video = 0 AND a.deleted_at IS NULL
+WHERE fp.person_id = ? AND a.is_live_photo_video = 0 AND a.deleted_at IS NULL AND a.offline = 0
 ORDER BY COALESCE(a.taken_at, a.indexed_at) DESC
 LIMIT ? OFFSET ?`, personID, limit, offset)
 	if err != nil {
@@ -502,7 +502,7 @@ FROM assets a
 LEFT JOIN asset_exif e ON e.asset_id = a.id
 LEFT JOIN asset_favorites f ON f.asset_id = a.id AND f.user_id = ?
 ` + geoJoin + `
-WHERE a.is_live_photo_video = 0 AND a.deleted_at IS NULL` + whereExtra + `
+WHERE a.is_live_photo_video = 0 AND a.deleted_at IS NULL AND a.offline = 0` + whereExtra + `
 ORDER BY COALESCE(a.taken_at, a.indexed_at) DESC
 LIMIT ? OFFSET ?`
 
@@ -541,7 +541,7 @@ SELECT a.id, a.file_path, a.file_size, COALESCE(a.mime_type,''),
 FROM assets a
 LEFT JOIN asset_exif e ON e.asset_id = a.id
 LEFT JOIN asset_favorites f ON f.asset_id = a.id AND f.user_id = ?
-WHERE a.is_live_photo_video = 0 AND a.deleted_at IS NULL
+WHERE a.is_live_photo_video = 0 AND a.deleted_at IS NULL AND a.offline = 0
   AND a.id IN (` + strings.Join(placeholders, ",") + `)`
 
 	rows, err := s.db.Query(q, args...)

@@ -919,6 +919,85 @@ func TestUpdatePerson_HeroAssetID_SoftDeletedAssetReturnsEmpty(t *testing.T) {
 	require.Empty(t, list[0].HeroAssetID, "soft-deleted hero asset must not appear in list")
 }
 
+// TestListPersons_ExcludesOfflineAssetsFromCounts verifies that a person's
+// count/first-last-seen stop counting a face whose asset is on a currently
+// unplugged removable drive (offline=1), matching every other list surface.
+func TestListPersons_ExcludesOfflineAssetsFromCounts(t *testing.T) {
+	db := makeTestFaceDB(t)
+	dim := 512
+	v := make([]float32, dim)
+	v[0] = 1.0
+	insertAssetFace(t, db, "cnt-online", normalize(v))
+	insertAssetFace(t, db, "cnt-offline", normalize(v))
+	require.NoError(t, service.NewFaceService(db).RunClustering(context.Background()))
+	personID := mustFirstPersonID(t, db)
+
+	_, err := db.Exec(`UPDATE assets SET offline=1 WHERE id='cnt-offline'`)
+	require.NoError(t, err)
+
+	ps := service.NewPersonService(db)
+	p, err := ps.GetPerson(personID)
+	require.NoError(t, err)
+	require.Equal(t, 1, p.Count, "offline 资产的脸不应计入 person 出现次数")
+
+	list, err := ps.ListPersons()
+	require.NoError(t, err)
+	require.Len(t, list, 1)
+	require.Equal(t, 1, list[0].Count, "ListPersons 的 count 同样不应计入 offline 资产")
+}
+
+// TestPersonCoverFallsBackToHeroWhenOffline verifies the fix for the
+// cover_asset_id/hero_asset_id inconsistency: cover is now validated the same
+// way as hero (deleted_at IS NULL AND offline=0). When the pinned cover asset
+// goes offline, CoverAssetID falls back to a valid hero, or empty if there is
+// none — it never returns a dangling reference to an unreachable asset.
+func TestPersonCoverFallsBackToHeroWhenOffline(t *testing.T) {
+	db := makeTestFaceDB(t)
+	dim := 512
+	v := make([]float32, dim)
+	v[0] = 1.0
+	insertAssetFace(t, db, "cov-a1", normalize(v))
+	insertAssetFace(t, db, "cov-a2", normalize(v))
+	require.NoError(t, service.NewFaceService(db).RunClustering(context.Background()))
+	personID := mustFirstPersonID(t, db)
+
+	ps := service.NewPersonService(db)
+	_, err := ps.SetPersonCover(personID, "cov-a1")
+	require.NoError(t, err)
+
+	// Sanity: cover resolves to the pinned asset while it is online.
+	p, err := ps.GetPerson(personID)
+	require.NoError(t, err)
+	require.Equal(t, "cov-a1", p.CoverAssetID)
+
+	// The cover's drive goes offline.
+	_, err = db.Exec(`UPDATE assets SET offline=1 WHERE id='cov-a1'`)
+	require.NoError(t, err)
+
+	// No hero set yet: cover must fall back to empty, not the offline asset.
+	p, err = ps.GetPerson(personID)
+	require.NoError(t, err)
+	require.Empty(t, p.CoverAssetID, "offline cover 应失效为空（无 hero 可回退）")
+
+	list, err := ps.ListPersons()
+	require.NoError(t, err)
+	require.Len(t, list, 1)
+	require.Empty(t, list[0].CoverAssetID, "ListPersons 同样应回退为空")
+
+	// Now set a hero on the still-online asset — cover must fall back to it.
+	heroVal := "cov-a2"
+	require.NoError(t, ps.UpdatePerson(personID, service.PersonPatch{HeroAssetID: &heroVal}))
+
+	p, err = ps.GetPerson(personID)
+	require.NoError(t, err)
+	require.Equal(t, "cov-a2", p.CoverAssetID, "offline cover 应回退到有效的 hero")
+
+	list, err = ps.ListPersons()
+	require.NoError(t, err)
+	require.Len(t, list, 1)
+	require.Equal(t, "cov-a2", list[0].CoverAssetID, "ListPersons 同样应回退到 hero")
+}
+
 func TestDetachAssetsFromPerson_ClearsHeroWhenDetached(t *testing.T) {
 	db := makeTestFaceDB(t)
 	dim := 512

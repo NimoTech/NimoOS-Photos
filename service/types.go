@@ -177,4 +177,10 @@ type IndexStatus struct {
 	DiskAvail  int64  `json:"diskAvail,omitempty"`
 	// MLReady reflects whether the immich-machine-learning backend answers /ping.
 	MLReady bool `json:"mlReady"`
+	// Offline counts assets currently flagged offline=1 (their removable drive
+	// is unplugged). These assets are hidden from every user-facing surface but
+	// still count toward Indexed above — Indexed reflects the assets.status
+	// column, which offline does not change. The frontend can use this to show
+	// a "N photos are on a disconnected drive" hint.
+	Offline int `json:"offline"`
 }

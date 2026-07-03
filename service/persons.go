@@ -25,28 +25,33 @@ func NewPersonService(db *sql.DB) *PersonService { return &PersonService{db: db}
 // ListPersons returns all non-hidden persons as rich objects (with count/confidence/first-last-seen/places count).
 func (s *PersonService) ListPersons() ([]Person, error) {
 	rows, err := s.db.Query(`
-SELECT p.id, p.name, COALESCE(p.cover_asset_id,''), COALESCE(p.cover_face_id,''),
+SELECT p.id, p.name,
+       COALESCE(
+           (SELECT a.id FROM assets a WHERE a.id=p.cover_asset_id AND a.deleted_at IS NULL AND a.offline=0),
+           (SELECT a.id FROM assets a WHERE a.id=p.hero_asset_id AND a.deleted_at IS NULL AND a.offline=0),
+           '') AS cover,
+       COALESCE(p.cover_face_id,''),
        p.favorite, COALESCE(p.relation,''), p.confidence,
        (SELECT COUNT(DISTINCT a.id)
           FROM face_person fp JOIN face_detections fd ON fd.id=fp.face_id
           JOIN assets a ON a.id=fd.asset_id
-          WHERE fp.person_id=p.id AND a.deleted_at IS NULL AND a.is_live_photo_video=0) AS cnt,
+          WHERE fp.person_id=p.id AND a.deleted_at IS NULL AND a.offline=0 AND a.is_live_photo_video=0) AS cnt,
        (SELECT MIN(a.taken_at)
           FROM face_person fp JOIN face_detections fd ON fd.id=fp.face_id
           JOIN assets a ON a.id=fd.asset_id
-          WHERE fp.person_id=p.id AND a.deleted_at IS NULL AND a.is_live_photo_video=0) AS first_seen,
+          WHERE fp.person_id=p.id AND a.deleted_at IS NULL AND a.offline=0 AND a.is_live_photo_video=0) AS first_seen,
        (SELECT MAX(a.taken_at)
           FROM face_person fp JOIN face_detections fd ON fd.id=fp.face_id
           JOIN assets a ON a.id=fd.asset_id
-          WHERE fp.person_id=p.id AND a.deleted_at IS NULL AND a.is_live_photo_video=0) AS last_seen,
+          WHERE fp.person_id=p.id AND a.deleted_at IS NULL AND a.offline=0 AND a.is_live_photo_video=0) AS last_seen,
        (SELECT COUNT(DISTINCT (CAST(e.latitude*2 AS INT) || ',' || CAST(e.longitude*2 AS INT)))
           FROM face_person fp JOIN face_detections fd ON fd.id=fp.face_id
           JOIN assets a ON a.id=fd.asset_id
           JOIN asset_exif e ON e.asset_id=fd.asset_id
-          WHERE fp.person_id=p.id AND a.deleted_at IS NULL AND a.is_live_photo_video=0
+          WHERE fp.person_id=p.id AND a.deleted_at IS NULL AND a.offline=0 AND a.is_live_photo_video=0
             AND e.latitude IS NOT NULL AND e.longitude IS NOT NULL
             AND NOT (e.latitude=0 AND e.longitude=0)) AS places,
-       COALESCE((SELECT a.id FROM assets a WHERE a.id=p.hero_asset_id AND a.deleted_at IS NULL),'') AS hero
+       COALESCE((SELECT a.id FROM assets a WHERE a.id=p.hero_asset_id AND a.deleted_at IS NULL AND a.offline=0),'') AS hero
 FROM persons p
 WHERE p.hidden=0
 ORDER BY cnt DESC, p.rowid`)
@@ -81,9 +86,14 @@ func (s *PersonService) GetPerson(id string) (*Person, error) {
 	var p Person
 	var fav int
 	err := s.db.QueryRow(`
-SELECT p.id, p.name, COALESCE(p.cover_asset_id,''), COALESCE(p.cover_face_id,''),
+SELECT p.id, p.name,
+       COALESCE(
+           (SELECT a.id FROM assets a WHERE a.id=p.cover_asset_id AND a.deleted_at IS NULL AND a.offline=0),
+           (SELECT a.id FROM assets a WHERE a.id=p.hero_asset_id AND a.deleted_at IS NULL AND a.offline=0),
+           '') AS cover,
+       COALESCE(p.cover_face_id,''),
        p.favorite, COALESCE(p.relation,''), p.confidence,
-       COALESCE((SELECT a.id FROM assets a WHERE a.id=p.hero_asset_id AND a.deleted_at IS NULL),'') AS hero
+       COALESCE((SELECT a.id FROM assets a WHERE a.id=p.hero_asset_id AND a.deleted_at IS NULL AND a.offline=0),'') AS hero
 FROM persons p WHERE p.id=? AND p.hidden=0`, id).Scan(
 		&p.ID, &p.Name, &p.CoverAssetID, &p.CoverFaceID, &fav, &p.Relation, &p.Confidence, &p.HeroAssetID)
 	if err == sql.ErrNoRows {
@@ -101,7 +111,7 @@ FROM persons p WHERE p.id=? AND p.hidden=0`, id).Scan(
 SELECT COUNT(DISTINCT a.id), MIN(a.taken_at), MAX(a.taken_at)
 FROM face_person fp JOIN face_detections fd ON fd.id=fp.face_id
 JOIN assets a ON a.id=fd.asset_id
-WHERE fp.person_id=? AND a.deleted_at IS NULL AND a.is_live_photo_video=0`, id).
+WHERE fp.person_id=? AND a.deleted_at IS NULL AND a.offline=0 AND a.is_live_photo_video=0`, id).
 		Scan(&cnt, &first, &last); err != nil {
 		return nil, fmt.Errorf("GetPerson stats: %w", err)
 	}
@@ -120,7 +130,7 @@ SELECT COUNT(DISTINCT (CAST(e.latitude*2 AS INT) || ',' || CAST(e.longitude*2 AS
 FROM face_person fp JOIN face_detections fd ON fd.id=fp.face_id
 JOIN assets a ON a.id=fd.asset_id
 JOIN asset_exif e ON e.asset_id=fd.asset_id
-WHERE fp.person_id=? AND a.deleted_at IS NULL AND a.is_live_photo_video=0
+WHERE fp.person_id=? AND a.deleted_at IS NULL AND a.offline=0 AND a.is_live_photo_video=0
   AND e.latitude IS NOT NULL AND e.longitude IS NOT NULL
   AND NOT (e.latitude=0 AND e.longitude=0)`, id).Scan(&places); err != nil {
 		return nil, fmt.Errorf("GetPerson places: %w", err)
@@ -398,7 +408,7 @@ FROM face_person fp1
 JOIN face_detections fd1 ON fd1.id=fp1.face_id
 JOIN face_detections fd2 ON fd2.asset_id=fd1.asset_id AND fd2.id!=fd1.id
 JOIN face_person fp2 ON fp2.face_id=fd2.id
-JOIN assets a ON a.id=fd1.asset_id AND a.deleted_at IS NULL AND a.is_live_photo_video=0
+JOIN assets a ON a.id=fd1.asset_id AND a.deleted_at IS NULL AND a.offline=0 AND a.is_live_photo_video=0
 JOIN persons p ON p.id=fp2.person_id AND p.hidden=0
 WHERE fp1.person_id=? AND fp2.person_id!=fp1.person_id
 GROUP BY fp2.person_id
@@ -446,7 +456,7 @@ SELECT e.latitude, e.longitude, a.taken_at,
        COALESCE(g.city, ''), COALESCE(g.country, '')
 FROM face_person fp
 JOIN face_detections fd ON fd.id=fp.face_id
-JOIN assets a ON a.id=fd.asset_id AND a.deleted_at IS NULL AND a.is_live_photo_video=0
+JOIN assets a ON a.id=fd.asset_id AND a.deleted_at IS NULL AND a.offline=0 AND a.is_live_photo_video=0
 JOIN asset_exif e ON e.asset_id=a.id
 LEFT JOIN asset_geo g ON g.asset_id=a.id
 WHERE fp.person_id=? AND e.latitude IS NOT NULL AND e.longitude IS NOT NULL

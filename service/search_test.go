@@ -161,6 +161,101 @@ func TestTimelineEnrichesPlaceName(t *testing.T) {
 	}
 }
 
+// TestSmartSearchExcludesOffline 验证:资产所在可移动盘被拔出(offline=1)时,
+// 即使有 CLIP 向量也不应出现在语义搜索结果里,如同暂时不存在。
+func TestSmartSearchExcludesOffline(t *testing.T) {
+	db, err := sqlite.Open(filepath.Join(t.TempDir(), "so.db"))
+	require.NoError(t, err)
+	defer db.Close()
+
+	seed := func(id, path string) {
+		_, err := db.Exec(`INSERT INTO assets(id, file_path, status, is_live_photo_video) VALUES(?,?,'indexed',0)`, id, path)
+		require.NoError(t, err)
+		_, err = db.Exec(`INSERT INTO asset_clip_idx(asset_id) VALUES(?)`, id)
+		require.NoError(t, err)
+		var rowid int64
+		require.NoError(t, db.QueryRow(`SELECT rowid FROM asset_clip_idx WHERE asset_id=?`, id).Scan(&rowid))
+		vec := make([]float32, common.CLIPDim)
+		vec[0] = 1.0
+		_, err = db.Exec(`INSERT INTO clip_embeddings(rowid, embedding) VALUES(?,?)`, rowid, sqlite.SerializeFloat32(vec))
+		require.NoError(t, err)
+	}
+	seed("online", "/DATA/beach.jpg")
+	seed("offline", "/media/X/beach2.jpg")
+	_, err = db.Exec(`UPDATE assets SET offline=1 WHERE id='offline'`)
+	require.NoError(t, err)
+
+	svc := service.NewSearchService(db, &mockTextML{})
+	results, err := svc.SmartSearch("beach", 10, service.SearchFilters{})
+	require.NoError(t, err)
+	ids := map[string]bool{}
+	for _, a := range results {
+		ids[a.ID] = true
+	}
+	require.True(t, ids["online"], "在线资产应出现在结果中")
+	require.False(t, ids["offline"], "offline 资产必须从语义搜索结果中隐藏")
+}
+
+// TestTimelineExcludesOffline 验证时间线视图隐藏 offline=1 的资产。
+func TestTimelineExcludesOffline(t *testing.T) {
+	db, err := sqlite.Open(filepath.Join(t.TempDir(), "tlo.db"))
+	require.NoError(t, err)
+	defer db.Close()
+
+	db.Exec(`INSERT INTO assets(id,file_path,status,taken_at,is_live_photo_video) VALUES('online','/p1.jpg','indexed','2025-07-15 10:00:00',0)`)
+	db.Exec(`INSERT INTO assets(id,file_path,status,taken_at,is_live_photo_video) VALUES('offline','/media/X/p2.jpg','indexed','2025-07-15 11:00:00',0)`)
+	_, err = db.Exec(`UPDATE assets SET offline=1 WHERE id='offline'`)
+	require.NoError(t, err)
+
+	svc := service.NewSearchService(db, nil)
+	groups, err := svc.Timeline("default")
+	require.NoError(t, err)
+	require.Len(t, groups, 1)
+	require.Len(t, groups[0].Assets, 1, "offline 资产必须从 Timeline 隐藏")
+	require.Equal(t, "online", groups[0].Assets[0].ID)
+}
+
+// TestListAssetsExcludesOffline 验证 ListAssets 隐藏 offline=1 的资产。
+func TestListAssetsExcludesOffline(t *testing.T) {
+	db, err := sqlite.Open(filepath.Join(t.TempDir(), "lao.db"))
+	require.NoError(t, err)
+	defer db.Close()
+
+	db.Exec(`INSERT INTO assets(id,file_path,status,is_live_photo_video) VALUES('online','/p1.jpg','indexed',0)`)
+	db.Exec(`INSERT INTO assets(id,file_path,status,is_live_photo_video) VALUES('offline','/media/X/p2.jpg','indexed',0)`)
+	_, err = db.Exec(`UPDATE assets SET offline=1 WHERE id='offline'`)
+	require.NoError(t, err)
+
+	svc := service.NewSearchService(db, nil)
+	assets, err := svc.ListAssets("default", 10, 0)
+	require.NoError(t, err)
+	require.Len(t, assets, 1)
+	require.Equal(t, "online", assets[0].ID)
+}
+
+// TestPersonAssetsExcludesOffline 验证人物详情页的资产列表隐藏 offline 资产。
+func TestPersonAssetsExcludesOffline(t *testing.T) {
+	db, err := sqlite.Open(filepath.Join(t.TempDir(), "pao.db"))
+	require.NoError(t, err)
+	defer db.Close()
+
+	db.Exec(`INSERT INTO assets(id,file_path,status,is_live_photo_video) VALUES('online','/p1.jpg','indexed',0)`)
+	db.Exec(`INSERT INTO assets(id,file_path,status,is_live_photo_video) VALUES('offline','/media/X/p2.jpg','indexed',0)`)
+	_, err = db.Exec(`UPDATE assets SET offline=1 WHERE id='offline'`)
+	require.NoError(t, err)
+	db.Exec(`INSERT INTO persons(id,name) VALUES('per1','Alice')`)
+	for _, aid := range []string{"online", "offline"} {
+		db.Exec(`INSERT INTO face_detections(id,asset_id,bbox,embedding) VALUES(?,?,'{}',?)`, "fd-"+aid, aid, []byte{})
+		db.Exec(`INSERT INTO face_person(face_id,person_id) VALUES(?,?)`, "fd-"+aid, "per1")
+	}
+
+	svc := service.NewSearchService(db, nil)
+	assets, err := svc.PersonAssets("per1", 10, 0)
+	require.NoError(t, err)
+	require.Len(t, assets, 1)
+	require.Equal(t, "online", assets[0].ID)
+}
+
 func TestListAssets(t *testing.T) {
 	db, err := sqlite.Open(filepath.Join(t.TempDir(), "la.db"))
 	require.NoError(t, err)

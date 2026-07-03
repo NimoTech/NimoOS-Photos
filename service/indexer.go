@@ -1351,6 +1351,11 @@ func (ix *Indexer) StatusCounts() IndexStatus {
 	_ = ix.db.QueryRow(
 		`SELECT COALESCE(SUM(file_size), 0) FROM assets WHERE status = 'indexed'`,
 	).Scan(&s.TotalBytes)
+
+	// Offline count is independent of the status breakdown above: offline=1
+	// assets keep whatever status they had (usually 'indexed') and are still
+	// counted there — this is a separate, additive figure surfaced to the UI.
+	_ = ix.db.QueryRow(`SELECT COUNT(*) FROM assets WHERE offline = 1`).Scan(&s.Offline)
 	return s
 }
 

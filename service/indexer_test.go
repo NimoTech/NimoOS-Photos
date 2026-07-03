@@ -529,6 +529,25 @@ func TestPruneMissingUnderKeepsOfflineAssets(t *testing.T) {
 	require.Equal(t, 0, n, "offline=0 且文件确实消失的资产应照常清理")
 }
 
+// TestStatusCountsReportsOfflineCount 验证 StatusCounts().Offline 正确统计
+// offline=1 的资产数,且不影响 Indexed 的既有口径(offline 资产仍按 status
+// 计入 Indexed,Offline 是独立叠加的统计维度)。
+func TestStatusCountsReportsOfflineCount(t *testing.T) {
+	db := makeTestDB(t)
+	insertAsset(t, db, "/DATA/a.jpg", "indexed")
+	offID := insertAsset(t, db, "/media/X/b.jpg", "indexed")
+	insertAsset(t, db, "/DATA/c.jpg", "pending")
+	_, err := db.Exec(`UPDATE assets SET offline=1 WHERE id=?`, offID)
+	require.NoError(t, err)
+
+	ix := NewIndexer(db, &mockML{}, t.TempDir(), 1)
+	status := ix.StatusCounts()
+
+	require.Equal(t, 1, status.Offline, "offline=1 的资产数必须被统计")
+	require.Equal(t, 2, status.Indexed, "Indexed 口径不变:offline 资产仍按 status 计入")
+	require.Equal(t, 1, status.Pending)
+}
+
 // TestPruneMissingUnderLikeMetacharSiblings:`_` 是 LIKE 通配符,真实 U 盘卷标
 // 就含下划线(Kingston_DataTra)。对 …/disk_A 的 prune 不得波及仅 `_` 位不同的
 // 兄弟挂载 …/diskXA——旧的 `LIKE 'disk_A/%'` 会连带匹配并把兄弟盘上

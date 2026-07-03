@@ -112,6 +112,30 @@ func TestListFavoritesLimitOffset(t *testing.T) {
 	require.Equal(t, "a1", page2[0].ID)
 }
 
+// TestFavoritesListExcludesOffline verifies List() hides a favorited asset
+// whose removable drive is currently unplugged (offline=1).
+func TestFavoritesListExcludesOffline(t *testing.T) {
+	db, err := sqlite.Open(filepath.Join(t.TempDir(), "test.db"))
+	require.NoError(t, err)
+	defer db.Close()
+	_, err = db.Exec(`INSERT INTO assets(id, file_path, status) VALUES
+		('online','/DATA/1.jpg','indexed'),('offline','/media/X/2.jpg','indexed')`)
+	require.NoError(t, err)
+	_, err = db.Exec(`UPDATE assets SET offline=1 WHERE id='offline'`)
+	require.NoError(t, err)
+
+	svc := service.NewFavoritesService(db)
+	_, err = svc.Favorite("default", "online")
+	require.NoError(t, err)
+	_, err = svc.Favorite("default", "offline")
+	require.NoError(t, err)
+
+	list, err := svc.List("default", service.ListFavoritesOpts{})
+	require.NoError(t, err)
+	require.Len(t, list, 1, "offline 资产必须从收藏列表隐藏")
+	require.Equal(t, "online", list[0].ID)
+}
+
 func TestTopOrdersByViewCountThenFavoritedAt(t *testing.T) {
 	// 该用例需要同库的 ViewsService 播种浏览次数，openTestFavSvc 不暴露 db，故自建 db。
 	db, err := sqlite.Open(filepath.Join(t.TempDir(), "test.db"))

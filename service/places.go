@@ -36,7 +36,7 @@ func (s *PlacesService) ListPlaces() (PlacesResponse, error) {
 	rows, err := s.db.Query(`
 SELECT g.city_id, g.city, g.country, g.region, COUNT(*) AS cnt, MAX(a.taken_at) AS last_taken
 FROM asset_geo g
-JOIN assets a ON a.id=g.asset_id AND a.deleted_at IS NULL AND a.is_live_photo_video=0
+JOIN assets a ON a.id=g.asset_id AND a.deleted_at IS NULL AND a.offline=0 AND a.is_live_photo_video=0
 WHERE g.city_id IS NOT NULL
 GROUP BY g.city_id
 ORDER BY cnt DESC`)
@@ -114,7 +114,7 @@ ORDER BY cnt DESC`)
 func (s *PlacesService) recentThumbs(cityID int32, n int) []string {
 	rows, err := s.db.Query(`
 SELECT a.id FROM asset_geo g
-JOIN assets a ON a.id=g.asset_id AND a.deleted_at IS NULL AND a.is_live_photo_video=0
+JOIN assets a ON a.id=g.asset_id AND a.deleted_at IS NULL AND a.offline=0 AND a.is_live_photo_video=0
 WHERE g.city_id=?
 ORDER BY a.taken_at DESC
 LIMIT ?`, cityID, n)
@@ -143,7 +143,7 @@ type takenItem struct {
 func (s *PlacesService) loadTakenTimes(cityID int32) ([]takenItem, error) {
 	rows, err := s.db.Query(`
 SELECT a.id, a.taken_at FROM asset_geo g
-JOIN assets a ON a.id=g.asset_id AND a.deleted_at IS NULL AND a.is_live_photo_video=0
+JOIN assets a ON a.id=g.asset_id AND a.deleted_at IS NULL AND a.offline=0 AND a.is_live_photo_video=0
 WHERE g.city_id=? AND a.taken_at IS NOT NULL
 ORDER BY a.taken_at ASC`, cityID)
 	if err != nil {
@@ -190,7 +190,7 @@ func (s *PlacesService) currentTripCity() (int32, bool) {
 	var cid sql.NullInt64
 	err := s.db.QueryRow(`
 SELECT g.city_id FROM asset_geo g
-JOIN assets a ON a.id=g.asset_id AND a.deleted_at IS NULL AND a.is_live_photo_video=0
+JOIN assets a ON a.id=g.asset_id AND a.deleted_at IS NULL AND a.offline=0 AND a.is_live_photo_video=0
 WHERE a.taken_at IS NOT NULL AND g.city_id IS NOT NULL
 ORDER BY a.taken_at DESC
 LIMIT 1`).Scan(&cid)
@@ -264,7 +264,7 @@ func (s *PlacesService) Visits(cityID int32) ([]Visit, error) {
 func (s *PlacesService) topFacesBetween(cityID int32, from, to time.Time, n int) []string {
 	rows, err := s.db.Query(`
 SELECT p.name, COUNT(*) c FROM asset_geo g
-JOIN assets a ON a.id=g.asset_id AND a.deleted_at IS NULL
+JOIN assets a ON a.id=g.asset_id AND a.deleted_at IS NULL AND a.offline=0
 JOIN face_detections fd ON fd.asset_id=a.id
 JOIN face_person fp ON fp.face_id=fd.id
 JOIN persons p ON p.id=fp.person_id
@@ -318,7 +318,7 @@ func spotKeyForCentroid(cityID int32, cLat, cLon float64) string {
 func (s *PlacesService) clusterCity(cityID int32) []*spotCluster {
 	rows, err := s.db.Query(`
 SELECT a.id, g.lat, g.lon FROM asset_geo g
-JOIN assets a ON a.id=g.asset_id AND a.deleted_at IS NULL AND a.is_live_photo_video=0
+JOIN assets a ON a.id=g.asset_id AND a.deleted_at IS NULL AND a.offline=0 AND a.is_live_photo_video=0
 WHERE g.city_id=? AND g.lat IS NOT NULL AND g.lon IS NOT NULL
 ORDER BY a.taken_at DESC`, cityID)
 	if err != nil {
@@ -508,7 +508,7 @@ func (s *PlacesService) insights(cityID int32, p Place, resp PlacesResponse) []I
 // SetCover persists a per-user cover override for a place. Validates the asset exists.
 func (s *PlacesService) SetCover(userID string, placeKey int32, assetID string) error {
 	var n int
-	if err := s.db.QueryRow(`SELECT COUNT(*) FROM assets WHERE id=? AND deleted_at IS NULL`, assetID).Scan(&n); err != nil {
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM assets WHERE id=? AND deleted_at IS NULL AND offline=0`, assetID).Scan(&n); err != nil {
 		return err
 	}
 	if n == 0 {
@@ -533,7 +533,7 @@ func (s *PlacesService) GetCover(userID string, placeKey int32) (string, error) 
 		return "", err
 	}
 	var n int
-	s.db.QueryRow(`SELECT COUNT(*) FROM assets WHERE id=? AND deleted_at IS NULL`, id).Scan(&n) //nolint:errcheck
+	s.db.QueryRow(`SELECT COUNT(*) FROM assets WHERE id=? AND deleted_at IS NULL AND offline=0`, id).Scan(&n) //nolint:errcheck
 	if n == 0 {
 		return "", nil
 	}
@@ -546,7 +546,7 @@ func (s *PlacesService) GetCover(userID string, placeKey int32) (string, error) 
 func (s *PlacesService) CoverOverrides(userID string) map[int32]string {
 	rows, err := s.db.Query(`
 SELECT o.place_key, o.asset_id FROM place_cover_overrides o
-JOIN assets a ON a.id=o.asset_id AND a.deleted_at IS NULL
+JOIN assets a ON a.id=o.asset_id AND a.deleted_at IS NULL AND a.offline=0
 WHERE o.user_id=?`, userID)
 	if err != nil {
 		return nil
@@ -608,7 +608,7 @@ func (s *PlacesService) SpotNameOverrides(userID string) map[string]string {
 func (s *PlacesService) placeAssetIDs(cityID int32, from, to string) ([]string, error) {
 	q := `
 SELECT a.id FROM asset_geo g
-JOIN assets a ON a.id=g.asset_id AND a.deleted_at IS NULL AND a.is_live_photo_video=0
+JOIN assets a ON a.id=g.asset_id AND a.deleted_at IS NULL AND a.offline=0 AND a.is_live_photo_video=0
 WHERE g.city_id=?`
 	args := []any{cityID}
 	if from != "" && to != "" {
@@ -638,7 +638,7 @@ WHERE g.city_id=?`
 func (s *PlacesService) CoverCandidates(cityID int32, tab, q string, page, pageSize int) (CoverCandidatesResult, error) {
 	base := `
 FROM asset_geo g
-JOIN assets a ON a.id=g.asset_id AND a.deleted_at IS NULL AND a.is_live_photo_video=0`
+JOIN assets a ON a.id=g.asset_id AND a.deleted_at IS NULL AND a.offline=0 AND a.is_live_photo_video=0`
 	order := ` ORDER BY a.taken_at DESC`
 	join := ``
 	where := ` WHERE g.city_id=?`
@@ -689,7 +689,7 @@ func (s *PlacesService) coverTabCounts(cityID int32) []CoverTab {
 	count := func(extra string) int {
 		var n int
 		s.db.QueryRow(`SELECT COUNT(*) FROM asset_geo g
-JOIN assets a ON a.id=g.asset_id AND a.deleted_at IS NULL AND a.is_live_photo_video=0`+extra+
+JOIN assets a ON a.id=g.asset_id AND a.deleted_at IS NULL AND a.offline=0 AND a.is_live_photo_video=0`+extra+
 			` WHERE g.city_id=?`, cityID).Scan(&n) //nolint:errcheck
 		return n
 	}

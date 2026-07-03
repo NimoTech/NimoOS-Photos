@@ -97,6 +97,45 @@ func TestEvaluateIntersectionAndScore(t *testing.T) {
 	require.Equal(t, 2, cnt)
 }
 
+// TestEvaluateAndPreviewExcludeOfflineAssets verifies that both the persisted
+// Evaluate path (used by Create/Update/EvaluateAllLive) and the unpersisted
+// Preview path drop matches whose asset is currently offline=1 (removable
+// drive unplugged) — the smart view must hide it exactly like every other
+// list surface.
+func TestEvaluateAndPreviewExcludeOfflineAssets(t *testing.T) {
+	s := svTestService(t)
+	db := s.db
+	_, _ = db.Exec(`INSERT INTO assets(id,file_path,status,is_live_photo_video) VALUES('online','/p/a1.jpg','indexed',0)`)
+	_, _ = db.Exec(`INSERT INTO assets(id,file_path,status,is_live_photo_video) VALUES('offline','/media/X/a2.jpg','indexed',0)`)
+	_, err := db.Exec(`UPDATE assets SET offline=1 WHERE id='offline'`)
+	require.NoError(t, err)
+	_, _ = db.Exec(`INSERT INTO persons(id,name) VALUES('p-sara','Sara')`)
+	for _, fid := range []struct{ f, a string }{{"f1", "online"}, {"f2", "offline"}} {
+		_, _ = db.Exec(`INSERT INTO face_detections(id,asset_id,bbox,embedding) VALUES(?,?,'{}',X'00')`, fid.f, fid.a)
+		_, _ = db.Exec(`INSERT INTO face_person(face_id,person_id) VALUES(?, 'p-sara')`, fid.f)
+	}
+
+	// Evaluate (live) path: only the online asset should end up in smart_view_matches.
+	_, err = s.Create(SmartViewInput{ID: "sv-off", Name: "Sara", CondsRaw: []string{"Sara"}, Threshold: 50, Live: true})
+	require.NoError(t, err)
+	var ids []string
+	rows, err := db.Query(`SELECT asset_id FROM smart_view_matches WHERE smart_view_id='sv-off'`)
+	require.NoError(t, err)
+	for rows.Next() {
+		var id string
+		require.NoError(t, rows.Scan(&id))
+		ids = append(ids, id)
+	}
+	rows.Close()
+	require.Equal(t, []string{"online"}, ids, "offline 资产不应进入 smart_view_matches")
+
+	// Preview path: same condition, unpersisted — must also exclude offline.
+	total, seeds, _, err := s.Preview([]string{"Sara"}, "", 50, true)
+	require.NoError(t, err)
+	require.Equal(t, 1, total, "Preview 计数不应包含 offline 资产")
+	require.Equal(t, []string{"online"}, seeds)
+}
+
 func TestEvaluatePureStructuralScoreIsOne(t *testing.T) {
 	s := svTestService(t)
 	db := s.db

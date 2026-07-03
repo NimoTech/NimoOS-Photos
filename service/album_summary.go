@@ -66,6 +66,7 @@ func (s *AlbumService) Summary(albumID string) (*AlbumSummary, error) {
 		JOIN assets a ON a.id = aa.asset_id
 		WHERE aa.album_id = ?
 		  AND a.deleted_at IS NULL
+		  AND a.offline = 0
 		  AND a.is_live_photo_video = 0
 	`, albumID).Scan(&sum.AssetCount, &sum.PhotoCount, &sum.VideoCount, &dateStart, &dateEnd)
 	if err != nil {
@@ -86,6 +87,7 @@ func (s *AlbumService) Summary(albumID string) (*AlbumSummary, error) {
 		JOIN asset_geo g ON g.asset_id = a.id
 		WHERE aa.album_id = ?
 		  AND a.deleted_at IS NULL
+		  AND a.offline = 0
 		  AND a.is_live_photo_video = 0
 		  AND COALESCE(g.city,'') <> ''
 		GROUP BY g.city, g.country
@@ -119,6 +121,7 @@ func (s *AlbumService) Summary(albumID string) (*AlbumSummary, error) {
 		JOIN persons p ON p.id = fp.person_id
 		WHERE aa.album_id = ?
 		  AND a.deleted_at IS NULL
+		  AND a.offline = 0
 		  AND a.is_live_photo_video = 0
 		  AND fd.excluded = 0
 		  AND p.name <> ''
@@ -150,6 +153,7 @@ func (s *AlbumService) Summary(albumID string) (*AlbumSummary, error) {
 		JOIN asset_ocr o ON o.asset_id = a.id
 		WHERE aa.album_id = ?
 		  AND a.deleted_at IS NULL
+		  AND a.offline = 0
 		  AND a.is_live_photo_video = 0
 		  AND o.text <> ''
 		ORDER BY length(o.text) DESC
@@ -179,6 +183,7 @@ func (s *AlbumService) Summary(albumID string) (*AlbumSummary, error) {
 		JOIN assets a ON a.id = aa.asset_id
 		WHERE aa.album_id = ?
 		  AND a.deleted_at IS NULL
+		  AND a.offline = 0
 		  AND a.is_live_photo_video = 0
 		ORDER BY a.taken_at IS NULL, a.taken_at
 		LIMIT 5
@@ -206,6 +211,7 @@ func (s *AlbumService) Summary(albumID string) (*AlbumSummary, error) {
 		JOIN assets a ON a.id = aa.asset_id
 		WHERE aa.album_id = ?
 		  AND a.deleted_at IS NULL
+		  AND a.offline = 0
 		  AND a.is_live_photo_video = 0
 		  AND COALESCE(a.mime_type,'') NOT LIKE 'video/%'
 		ORDER BY a.taken_at IS NULL, a.taken_at
