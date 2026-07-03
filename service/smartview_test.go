@@ -187,28 +187,33 @@ func seedClipAssetWithSim(t *testing.T, s *SmartViewService, id string, sim floa
 // evalParsed 不得再做第二次映射——否则滑块语义与搜索页百分比脱钩。
 func TestSemanticScoreCalibration(t *testing.T) {
 	s := svTestService(t)
-	seedClipAssetWithSim(t, s, "good", 0.20, "2024-06-01T00:00:00Z") // 展示分 (0.20-0.02)/0.23 ≈ 78%
-	seedClipAssetWithSim(t, s, "bad", 0.10, "2024-06-01T00:00:00Z")  // 展示分 (0.10-0.02)/0.23 ≈ 35%
+	// 种子裸分相对标定端点取值,期望值由 displayScore 现算,换模型重标端点时
+	// 本测试自动跟随,不再硬编码百分比。
+	goodRaw := simDisplayFloor + (simDisplayCeil-simDisplayFloor)*0.9 // 展示分 90%
+	badRaw := simDisplayFloor + (simDisplayCeil-simDisplayFloor)*0.2 // 展示分 20%
+	seedClipAssetWithSim(t, s, "good", goodRaw, "2024-06-01T00:00:00Z")
+	seedClipAssetWithSim(t, s, "bad", badRaw, "2024-06-01T00:00:00Z")
 
 	count, _, _, err := s.Preview([]string{"scene: bike"}, "", 50, false)
 	require.NoError(t, err)
-	require.Equal(t, 1, count, "raw 0.20 → ~78% must pass a 50% threshold; raw 0.10 → ~35% must not")
+	require.Equal(t, 1, count, "90% must pass a 50% threshold; 20% must not")
 
 	count, _, _, err = s.Preview([]string{"scene: bike"}, "", 70, false)
 	require.NoError(t, err)
 	require.Equal(t, 1, count)
 
-	count, _, _, err = s.Preview([]string{"scene: bike"}, "", 85, false)
+	count, _, _, err = s.Preview([]string{"scene: bike"}, "", 95, false)
 	require.NoError(t, err)
-	require.Equal(t, 0, count, "~78% must fail an 85% threshold")
+	require.Equal(t, 0, count, "90% must fail a 95% threshold")
 }
 
 // 用户场景还原：chips ["2024","bike"]——裸年份按日期过滤、bike 走 CLIP，
 // 2024 年的高分照片必须匹配，2023 年的不匹配。
 func TestBareYearPlusSemantic(t *testing.T) {
 	s := svTestService(t)
-	seedClipAssetWithSim(t, s, "a24", 0.20, "2024-06-01T00:00:00Z")
-	seedClipAssetWithSim(t, s, "a23", 0.20, "2023-06-01T00:00:00Z")
+	highRaw := simDisplayFloor + (simDisplayCeil-simDisplayFloor)*0.9 // 展示分 90%
+	seedClipAssetWithSim(t, s, "a24", highRaw, "2024-06-01T00:00:00Z")
+	seedClipAssetWithSim(t, s, "a23", highRaw, "2023-06-01T00:00:00Z")
 
 	_, err := s.Create(SmartViewInput{ID: "sv-bike", Name: "2024 bike",
 		CondsRaw: []string{"2024", "bike"}, Threshold: 50, Live: true})
@@ -228,7 +233,7 @@ func TestBareYearPlusSemantic(t *testing.T) {
 	// 不允许再有第二层映射改写它
 	var score float64
 	require.NoError(t, s.db.QueryRow(`SELECT match_score FROM smart_view_matches WHERE smart_view_id='sv-bike'`).Scan(&score))
-	require.InDelta(t, 0.783, score, 0.01) // displayScore(0.20) = (0.20-0.02)/0.23 ≈ 0.783
+	require.InDelta(t, displayScore(highRaw), score, 0.01) // 落库分 = 唯一标定层 displayScore 的输出
 }
 
 // Evaluate 必须从 conds_raw 现解析，而不是用建库时固化的 conds_parsed 快照：
