@@ -1355,7 +1355,10 @@ func (ix *Indexer) StatusCounts() IndexStatus {
 	// Offline count is independent of the status breakdown above: offline=1
 	// assets keep whatever status they had (usually 'indexed') and are still
 	// counted there — this is a separate, additive figure surfaced to the UI.
-	_ = ix.db.QueryRow(`SELECT COUNT(*) FROM assets WHERE offline = 1`).Scan(&s.Offline)
+	// deleted_at IS NULL: a trashed asset that also sits on an unplugged drive
+	// is already gone from the library view; it must not inflate the
+	// "N photos are on a disconnected drive" hint.
+	_ = ix.db.QueryRow(`SELECT COUNT(*) FROM assets WHERE offline = 1 AND deleted_at IS NULL`).Scan(&s.Offline)
 	return s
 }
 

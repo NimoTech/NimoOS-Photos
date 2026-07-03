@@ -145,7 +145,10 @@ type Album struct {
 	Name         string    `json:"name"`
 	CreatedAt    time.Time `json:"createdAt"`
 	CoverAssetID string    `json:"coverAssetId,omitempty"`
-	AssetCount   int       `json:"assetCount,omitempty"`
+	// AssetCount is the album card badge: visible members only (live-photo
+	// companion videos, trashed and offline assets excluded), so it always
+	// matches the number of items ListAssets returns when the album is opened.
+	AssetCount int `json:"assetCount,omitempty"`
 
 	// DateStart / DateEnd are the raw taken_at strings of the earliest and
 	// latest dated assets in the album (empty when the album has no dated

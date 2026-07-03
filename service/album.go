@@ -60,7 +60,8 @@ func (s *AlbumService) List() ([]Album, error) {
 		               WHERE aa2.album_id = a.id
 		               ORDER BY aa2.position ASC, aa2.rowid ASC LIMIT 1),
 		           '') AS cover,
-		       COUNT(aa.asset_id) AS cnt,
+		       SUM(CASE WHEN sp.is_live_photo_video = 0 AND sp.deleted_at IS NULL AND sp.offline = 0
+		                 THEN 1 ELSE 0 END) AS cnt,
 		       MIN(sp.taken_at) AS date_start,
 		       MAX(sp.taken_at) AS date_end,
 		       SUM(CASE WHEN sp.is_live_photo_video = 0 AND sp.deleted_at IS NULL AND sp.offline = 0

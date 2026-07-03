@@ -136,6 +136,37 @@ func TestFavoritesListExcludesOffline(t *testing.T) {
 	require.Equal(t, "online", list[0].ID)
 }
 
+// TestFavoritesTopExcludesOfflineAndDeleted verifies Top() applies the same
+// visibility filter as List(): favorited assets that are soft-deleted or on a
+// currently-unplugged removable drive (offline=1) must not appear.
+func TestFavoritesTopExcludesOfflineAndDeleted(t *testing.T) {
+	db, err := sqlite.Open(filepath.Join(t.TempDir(), "test.db"))
+	require.NoError(t, err)
+	defer db.Close()
+	_, err = db.Exec(`INSERT INTO assets(id, file_path, status) VALUES
+		('online','/DATA/1.jpg','indexed'),
+		('offline','/media/X/2.jpg','indexed'),
+		('trashed','/DATA/3.jpg','indexed')`)
+	require.NoError(t, err)
+	_, err = db.Exec(`UPDATE assets SET offline=1 WHERE id='offline'`)
+	require.NoError(t, err)
+
+	svc := service.NewFavoritesService(db)
+	for _, id := range []string{"online", "offline", "trashed"} {
+		_, e := svc.Favorite("default", id)
+		require.NoError(t, e)
+	}
+	// 软删放在收藏之后:Favorite() 对不存在的资产会报错,但对已软删的资产,
+	// 现实顺序也是"先收藏、后进回收站"。
+	_, err = db.Exec(`UPDATE assets SET deleted_at='2026-01-01 00:00:00' WHERE id='trashed'`)
+	require.NoError(t, err)
+
+	top, err := svc.Top("default", 5)
+	require.NoError(t, err)
+	require.Len(t, top, 1, "offline 与回收站资产不得出现在热门收藏")
+	require.Equal(t, "online", top[0].ID)
+}
+
 func TestTopOrdersByViewCountThenFavoritedAt(t *testing.T) {
 	// 该用例需要同库的 ViewsService 播种浏览次数，openTestFavSvc 不暴露 db，故自建 db。
 	db, err := sqlite.Open(filepath.Join(t.TempDir(), "test.db"))

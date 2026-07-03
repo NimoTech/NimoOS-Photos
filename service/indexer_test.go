@@ -531,7 +531,9 @@ func TestPruneMissingUnderKeepsOfflineAssets(t *testing.T) {
 
 // TestStatusCountsReportsOfflineCount 验证 StatusCounts().Offline 正确统计
 // offline=1 的资产数,且不影响 Indexed 的既有口径(offline 资产仍按 status
-// 计入 Indexed,Offline 是独立叠加的统计维度)。
+// 计入 Indexed,Offline 是独立叠加的统计维度)。回收站里的 offline 资产
+// (deleted_at 非空 + offline=1 双标)不计入——它已经从图库里消失,不属于
+// "N 张照片在已断开的磁盘上"要提示的对象。
 func TestStatusCountsReportsOfflineCount(t *testing.T) {
 	db := makeTestDB(t)
 	insertAsset(t, db, "/DATA/a.jpg", "indexed")
@@ -539,12 +541,16 @@ func TestStatusCountsReportsOfflineCount(t *testing.T) {
 	insertAsset(t, db, "/DATA/c.jpg", "pending")
 	_, err := db.Exec(`UPDATE assets SET offline=1 WHERE id=?`, offID)
 	require.NoError(t, err)
+	// 双标资产:先进回收站、后拔盘(或反之)——不应计入 Offline。
+	dualID := insertAsset(t, db, "/media/X/trashed.jpg", "indexed")
+	_, err = db.Exec(`UPDATE assets SET offline=1, deleted_at='2026-01-01 00:00:00' WHERE id=?`, dualID)
+	require.NoError(t, err)
 
 	ix := NewIndexer(db, &mockML{}, t.TempDir(), 1)
 	status := ix.StatusCounts()
 
-	require.Equal(t, 1, status.Offline, "offline=1 的资产数必须被统计")
-	require.Equal(t, 2, status.Indexed, "Indexed 口径不变:offline 资产仍按 status 计入")
+	require.Equal(t, 1, status.Offline, "offline=1 计数不得包含回收站双标资产")
+	require.Equal(t, 3, status.Indexed, "Indexed 口径不变:offline 资产仍按 status 计入")
 	require.Equal(t, 1, status.Pending)
 }
 
