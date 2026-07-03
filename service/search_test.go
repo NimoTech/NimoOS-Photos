@@ -20,6 +20,20 @@ func (m *mockTextML) CLIPTextEmbed(_ string) ([]float32, error) {
 	return v, nil
 }
 
+// capturingTextML records the exact string passed to CLIPTextEmbed so tests
+// can assert SmartSearch applies the caption-template expansion before
+// embedding, without duplicating expandQuery's logic in the test.
+type capturingTextML struct {
+	got string
+}
+
+func (m *capturingTextML) CLIPTextEmbed(text string) ([]float32, error) {
+	m.got = text
+	v := make([]float32, common.CLIPDim)
+	v[0] = 1.0
+	return v, nil
+}
+
 func openSearchDB(t *testing.T) *service.SearchService {
 	t.Helper()
 	db, err := sqlite.Open(filepath.Join(t.TempDir(), "search.db"))
@@ -108,6 +122,27 @@ func TestSmartSearchIncludeOCR(t *testing.T) {
 	results, err = svc.SmartSearch("RECEIPT", 10, service.SearchFilters{IncludeOCR: true})
 	require.NoError(t, err)
 	require.Equal(t, "a3", results[0].ID)
+}
+
+// TestSmartSearchExpandsShortQuery verifies SmartSearch embeds the
+// caption-templated form of a short/word-style query (nllb-clip's text
+// encoder is sentence-oriented and under-performs on bare words), while a
+// query that already reads as a sentence is passed through untouched.
+func TestSmartSearchExpandsShortQuery(t *testing.T) {
+	db, err := sqlite.Open(filepath.Join(t.TempDir(), "expand.db"))
+	require.NoError(t, err)
+	defer db.Close()
+
+	ml := &capturingTextML{}
+	svc := service.NewSearchService(db, ml)
+
+	_, err = svc.SmartSearch("kid", 10, service.SearchFilters{})
+	require.NoError(t, err)
+	require.Equal(t, "a photo of kid", ml.got, "short word query must be expanded before embedding")
+
+	_, err = svc.SmartSearch("a happy kid playing in the park", 10, service.SearchFilters{})
+	require.NoError(t, err)
+	require.Equal(t, "a happy kid playing in the park", ml.got, "sentence-like query must be passed through unchanged")
 }
 
 func TestTimeline(t *testing.T) {
