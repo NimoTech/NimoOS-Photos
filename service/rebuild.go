@@ -163,10 +163,15 @@ func (r *Rebuilder) run(taskID string) {
 			time.Now().UTC().Format(time.RFC3339)); err != nil {
 			zap.L().Warn("rebuild: write meta failed", zap.Error(err))
 		}
-		if _, err := r.db.Exec(`INSERT INTO photos_meta(key,value) VALUES(?,?)
-			ON CONFLICT(key) DO UPDATE SET value=excluded.value`,
-			mlModelGenKey, common.MLModelGen); err != nil {
-			zap.L().Warn("rebuild: write ml_model_gen failed", zap.Error(err))
+		if shouldStampModelGen(total, atomic.LoadInt64(&failed)) {
+			if _, err := r.db.Exec(`INSERT INTO photos_meta(key,value) VALUES(?,?)
+				ON CONFLICT(key) DO UPDATE SET value=excluded.value`,
+				mlModelGenKey, common.MLModelGen); err != nil {
+				zap.L().Warn("rebuild: write ml_model_gen failed", zap.Error(err))
+			}
+		} else {
+			zap.L().Warn("rebuild: all targets failed — leaving ml_model_gen stale so next boot retries",
+				zap.Int("targets", len(targets)))
 		}
 	}
 
@@ -258,6 +263,14 @@ func modelGenStale(db *sql.DB) bool {
 	var gen string
 	_ = db.QueryRow(`SELECT value FROM photos_meta WHERE key=?`, mlModelGenKey).Scan(&gen)
 	return gen != common.MLModelGen
+}
+
+// shouldStampModelGen 判断本轮 rebuild 是否可以盖章 ml_model_gen：
+// total==0(空库，盖章合法)或至少有一个目标成功(failed<total)时可以盖章；
+// total>0 且全部失败(典型场景是模型换代恰逢移动盘整体离线)时不能盖章，
+// 否则 modelGenStale 判定永远不再触发，MaybeAutoRebuild 失去自动重试机会。
+func shouldStampModelGen(total, failed int64) bool {
+	return total == 0 || failed < total
 }
 
 // MaybeAutoRebuild 在模型代次变化时自动触发一次全量重建：等 ML 后端就绪
