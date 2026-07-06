@@ -185,7 +185,10 @@ func (s *SmartViewService) Update(id string, p SmartViewPatch) (*SmartView, erro
 		}
 	}
 	s.logActivity(id, "updated", "", nil)
-	if p.CondsRaw != nil || p.Description != nil || p.Threshold != nil || p.IncludeVideos != nil {
+	// 恢复 live(取消暂停)也要重算:暂停期间 displayScore 标定端点
+	// (simDisplayFloor/Ceil)可能已随模型换代调整,旧 match_score 是旧标度。
+	resumed := p.Live != nil && *p.Live
+	if p.CondsRaw != nil || p.Description != nil || p.Threshold != nil || p.IncludeVideos != nil || resumed {
 		if err := s.Evaluate(id); err != nil {
 			return nil, err
 		}

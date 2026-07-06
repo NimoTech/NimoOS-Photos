@@ -375,6 +375,53 @@ func TestFaceThumbnail_HiddenReturnsNotFound(t *testing.T) {
 	require.ErrorIs(t, err, service.ErrNotFound)
 }
 
+func TestFaceThumbnailOfflineCoverReturnsNotFound(t *testing.T) {
+	db := makeTestFaceDB(t)
+	dir := t.TempDir()
+	srcPath := filepath.Join(dir, "src.jpg")
+	writeTestJPEG(t, srcPath, 400, 300)
+	_, err := db.Exec(`INSERT INTO assets(id, file_path, status, offline) VALUES('fo', ?, 'indexed', 1)`, srcPath)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO face_detections(id, asset_id, bbox, embedding) VALUES('face-o','fo',?,?)`,
+		`{"x1":100,"y1":75,"x2":240,"y2":210}`, sqlite.SerializeFloat32(make([]float32, common.FaceDim)))
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO persons(id, name, cover_asset_id, cover_face_id) VALUES('po','','fo','face-o')`)
+	require.NoError(t, err)
+
+	ps := service.NewPersonService(db)
+	_, err = ps.FaceThumbnail("po", filepath.Join(dir, "fo-cache"), "")
+	require.ErrorIs(t, err, service.ErrNotFound)
+}
+
+// 回归锁定：offline=1 的视频资产即便本地已有 thumbDir/large.jpg 缓存，
+// FaceThumbnail 也必须返回 ErrNotFound——"offline 一律隐藏/降级" 对视频源同样
+// 成立，不因为缩略图缓存还在本地就绕过。SQL 里的 a.offline=0 过滤本就已经
+// 挡住了这种情况，这条测试不改代码，只是把这个既有行为钉死防回归。
+func TestFaceThumbnailOfflineVideoWithCachedThumbReturnsNotFound(t *testing.T) {
+	db := makeTestFaceDB(t)
+	dir := t.TempDir()
+
+	thumbDir := filepath.Join(dir, "thumbs")
+	assetID := "fov"
+	largeDir := filepath.Join(thumbDir, assetID)
+	require.NoError(t, os.MkdirAll(largeDir, 0o755))
+	writeTestJPEG(t, filepath.Join(largeDir, "large.jpg"), 1280, 720)
+
+	_, err := db.Exec(`INSERT INTO assets(id, file_path, mime_type, status, offline) VALUES(?, '/x.mp4', 'video/mp4', 'indexed', 1)`, assetID)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO asset_exif(asset_id, width, height) VALUES(?, 1920, 1080)`, assetID)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO face_detections(id, asset_id, bbox, embedding) VALUES('fov-face',?,?,?)`,
+		assetID, `{"x1":480,"y1":270,"x2":960,"y2":810}`, sqlite.SerializeFloat32(make([]float32, common.FaceDim)))
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO persons(id, name, cover_asset_id, cover_face_id) VALUES('pov','','` + assetID + `','fov-face')`)
+	require.NoError(t, err)
+
+	ps := service.NewPersonService(db)
+	_, err = ps.FaceThumbnail("pov", filepath.Join(dir, "face-thumbs"), thumbDir)
+	require.ErrorIs(t, err, service.ErrNotFound)
+}
+
 // 视频源：bbox 基于关键帧（asset_exif W/H = 1920×1080），thumb large.jpg 是 1280×720。
 // FaceThumbnail 必须按 thumb/exif 比例缩放 bbox，否则坐标爆掉。
 func TestFaceThumbnail_VideoScalesBBoxToThumb(t *testing.T) {

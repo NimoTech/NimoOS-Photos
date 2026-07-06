@@ -7,6 +7,8 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math"
+	"regexp"
+	"strconv"
 	"strings"
 
 	sqlite_vec "github.com/asg017/sqlite-vec-go-bindings/cgo"
@@ -472,6 +474,20 @@ func migrate(db *sql.DB) error {
 	return nil
 }
 
+var clipDimRe = regexp.MustCompile(`float\[(\d+)\]`)
+
+// clipDimMatches 精确解析 DDL 中的向量维度再比较。此前用
+// strings.Contains(ddl, "float[N]") 子串匹配,目标维度是既有维度的
+// 前缀时(如 115 vs 1152)会误判「已正确」而跳过必要的重建。
+func clipDimMatches(ddl string, dim int) bool {
+	m := clipDimRe.FindStringSubmatch(ddl)
+	if m == nil {
+		return false
+	}
+	got, err := strconv.Atoi(m[1])
+	return err == nil && got == dim
+}
+
 // migrateClipDim 检查已存在的 clip_embeddings 表维度是否等于 common.CLIPDim,
 // 不符则 DROP(vec0 影子表随之删除)并清空 asset_clip_idx。表不存在时为 no-op。
 func migrateClipDim(db *sql.DB) error {
@@ -483,7 +499,7 @@ func migrateClipDim(db *sql.DB) error {
 	if err != nil {
 		return fmt.Errorf("migrateClipDim read ddl: %w", err)
 	}
-	if strings.Contains(ddl, fmt.Sprintf("float[%d]", common.CLIPDim)) {
+	if clipDimMatches(ddl, common.CLIPDim) {
 		return nil // 维度已正确
 	}
 	if _, err := db.Exec(`DROP TABLE clip_embeddings`); err != nil {

@@ -523,3 +523,39 @@ func TestIncrementalEvaluateRespectsPaused(t *testing.T) {
 	require.Equal(t, 1, liveN)
 	require.Equal(t, 0, pausedN)
 }
+
+// TestUpdateResumeLiveTriggersEvaluate: 暂停期间 displayScore 标定端点
+// (simDisplayFloor/Ceil) 可能随模型换代调整，导致 match_score 停留在旧标度。
+// 恢复 live（Live: true）必须触发一次重算，把陈旧分数刷新；仅改 name 之类
+// 不影响匹配的 patch 不应触发重算。
+func TestUpdateResumeLiveTriggersEvaluate(t *testing.T) {
+	s := svTestService(t)
+	db := s.db
+	_, _ = db.Exec(`INSERT INTO assets(id,file_path,status,is_live_photo_video) VALUES('a1','/p/a1.jpg','indexed',0)`)
+	_, _ = db.Exec(`INSERT INTO persons(id,name) VALUES('p-sara','Sara')`)
+	_, _ = db.Exec(`INSERT INTO face_detections(id,asset_id,bbox,embedding) VALUES('f1','a1','{}',X'00')`)
+	_, _ = db.Exec(`INSERT INTO face_person(face_id,person_id) VALUES('f1','p-sara')`)
+
+	_, err := s.Create(SmartViewInput{ID: "sv-resume", Name: "R",
+		CondsRaw: []string{"Sara"}, Threshold: 50, Live: false})
+	require.NoError(t, err)
+
+	// Create() 的首次 Evaluate 已经插入真实匹配（纯结构条件，score=1.0）。
+	// 这里把它改成一个陈旧的旧标度分数，模拟暂停期间标定端点变化后残留的
+	// 旧 match_score。
+	_, err = db.Exec(`UPDATE smart_view_matches SET match_score=0.05 WHERE smart_view_id='sv-resume' AND asset_id='a1'`)
+	require.NoError(t, err)
+
+	// 不影响匹配结果的 patch（仅改 name，Live 为 nil）不应触发重算。
+	_, err = s.Update("sv-resume", SmartViewPatch{Name: ptr("Renamed")})
+	require.NoError(t, err)
+	var score float64
+	require.NoError(t, db.QueryRow(`SELECT match_score FROM smart_view_matches WHERE smart_view_id='sv-resume' AND asset_id='a1'`).Scan(&score))
+	require.InDelta(t, 0.05, score, 1e-9, "仅改 name 不应触发重算")
+
+	// 恢复 live（Live: true）必须重算，把陈旧分数刷新回真实值。
+	_, err = s.Update("sv-resume", SmartViewPatch{Live: ptr(true)})
+	require.NoError(t, err)
+	require.NoError(t, db.QueryRow(`SELECT match_score FROM smart_view_matches WHERE smart_view_id='sv-resume' AND asset_id='a1'`).Scan(&score))
+	require.InDelta(t, 1.0, score, 1e-9, "恢复 live 应重算并刷新陈旧的 match_score")
+}

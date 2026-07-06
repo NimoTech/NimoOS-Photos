@@ -265,6 +265,7 @@ func (s *PlacesService) topFacesBetween(cityID int32, from, to time.Time, n int)
 	rows, err := s.db.Query(`
 SELECT p.name, COUNT(*) c FROM asset_geo g
 JOIN assets a ON a.id=g.asset_id AND a.deleted_at IS NULL AND a.offline=0
+     AND COALESCE(a.is_live_photo_video,0)=0
 JOIN face_detections fd ON fd.asset_id=a.id
 JOIN face_person fp ON fp.face_id=fd.id
 JOIN persons p ON p.id=fp.person_id
