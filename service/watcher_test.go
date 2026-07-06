@@ -339,6 +339,23 @@ func TestWalkSupportedHonorsCtxCancel(t *testing.T) {
 	require.Equal(t, 0, calls)
 }
 
+func TestWalkSupportedSkipsUnreadableEntry(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores permissions")
+	}
+	dir := t.TempDir()
+	bad := filepath.Join(dir, "a-locked")
+	require.NoError(t, os.Mkdir(bad, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "z-ok.jpg"), []byte("x"), 0o644))
+	require.NoError(t, os.Chmod(bad, 0o000))
+	t.Cleanup(func() { _ = os.Chmod(bad, 0o755) })
+
+	var got []string
+	err := walkSupported(context.Background(), dir, func(p string) { got = append(got, p) })
+	require.NoError(t, err) // 坏子目录被跳过,不再中止整树
+	require.Equal(t, []string{filepath.Join(dir, "z-ok.jpg")}, got)
+}
+
 // TestSkipCatchupScan pins down skipCatchupScan's semantics: added==0 alone
 // must NOT mean "skip the catch-up scan" — it is ambiguous between "directory
 // excluded/vanished" (safe to skip: no watch coverage was ever intended) and

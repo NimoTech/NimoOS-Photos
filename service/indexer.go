@@ -1082,7 +1082,16 @@ func walkSupported(ctx context.Context, dir string, fn func(path string)) error 
 		default:
 		}
 		if err != nil {
-			return err
+			// 2026-07-06 plan02 审查并入:单个条目不可读(权限/竞态删除/悬空链接)
+			// 只跳过该子树,不中止整棵遍历——此前 return err 会让排在坏条目之后的
+			// 全部文件错过本轮扫描/实时索引;根目录本身出错仍上抛让调用方知晓。
+			if path == dir {
+				return err
+			}
+			if d != nil && d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
 		}
 		if d.IsDir() {
 			if path != dir && strings.HasPrefix(d.Name(), ".") {
