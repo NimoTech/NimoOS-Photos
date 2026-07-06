@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -308,15 +309,17 @@ func TestHandleWatchErrorOverflowTriggersRescan(t *testing.T) {
 
 	w, idx := newWatcherTestHarness(t, ctx, []string{root})
 	w.roots = []string{root}
+	var wg sync.WaitGroup
+	defer wg.Wait()
 
 	// Non-overflow error: must not panic and must not trigger a rescan.
-	w.handleWatchError(context.Background(), errors.New("boom"))
+	w.handleWatchError(context.Background(), &wg, errors.New("boom"))
 	require.Never(t, func() bool {
 		return assetIndexed(t, idx, preFile)
 	}, 500*time.Millisecond, 50*time.Millisecond,
 		"a non-overflow watch error must not trigger a rescan")
 
-	w.handleWatchError(context.Background(), fsnotify.ErrEventOverflow)
+	w.handleWatchError(context.Background(), &wg, fsnotify.ErrEventOverflow)
 	require.Eventually(t, func() bool {
 		return assetIndexed(t, idx, preFile)
 	}, 5*time.Second, 100*time.Millisecond,
@@ -365,4 +368,88 @@ func TestTrackNewDirDedup(t *testing.T) {
 	require.True(t, w.walkCovered(child))        // 祖先在途 → 覆盖
 	require.True(t, w.walkCovered(root))         // 自身在途 → 覆盖
 	require.False(t, w.walkCovered(t.TempDir())) // 无关目录 → 不覆盖
+}
+
+// TestTrackNewDirWatchesDespiteAncestorCoverage is the regression test for
+// the Task 4 dedup bug: walkCovered must gate ONLY the redundant catch-up
+// index scan, never addRecursiveWatch itself. filepath.WalkDir is a single
+// pre-order pass — a subdirectory created under an ancestor AFTER that
+// ancestor's walk already snapshotted its children is never revisited by the
+// ancestor's walk, so if trackNewDir also skips watching such a directory
+// whenever walkCovered reports true, that directory is left permanently
+// unwatched: files dropped into it afterward go undetected until the next
+// 24h full rescan.
+//
+// The test simulates exactly that: it manually pre-stores an ANCESTOR's key
+// in walkInFlight (so walkCovered(child) is true, mirroring an ancestor scan
+// still "in flight"), then calls trackNewDir directly on a real child
+// directory that already contains a media file. It asserts two things:
+//   - the pre-existing file is NOT enqueued by trackNewDir's own catch-up
+//     scan (dedup still applies to the expensive indexing walk — the fake
+//     ancestor "covers" it), and
+//   - a file written into that same child directory AFTER trackNewDir
+//     returns DOES get indexed via a live fsnotify event, proving
+//     addRecursiveWatch actually ran and registered a real inotify watch on
+//     child despite walkCovered==true.
+//
+// Against the pre-fix code (which returns out of trackNewDir immediately
+// when walkCovered is true, before ever calling addRecursiveWatch), the
+// second assertion fails: child is never watched, so the post-return write
+// produces no event and the file is never indexed.
+func TestTrackNewDirWatchesDespiteAncestorCoverage(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	root := t.TempDir()
+	child := filepath.Join(root, "child")
+	require.NoError(t, os.MkdirAll(child, 0o755))
+	existingFile := filepath.Join(child, "existing.jpg")
+	writeFile(t, existingFile, "pre-existing")
+
+	w, idx := newWatcherTestHarness(t, ctx, nil)
+
+	fw, err := fsnotify.NewWatcher()
+	require.NoError(t, err)
+	defer fw.Close()
+
+	var wg sync.WaitGroup
+	defer wg.Wait()
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case event, ok := <-fw.Events:
+				if !ok {
+					return
+				}
+				w.handleEvent(ctx, fw, &wg, event)
+			case _, ok := <-fw.Errors:
+				if !ok {
+					return
+				}
+			}
+		}
+	}()
+
+	// Simulate an ancestor's recursive walk already in flight, covering child.
+	w.walkInFlight.Store(withSep(root), struct{}{})
+
+	w.trackNewDir(ctx, fw, child)
+
+	// Dedup must still suppress the redundant catch-up scan: the pre-existing
+	// file must not have been enqueued by trackNewDir itself.
+	require.Never(t, func() bool {
+		return assetIndexed(t, idx, existingFile)
+	}, 500*time.Millisecond, 50*time.Millisecond,
+		"catch-up scan must stay deduped when an ancestor walk is in flight")
+
+	// But watch coverage must NOT have been dropped: a file written into
+	// child after trackNewDir returns must still be picked up live.
+	newFile := filepath.Join(child, "new.jpg")
+	require.Eventually(t, func() bool {
+		writeFile(t, newFile, "new")
+		return assetIndexed(t, idx, newFile)
+	}, 5*time.Second, 100*time.Millisecond,
+		"child directory must still be watched even though an ancestor scan is in flight (walkCovered must gate only the catch-up scan, not addRecursiveWatch)")
 }

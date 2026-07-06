@@ -122,7 +122,7 @@ func (w *Watcher) Start(parentCtx context.Context) {
 			if !ok {
 				return
 			}
-			w.handleWatchError(ctx, watchErr)
+			w.handleWatchError(ctx, &wg, watchErr)
 		}
 	}
 }
@@ -130,7 +130,7 @@ func (w *Watcher) Start(parentCtx context.Context) {
 // handleWatchError:inotify 队列溢出意味着事件已经丢失,唯一可靠的恢复
 // 是对所有根做一次补扫(Enqueue 幂等,重复入队无害)。单飞防抖:溢出
 // 往往连环出现,补扫进行中忽略后续溢出。
-func (w *Watcher) handleWatchError(ctx context.Context, err error) {
+func (w *Watcher) handleWatchError(ctx context.Context, wg *sync.WaitGroup, err error) {
 	if !errors.Is(err, fsnotify.ErrEventOverflow) {
 		zap.L().Warn("watcher: fsnotify error", zap.Error(err))
 		return
@@ -142,7 +142,11 @@ func (w *Watcher) handleWatchError(ctx context.Context, err error) {
 	w.mu.Lock()
 	roots := append([]string(nil), w.roots...)
 	w.mu.Unlock()
+	// Tracked by wg (like trackNewDir's goroutines) so Start() cannot return
+	// and close fw while this rescan is still running.
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		defer w.overflowRescanning.Store(false)
 		for _, root := range roots {
 			if err := walkSupported(ctx, root, func(p string) { w.indexer.Enqueue(p) }); err != nil && !errors.Is(err, context.Canceled) {
@@ -211,11 +215,24 @@ func (w *Watcher) trackNewDir(ctx context.Context, fw *fsnotify.Watcher, dir str
 		return
 	}
 	key := withSep(dir)
-	if w.walkCovered(dir) {
-		return
-	}
+	// ancestorCovered must be evaluated BEFORE this directory registers its
+	// own key below — walkCovered does a prefix match, so checking it any
+	// later would trivially match dir against itself (every string is a
+	// prefix of itself) and wrongly report "covered" on every single call,
+	// permanently disabling the catch-up scan. Evaluated here, it only
+	// reflects whether a genuine ANCESTOR walk is already in flight.
+	ancestorCovered := w.walkCovered(dir)
 	w.walkInFlight.Store(key, struct{}{})
 	defer w.walkInFlight.Delete(key)
+
+	// addRecursiveWatch always runs, even when ancestorCovered is true:
+	// filepath.WalkDir is a single pre-order pass, so an ancestor's
+	// in-flight walk may already have snapshotted this directory's parent
+	// before `dir` existed — meaning the ancestor's walk will never revisit
+	// it. Skipping the watch here (as a prior version of this function did)
+	// left such directories permanently unwatched: any file dropped into
+	// them afterward would go undetected until the next full 24h rescan.
+	// fw.Add is cheap and idempotent, so calling it unconditionally is safe.
 	added, enospc := addRecursiveWatch(ctx, fw, dir)
 	if skipCatchupScan(added, enospc) {
 		// 目录被排除(scanExcludeDirs/IsExcludedMount)或 walk 前已消失:
@@ -229,6 +246,13 @@ func (w *Watcher) trackNewDir(ctx context.Context, fw *fsnotify.Watcher, dir str
 	zap.L().Info("watcher: now watching new directory",
 		zap.String("dir", dir), zap.Int("watches", added))
 
+	// Dedup only applies to the redundant catch-up INDEX scan below: if an
+	// ancestor's walk is already in flight, it will walk this subtree too
+	// and enqueue everything under it, so re-walking here for indexing is
+	// wasted IO. Watch coverage above is never skipped by this dedup.
+	if ancestorCovered {
+		return
+	}
 	// walkSupported (service/indexer.go) already encodes the same
 	// hidden/scanExcludeDirs skip rules used by the full scanner, so the
 	// catch-up scan can't index anything the periodic scan would have
