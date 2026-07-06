@@ -1297,6 +1297,11 @@ func (ix *Indexer) pruneMissingUnder(dir string) error {
 	if err := rows.Err(); err != nil {
 		return err
 	}
+	if len(gone) > 0 && !pruneDeleteAllowed(dir, ix.dirUnderMountedRoot) {
+		zap.L().Warn("pruneMissingUnder: mount state changed during scan, aborting prune",
+			zap.String("dir", dir), zap.Int("wouldDelete", len(gone)))
+		return nil
+	}
 	for _, r := range gone {
 		dropClipVector(ix.db, r.id) // before the cascade drops asset_clip_idx
 		if _, err := ix.db.Exec(`DELETE FROM assets WHERE id = ?`, r.id); err != nil {
@@ -1308,6 +1313,19 @@ func (ix *Indexer) pruneMissingUnder(dir string) error {
 		ix.seen.Delete(r.path)
 	}
 	return nil
+}
+
+// pruneDeleteAllowed re-validates right before the destructive pass:
+// stat 循环期间可移动盘可能被拔出,届时所有文件都 stat 失败,若不复核
+// 会把整棵子树的资产/向量/缩略图批量误删。
+func pruneDeleteAllowed(dir string, underMountedRoot func(string) bool) bool {
+	if !underMountedRoot(dir) {
+		return false
+	}
+	if _, err := os.Stat(dir); err != nil {
+		return false
+	}
+	return true
 }
 
 // dirUnderMountedRoot reports whether dir is one of (or lives under one of)
