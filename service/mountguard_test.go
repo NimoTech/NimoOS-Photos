@@ -17,12 +17,14 @@ import (
 // Recovery runs asynchronously (see spawnRecovery), so hook assertions poll.
 func TestMountGuard_UnplugMarksOfflineReplugRestoresAndTriggersRecovery(t *testing.T) {
 	db := makeTestDB(t)
-	// devmon-style automount naming: /media/<agent>/<label>/<file...>.
-	mediaAsset := insertAsset(t, db, "/media/devmon/X/photo.jpg", "indexed")
+	// A generic tracked removable mount: RAID-style 2-segment naming under
+	// /media/ (NOT /media/devmon/, which is excluded entirely — see
+	// TestMountGuard_DevmonMountsIgnoredEntirely below).
+	mediaAsset := insertAsset(t, db, "/media/RAID_X/photo.jpg", "indexed")
 	dataAsset := insertAsset(t, db, "/DATA/Gallery/photo.jpg", "indexed")
 
 	mg := NewMountGuard(db)
-	mounts := []string{"/media/devmon/X"}
+	mounts := []string{"/media/RAID_X"}
 	mg.currentMounts = func() []string { return mounts }
 
 	var watcherCalls, scanCalls, backfillCalls, ocrCalls atomic.Int32
@@ -44,18 +46,18 @@ func TestMountGuard_UnplugMarksOfflineReplugRestoresAndTriggersRecovery(t *testi
 	require.False(t, offlineFlag(mediaAsset))
 	require.False(t, offlineFlag(dataAsset))
 
-	// Unplug: /media/devmon/X disappears from the mount snapshot.
+	// Unplug: /media/RAID_X disappears from the mount snapshot.
 	mounts = []string{}
 	mg.checkOnce(context.Background())
-	require.True(t, offlineFlag(mediaAsset), "/media/devmon/X 资产应被标记 offline")
+	require.True(t, offlineFlag(mediaAsset), "/media/RAID_X 资产应被标记 offline")
 	require.False(t, offlineFlag(dataAsset), "/DATA 资产不受影响")
 	require.Equal(t, int32(0), watcherCalls.Load(), "拔出时不应触发恢复回调")
 	require.Equal(t, int32(0), scanCalls.Load())
 	require.Equal(t, int32(0), backfillCalls.Load())
 	require.Equal(t, int32(0), ocrCalls.Load())
 
-	// Replug: /media/devmon/X reappears.
-	mounts = []string{"/media/devmon/X"}
+	// Replug: /media/RAID_X reappears.
+	mounts = []string{"/media/RAID_X"}
 	mg.checkOnce(context.Background())
 	require.False(t, offlineFlag(mediaAsset), "重新插入后应恢复 offline=0")
 	require.False(t, offlineFlag(dataAsset))
@@ -63,7 +65,7 @@ func TestMountGuard_UnplugMarksOfflineReplugRestoresAndTriggersRecovery(t *testi
 		return watcherCalls.Load() == 1 && scanCalls.Load() == 1 &&
 			backfillCalls.Load() == 1 && ocrCalls.Load() == 1
 	}, 5*time.Second, 10*time.Millisecond, "重新插入应各触发一次 watcher 重启/rescan/CLIP/OCR 补跑")
-	require.Equal(t, "/media/devmon/X", scannedMount.Load())
+	require.Equal(t, "/media/RAID_X", scannedMount.Load())
 }
 
 // TestMountGuard_AlignOnStartupCatchesUnplugWhileServiceWasDown covers the
@@ -125,12 +127,12 @@ func TestMountGuard_AlignOnStartupTwoSegmentMountStaysOnline(t *testing.T) {
 // come back online during the alignment pass.
 func TestMountGuard_AlignOnStartupRestoresOnlineWhenMountPresent(t *testing.T) {
 	db := makeTestDB(t)
-	assetID := insertAsset(t, db, "/media/devmon/Z/photo.jpg", "indexed")
+	assetID := insertAsset(t, db, "/media/Z/photo.jpg", "indexed")
 	_, err := db.Exec(`UPDATE assets SET offline=1 WHERE id=?`, assetID)
 	require.NoError(t, err)
 
 	mg := NewMountGuard(db)
-	mg.currentMounts = func() []string { return []string{"/media/devmon/Z"} }
+	mg.currentMounts = func() []string { return []string{"/media/Z"} }
 
 	mg.AlignOnStartup()
 
@@ -141,21 +143,21 @@ func TestMountGuard_AlignOnStartupRestoresOnlineWhenMountPresent(t *testing.T) {
 
 // TestMountGuard_LikeMetacharSiblingMountsUnaffected: `_` is a LIKE wildcard,
 // and real USB labels contain it (Kingston_DataTra). Unplugging
-// /media/devmon/disk_A must not touch its sibling /media/devmon/diskXA, which
+// /media/disk_A must not touch its sibling /media/diskXA, which
 // a naive `LIKE 'disk_A/%'` prefix pattern would also match.
 func TestMountGuard_LikeMetacharSiblingMountsUnaffected(t *testing.T) {
 	db := makeTestDB(t)
-	aAsset := insertAsset(t, db, "/media/devmon/disk_A/photo.jpg", "indexed")
-	xAsset := insertAsset(t, db, "/media/devmon/diskXA/photo.jpg", "indexed")
+	aAsset := insertAsset(t, db, "/media/disk_A/photo.jpg", "indexed")
+	xAsset := insertAsset(t, db, "/media/diskXA/photo.jpg", "indexed")
 
 	mg := NewMountGuard(db)
-	mounts := []string{"/media/devmon/disk_A", "/media/devmon/diskXA"}
+	mounts := []string{"/media/disk_A", "/media/diskXA"}
 	mg.currentMounts = func() []string { return mounts }
 	mg.AlignOnStartup()
 	mg.lastMounts = toMountSet(mg.currentMounts())
 
 	// Unplug disk_A only.
-	mounts = []string{"/media/devmon/diskXA"}
+	mounts = []string{"/media/diskXA"}
 	mg.checkOnce(context.Background())
 
 	var offline int
@@ -167,7 +169,7 @@ func TestMountGuard_LikeMetacharSiblingMountsUnaffected(t *testing.T) {
 	// Same for the startup alignment direction: only disk_A absent.
 	_, err := db.Exec(`UPDATE assets SET offline=0`)
 	require.NoError(t, err)
-	mg.currentMounts = func() []string { return []string{"/media/devmon/diskXA"} }
+	mg.currentMounts = func() []string { return []string{"/media/diskXA"} }
 	mg.AlignOnStartup()
 	require.NoError(t, db.QueryRow(`SELECT offline FROM assets WHERE id=?`, aAsset).Scan(&offline))
 	require.Equal(t, 1, offline)
@@ -182,11 +184,11 @@ func TestMountGuard_LikeMetacharSiblingMountsUnaffected(t *testing.T) {
 // instead of stacking a concurrent duplicate scan.
 func TestMountGuard_RecoveryIsAsyncAndDeduped(t *testing.T) {
 	db := makeTestDB(t)
-	_ = insertAsset(t, db, "/media/devmon/X/photo.jpg", "indexed")
-	yAsset := insertAsset(t, db, "/media/devmon/Y/photo.jpg", "indexed")
+	_ = insertAsset(t, db, "/media/X/photo.jpg", "indexed")
+	yAsset := insertAsset(t, db, "/media/Y/photo.jpg", "indexed")
 
 	mg := NewMountGuard(db)
-	mounts := []string{"/media/devmon/X", "/media/devmon/Y"}
+	mounts := []string{"/media/X", "/media/Y"}
 	mg.currentMounts = func() []string { return mounts }
 	mg.AlignOnStartup()
 	mg.lastMounts = toMountSet(mg.currentMounts())
@@ -202,9 +204,9 @@ func TestMountGuard_RecoveryIsAsyncAndDeduped(t *testing.T) {
 	})
 
 	// X unplugged, then replugged → recovery starts and blocks inside scanDir.
-	mounts = []string{"/media/devmon/Y"}
+	mounts = []string{"/media/Y"}
 	mg.checkOnce(context.Background())
-	mounts = []string{"/media/devmon/X", "/media/devmon/Y"}
+	mounts = []string{"/media/X", "/media/Y"}
 
 	done := make(chan struct{})
 	go func() { mg.checkOnce(context.Background()); close(done) }()
@@ -217,7 +219,7 @@ func TestMountGuard_RecoveryIsAsyncAndDeduped(t *testing.T) {
 
 	// While X's recovery is blocked, Y is unplugged — the poll loop must still
 	// be able to flag it.
-	mounts = []string{"/media/devmon/X"}
+	mounts = []string{"/media/X"}
 	mg.checkOnce(context.Background())
 	var offline int
 	require.NoError(t, db.QueryRow(`SELECT offline FROM assets WHERE id=?`, yAsset).Scan(&offline))
@@ -227,7 +229,7 @@ func TestMountGuard_RecoveryIsAsyncAndDeduped(t *testing.T) {
 	// re-trigger must be deduped, not stacked.
 	mounts = []string{}
 	mg.checkOnce(context.Background())
-	mounts = []string{"/media/devmon/X"}
+	mounts = []string{"/media/X"}
 	mg.checkOnce(context.Background())
 	time.Sleep(50 * time.Millisecond) // give a would-be duplicate goroutine time to run
 	require.Equal(t, int32(1), scanCalls.Load(), "恢复进行中同一挂载点的重复触发必须被去重")
@@ -243,8 +245,84 @@ func TestMountGuard_RecoveryIsAsyncAndDeduped(t *testing.T) {
 
 	mounts = []string{}
 	mg.checkOnce(context.Background())
-	mounts = []string{"/media/devmon/X"}
+	mounts = []string{"/media/X"}
 	mg.checkOnce(context.Background())
 	require.Eventually(t, func() bool { return scanCalls.Load() == 2 },
 		5*time.Second, 10*time.Millisecond, "上一轮恢复结束后,新的插回应能再次触发恢复")
+}
+
+// TestMountGuard_DevmonMountsIgnoredEntirely covers the product decision to
+// stop indexing devmon's removable USB mounts (/media/devmon/<label>):
+// MountGuard must treat them as if they don't exist at all — never counted as
+// "present" for AlignOnStartup's restore pass, never diffed as an unplug/
+// replug transition by checkOnce, and (defensively — after the startup purge
+// there should be no such asset left) never flipped offline by the blanket
+// markOfflineOutside pass either. This is the mirror image of
+// TestMountGuard_UnplugMarksOfflineReplugRestoresAndTriggersRecovery, which
+// covers the same lifecycle for a mount that IS tracked.
+func TestMountGuard_DevmonMountsIgnoredEntirely(t *testing.T) {
+	db := makeTestDB(t)
+	asset := insertAsset(t, db, "/media/devmon/USB1/photo.jpg", "indexed")
+
+	mg := NewMountGuard(db)
+	mounts := []string{"/media/devmon/USB1"}
+	mg.currentMounts = func() []string { return mounts }
+
+	var watcherCalls, scanCalls, backfillCalls, ocrCalls atomic.Int32
+	mg.SetWatcherRestart(func() { watcherCalls.Add(1) })
+	mg.SetScanDir(func(m string) error { scanCalls.Add(1); return nil })
+	mg.SetBackfill(func(ctx context.Context) error { backfillCalls.Add(1); return nil })
+	mg.SetBackfillOCR(func(ctx context.Context) error { ocrCalls.Add(1); return nil })
+
+	offlineFlag := func() bool {
+		var v int
+		require.NoError(t, db.QueryRow(`SELECT offline FROM assets WHERE id=?`, asset).Scan(&v))
+		return v == 1
+	}
+
+	// Startup alignment with the devmon mount "present": must not be treated
+	// as an online mount (it's excluded), and markOfflineOutside's blanket
+	// /media/* sweep must not flip it offline either.
+	mg.AlignOnStartup()
+	require.False(t, offlineFlag(), "devmon 挂载点存在时资产不应被启动对齐波及")
+	mg.lastMounts = toMountSet(mg.currentMounts())
+	require.Empty(t, mg.lastMounts, "devmon 挂载点不应进入 MountGuard 的快照")
+
+	// "Unplug": devmon mount disappears from the raw enumeration.
+	mounts = []string{}
+	mg.checkOnce(context.Background())
+	require.False(t, offlineFlag(), "devmon 拔出不应标记 offline(清理后本不应存在此类资产,防御性排除)")
+	require.Equal(t, int32(0), watcherCalls.Load())
+	require.Equal(t, int32(0), scanCalls.Load())
+	require.Equal(t, int32(0), backfillCalls.Load())
+	require.Equal(t, int32(0), ocrCalls.Load())
+
+	// "Replug": devmon mount reappears in the raw enumeration.
+	mounts = []string{"/media/devmon/USB1"}
+	mg.checkOnce(context.Background())
+	require.False(t, offlineFlag())
+	time.Sleep(50 * time.Millisecond) // give a would-be async recovery goroutine a chance to fire
+	require.Equal(t, int32(0), watcherCalls.Load(), "devmon 挂载点重新出现不应触发任何恢复回调")
+	require.Equal(t, int32(0), scanCalls.Load())
+	require.Equal(t, int32(0), backfillCalls.Load())
+	require.Equal(t, int32(0), ocrCalls.Load())
+}
+
+// TestMountGuard_AlignOnStartupNeverFlagsDevmonAssetsOffline is the narrow
+// regression for markOfflineOutside's devmon exclusion in isolation: even
+// with the devmon mount absent at startup (the common case — devmon assets
+// shouldn't exist post-purge, but if one lingers), alignment must not mark it
+// offline the way it would any other /media/* asset under an absent mount.
+func TestMountGuard_AlignOnStartupNeverFlagsDevmonAssetsOffline(t *testing.T) {
+	db := makeTestDB(t)
+	asset := insertAsset(t, db, "/media/devmon/USB2/photo.jpg", "indexed")
+
+	mg := NewMountGuard(db)
+	mg.currentMounts = func() []string { return nil }
+
+	mg.AlignOnStartup()
+
+	var offline int
+	require.NoError(t, db.QueryRow(`SELECT offline FROM assets WHERE id=?`, asset).Scan(&offline))
+	require.Equal(t, 0, offline, "devmon 资产不应被启动对齐标记 offline")
 }

@@ -15,6 +15,11 @@ import (
 // /DATA and any manually-mounted volumes under /mnt (MergerFS, NAS shares)
 // are permanent storage and are never touched, even if they transiently
 // vanish from /proc/mounts.
+//
+// /media/devmon/* sits under this namespace by path shape but is excluded via
+// IsExcludedMount (see toMountSet): devmon USB mounts are not indexed at all
+// (scanroots.go), so MountGuard must not track them either — see toMountSet
+// and markOfflineOutside for where that exclusion is enforced.
 var removableRoots = []string{"/media/"}
 
 // mountGuardPollInterval is how often MountGuard re-reads the mount table to
@@ -89,7 +94,11 @@ func (g *MountGuard) SetBackfillOCR(f func(ctx context.Context) error) { g.backf
 // currentRemovableMounts is the production currentMounts implementation. It
 // reuses EnumerateScanRoots' /proc/mounts parsing and keeps only the /media/*
 // entries (removableRoots) — /DATA and /mnt mounts are out of scope for
-// offline tracking.
+// offline tracking. EnumerateScanRoots already excludes devmon mounts (see
+// isUserPartition/IsExcludedMount), so they never reach this function's
+// output in production; toMountSet applies the same exclusion again so
+// test-injected currentMounts fixtures (and any future caller) can't
+// accidentally reintroduce them.
 func currentRemovableMounts() []string {
 	var out []string
 	for _, m := range EnumerateScanRoots() {
@@ -172,12 +181,23 @@ func (g *MountGuard) alignWith(cur map[string]bool) {
 // names routinely contain LIKE metacharacters (e.g. a USB stick labelled
 // Kingston_DataTra: `_` matches any character in a LIKE pattern and would
 // bleed onto sibling mounts).
+//
+// excludedMountPrefixes (devmon) is ALSO subtracted unconditionally here, on
+// top of cur never containing a devmon mount (see toMountSet): devmon is
+// excluded from indexing entirely, so no asset should legitimately live under
+// it after the startup purge runs, but this guards defensively against the
+// purge/alignment startup-ordering race — a stray devmon row must never be
+// flipped offline by this blanket query.
 func (g *MountGuard) markOfflineOutside(cur map[string]bool) {
 	q := `UPDATE assets SET offline=1 WHERE offline=0 AND substr(file_path,1,7)='/media/'`
 	var args []any
 	for m := range cur {
 		q += ` AND NOT substr(file_path,1,length(?))=?`
 		p := strings.TrimRight(m, "/") + "/"
+		args = append(args, p, p)
+	}
+	for _, p := range excludedMountPrefixes {
+		q += ` AND NOT substr(file_path,1,length(?))=?`
 		args = append(args, p, p)
 	}
 	res, err := g.db.Exec(q, args...)
@@ -321,9 +341,18 @@ func (g *MountGuard) markOnline(mount string) error {
 	return nil
 }
 
+// toMountSet builds the mount-point snapshot MountGuard diffs against. This is
+// the single choke point where excluded mounts (devmon — see IsExcludedMount)
+// are dropped: every snapshot MountGuard ever holds (Run's ticker loop,
+// AlignOnStartup, checkOnce) is built through this function, so a devmon mount
+// appearing or disappearing can never register as a "transition" and can
+// never trigger offline marking or the onMountBack recovery sequence.
 func toMountSet(mounts []string) map[string]bool {
 	set := make(map[string]bool, len(mounts))
 	for _, m := range mounts {
+		if IsExcludedMount(m) {
+			continue
+		}
 		set[m] = true
 	}
 	return set

@@ -199,29 +199,51 @@ func (ix *Indexer) ScanAllRoots() {
 	}
 }
 
-// pruneSystemMountAssets removes any indexed asset that lives under a known
-// system mount (see systemMounts). An earlier over-broad scan indexed OS files
-// (e.g. the /media/root-ro Adwaita icon themes); this runs at startup so that
-// pollution self-heals and can never linger once the scan scope is corrected.
-// It reuses RemoveByPath so the asset row, its cascaded rows and its thumbnails
-// are all cleaned the same way a normal deletion would.
+// pruneSystemMountAssets removes any indexed asset that lives under a mount
+// IsExcludedMount says Photos must never index: a known OS system mount (see
+// systemMounts) or a devmon removable-media mount (see excludedMountPrefixes).
+// An earlier over-broad scan indexed OS files (e.g. the /media/root-ro Adwaita
+// icon themes); the devmon case is the product decision to stop indexing USB
+// drives entirely (legacy assets predating that decision, ~338 on the
+// production box at the time of writing). This runs at startup so both kinds
+// of pollution self-heal and can never linger once the scan scope is
+// corrected/narrowed. It reuses RemoveByPath so the asset row, its cascaded
+// rows (face_detections via FK, CLIP vector via dropClipVector) and its
+// thumbnails are all cleaned the same way a normal deletion would.
 func (ix *Indexer) pruneSystemMountAssets() {
 	for mp := range systemMounts {
-		rows, err := ix.db.Query(`SELECT file_path FROM assets WHERE file_path = ? OR file_path LIKE ?`, mp, mp+"/%")
-		if err != nil {
-			continue
+		ix.prunePathsMatching(`file_path = ? OR file_path LIKE ?`, mp, mp+"/%")
+	}
+	for _, prefix := range excludedMountPrefixes {
+		// prefix (e.g. "/media/devmon/") is a fixed literal with no LIKE
+		// metacharacters of its own, so a plain suffix-wildcard LIKE is safe
+		// here — unlike MountGuard's per-drive-label offline comparisons, the
+		// variable part (the USB label) is DATA being matched against the
+		// pattern, not woven INTO the pattern, so it cannot misfire onto a
+		// sibling label the way `LIKE 'disk_A/%'` would match "diskXA".
+		ix.prunePathsMatching(`file_path LIKE ?`, prefix+"%")
+	}
+}
+
+// prunePathsMatching deletes every asset whose file_path matches the given SQL
+// WHERE fragment (against args), via RemoveByPath. Shared helper for
+// pruneSystemMountAssets' two exclusion kinds (exact system mounts, devmon
+// prefix).
+func (ix *Indexer) prunePathsMatching(where string, args ...any) {
+	rows, err := ix.db.Query(`SELECT file_path FROM assets WHERE `+where, args...)
+	if err != nil {
+		return
+	}
+	var paths []string
+	for rows.Next() {
+		var p string
+		if rows.Scan(&p) == nil {
+			paths = append(paths, p)
 		}
-		var paths []string
-		for rows.Next() {
-			var p string
-			if rows.Scan(&p) == nil {
-				paths = append(paths, p)
-			}
-		}
-		rows.Close()
-		for _, p := range paths {
-			ix.RemoveByPath(p)
-		}
+	}
+	rows.Close()
+	for _, p := range paths {
+		ix.RemoveByPath(p)
 	}
 }
 

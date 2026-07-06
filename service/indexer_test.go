@@ -573,3 +573,28 @@ func TestPruneMissingUnderLikeMetacharSiblings(t *testing.T) {
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM assets WHERE id=?`, siblingID).Scan(&n))
 	require.Equal(t, 1, n, "prune disk_A 不得误删兄弟挂载 diskXA 的资产")
 }
+
+// TestPruneSystemMountAssetsPurgesDevmonAssets:启动清理必须把 devmon(U 盘)
+// 存量资产连 CLIP 向量、人脸行一起硬删,其它路径资产不受影响。
+func TestPruneSystemMountAssetsPurgesDevmonAssets(t *testing.T) {
+	db := makeTestDB(t)
+	usb := insertAsset(t, db, "/media/devmon/stickA/photo.jpg", "indexed")
+	keep := insertAsset(t, db, "/DATA/Gallery/keep.jpg", "indexed")
+	seedFaceAndClip(t, db, usb)
+	seedFaceAndClip(t, db, keep)
+
+	ix := NewIndexer(db, &mockML{}, t.TempDir(), 1)
+	ix.pruneSystemMountAssets()
+
+	var n int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM assets WHERE id=?`, usb).Scan(&n))
+	require.Equal(t, 0, n, "devmon 资产行必须被硬删")
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM asset_clip_idx WHERE asset_id=?`, usb).Scan(&n))
+	require.Equal(t, 0, n, "devmon 资产的 CLIP 映射必须被清")
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM face_detections WHERE asset_id=?`, usb).Scan(&n))
+	require.Equal(t, 0, n, "devmon 资产的人脸行必须被清")
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM assets WHERE id=?`, keep).Scan(&n))
+	require.Equal(t, 1, n, "非 devmon 资产不得被波及")
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM asset_clip_idx WHERE asset_id=?`, keep).Scan(&n))
+	require.Equal(t, 1, n)
+}

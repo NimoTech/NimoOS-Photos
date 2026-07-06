@@ -125,6 +125,8 @@ ScanDirectory (手动/启动) → walkSupported → processFile (串行)
 TUS 上传完成 → MarkAndReserve + rename → SubmitReserved
 ```
 
+扫描范围是黑名单而非白名单（`service/scanroots.go` `isUserPartition`）：`/media` 或 `/mnt` 下任意挂载点默认都会被扫描，但 `/media/devmon/<卷标>`（devmon 自动挂载的可移动 U 盘/读卡器）被产品决策整体排除——不扫描、不被 MountGuard 追踪 offline，且启动时会硬删（含 CLIP 向量、缩略图）任何历史遗留的 devmon 资产；RAID（`/media/RAID_*`）、单盘 storage（`/mnt/Disk-*`）、MergerFS 等仍正常纳入。已知限制：若 devmon 被禁用/卸载，同一块 U 盘可能被 LocalStorage 抢挂到 `/mnt/Disk-*`，届时会被当作普通固定盘重新扫描。
+
 **processFile 流水线（`service/indexer.go`）：**
 
 1. 读取文件 → SHA-256 去重（`status='indexed'` 时跳过）
