@@ -21,16 +21,16 @@ type busEvent struct {
 	UUID       string            `json:"uuid"`
 }
 
-// extractDeletedPaths parses a MessageBus event envelope and returns the list
+// extractEventPaths parses a MessageBus event envelope and returns the list
 // of absolute file/directory paths encoded in properties["paths"].
-// Only messages whose Name is "nimoos:media:deleted" are handled; any other
+// Only messages whose Name matches eventName are handled; any other
 // message (heartbeat, different event) returns nil. Parse errors also return nil.
-func extractDeletedPaths(message []byte) []string {
+func extractEventPaths(message []byte, eventName string) []string {
 	var ev busEvent
 	if err := json.Unmarshal(message, &ev); err != nil {
 		return nil
 	}
-	if ev.Name != "nimoos:media:deleted" {
+	if ev.Name != eventName {
 		return nil
 	}
 	rawPaths, ok := ev.Properties["paths"]
@@ -79,8 +79,8 @@ func handleDeletedPaths(ix *Indexer, paths []string) {
 
 // busWsURL converts the HTTP address returned by external.GetMessageBusAddress
 // (e.g. "http://127.0.0.1:8090/v2/message_bus" or "127.0.0.1:8090/v2/message_bus")
-// into the WebSocket subscription URL for the nimoos:media:deleted event stream.
-func busWsURL(busAddr string) string {
+// into the WebSocket subscription URL for the given event name.
+func busWsURL(busAddr, eventName string) string {
 	// Strip trailing slash for consistency.
 	busAddr = strings.TrimRight(busAddr, "/")
 
@@ -102,24 +102,24 @@ func busWsURL(busAddr string) string {
 	// Subscription route (verified against the bus router and a live 101
 	// handshake): GET /v2/message_bus/event/{source_id}?names=... upgrades to
 	// WebSocket. Note: it is "event" (singular), with no "/ws" suffix.
-	return wsBase + "/v2/message_bus/event/nimoos?names=nimoos:media:deleted"
+	return wsBase + "/v2/message_bus/event/nimoos?names=" + eventName
 }
 
-// StartMediaDeletedSubscriber connects to the MessageBus via WebSocket and
-// listens for "nimoos:media:deleted" events, immediately cleaning up any indexed
-// assets and CLIP vectors for the reported paths.
+// runBusPathsSubscriber connects to the MessageBus via WebSocket and listens
+// for events named eventName, invoking handle with the list of paths reported
+// in each event's properties["paths"].
 //
-// This is the real-time deletion layer. Periodic full-disk scans
-// (ScanAllRoots / pruneMissingUnder) remain the durable safety net — this
-// subscriber complements them by reacting within milliseconds so that deleted
-// files do not linger in CLIP search results until the next scheduled scan.
+// This is the real-time layer. Periodic full-disk scans (ScanAllRoots /
+// pruneMissingUnder) remain the durable safety net — this subscriber
+// complements them by reacting within milliseconds so that changes do not
+// linger unreflected until the next scheduled scan.
 //
 // The function runs inside a goroutine (the caller is responsible for the go
 // statement). On connection failure or disconnection it backs off with
 // exponential delay (5 s → 10 s → … → 60 s max) and retries automatically.
 // It exits cleanly when ctx is cancelled. All errors are logged at Warn level;
 // the function never panics.
-func StartMediaDeletedSubscriber(ctx context.Context, runtimePath string, ix *Indexer) {
+func runBusPathsSubscriber(ctx context.Context, runtimePath, eventName string, handle func(paths []string)) {
 	const (
 		initialBackoff = 5 * time.Second
 		maxBackoff     = 60 * time.Second
@@ -136,7 +136,7 @@ func StartMediaDeletedSubscriber(ctx context.Context, runtimePath string, ix *In
 
 		busAddr, err := external.GetMessageBusAddress(runtimePath)
 		if err != nil {
-			zap.L().Warn("busdelete: cannot resolve MessageBus address",
+			zap.L().Warn("bus subscriber: cannot resolve MessageBus address",
 				zap.String("runtimePath", runtimePath),
 				zap.Error(err))
 			if !sleepOrCancel(ctx, backoff) {
@@ -146,12 +146,14 @@ func StartMediaDeletedSubscriber(ctx context.Context, runtimePath string, ix *In
 			continue
 		}
 
-		wsURL := busWsURL(busAddr)
-		zap.L().Info("busdelete: connecting to MessageBus", zap.String("url", wsURL))
+		wsURL := busWsURL(busAddr, eventName)
+		zap.L().Info("bus subscriber: connecting to MessageBus",
+			zap.String("url", wsURL),
+			zap.String("event", eventName))
 
 		conn, _, dialErr := websocket.DefaultDialer.DialContext(ctx, wsURL, nil)
 		if dialErr != nil {
-			zap.L().Warn("busdelete: WebSocket dial failed",
+			zap.L().Warn("bus subscriber: WebSocket dial failed",
 				zap.String("url", wsURL),
 				zap.Error(dialErr))
 			if !sleepOrCancel(ctx, backoff) {
@@ -163,7 +165,7 @@ func StartMediaDeletedSubscriber(ctx context.Context, runtimePath string, ix *In
 
 		// Reset backoff on successful connection.
 		backoff = initialBackoff
-		zap.L().Info("busdelete: connected to MessageBus")
+		zap.L().Info("bus subscriber: connected to MessageBus", zap.String("event", eventName))
 
 		// Start a goroutine that closes the connection when ctx is cancelled so
 		// that conn.ReadMessage() unblocks and the read loop exits promptly.
@@ -187,9 +189,9 @@ func StartMediaDeletedSubscriber(ctx context.Context, runtimePath string, ix *In
 					// Ping/Pong/Close frames — gorilla handles Ping automatically.
 					continue
 				}
-				paths := extractDeletedPaths(data)
+				paths := extractEventPaths(data, eventName)
 				if len(paths) > 0 {
-					handleDeletedPaths(ix, paths)
+					handle(paths)
 				}
 			}
 		}()
@@ -202,7 +204,8 @@ func StartMediaDeletedSubscriber(ctx context.Context, runtimePath string, ix *In
 			return
 		}
 
-		zap.L().Warn("busdelete: WebSocket connection lost; will retry",
+		zap.L().Warn("bus subscriber: WebSocket connection lost; will retry",
+			zap.String("event", eventName),
 			zap.Error(readErr),
 			zap.Duration("backoff", backoff))
 		if !sleepOrCancel(ctx, backoff) {
@@ -210,6 +213,15 @@ func StartMediaDeletedSubscriber(ctx context.Context, runtimePath string, ix *In
 		}
 		backoff = nextBackoff(backoff, maxBackoff)
 	}
+}
+
+// StartMediaDeletedSubscriber connects to the MessageBus via WebSocket and
+// listens for "nimoos:media:deleted" events, immediately cleaning up any indexed
+// assets and CLIP vectors for the reported paths.
+func StartMediaDeletedSubscriber(ctx context.Context, runtimePath string, ix *Indexer) {
+	runBusPathsSubscriber(ctx, runtimePath, "nimoos:media:deleted", func(paths []string) {
+		handleDeletedPaths(ix, paths)
+	})
 }
 
 // sleepOrCancel sleeps for d or returns false immediately when ctx is done.

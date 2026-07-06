@@ -21,7 +21,7 @@ func TestExtractDeletedPaths_ValidMessage(t *testing.T) {
 		"timestamp":1234567890,
 		"uuid":"abc-123"
 	}`)
-	got := extractDeletedPaths(msg)
+	got := extractEventPaths(msg, "nimoos:media:deleted")
 	require.Equal(t, []string{"/DATA/a.jpg", "/DATA/b/c.png"}, got)
 }
 
@@ -33,7 +33,7 @@ func TestExtractDeletedPaths_WrongName(t *testing.T) {
 		"timestamp":1,
 		"uuid":"x"
 	}`)
-	require.Nil(t, extractDeletedPaths(msg))
+	require.Nil(t, extractEventPaths(msg, "nimoos:media:deleted"))
 }
 
 func TestExtractDeletedPaths_InvalidPathsJSON(t *testing.T) {
@@ -45,11 +45,11 @@ func TestExtractDeletedPaths_InvalidPathsJSON(t *testing.T) {
 		"timestamp":1,
 		"uuid":"x"
 	}`)
-	require.Nil(t, extractDeletedPaths(msg))
+	require.Nil(t, extractEventPaths(msg, "nimoos:media:deleted"))
 }
 
 func TestExtractDeletedPaths_InvalidEnvelope(t *testing.T) {
-	require.Nil(t, extractDeletedPaths([]byte(`{broken`)))
+	require.Nil(t, extractEventPaths([]byte(`{broken`), "nimoos:media:deleted"))
 }
 
 // ---------------------------------------------------------------------------
@@ -154,7 +154,7 @@ func TestHandleDeletedPaths_NonMediaPathSkipped(t *testing.T) {
 // handshake): /v2/message_bus/event/{source_id} — "event" singular, no "/ws".
 func TestBusWsURL(t *testing.T) {
 	// GetMessageBusAddress returns "<content of message-bus.url>" + "/v2/message_bus".
-	got := busWsURL("http://127.0.0.1:36085/v2/message_bus")
+	got := busWsURL("http://127.0.0.1:36085/v2/message_bus", "nimoos:media:deleted")
 	want := "ws://127.0.0.1:36085/v2/message_bus/event/nimoos?names=nimoos:media:deleted"
 	if got != want {
 		t.Fatalf("busWsURL\n got=%s\nwant=%s", got, want)
