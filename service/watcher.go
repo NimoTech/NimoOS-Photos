@@ -11,10 +11,18 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 
 	"github.com/fsnotify/fsnotify"
 	"go.uber.org/zap"
 )
+
+// overflowRescanCooldown 限制两次溢出补扫之间的最小间隔:写入风暴期间
+// inotify 队列会连环溢出,单飞(overflowRescanning)只防止并发,不防止
+// 补扫刚结束、下一次溢出又立刻触发——每次全树补扫都是一次 IO 开销,风暴期
+// 内的连环溢出应合并进冷却期内已完成/正在进行的这一轮,交给周期性
+// ScanDirectory 兜底覆盖剩余未扫到的变更。
+const overflowRescanCooldown = 5 * time.Minute
 
 // Watcher monitors directories for new or modified media files and enqueues
 // them for indexing. It also provides live-photo pairing via PairLivePhotos.
@@ -43,6 +51,9 @@ type Watcher struct {
 	// to be in flight at a time (walkSupported + Indexer.Enqueue are
 	// idempotent, so a rescan already covers anything a second one would).
 	overflowRescanning atomic.Bool
+	// lastOverflowRescan 记录上一轮溢出补扫结束的 Unix 秒时间戳,配合
+	// overflowRescanCooldown 抑制写入风暴下的连环补扫。
+	lastOverflowRescan atomic.Int64
 	// walkInFlight tracks directories (keyed by withSep) whose trackNewDir
 	// recursive walk is currently running. A dense mkdir burst (e.g. an
 	// entire subtree being copied/moved in) can fire a Create event for
@@ -135,6 +146,9 @@ func (w *Watcher) handleWatchError(ctx context.Context, wg *sync.WaitGroup, err 
 		zap.L().Warn("watcher: fsnotify error", zap.Error(err))
 		return
 	}
+	if time.Now().Unix()-w.lastOverflowRescan.Load() < int64(overflowRescanCooldown/time.Second) {
+		return // 风暴期内的连环溢出合并进上一轮补扫,交给周期扫描兜底
+	}
 	if !w.overflowRescanning.CompareAndSwap(false, true) {
 		return
 	}
@@ -148,6 +162,7 @@ func (w *Watcher) handleWatchError(ctx context.Context, wg *sync.WaitGroup, err 
 	go func() {
 		defer wg.Done()
 		defer w.overflowRescanning.Store(false)
+		defer w.lastOverflowRescan.Store(time.Now().Unix())
 		for _, root := range roots {
 			if err := walkSupported(ctx, root, func(p string) { w.indexer.Enqueue(p) }); err != nil && !errors.Is(err, context.Canceled) {
 				zap.L().Warn("watcher: overflow rescan failed", zap.String("root", root), zap.Error(err))
