@@ -23,6 +23,7 @@ import (
 
 	_ "golang.org/x/image/webp"
 
+	"github.com/NimoTech/NimoOS-Photos/common"
 	"github.com/NimoTech/NimoOS-Photos/pkg/config"
 	"github.com/NimoTech/NimoOS-Photos/pkg/exif"
 	"github.com/NimoTech/NimoOS-Photos/pkg/ffmpeg"
@@ -30,6 +31,7 @@ import (
 	"github.com/NimoTech/NimoOS-Photos/pkg/sqlite"
 	"github.com/NimoTech/NimoOS-Photos/pkg/thumb"
 	"github.com/google/uuid"
+	"go.uber.org/zap"
 )
 
 // MLProvider is the interface the Indexer uses for ML inference.
@@ -141,6 +143,15 @@ type Indexer struct {
 	ingest     *ingestTracker // aggregates Enqueue/processFile into a single rolling task
 	scanActive int32          // CAS guard so only one full ScanAllRoots runs at a time
 
+	// mountRoots returns the currently-mounted scan roots. pruneMissingUnder
+	// consults it as a safety interlock: it refuses to prune a directory whose
+	// backing mount has vanished (e.g. a USB drive unplugged right after its
+	// post-remount rescan started, leaving an empty leftover mount dir — every
+	// file would stat as missing and the whole library on that drive would be
+	// wiped, vectors and thumbnails included). Defaults to EnumerateScanRoots;
+	// injectable so tests don't depend on the real /proc/mounts.
+	mountRoots func() []string
+
 	// lastActivity 记录最近一次入队/处理完成的时刻(UnixNano)。人脸聚类的「安全网」
 	// 触发(scheduler 每分钟那条)据此去抖:仅在索引活动安静一段时间后才触发,
 	// 避免大上传途中索引队列出现 pending==0 空档时被误判为「上传结束」而提前聚类。
@@ -188,29 +199,51 @@ func (ix *Indexer) ScanAllRoots() {
 	}
 }
 
-// pruneSystemMountAssets removes any indexed asset that lives under a known
-// system mount (see systemMounts). An earlier over-broad scan indexed OS files
-// (e.g. the /media/root-ro Adwaita icon themes); this runs at startup so that
-// pollution self-heals and can never linger once the scan scope is corrected.
-// It reuses RemoveByPath so the asset row, its cascaded rows and its thumbnails
-// are all cleaned the same way a normal deletion would.
+// pruneSystemMountAssets removes any indexed asset that lives under a mount
+// IsExcludedMount says Photos must never index: a known OS system mount (see
+// systemMounts) or a devmon removable-media mount (see excludedMountPrefixes).
+// An earlier over-broad scan indexed OS files (e.g. the /media/root-ro Adwaita
+// icon themes); the devmon case is the product decision to stop indexing USB
+// drives entirely (legacy assets predating that decision, ~338 on the
+// production box at the time of writing). This runs at startup so both kinds
+// of pollution self-heal and can never linger once the scan scope is
+// corrected/narrowed. It reuses RemoveByPath so the asset row, its cascaded
+// rows (face_detections via FK, CLIP vector via dropClipVector) and its
+// thumbnails are all cleaned the same way a normal deletion would.
 func (ix *Indexer) pruneSystemMountAssets() {
 	for mp := range systemMounts {
-		rows, err := ix.db.Query(`SELECT file_path FROM assets WHERE file_path = ? OR file_path LIKE ?`, mp, mp+"/%")
-		if err != nil {
-			continue
+		ix.prunePathsMatching(`file_path = ? OR file_path LIKE ?`, mp, mp+"/%")
+	}
+	for _, prefix := range excludedMountPrefixes {
+		// prefix (e.g. "/media/devmon/") is a fixed literal with no LIKE
+		// metacharacters of its own, so a plain suffix-wildcard LIKE is safe
+		// here — unlike MountGuard's per-drive-label offline comparisons, the
+		// variable part (the USB label) is DATA being matched against the
+		// pattern, not woven INTO the pattern, so it cannot misfire onto a
+		// sibling label the way `LIKE 'disk_A/%'` would match "diskXA".
+		ix.prunePathsMatching(`file_path LIKE ?`, prefix+"%")
+	}
+}
+
+// prunePathsMatching deletes every asset whose file_path matches the given SQL
+// WHERE fragment (against args), via RemoveByPath. Shared helper for
+// pruneSystemMountAssets' two exclusion kinds (exact system mounts, devmon
+// prefix).
+func (ix *Indexer) prunePathsMatching(where string, args ...any) {
+	rows, err := ix.db.Query(`SELECT file_path FROM assets WHERE `+where, args...)
+	if err != nil {
+		return
+	}
+	var paths []string
+	for rows.Next() {
+		var p string
+		if rows.Scan(&p) == nil {
+			paths = append(paths, p)
 		}
-		var paths []string
-		for rows.Next() {
-			var p string
-			if rows.Scan(&p) == nil {
-				paths = append(paths, p)
-			}
-		}
-		rows.Close()
-		for _, p := range paths {
-			ix.RemoveByPath(p)
-		}
+	}
+	rows.Close()
+	for _, p := range paths {
+		ix.RemoveByPath(p)
 	}
 }
 
@@ -423,6 +456,7 @@ func NewIndexer(db *sql.DB, ml MLProvider, thumbDir string, workers int) *Indexe
 		queue:        make(chan ingestQueueItem, 1024),
 		ingest:       newIngestTracker(),
 		pendingAlbum: make(map[string]string),
+		mountRoots:   EnumerateScanRoots,
 	}
 }
 
@@ -854,7 +888,7 @@ func (ix *Indexer) processFileInternal(path string, opts processOpts) (success b
 			if config.Cfg == nil || config.Cfg.FacesEnabled {
 				if faces, faceErr := ix.ml.DetectAndRecognizeFaces(faceData); faceErr == nil {
 					for _, face := range faces {
-						if len(face.Embedding) != 512 {
+						if len(face.Embedding) != common.FaceDim {
 							continue
 						}
 						bboxJSON, _ := json.Marshal(face.BBox)
@@ -872,8 +906,11 @@ func (ix *Indexer) processFileInternal(path string, opts processOpts) (success b
 			// OCR uses the same full-detail input as faces (original photo or
 			// full keyframe) — small text on receipts/documents is lost at
 			// thumbnail resolution.
-			// OCR（OCREnabled 关闭时跳过）。
-			if config.Cfg == nil || config.Cfg.OCREnabled {
+			// 视频不跑 OCR:对视频关键帧做 OCR 没有实际意义,还会把「录屏/含文字画面」的
+			// 视频误判进「OCR/文档」分类(asset_ocr 命中即归类)。视频只保留 CLIP 用于
+			// 视觉检索;真正的视频理解(分段 embedding)是后续工作。
+			// OCR（OCREnabled 关闭或视频时跳过）。
+			if !isVideo && (config.Cfg == nil || config.Cfg.OCREnabled) {
 				if err := ix.ocrAsset(assetID, faceData); err != nil {
 					fmt.Fprintf(os.Stderr, "[indexer] OCR failed for %s: %v\n", assetID, err)
 				}
@@ -1179,6 +1216,14 @@ func pruneOrphanClipVectors(db *sql.DB) {
 	_, _ = db.Exec(`DELETE FROM clip_embeddings WHERE rowid NOT IN (SELECT rowid FROM asset_clip_idx)`)
 }
 
+// pruneVideoOCR 删除视频的 OCR 行。视频不再跑 OCR(关键帧 OCR 无意义,还会把含文字
+// 画面的视频误判进「OCR/文档」分类);这里在启动时清掉历史遗留的视频 OCR 行,使已索引
+// 的视频也立即退出 OCR 分类。幂等:之后视频不再产生 asset_ocr 行。
+func pruneVideoOCR(db *sql.DB) {
+	_, _ = db.Exec(`DELETE FROM asset_ocr WHERE asset_id IN
+		(SELECT id FROM assets WHERE mime_type LIKE 'video/%')`)
+}
+
 func (ix *Indexer) RemoveByPath(path string) {
 	var id string
 	// Never remove a soft-deleted (trashed) asset: its file legitimately lives
@@ -1202,11 +1247,29 @@ func (ix *Indexer) RemoveByPath(path string) {
 
 // pruneMissingUnder removes asset rows whose file_path is under dir but whose
 // file no longer exists on disk. Thumbnails for removed assets are deleted too.
+//
+// Two interlocks protect against wiping a removable drive's library:
+//  1. dir must still sit under a currently-mounted scan root (ix.mountRoots).
+//     If the mount vanished between the scan starting and the prune (unplug
+//     right after replug, leaving an empty leftover mount dir), every file
+//     stats as missing and pruning would physically delete every asset row,
+//     CLIP vector and thumbnail for that drive.
+//  2. offline=1 assets are excluded: their files being unreachable is exactly
+//     the state the flag records, not evidence of deletion.
 func (ix *Indexer) pruneMissingUnder(dir string) error {
+	if !ix.dirUnderMountedRoot(dir) {
+		zap.L().Warn("pruneMissingUnder: directory not under any mounted scan root, skipping prune",
+			zap.String("dir", dir))
+		return nil
+	}
+	// substr() prefix compare instead of LIKE: mount/directory names routinely
+	// contain LIKE metacharacters (`_` in USB labels like Kingston_DataTra
+	// matches any character and would bleed onto sibling directories).
 	prefix := strings.TrimRight(dir, string(filepath.Separator)) + string(filepath.Separator)
 	rows, err := ix.db.Query(
-		`SELECT id, file_path FROM assets WHERE file_path = ? OR file_path LIKE ?`,
-		dir, prefix+"%",
+		`SELECT id, file_path FROM assets
+		 WHERE offline = 0 AND (file_path = ? OR substr(file_path,1,length(?)) = ?)`,
+		dir, prefix, prefix,
 	)
 	if err != nil {
 		return fmt.Errorf("pruneMissingUnder query: %w", err)
@@ -1238,6 +1301,25 @@ func (ix *Indexer) pruneMissingUnder(dir string) error {
 		ix.seen.Delete(r.path)
 	}
 	return nil
+}
+
+// dirUnderMountedRoot reports whether dir is one of (or lives under one of)
+// the currently-mounted scan roots. Roots always include /DATA, so library
+// directories on the system disk are always eligible; a /media/* mount that
+// has vanished from the mount table is not.
+func (ix *Indexer) dirUnderMountedRoot(dir string) bool {
+	mounts := ix.mountRoots
+	if mounts == nil {
+		mounts = EnumerateScanRoots
+	}
+	cleaned := strings.TrimRight(dir, string(filepath.Separator))
+	for _, root := range mounts() {
+		r := strings.TrimRight(root, string(filepath.Separator))
+		if cleaned == r || strings.HasPrefix(cleaned, r+string(filepath.Separator)) {
+			return true
+		}
+	}
+	return false
 }
 
 // ScanPending enqueues all assets currently in 'pending' status.
@@ -1291,6 +1373,14 @@ func (ix *Indexer) StatusCounts() IndexStatus {
 	_ = ix.db.QueryRow(
 		`SELECT COALESCE(SUM(file_size), 0) FROM assets WHERE status = 'indexed'`,
 	).Scan(&s.TotalBytes)
+
+	// Offline count is independent of the status breakdown above: offline=1
+	// assets keep whatever status they had (usually 'indexed') and are still
+	// counted there — this is a separate, additive figure surfaced to the UI.
+	// deleted_at IS NULL: a trashed asset that also sits on an unplugged drive
+	// is already gone from the library view; it must not inflate the
+	// "N photos are on a disconnected drive" hint.
+	_ = ix.db.QueryRow(`SELECT COUNT(*) FROM assets WHERE offline = 1 AND deleted_at IS NULL`).Scan(&s.Offline)
 	return s
 }
 

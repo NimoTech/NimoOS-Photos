@@ -24,13 +24,13 @@ func (h *AboutHandler) Get(c echo.Context) error {
 	// Errors are intentionally ignored; fields degrade to zero/null rather
 	// than returning 500 — this endpoint is informational and partial data
 	// is acceptable.
-	_ = db.QueryRow(`SELECT MIN(indexed_at) FROM assets WHERE status='indexed' AND deleted_at IS NULL`).Scan(&librarySince)
+	_ = db.QueryRow(`SELECT MIN(indexed_at) FROM assets WHERE status='indexed' AND deleted_at IS NULL AND offline=0`).Scan(&librarySince)
 	_ = db.QueryRow(`SELECT value FROM photos_meta WHERE key='index_last_rebuilt'`).Scan(&lastBuilt)
 
 	var coverage int
 	_ = db.QueryRow(`SELECT COUNT(*) FROM asset_clip_idx i
 		JOIN assets a ON a.id = i.asset_id
-		WHERE a.status='indexed' AND a.deleted_at IS NULL`).Scan(&coverage)
+		WHERE a.status='indexed' AND a.deleted_at IS NULL AND a.offline=0`).Scan(&coverage)
 
 	host, _ := os.Hostname()
 

@@ -31,18 +31,18 @@ NimoOS 的相册服务，提供**照片/视频索引、EXIF 解析、缩略图�
                      │   SQLite (WAL) + sqlite-vec       │
                      │  assets / asset_exif             │
                      │  face_detections / persons        │
-                     │  clip_embeddings (vec0, 512-dim)  │
+                     │  clip_embeddings (vec0, 1152-dim) │
                      │  asset_ocr / asset_geo            │
                      │  albums / smart_views / ...       │
                      └───────────────────────────────────┘
                                     │
-                     ┌──────────────▼──────────────────┐
-                     │  immich-machine-learning (Docker) │
-                     │  127.0.0.1:3003  /predict        │
-                     │  - CLIP ViT-B-32 (512-dim 向量)  │
-                     │  - 人脸检测+识别 buffalo_l (512-dim) │
-                     │  - OCR PP-OCRv5_mobile           │
-                     └─────────────────────────────────┘
+                     ┌──────────────▼──────────────────────────┐
+                     │  immich-machine-learning (Docker)       │
+                     │  127.0.0.1:3003  /predict               │
+                     │  - CLIP nllb-clip-large-siglip__v1(1152维)│
+                     │  - 人脸检测+识别 antelopev2 (512-dim)     │
+                     │  - OCR PP-OCRv5_server                  │
+                     └───────────────────────────────────────┘
 ```
 
 ML 后端为独立 Docker Compose 栈（`deploy/ml/docker-compose.yml`），绑定 `127.0.0.1:3003`，镜像离线捆绑、不联网拉取。
@@ -125,6 +125,8 @@ ScanDirectory (手动/启动) → walkSupported → processFile (串行)
 TUS 上传完成 → MarkAndReserve + rename → SubmitReserved
 ```
 
+扫描范围是黑名单而非白名单（`service/scanroots.go` `isUserPartition`）：`/media` 或 `/mnt` 下任意挂载点默认都会被扫描，但 `/media/devmon/<卷标>`（devmon 自动挂载的可移动 U 盘/读卡器）被产品决策整体排除——不扫描、不被 MountGuard 追踪 offline，且启动时会硬删（含 CLIP 向量、缩略图）任何历史遗留的 devmon 资产；RAID（`/media/RAID_*`）、单盘 storage（`/mnt/Disk-*`）、MergerFS 等仍正常纳入。已知限制：若 devmon 被禁用/卸载，同一块 U 盘可能被 LocalStorage 抢挂到 `/mnt/Disk-*`，届时会被当作普通固定盘重新扫描。
+
 **processFile 流水线（`service/indexer.go`）：**
 
 1. 读取文件 → SHA-256 去重（`status='indexed'` 时跳过）
@@ -134,16 +136,16 @@ TUS 上传完成 → MarkAndReserve + rename → SubmitReserved
 5. INSERT/UPDATE `assets` + `asset_exif`（状态 `'pending'`）
 6. 生成缩略图（small 250px / large 1280px，`disintegration/imaging`）
 7. ML 推理（ML 服务就绪时）：
-   - **CLIP 图像嵌入**：`ViT-B-32__openai`，512 维，用 small.jpg 缩略图计算（与用户看到的帧一致），写入 `clip_embeddings`（sqlite-vec vec0 虚拟表）
-   - **人脸检测+识别**：`buffalo_l`，512 维，写入 `face_detections`
-   - **OCR**：`PP-OCRv5_mobile`，置信度 ≥0.5 的文字行写入 `asset_ocr`
+   - **CLIP 图像嵌入**：`nllb-clip-large-siglip__v1`（多语言，SigLIP SO400M 图像塔），1152 维，用 small.jpg 缩略图计算（与用户看到的帧一致），写入 `clip_embeddings`（sqlite-vec vec0 虚拟表）
+   - **人脸检测+识别**：`antelopev2`（InsightFace ResNet100@Glint360K），512 维，写入 `face_detections`
+   - **OCR**：`PP-OCRv5_server`，置信度 ≥0.5 的文字行写入 `asset_ocr`
 8. 更新状态 `'indexed'`
 
 ### 2. 语义搜索（CLIP）
 
 ```
 POST /search/smart
-  → CLIPTextEmbed(query) → 512 维查询向量
+  → CLIPTextEmbed(query) → 1152 维查询向量
   → sqlite-vec KNN: "WHERE clip_embeddings MATCH ? AND k = ?"
   → 按 cosine distance 排序
   → （可选）OCR 精确匹配结果插队至顶部
@@ -172,6 +174,10 @@ Smart View 也复用 `SmartSearch` 接口，按自然语言条件定义动态相
 
 `GeoService` 从 `asset_exif` 读取 GPS 坐标，用内嵌 Gazetteer（`pkg/geo/data/*.tsv.gz`：城市 15000+、国家、POI）做离线反编码，写入 `asset_geo`。Gazetteer 版本（`geoGazVersion`）变更时自动清空 `asset_geo` 并重跑。
 
+### 6. ML 模型代次自动重建
+
+`common.MLModelGen`（当前 `"2"`）标识当前二进制绑定的模型组合（CLIP/人脸/OCR 三个选型 + 维度）；成功重建后写入 `photos_meta.ml_model_gen`。服务启动时若检测到该键缺失（老库）或与当前 `MLModelGen` 不符，`Rebuilder.MaybeAutoRebuild`（`service/rebuild.go`）会轮询等待 ML 后端就绪（新模型缓存就位）后自动触发一次全量重建：清空 `clip_embeddings`/`asset_clip_idx`、对所有 `status='indexed'` 资产重跑 CLIP/人脸/OCR、重新聚类人脸并清理无脸的空 `persons`，最后写回新代次。空库（无资产）跳过 worker pool，直接完成重聚类并写代次，秒级完成。代次仅在重建成功收尾（`finalize()`）后写入，中途失败或断电会在下次启动时重试。
+
 ---
 
 ## 数据存储
@@ -197,7 +203,7 @@ Smart View 也复用 `SmartSearch` 接口，按自然语言条件定义动态相
 |---|---|
 | `assets` | 资产主表（路径、MIME、拍摄时间、checksum、状态、软删除） |
 | `asset_exif` | EXIF/视频元数据（分辨率、GPS、相机、ISO、编解码等） |
-| `clip_embeddings` | sqlite-vec **vec0** 虚拟表，512 维 CLIP 向量 |
+| `clip_embeddings` | sqlite-vec **vec0** 虚拟表，1152 维 CLIP 向量 |
 | `asset_clip_idx` | rowid ↔ asset_id 映射（连接 clip_embeddings 与 assets） |
 | `face_detections` | 人脸检测结果（bbox、512 维嵌入、excluded 标志） |
 | `persons` | 人脸聚类结果（名称、封面、质心、置信度） |
@@ -211,7 +217,7 @@ Smart View 也复用 `SmartSearch` 接口，按自然语言条件定义动态相
 | `merge_rejections` | 被拒绝的人脸合并建议对 |
 | `place_cover_overrides` | 用户自定义地点封面 |
 | `spot_name_overrides` | 用户自定义打点名称 |
-| `photos_meta` | 键值元数据（如 `index_last_rebuilt`） |
+| `photos_meta` | 键值元数据（如 `index_last_rebuilt`、`ml_model_gen`） |
 
 ---
 
@@ -309,12 +315,17 @@ CGO_ENABLED=1 go build -o nimoos-photos .
 bash nimo_os_docs/scripts/deploy.sh photos
 ```
 
-ML 后端独立部署：
+ML 后端独立部署（`deploy/ml/`），按核显厂商分 **openvino**（Intel）/ **rocm**（AMD，含 gfx1151 / AI Max+ 395 Strix Halo 的 `HSA_OVERRIDE_GFX_VERSION` 覆盖）两个离线分发包 flavor：
+
+- **打包**（`script/package-photos-ml.sh <openvino|rocm|cpu> [输出目录]`，在有外网的机器上执行一次）：拉取对应 immich-machine-learning 官方镜像 tag 并重打本地标签、启动临时容器预热 CLIP 图/文塔、人脸、OCR 三个模型缓存（模型名从 `common/constants.go` 用正则抓取，保证打包与代码选型一致），再把镜像 tar、模型缓存 tar、`docker-compose.yml`、`install.sh`、`overrides/` 打成一个分发压缩包。
+- **安装**（`install.sh`，幂等，重复运行=更新到包内镜像版本）：读取包内 `FLAVOR` 文件，用 `/sys/class/drm/card*/device/vendor`（Intel=`0x8086`、AMD=`0x1002`）自动识别本机核显厂商并与 flavor 校验（不匹配则拒绝安装）；按 flavor 把 `overrides/<flavor>.yml` 拷贝为 `docker-compose.override.yml` 叠加设备直通（`/dev/dri`；AMD 再加 `/dev/kfd` + `HSA_OVERRIDE_GFX_VERSION`）；随包模型缓存解压进 `ml-cache`（已存在则跳过，`FORCE_MODELS=1` 强制覆盖）；`docker compose up -d` 后轮询 `/ping` 确认就绪。
+- **运行时环境变量**（`docker-compose.yml`）：`MACHINE_LEARNING_MODEL_TTL=300` 秒闲置自动卸载模型释放内存（nllb-large + PP-OCRv5_server 常驻内存/显存开销较大）、`MACHINE_LEARNING_MODEL_TTL_POLL_S=10`、`HF_HUB_OFFLINE=1` 禁止运行时联网查 HuggingFace（模型缓存已随包预置，离线/内网机器联网查询会卡超时）。
 
 ```bash
-# 首次加载离线镜像
-docker load -i nimoos-photos-ml.tar
+# 打包（一次性，需要外网）
+script/package-photos-ml.sh openvino   # 或 rocm / cpu
 
-# 启动（docker-compose）
-cd deploy/ml && docker compose up -d
+# 目标机器：解压分发包后安装/更新（幂等）
+tar -xzf photos-ml-openvino-v2.7.5.tar.gz -C /tmp/photos-ml
+/tmp/photos-ml/install.sh
 ```

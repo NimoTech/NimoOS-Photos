@@ -62,6 +62,39 @@ func TestListPlaces(t *testing.T) {
 	require.Equal(t, "asia", tokyo.Region)
 }
 
+// TestListPlacesExcludesOffline verifies that ListPlaces and recentThumbs no
+// longer count/show assets whose removable drive is currently unplugged.
+func TestListPlacesExcludesOffline(t *testing.T) {
+	db, err := sqlite.Open(filepath.Join(t.TempDir(), "off.db"))
+	require.NoError(t, err)
+	defer db.Close()
+
+	gaz, err := geo.Load()
+	require.NoError(t, err)
+	geoSvc := service.NewGeoService(db, gaz)
+
+	seed := func(id, path string, lat, lon float64) {
+		_, err := db.Exec(`INSERT INTO assets(id,file_path,status,taken_at,is_live_photo_video)
+			VALUES(?,?, 'indexed', '2026-01-01 00:00:00', 0)`, id, path)
+		require.NoError(t, err)
+		_, err = db.Exec(`INSERT INTO asset_exif(asset_id,latitude,longitude) VALUES(?,?,?)`, id, lat, lon)
+		require.NoError(t, err)
+		require.NoError(t, geoSvc.GeocodeAsset(id))
+	}
+	seed("online", "/DATA/x1", 35.6895, 139.6917)
+	seed("offline", "/media/X/x2", 35.6895, 139.6917)
+	_, err = db.Exec(`UPDATE assets SET offline=1 WHERE id='offline'`)
+	require.NoError(t, err)
+
+	svc := service.NewPlacesService(db, gaz, geoSvc)
+	resp, err := svc.ListPlaces()
+	require.NoError(t, err)
+	require.Len(t, resp.Places, 1)
+	require.Equal(t, 1, resp.Places[0].Count, "offline 资产不应计入城市照片数")
+	require.Contains(t, resp.Places[0].Thumbs, "online")
+	require.NotContains(t, resp.Places[0].Thumbs, "offline")
+}
+
 func TestSpotsCluster(t *testing.T) {
 	db, err := sqlite.Open(filepath.Join(t.TempDir(), "t.db"))
 	require.NoError(t, err)

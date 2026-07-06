@@ -46,3 +46,30 @@ func TestParseScanRootsAlwaysIncludesDATAOnce(t *testing.T) {
 		t.Fatalf("want [/DATA], got %v", got)
 	}
 }
+
+// TestIsExcludedMountAndUserPartition:U 盘(devmon 命名空间)整体排除,
+// RAID/单盘 storage/任意用户挂载保留,系统挂载点仍被拒。
+func TestIsExcludedMountAndUserPartition(t *testing.T) {
+	cases := []struct {
+		mp       string
+		excluded bool
+		user     bool
+	}{
+		{"/media/devmon/sdg1-usb-Kingston_DataTra", true, false},
+		{"/media/devmon/x", true, false},
+		{"/media/RAID_0", false, true},
+		{"/media/MyVolume", false, true},
+		{"/mnt/Disk-abc12345", false, true},
+		{"/media/root-ro", true, false},
+		{"/mnt/overlay", true, false},
+		{"/home/user", false, false}, // 前缀不符,非用户分区但也非"排除名单"
+	}
+	for _, c := range cases {
+		if got := IsExcludedMount(c.mp); got != c.excluded {
+			t.Errorf("IsExcludedMount(%q) = %v, want %v", c.mp, got, c.excluded)
+		}
+		if got := isUserPartition(c.mp); got != c.user {
+			t.Errorf("isUserPartition(%q) = %v, want %v", c.mp, got, c.user)
+		}
+	}
+}

@@ -99,11 +99,34 @@ func scanAssets(rows *sql.Rows) ([]Asset, error) {
 	return assets, rows.Err()
 }
 
+// SigLIP2(SO400M)的图文余弦相似度分布比 openai CLIP 低一个量级:
+// 噪声 ≤0.03,强相关 ~0.09-0.13(本库 7 图 × 8 查询 A/B 实测标定,
+// 换 CLIP 模型后需重标)。展示层把 [simDisplayFloor, simDisplayCeil]
+// 线性映射到 [0,1],OCR 精确命中(sim=1.0)钳到 1 不受影响。
+const (
+	simDisplayFloor = 0.03
+	simDisplayCeil  = 0.13
+)
+
+// displayScore linearly rescales a raw cosine similarity (as produced from the
+// sqlite-vec L2 distance over unit-length vectors) from [simDisplayFloor,
+// simDisplayCeil] into [0,1], clamping outside that band. OCR exact hits pass
+// in raw=1.0, which is above simDisplayCeil and clamps to 1 as intended.
+func displayScore(raw float64) float64 {
+	sim := (raw - simDisplayFloor) / (simDisplayCeil - simDisplayFloor)
+	if sim < 0 {
+		sim = 0
+	} else if sim > 1 {
+		sim = 1
+	}
+	return sim
+}
+
 // scanSearchAssets scans rows from SmartSearch: the scanAssets column list PLUS
 // latitude, longitude (from asset_exif) and a trailing vec.distance column. The
 // L2 distance over unit-length CLIP vectors is converted to a cosine similarity
-// in [0,1] (sim = 1 - d²/2) and stored on Asset.MatchScore so the UI can show a
-// per-result match percentage.
+// (sim = 1 - d²/2), then rescaled by displayScore into [0,1] and stored on
+// Asset.MatchScore so the UI can show a per-result match percentage.
 func scanSearchAssets(rows *sql.Rows) ([]Asset, error) {
 	var assets []Asset
 	for rows.Next() {
@@ -140,11 +163,7 @@ func scanSearchAssets(rows *sql.Rows) ([]Asset, error) {
 		}
 		if distance.Valid {
 			sim := 1 - distance.Float64*distance.Float64/2
-			if sim < 0 {
-				sim = 0
-			} else if sim > 1 {
-				sim = 1
-			}
+			sim = displayScore(sim)
 			a.MatchScore = &sim
 		}
 		assets = append(assets, a)

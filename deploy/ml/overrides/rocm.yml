@@ -1,0 +1,8 @@
+# AMD 核显(ROCm)设备映射;gfx1151(AI Max+ 395 / Strix Halo)需 HSA override
+services:
+  immich-machine-learning:
+    devices:
+      - /dev/kfd:/dev/kfd
+      - /dev/dri:/dev/dri
+    environment:
+      HSA_OVERRIDE_GFX_VERSION: "11.5.1"

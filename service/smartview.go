@@ -273,7 +273,7 @@ func (s *SmartViewService) MatchedAssets(id string, limit, offset int, recent bo
 	       (v.last_viewed_at IS NULL OR julianday(v.last_viewed_at) < julianday(m.matched_at))
 	FROM smart_view_matches m JOIN assets a ON a.id=m.asset_id
 	LEFT JOIN asset_views v ON v.user_id=? AND v.asset_id=a.id
-	WHERE ` + where + ` AND a.deleted_at IS NULL
+	WHERE ` + where + ` AND a.deleted_at IS NULL AND a.offline = 0
 	ORDER BY m.match_score DESC, COALESCE(a.taken_at,a.indexed_at) DESC
 	LIMIT ? OFFSET ?`
 	args = append(args, limit, offset)
@@ -436,7 +436,7 @@ func (s *SmartViewService) assetsForPerson(personID string) (map[string]struct{}
 	rows, err := s.db.Query(`SELECT DISTINCT fd.asset_id
 		FROM face_detections fd JOIN face_person fp ON fp.face_id=fd.id
 		JOIN assets a ON a.id=fd.asset_id
-		WHERE fp.person_id=? AND a.is_live_photo_video=0 AND a.deleted_at IS NULL`, personID)
+		WHERE fp.person_id=? AND a.is_live_photo_video=0 AND a.deleted_at IS NULL AND a.offline=0`, personID)
 	return scanIDSet(rows, err)
 }
 
@@ -444,13 +444,13 @@ func (s *SmartViewService) assetsForPlace(text string) (map[string]struct{}, err
 	rows, err := s.db.Query(`SELECT DISTINCT g.asset_id FROM asset_geo g
 		JOIN assets a ON a.id=g.asset_id
 		WHERE (lower(g.city)=lower(?) OR lower(g.country)=lower(?) OR lower(g.region)=lower(?))
-		  AND a.is_live_photo_video=0 AND a.deleted_at IS NULL`, text, text, text)
+		  AND a.is_live_photo_video=0 AND a.deleted_at IS NULL AND a.offline=0`, text, text, text)
 	return scanIDSet(rows, err)
 }
 
 func (s *SmartViewService) assetsForDateRange(start, end time.Time) (map[string]struct{}, error) {
 	rows, err := s.db.Query(`SELECT id FROM assets
-		WHERE taken_at BETWEEN ? AND ? AND is_live_photo_video=0 AND deleted_at IS NULL`,
+		WHERE taken_at BETWEEN ? AND ? AND is_live_photo_video=0 AND deleted_at IS NULL AND offline=0`,
 		start.UTC().Format("2006-01-02T15:04:05Z"), end.UTC().Format("2006-01-02T15:04:05Z"))
 	return scanIDSet(rows, err)
 }
@@ -475,7 +475,7 @@ func (s *SmartViewService) assetsForOCR(query string) (map[string]struct{}, erro
 	rows, err := s.db.Query(`SELECT o.asset_id FROM asset_ocr o
 		JOIN assets a ON a.id=o.asset_id
 		WHERE (`+strings.Join(conds, " OR ")+`)
-		  AND a.is_live_photo_video=0 AND a.deleted_at IS NULL`, args...)
+		  AND a.is_live_photo_video=0 AND a.deleted_at IS NULL AND a.offline=0`, args...)
 	return scanIDSet(rows, err)
 }
 
@@ -762,38 +762,18 @@ func (s *SmartViewService) evalParsed(parsed []ParsedCond, threshold int, exclud
 			for _, v := range vs {
 				sum += v
 			}
-			// Raw CLIP text↔image cosine rarely exceeds ~0.32 (modality gap), so
-			// comparing it against the 50–99% slider directly would match nothing.
-			// Map through the same empirical band the search UI uses, so the
-			// slider, stored match_score, Median stat and the 50–100% distribution
-			// chart all live on one perceptual scale.
-			score = perceptualScore(sum / float64(len(vs)))
+			// SmartSearch's MatchScore is already the recalibrated [0,1] display
+			// score (see displayScore in scan.go) — the single calibration layer
+			// shared with the search UI's percentage. Use it as-is so the slider,
+			// the stored match_score, the Median stat and the 50–100% distribution
+			// chart all live on that one scale, with no second remapping here.
+			score = sum / float64(len(vs))
 		}
 		if score >= thr {
 			out[aid] = score
 		}
 	}
 	return out, nil
-}
-
-// clipScoreLo/Hi mirror SCORE_LO/SCORE_HI in PhotosSearchView.vue matchPct().
-// Keep the two in sync when recalibrating (empirical for CLIP ViT-B/32).
-const (
-	clipScoreLo = 0.14
-	clipScoreHi = 0.32
-)
-
-// perceptualScore rescales a raw CLIP cosine similarity into the intuitive
-// 0–1 band shown to users. Monotonic, so ordering is unaffected.
-func perceptualScore(sim float64) float64 {
-	t := (sim - clipScoreLo) / (clipScoreHi - clipScoreLo)
-	if t < 0 {
-		return 0
-	}
-	if t > 1 {
-		return 1
-	}
-	return t
 }
 
 // topNByScore returns the IDs of the top n entries in m by score (descending).

@@ -4,6 +4,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/NimoTech/NimoOS-Photos/common"
 	"github.com/NimoTech/NimoOS-Photos/pkg/sqlite"
 	"github.com/stretchr/testify/require"
 )
@@ -60,14 +61,14 @@ func TestShouldHandleDeletedPath(t *testing.T) {
 		path string
 		want bool
 	}{
-		{"/a/b.jpg", true},        // supported media extension
-		{"/a/b.txt", false},       // non-media extension
-		{"/a/dirname", true},      // no extension → treat as directory
-		{"/a/b.PNG", true},        // uppercase extension → supported
-		{"/a/b.mp4", true},        // supported video extension
-		{"/a/b.pdf", false},       // non-media extension
-		{"/a/b.HEIC", true},       // uppercase supported
-		{"/a/b.", false},          // dot with empty ext — filepath.Ext returns "." which is not in supportedExts
+		{"/a/b.jpg", true},   // supported media extension
+		{"/a/b.txt", false},  // non-media extension
+		{"/a/dirname", true}, // no extension → treat as directory
+		{"/a/b.PNG", true},   // uppercase extension → supported
+		{"/a/b.mp4", true},   // supported video extension
+		{"/a/b.pdf", false},  // non-media extension
+		{"/a/b.HEIC", true},  // uppercase supported
+		{"/a/b.", false},     // dot with empty ext — filepath.Ext returns "." which is not in supportedExts
 	}
 	for _, tt := range tests {
 		got := shouldHandleDeletedPath(tt.path)
@@ -106,7 +107,7 @@ func TestHandleDeletedPaths_CleansAssetAndVector(t *testing.T) {
 	var rowid int64
 	require.NoError(t, db.QueryRow(`SELECT rowid FROM asset_clip_idx WHERE asset_id=?`, assetID).Scan(&rowid))
 
-	vec := make([]float32, 512)
+	vec := make([]float32, common.CLIPDim)
 	vec[0] = 0.5
 	blob := sqlite.SerializeFloat32(vec)
 	_, err = db.Exec(`INSERT INTO clip_embeddings(rowid,embedding) VALUES(?,?)`, rowid, blob)

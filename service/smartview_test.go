@@ -6,14 +6,15 @@ import (
 	"testing"
 	"time"
 
-	"github.com/stretchr/testify/require"
+	"github.com/NimoTech/NimoOS-Photos/common"
 	"github.com/NimoTech/NimoOS-Photos/pkg/sqlite"
+	"github.com/stretchr/testify/require"
 )
 
 type mockTextMLSV struct{}
 
 func (m *mockTextMLSV) CLIPTextEmbed(_ string) ([]float32, error) {
-	v := make([]float32, 512)
+	v := make([]float32, common.CLIPDim)
 	v[0] = 1.0
 	return v, nil
 }
@@ -66,7 +67,7 @@ func TestEvaluateIntersectionAndScore(t *testing.T) {
 		require.NoError(t, err)
 		var rowid int64
 		require.NoError(t, db.QueryRow(`SELECT rowid FROM asset_clip_idx WHERE asset_id=?`, id).Scan(&rowid))
-		vec := make([]float32, 512)
+		vec := make([]float32, common.CLIPDim)
 		vec[0] = 1.0
 		_, err = db.Exec(`INSERT INTO clip_embeddings(rowid,embedding) VALUES(?,?)`, rowid, sqlite.SerializeFloat32(vec))
 		require.NoError(t, err)
@@ -94,6 +95,45 @@ func TestEvaluateIntersectionAndScore(t *testing.T) {
 	var cnt int
 	db.QueryRow(`SELECT COUNT(*) FROM smart_view_matches WHERE smart_view_id='sv-x' AND match_score>0`).Scan(&cnt)
 	require.Equal(t, 2, cnt)
+}
+
+// TestEvaluateAndPreviewExcludeOfflineAssets verifies that both the persisted
+// Evaluate path (used by Create/Update/EvaluateAllLive) and the unpersisted
+// Preview path drop matches whose asset is currently offline=1 (removable
+// drive unplugged) — the smart view must hide it exactly like every other
+// list surface.
+func TestEvaluateAndPreviewExcludeOfflineAssets(t *testing.T) {
+	s := svTestService(t)
+	db := s.db
+	_, _ = db.Exec(`INSERT INTO assets(id,file_path,status,is_live_photo_video) VALUES('online','/p/a1.jpg','indexed',0)`)
+	_, _ = db.Exec(`INSERT INTO assets(id,file_path,status,is_live_photo_video) VALUES('offline','/media/X/a2.jpg','indexed',0)`)
+	_, err := db.Exec(`UPDATE assets SET offline=1 WHERE id='offline'`)
+	require.NoError(t, err)
+	_, _ = db.Exec(`INSERT INTO persons(id,name) VALUES('p-sara','Sara')`)
+	for _, fid := range []struct{ f, a string }{{"f1", "online"}, {"f2", "offline"}} {
+		_, _ = db.Exec(`INSERT INTO face_detections(id,asset_id,bbox,embedding) VALUES(?,?,'{}',X'00')`, fid.f, fid.a)
+		_, _ = db.Exec(`INSERT INTO face_person(face_id,person_id) VALUES(?, 'p-sara')`, fid.f)
+	}
+
+	// Evaluate (live) path: only the online asset should end up in smart_view_matches.
+	_, err = s.Create(SmartViewInput{ID: "sv-off", Name: "Sara", CondsRaw: []string{"Sara"}, Threshold: 50, Live: true})
+	require.NoError(t, err)
+	var ids []string
+	rows, err := db.Query(`SELECT asset_id FROM smart_view_matches WHERE smart_view_id='sv-off'`)
+	require.NoError(t, err)
+	for rows.Next() {
+		var id string
+		require.NoError(t, rows.Scan(&id))
+		ids = append(ids, id)
+	}
+	rows.Close()
+	require.Equal(t, []string{"online"}, ids, "offline 资产不应进入 smart_view_matches")
+
+	// Preview path: same condition, unpersisted — must also exclude offline.
+	total, seeds, _, err := s.Preview([]string{"Sara"}, "", 50, true)
+	require.NoError(t, err)
+	require.Equal(t, 1, total, "Preview 计数不应包含 offline 资产")
+	require.Equal(t, []string{"online"}, seeds)
 }
 
 func TestEvaluatePureStructuralScoreIsOne(t *testing.T) {
@@ -156,7 +196,7 @@ func seedClipAsset(t *testing.T, s *SmartViewService, id string) {
 	require.NoError(t, err)
 	var rowid int64
 	require.NoError(t, db.QueryRow(`SELECT rowid FROM asset_clip_idx WHERE asset_id=?`, id).Scan(&rowid))
-	vec := make([]float32, 512)
+	vec := make([]float32, common.CLIPDim)
 	vec[0] = 1.0
 	_, err = db.Exec(`INSERT INTO clip_embeddings(rowid,embedding) VALUES(?,?)`, rowid, sqlite.SerializeFloat32(vec))
 	require.NoError(t, err)
@@ -174,40 +214,45 @@ func seedClipAssetWithSim(t *testing.T, s *SmartViewService, id string, sim floa
 	require.NoError(t, err)
 	var rowid int64
 	require.NoError(t, db.QueryRow(`SELECT rowid FROM asset_clip_idx WHERE asset_id=?`, id).Scan(&rowid))
-	vec := make([]float32, 512)
+	vec := make([]float32, common.CLIPDim)
 	vec[0] = float32(sim)
 	vec[1] = float32(math.Sqrt(1 - sim*sim))
 	_, err = db.Exec(`INSERT INTO clip_embeddings(rowid,embedding) VALUES(?,?)`, rowid, sqlite.SerializeFloat32(vec))
 	require.NoError(t, err)
 }
 
-// CLIP 原始余弦因 modality gap 极少超过 ~0.32，阈值滑块（50-99%）必须先经过
-// 与搜索 UI matchPct() 同一条标定曲线（[0.14,0.32]→0-100%）再比较，
-// 否则任何 semantic 条件在任何阈值下都是 0 匹配。
+// 语义条件的阈值滑块（50-99%）比较的是 SmartSearch 已重标定的展示分
+// （scan.go displayScore：[simDisplayFloor,simDisplayCeil]→0-100%，唯一标定层），
+// evalParsed 不得再做第二次映射——否则滑块语义与搜索页百分比脱钩。
 func TestSemanticScoreCalibration(t *testing.T) {
 	s := svTestService(t)
-	seedClipAssetWithSim(t, s, "good", 0.28, "2024-06-01T00:00:00Z") // 感知分 ≈78%
-	seedClipAssetWithSim(t, s, "bad", 0.10, "2024-06-01T00:00:00Z")  // 低于下界 → 0%
+	// 种子裸分相对标定端点取值,期望值由 displayScore 现算,换模型重标端点时
+	// 本测试自动跟随,不再硬编码百分比。
+	goodRaw := simDisplayFloor + (simDisplayCeil-simDisplayFloor)*0.9 // 展示分 90%
+	badRaw := simDisplayFloor + (simDisplayCeil-simDisplayFloor)*0.2 // 展示分 20%
+	seedClipAssetWithSim(t, s, "good", goodRaw, "2024-06-01T00:00:00Z")
+	seedClipAssetWithSim(t, s, "bad", badRaw, "2024-06-01T00:00:00Z")
 
 	count, _, _, err := s.Preview([]string{"scene: bike"}, "", 50, false)
 	require.NoError(t, err)
-	require.Equal(t, 1, count, "raw 0.28 → ~78% must pass a 50% threshold; raw 0.10 must not")
+	require.Equal(t, 1, count, "90% must pass a 50% threshold; 20% must not")
 
 	count, _, _, err = s.Preview([]string{"scene: bike"}, "", 70, false)
 	require.NoError(t, err)
 	require.Equal(t, 1, count)
 
-	count, _, _, err = s.Preview([]string{"scene: bike"}, "", 85, false)
+	count, _, _, err = s.Preview([]string{"scene: bike"}, "", 95, false)
 	require.NoError(t, err)
-	require.Equal(t, 0, count, "~78% must fail an 85% threshold")
+	require.Equal(t, 0, count, "90% must fail a 95% threshold")
 }
 
 // 用户场景还原：chips ["2024","bike"]——裸年份按日期过滤、bike 走 CLIP，
 // 2024 年的高分照片必须匹配，2023 年的不匹配。
 func TestBareYearPlusSemantic(t *testing.T) {
 	s := svTestService(t)
-	seedClipAssetWithSim(t, s, "a24", 0.30, "2024-06-01T00:00:00Z")
-	seedClipAssetWithSim(t, s, "a23", 0.30, "2023-06-01T00:00:00Z")
+	highRaw := simDisplayFloor + (simDisplayCeil-simDisplayFloor)*0.9 // 展示分 90%
+	seedClipAssetWithSim(t, s, "a24", highRaw, "2024-06-01T00:00:00Z")
+	seedClipAssetWithSim(t, s, "a23", highRaw, "2023-06-01T00:00:00Z")
 
 	_, err := s.Create(SmartViewInput{ID: "sv-bike", Name: "2024 bike",
 		CondsRaw: []string{"2024", "bike"}, Threshold: 50, Live: true})
@@ -223,10 +268,11 @@ func TestBareYearPlusSemantic(t *testing.T) {
 	rows.Close()
 	require.Equal(t, []string{"a24"}, ids)
 
-	// 存库分数也应是感知分数（与滑块/统计同量纲），而非原始余弦
+	// 存库分数就是 SmartSearch 的展示分（与滑块/搜索页百分比同量纲），
+	// 不允许再有第二层映射改写它
 	var score float64
 	require.NoError(t, s.db.QueryRow(`SELECT match_score FROM smart_view_matches WHERE smart_view_id='sv-bike'`).Scan(&score))
-	require.InDelta(t, 0.89, score, 0.03) // (0.30-0.14)/0.18 ≈ 0.89
+	require.InDelta(t, displayScore(highRaw), score, 0.01) // 落库分 = 唯一标定层 displayScore 的输出
 }
 
 // Evaluate 必须从 conds_raw 现解析，而不是用建库时固化的 conds_parsed 快照：
@@ -423,7 +469,13 @@ func TestSmartViewStats(t *testing.T) {
 	require.Len(t, sv.Seeds, 5)
 }
 
-func sumInts(a []int) int { s := 0; for _, v := range a { s += v }; return s }
+func sumInts(a []int) int {
+	s := 0
+	for _, v := range a {
+		s += v
+	}
+	return s
+}
 
 func recentOrOld(i int) string {
 	if i < 3 {

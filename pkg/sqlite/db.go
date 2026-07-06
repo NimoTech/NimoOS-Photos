@@ -11,6 +11,8 @@ import (
 
 	sqlite_vec "github.com/asg017/sqlite-vec-go-bindings/cgo"
 	_ "github.com/mattn/go-sqlite3" // CGO SQLite3 driver
+
+	"github.com/NimoTech/NimoOS-Photos/common"
 )
 
 func init() {
@@ -67,6 +69,13 @@ func Open(path string) (*sql.DB, error) {
 // migrate creates all tables, indexes, and virtual tables if they do not
 // already exist. It is idempotent and safe to call on every startup.
 func migrate(db *sql.DB) error {
+	// CLIP 维度迁移:换模型导致维度变化时,旧 vec0 表必须整表重建
+	// (vec0 不支持改维度)。asset_clip_idx 一并清空,向量由启动后的
+	// 自动全量重建 / Embedder 补跑重新生成。
+	if err := migrateClipDim(db); err != nil {
+		return err
+	}
+
 	statements := []string{
 		// ── Core asset table ──────────────────────────────────────────────
 		`CREATE TABLE IF NOT EXISTS assets (
@@ -146,10 +155,10 @@ func migrate(db *sql.DB) error {
 			asset_id TEXT UNIQUE NOT NULL REFERENCES assets(id) ON DELETE CASCADE
 		)`,
 
-		// ── sqlite-vec virtual table (512-dim CLIP embeddings) ────────────
-		`CREATE VIRTUAL TABLE IF NOT EXISTS clip_embeddings USING vec0(
-			embedding float[512]
-		)`,
+		// ── sqlite-vec virtual table (CLIP embeddings, 维度跟随 common.CLIPDim) ──
+		fmt.Sprintf(`CREATE VIRTUAL TABLE IF NOT EXISTS clip_embeddings USING vec0(
+			embedding float[%d]
+		)`, common.CLIPDim),
 
 		// ── Favorites (per-user, time-indexed) ────────────────────────────
 		`CREATE TABLE IF NOT EXISTS asset_favorites (
@@ -329,6 +338,51 @@ func migrate(db *sql.DB) error {
 		}
 	}
 
+	// Idempotent column expansion: assets.offline tracks whether the asset's
+	// source file currently lives on a removable drive that's unplugged (see
+	// MountGuard in service/mountguard.go). Same PRAGMA-based idempotent-add
+	// pattern as the asset_exif columns above (kept separate from the
+	// duplicate-column-error `alters` slice below, per design).
+	assetsNewCols := []struct {
+		name string
+		decl string
+	}{
+		{"offline", "INTEGER NOT NULL DEFAULT 0"},
+	}
+	assetsExisting := map[string]bool{}
+	aRows, err := db.Query(`PRAGMA table_info(assets)`)
+	if err != nil {
+		return fmt.Errorf("migrate pragma assets: %w", err)
+	}
+	for aRows.Next() {
+		var cid int
+		var name, ctype string
+		var notnull, pk int
+		var dflt sql.NullString
+		if err := aRows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			aRows.Close()
+			return fmt.Errorf("migrate pragma scan assets: %w", err)
+		}
+		assetsExisting[name] = true
+	}
+	aRows.Close()
+	for _, col := range assetsNewCols {
+		if assetsExisting[col.name] {
+			continue
+		}
+		stmt := fmt.Sprintf("ALTER TABLE assets ADD COLUMN %s %s", col.name, col.decl)
+		if _, err := db.Exec(stmt); err != nil {
+			return fmt.Errorf("migrate add column assets.%s: %w", col.name, err)
+		}
+	}
+	// No index on assets.offline: it's a low-cardinality boolean, and its
+	// consumers filter by prefix UPDATE/SELECT where the planner wouldn't use
+	// it anyway. DROP cleans up any DB migrated by an intermediate build that
+	// briefly created one.
+	if _, err := db.Exec(`DROP INDEX IF EXISTS idx_assets_offline`); err != nil {
+		return fmt.Errorf("migrate drop index assets_offline: %w", err)
+	}
+
 	// ── Idempotent column migration: legacy DBs created with CREATE TABLE IF NOT EXISTS
 	//    won't have new columns; ALTER TABLE ADD COLUMN fills them in.
 	//    SQLite raises "duplicate column" when the column already exists — ignore it.
@@ -415,6 +469,32 @@ func migrate(db *sql.DB) error {
 		return err
 	}
 
+	return nil
+}
+
+// migrateClipDim 检查已存在的 clip_embeddings 表维度是否等于 common.CLIPDim,
+// 不符则 DROP(vec0 影子表随之删除)并清空 asset_clip_idx。表不存在时为 no-op。
+func migrateClipDim(db *sql.DB) error {
+	var ddl string
+	err := db.QueryRow(`SELECT sql FROM sqlite_master WHERE type='table' AND name='clip_embeddings'`).Scan(&ddl)
+	if err == sql.ErrNoRows {
+		return nil // 新库,走正常建表路径
+	}
+	if err != nil {
+		return fmt.Errorf("migrateClipDim read ddl: %w", err)
+	}
+	if strings.Contains(ddl, fmt.Sprintf("float[%d]", common.CLIPDim)) {
+		return nil // 维度已正确
+	}
+	if _, err := db.Exec(`DROP TABLE clip_embeddings`); err != nil {
+		return fmt.Errorf("migrateClipDim drop: %w", err)
+	}
+	if _, err := db.Exec(`DELETE FROM asset_clip_idx`); err != nil {
+		// asset_clip_idx 可能尚未创建(极老库),忽略 no such table
+		if !strings.Contains(err.Error(), "no such table") {
+			return fmt.Errorf("migrateClipDim clear idx: %w", err)
+		}
+	}
 	return nil
 }
 

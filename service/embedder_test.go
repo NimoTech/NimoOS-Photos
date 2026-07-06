@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/NimoTech/NimoOS-Photos/pkg/config"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 )
@@ -49,6 +50,145 @@ func TestEmbedder_QueryMissing(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, []string{"/a.jpg"}, paths)
 	_ = missing
+}
+
+// TestEmbedder_QueryMissingExcludesOffline 验证:资产的移动盘已拔出
+// (offline=1)时,即使 asset_clip_idx 缺行也不应进入 CLIP 补跑目标——
+// 源文件读不到,补跑只会一直失败;插回后 MountGuard 会主动重新触发 Backfill。
+func TestEmbedder_QueryMissingExcludesOffline(t *testing.T) {
+	db := makeTestDB(t)
+	online := insertAsset(t, db, "/a.jpg", "indexed")
+	offline := insertAsset(t, db, "/media/X/b.jpg", "indexed")
+	_, err := db.Exec(`UPDATE assets SET offline=1 WHERE id=?`, offline)
+	require.NoError(t, err)
+
+	e := NewEmbedder(db, &mockML{}, nil, nil)
+	paths, err := e.queryMissing(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, []string{"/a.jpg"}, paths)
+	_ = online
+}
+
+// TestEmbedder_QueryMissingOCRExcludesOffline 同上,针对 OCR 补跑目标查询。
+func TestEmbedder_QueryMissingOCRExcludesOffline(t *testing.T) {
+	db := makeTestDB(t)
+	online := insertAsset(t, db, "/photo-online.jpg", "indexed")
+	offline := insertAsset(t, db, "/media/X/photo-offline.jpg", "indexed")
+	_, err := db.Exec(`UPDATE assets SET offline=1 WHERE id=?`, offline)
+	require.NoError(t, err)
+
+	e := NewEmbedder(db, &mockML{}, nil, nil)
+	targets, err := e.queryMissingOCR(context.Background())
+	require.NoError(t, err)
+	ids := map[string]bool{}
+	for _, tg := range targets {
+		ids[tg.id] = true
+	}
+	require.True(t, ids[online], "在线资产应是 OCR 补跑目标")
+	require.False(t, ids[offline], "offline 资产必须被排除出 OCR 补跑")
+}
+
+// 视频不参与 OCR:既不进补跑目标,历史遗留的视频 OCR 行也被 pruneVideoOCR 清掉。
+func TestVideoOCRExcludedAndPruned(t *testing.T) {
+	db := makeTestDB(t)
+	img := insertAsset(t, db, "/photo.jpg", "indexed") // 图片:缺 OCR → 应是补跑目标
+	vid := uuid.NewString()
+	_, err := db.Exec(`INSERT INTO assets(id,file_path,file_size,mime_type,original_name,is_live_photo_video,status,checksum)
+		VALUES(?, '/clip.mp4', 1, 'video/mp4', 'clip.mp4', 0, 'indexed', ?)`, vid, uuid.NewString())
+	require.NoError(t, err)
+
+	e := NewEmbedder(db, &mockML{}, nil, nil)
+	targets, err := e.queryMissingOCR(context.Background())
+	require.NoError(t, err)
+	ids := map[string]bool{}
+	for _, tg := range targets {
+		ids[tg.id] = true
+	}
+	require.True(t, ids[img], "图片应是缺 OCR 补跑目标")
+	require.False(t, ids[vid], "视频必须被排除出 OCR 补跑")
+
+	// pruneVideoOCR 删视频 OCR 行、保留图片 OCR 行。
+	_, err = db.Exec(`INSERT INTO asset_ocr(asset_id, text) VALUES(?, ?)`, vid, "spreadsheet text")
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO asset_ocr(asset_id, text) VALUES(?, ?)`, img, "receipt")
+	require.NoError(t, err)
+	pruneVideoOCR(db)
+	var vidRows, imgRows int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM asset_ocr WHERE asset_id=?`, vid).Scan(&vidRows))
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM asset_ocr WHERE asset_id=?`, img).Scan(&imgRows))
+	require.Equal(t, 0, vidRows, "视频 OCR 行应被清掉")
+	require.Equal(t, 1, imgRows, "图片 OCR 行应保留")
+}
+
+// gateML 的 CLIPImageEmbed 第一次调用会阻塞在 release 上并始终返回错误,
+// 用于制造「Backfill 长时间运行中」的窗口并让缺失向量的资产保持缺失。
+type gateML struct {
+	mockML
+	clipCalls atomic.Int32
+	entered   chan struct{}
+	release   chan struct{}
+}
+
+func (m *gateML) CLIPImageEmbed(_ []byte) ([]float32, error) {
+	if m.clipCalls.Add(1) == 1 {
+		m.entered <- struct{}{}
+		<-m.release
+	}
+	return nil, fmt.Errorf("clip backend unavailable")
+}
+
+// TestEmbedder_BackfillRerunsWhenTriggeredMidRun 验证 rerun-pending 机制:
+// Backfill 运行中收到第二次调用时,不能像以前那样撞上 CAS 就静默吞掉——
+// 进行中的那轮可能早已查过目标列表,查不到刚变成可补的资产(典型:MountGuard
+// 刚把插回的盘标回 online)。第二次调用应置 pending,当前轮结束后自动重新
+// 查询、再跑一轮。
+func TestEmbedder_BackfillRerunsWhenTriggeredMidRun(t *testing.T) {
+	prev := config.Cfg
+	t.Cleanup(func() { config.Cfg = prev })
+	// 只开 CLIP:人脸/OCR 关闭,避免无关 ML 调用干扰计数。
+	config.Cfg = &config.Config{ScenesEnabled: true}
+
+	db := makeTestDB(t)
+	path := makeTestJPEG(t, t.TempDir())
+	insertAsset(t, db, path, "indexed") // 缺 CLIP 向量 → Backfill 目标
+
+	ml := &gateML{entered: make(chan struct{}, 1), release: make(chan struct{})}
+	idx := NewIndexer(db, ml, t.TempDir(), 1)
+	e := NewEmbedder(db, ml, idx, NewTaskRegistry(nil))
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- e.Backfill(context.Background()) }()
+	<-ml.entered // 第一轮已进入 ML 调用:Backfill 确认处于运行中
+
+	// 运行中的第二次触发:立即返回 nil,但必须置 rerunPending 而不是被吞掉。
+	require.NoError(t, e.Backfill(context.Background()))
+	require.True(t, e.rerunPending.Load(), "运行中收到的触发必须置 rerunPending")
+
+	close(ml.release)
+	require.NoError(t, <-errCh)
+
+	// 第一轮结束后自动重跑了一轮:同一个仍缺向量的资产被再次尝试(共 2 次 CLIP 调用)。
+	require.Equal(t, int32(2), ml.clipCalls.Load(), "当前轮结束后应自动再跑一轮补跑")
+	require.False(t, e.rerunPending.Load(), "重跑轮结束后 pending 应被消费")
+	require.False(t, e.running.Load())
+}
+
+// TestEmbedder_BackfillOCRRerunPendingConsumedAfterRun 验证 OCR 补跑的同款
+// rerun-pending 机制(与 Backfill 共享同一循环形态,这里只验证 CAS/pending
+// 的置位与消费)。
+func TestEmbedder_BackfillOCRRerunPendingConsumedAfterRun(t *testing.T) {
+	db := makeTestDB(t)
+	e := NewEmbedder(db, &mockML{}, nil, nil)
+
+	// 模拟一轮 OCR 补跑正在运行:此时的触发必须置 pending 而不是被吞。
+	e.ocrRunning.Store(true)
+	require.NoError(t, e.BackfillOCR(context.Background()))
+	require.True(t, e.ocrRerunPending.Load(), "运行中收到的 OCR 触发必须置 ocrRerunPending")
+	e.ocrRunning.Store(false)
+
+	// 下一次真正运行结束时消费 pending 并再跑一轮(空库上两轮都立即完成)。
+	require.NoError(t, e.BackfillOCR(context.Background()))
+	require.False(t, e.ocrRerunPending.Load(), "补跑结束后 pending 应被消费")
 }
 
 // TestEmbedder_HasEmbeddingForPath

@@ -11,6 +11,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/NimoTech/NimoOS-Photos/common"
 )
 
 // BoundingBox represents a face detection bounding box with normalised coordinates.
@@ -127,9 +129,9 @@ func extractClip(data []byte) ([]float32, error) {
 	return parseClipField(clipRaw)
 }
 
-// CLIPImageEmbed returns a 512-dim CLIP embedding for the given JPEG image bytes.
+// CLIPImageEmbed returns the CLIP embedding (common.CLIPDim dims) for the given JPEG image bytes.
 func (c *MLClient) CLIPImageEmbed(imageData []byte) ([]float32, error) {
-	entries := `{"clip":{"visual":{"modelName":"ViT-B-32__openai"}}}`
+	entries := fmt.Sprintf(`{"clip":{"visual":{"modelName":%q}}}`, common.CLIPModelName)
 	body, ct := buildImageForm(entries, imageData)
 	data, err := c.post(body, ct)
 	if err != nil {
@@ -138,9 +140,9 @@ func (c *MLClient) CLIPImageEmbed(imageData []byte) ([]float32, error) {
 	return extractClip(data)
 }
 
-// CLIPTextEmbed returns a 512-dim CLIP embedding for the given text string.
+// CLIPTextEmbed returns the CLIP embedding (common.CLIPDim dims) for the given text string.
 func (c *MLClient) CLIPTextEmbed(text string) ([]float32, error) {
-	entries := `{"clip":{"textual":{"modelName":"ViT-B-32__openai"}}}`
+	entries := fmt.Sprintf(`{"clip":{"textual":{"modelName":%q}}}`, common.CLIPModelName)
 	body, ct := buildTextForm(entries, text)
 	data, err := c.post(body, ct)
 	if err != nil {
@@ -152,7 +154,8 @@ func (c *MLClient) CLIPTextEmbed(text string) ([]float32, error) {
 // DetectAndRecognizeFaces sends a single request that performs both face detection
 // and recognition, returning a list of FaceResult with Embedding populated.
 func (c *MLClient) DetectAndRecognizeFaces(imageData []byte) ([]FaceResult, error) {
-	entries := `{"facial-recognition":{"detection":{"modelName":"buffalo_l"},"recognition":{"modelName":"buffalo_l"}}}`
+	entries := fmt.Sprintf(`{"facial-recognition":{"detection":{"modelName":%q},"recognition":{"modelName":%q}}}`,
+		common.FaceModelName, common.FaceModelName)
 	body, ct := buildImageForm(entries, imageData)
 
 	data, err := c.post(body, ct)
@@ -209,7 +212,8 @@ type OCRLine struct {
 // and returns the recognized lines. An image without any text yields an
 // empty (non-nil) slice.
 func (c *MLClient) OCR(imageData []byte) ([]OCRLine, error) {
-	entries := `{"ocr":{"detection":{"modelName":"PP-OCRv5_mobile"},"recognition":{"modelName":"PP-OCRv5_mobile"}}}`
+	entries := fmt.Sprintf(`{"ocr":{"detection":{"modelName":%q},"recognition":{"modelName":%q}}}`,
+		common.OCRModelName, common.OCRModelName)
 	body, ct := buildImageForm(entries, imageData)
 
 	data, err := c.post(body, ct)

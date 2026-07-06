@@ -4,6 +4,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/NimoTech/NimoOS-Photos/common"
 	"github.com/NimoTech/NimoOS-Photos/pkg/sqlite"
 	"github.com/NimoTech/NimoOS-Photos/service"
 	"github.com/stretchr/testify/require"
@@ -22,7 +23,7 @@ func TestRemoveByPathDropsClipVector(t *testing.T) {
 	db.Exec(`INSERT INTO asset_clip_idx(asset_id) VALUES('a1')`)
 	var rowid int64
 	require.NoError(t, db.QueryRow(`SELECT rowid FROM asset_clip_idx WHERE asset_id='a1'`).Scan(&rowid))
-	vec := make([]float32, 512)
+	vec := make([]float32, common.CLIPDim)
 	vec[0] = 1.0
 	_, err = db.Exec(`INSERT INTO clip_embeddings(rowid,embedding) VALUES(?,?)`, rowid, sqlite.SerializeFloat32(vec))
 	require.NoError(t, err)
@@ -49,7 +50,7 @@ func TestPurgeAssetDropsClipVector(t *testing.T) {
 	db.Exec(`INSERT INTO asset_clip_idx(asset_id) VALUES('a1')`)
 	var rowid int64
 	require.NoError(t, db.QueryRow(`SELECT rowid FROM asset_clip_idx WHERE asset_id='a1'`).Scan(&rowid))
-	vec := make([]float32, 512)
+	vec := make([]float32, common.CLIPDim)
 	vec[0] = 1.0
 	_, err = db.Exec(`INSERT INTO clip_embeddings(rowid,embedding) VALUES(?,?)`, rowid, sqlite.SerializeFloat32(vec))
 	require.NoError(t, err)

@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/NimoTech/NimoOS-Photos/common"
 	"github.com/NimoTech/NimoOS-Photos/pkg/config"
 	"github.com/NimoTech/NimoOS-Photos/pkg/geo"
 	"github.com/NimoTech/NimoOS-Photos/pkg/mlclient"
@@ -35,6 +36,7 @@ type Services interface {
 	SmartViews() *SmartViewService
 	Storage() *StorageService
 	Rebuilder() *Rebuilder
+	MountGuard() *MountGuard
 	RestartWatcher(dirs []string)
 	RestartScanTicker(minutes int)
 }
@@ -58,6 +60,7 @@ type services struct {
 	smartViews       *SmartViewService
 	storage          *StorageService
 	rebuilder        *Rebuilder
+	mountGuard       *MountGuard
 	parentCtx        context.Context
 	scanMu           sync.Mutex
 	scanTickerCancel context.CancelFunc
@@ -80,6 +83,7 @@ func (s *services) Places() *PlacesService        { return s.places }
 func (s *services) SmartViews() *SmartViewService { return s.smartViews }
 func (s *services) Storage() *StorageService      { return s.storage }
 func (s *services) Rebuilder() *Rebuilder         { return s.rebuilder }
+func (s *services) MountGuard() *MountGuard       { return s.mountGuard }
 
 // NewService wires all service-layer components together from cfg and returns a
 // ready-to-use Services handle. It panics if the database cannot be opened.
@@ -135,6 +139,20 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 	rebuilder := NewRebuilder(parentCtx, db, idx, faces, taskReg, cfg.Workers)
 	embedder := NewEmbedder(db, ml, idx, taskReg)
 
+	// MountGuard: 追踪 /media/* 可移动盘的挂载/拔出,维护 assets.offline。
+	// 回调用函数字段注入以避免与 Watcher/Indexer/Embedder 产生导入依赖:
+	//   - watcherRestart 直接闭包捕获 watcher/parentCtx/cfg，重新 Add 配置中
+	//     watch 的目录(对没被配置监听的目录是无副作用的 no-op)；
+	//   - scanDir 复用 Indexer.ScanDirectory 自愈新增/删除的文件；
+	//   - backfill/backfillOCR 复用 Embedder，修复换代次重建期间 offline
+	//     资产恢复后缺失的 CLIP/OCR。
+	mountGuard := NewMountGuard(db)
+	mountGuard.SetWatcherRestart(func() { watcher.Restart(parentCtx, cfg.WatchDirs) })
+	mountGuard.SetScanDir(idx.ScanDirectory)
+	mountGuard.SetBackfill(embedder.Backfill)
+	mountGuard.SetBackfillOCR(embedder.BackfillOCR)
+	// Run() 由 main.go 与其它后台 worker 一起以 goroutine 启动。
+
 	// batch 上传完成后主动触发人脸聚类，让前端能看到从 0% 涨到 100% 的"识别人物" task。
 	// faces.RunClustering 内部用 CAS 防重入，多个 batch 同时 done 也只会跑一次。
 	idx.SetOnBatchDone(func() {
@@ -165,6 +183,7 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 		idx.ScanPending()
 		idx.pruneSystemMountAssets()
 		pruneOrphanClipVectors(db) // sweep any vec0 rows left orphaned by past deletes
+		pruneVideoOCR(db)          // 视频不再做 OCR:清掉历史遗留的视频 OCR 行,使其退出「OCR/文档」分类
 		idx.ScanAllRoots()
 		watcher.PairLivePhotos() //nolint:errcheck
 	}()
@@ -247,6 +266,7 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 		smartViews: smartViews,
 		storage:    storageSvc,
 		rebuilder:  rebuilder,
+		mountGuard: mountGuard,
 		parentCtx:  parentCtx,
 	}
 	svc.RestartScanTicker(cfg.ScanInterval)
@@ -310,4 +330,4 @@ func NewTestServices(db *sql.DB) Services {
 // It is used only in tests where actual ML inference is not needed.
 type zeroML struct{}
 
-func (zeroML) CLIPTextEmbed(string) ([]float32, error) { return make([]float32, 512), nil }
+func (zeroML) CLIPTextEmbed(string) ([]float32, error) { return make([]float32, common.CLIPDim), nil }

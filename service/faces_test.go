@@ -8,6 +8,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/NimoTech/NimoOS-Photos/common"
 	"github.com/NimoTech/NimoOS-Photos/pkg/sqlite"
 	"github.com/NimoTech/NimoOS-Photos/service"
 	"github.com/google/uuid"
@@ -111,7 +112,7 @@ func TestRunClustering_ConcurrencyGuard(t *testing.T) {
 	_, err := db.Exec(`INSERT INTO assets(id,file_path,status) VALUES('a','/a.jpg','indexed')`)
 	require.NoError(t, err)
 	for i := 0; i < 60; i++ {
-		vec := make([]float32, 512)
+		vec := make([]float32, common.FaceDim)
 		vec[i%512] = 1
 		_, err := db.Exec(`
             INSERT INTO face_detections(id, asset_id, bbox, embedding)
@@ -155,7 +156,7 @@ func TestRunClustering_StagesPublishProgress(t *testing.T) {
 	db := makeTestFaceDB(t)
 	_, _ = db.Exec(`INSERT INTO assets(id,file_path,status) VALUES('a','/a.jpg','indexed')`)
 	for i := 0; i < 5; i++ {
-		vec := make([]float32, 512)
+		vec := make([]float32, common.FaceDim)
 		vec[i] = 1
 		_, _ = db.Exec(`INSERT INTO face_detections(id, asset_id, bbox, embedding) VALUES(?, 'a', '{}', ?)`,
 			uuid.NewString(), sqlite.SerializeFloat32(vec))
@@ -197,7 +198,7 @@ func TestDBSCANWithProgress(t *testing.T) {
 	// 50 个完全分离的点，每个独立成簇（minPts=1）。
 	vecs := make([][]float32, 50)
 	for i := range vecs {
-		v := make([]float32, 512)
+		v := make([]float32, common.FaceDim)
 		v[i] = 1
 		vecs[i] = v
 	}

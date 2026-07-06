@@ -94,7 +94,7 @@ SELECT a.id, a.file_path, a.file_size, COALESCE(a.mime_type,''),
 FROM asset_favorites f
 JOIN assets a ON a.id = f.asset_id
 LEFT JOIN asset_exif e ON e.asset_id = a.id
-WHERE f.user_id = ? AND a.deleted_at IS NULL
+WHERE f.user_id = ? AND a.deleted_at IS NULL AND a.offline = 0
 ORDER BY f.favorited_at DESC`
 
 	args := []interface{}{userID}
@@ -203,7 +203,7 @@ FROM asset_favorites f
 JOIN assets a ON a.id = f.asset_id
 LEFT JOIN asset_exif e ON e.asset_id = a.id
 LEFT JOIN asset_views v ON v.user_id = f.user_id AND v.asset_id = f.asset_id
-WHERE f.user_id = ?
+WHERE f.user_id = ? AND a.deleted_at IS NULL AND a.offline = 0
 ORDER BY COALESCE(v.view_count, 0) DESC, f.favorited_at DESC
 LIMIT ?`
 

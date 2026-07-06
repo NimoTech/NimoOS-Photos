@@ -4,6 +4,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/NimoTech/NimoOS-Photos/common"
 	"github.com/NimoTech/NimoOS-Photos/pkg/sqlite"
 	"github.com/stretchr/testify/require"
 )
@@ -15,7 +16,7 @@ func TestPruneOrphanClipVectors(t *testing.T) {
 	require.NoError(t, err)
 	defer db.Close()
 
-	vec := make([]float32, 512)
+	vec := make([]float32, common.CLIPDim)
 	vec[0] = 1.0
 	blob := sqlite.SerializeFloat32(vec)
 

@@ -145,7 +145,10 @@ type Album struct {
 	Name         string    `json:"name"`
 	CreatedAt    time.Time `json:"createdAt"`
 	CoverAssetID string    `json:"coverAssetId,omitempty"`
-	AssetCount   int       `json:"assetCount,omitempty"`
+	// AssetCount is the album card badge: visible members only (live-photo
+	// companion videos, trashed and offline assets excluded), so it always
+	// matches the number of items ListAssets returns when the album is opened.
+	AssetCount int `json:"assetCount,omitempty"`
 
 	// DateStart / DateEnd are the raw taken_at strings of the earliest and
 	// latest dated assets in the album (empty when the album has no dated
@@ -177,4 +180,10 @@ type IndexStatus struct {
 	DiskAvail  int64  `json:"diskAvail,omitempty"`
 	// MLReady reflects whether the immich-machine-learning backend answers /ping.
 	MLReady bool `json:"mlReady"`
+	// Offline counts assets currently flagged offline=1 (their removable drive
+	// is unplugged). These assets are hidden from every user-facing surface but
+	// still count toward Indexed above — Indexed reflects the assets.status
+	// column, which offline does not change. The frontend can use this to show
+	// a "N photos are on a disconnected drive" hint.
+	Offline int `json:"offline"`
 }

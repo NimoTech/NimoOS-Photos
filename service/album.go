@@ -60,12 +60,13 @@ func (s *AlbumService) List() ([]Album, error) {
 		               WHERE aa2.album_id = a.id
 		               ORDER BY aa2.position ASC, aa2.rowid ASC LIMIT 1),
 		           '') AS cover,
-		       COUNT(aa.asset_id) AS cnt,
+		       SUM(CASE WHEN sp.is_live_photo_video = 0 AND sp.deleted_at IS NULL AND sp.offline = 0
+		                 THEN 1 ELSE 0 END) AS cnt,
 		       MIN(sp.taken_at) AS date_start,
 		       MAX(sp.taken_at) AS date_end,
-		       SUM(CASE WHEN sp.is_live_photo_video = 0 AND sp.deleted_at IS NULL
+		       SUM(CASE WHEN sp.is_live_photo_video = 0 AND sp.deleted_at IS NULL AND sp.offline = 0
 		                 AND sp.mime_type NOT LIKE 'video/%' THEN 1 ELSE 0 END) AS photo_cnt,
-		       SUM(CASE WHEN sp.is_live_photo_video = 0 AND sp.deleted_at IS NULL
+		       SUM(CASE WHEN sp.is_live_photo_video = 0 AND sp.deleted_at IS NULL AND sp.offline = 0
 		                 AND sp.mime_type LIKE 'video/%' THEN 1 ELSE 0 END) AS video_cnt
 		FROM albums a
 		LEFT JOIN album_assets aa ON aa.album_id = a.id
@@ -362,7 +363,7 @@ func (s *AlbumService) ListAssets(albumID string) ([]Asset, error) {
 		       a.indexed_at, a.status
 		FROM assets a
 		JOIN album_assets aa ON aa.asset_id = a.id
-		WHERE aa.album_id = ? AND a.is_live_photo_video = 0 AND a.deleted_at IS NULL
+		WHERE aa.album_id = ? AND a.is_live_photo_video = 0 AND a.deleted_at IS NULL AND a.offline = 0
 		ORDER BY aa.position ASC, aa.added_at ASC
 	`, albumID)
 	if err != nil {

@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/NimoTech/NimoOS-Photos/common"
 	"github.com/NimoTech/NimoOS-Photos/pkg/config"
 	"github.com/NimoTech/NimoOS-Photos/pkg/mlclient"
 	"github.com/NimoTech/NimoOS-Photos/pkg/sqlite"
@@ -22,10 +23,10 @@ import (
 type mockML struct{}
 
 func (m *mockML) CLIPImageEmbed(_ []byte) ([]float32, error) {
-	return make([]float32, 512), nil
+	return make([]float32, common.CLIPDim), nil
 }
 func (m *mockML) CLIPTextEmbed(_ string) ([]float32, error) {
-	return make([]float32, 512), nil
+	return make([]float32, common.CLIPDim), nil
 }
 func (m *mockML) DetectAndRecognizeFaces(_ []byte) ([]mlclient.FaceResult, error) {
 	return nil, nil
@@ -482,4 +483,118 @@ func TestResolveMimeType(t *testing.T) {
 	pngHeader := []byte{0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A}
 	require.Equal(t, "image/png", resolveMimeType(pngHeader, ".bin"),
 		"未知扩展名应回退到 http.DetectContentType")
+}
+
+// TestPruneMissingUnderSkipsWhenMountVanished:恢复扫描(插回 → ScanDirectory)
+// 末尾的 prune 与「扫描期间盘又被拔出、挂载点残留空目录」相撞时,该目录下所有
+// 文件都会 stat 成"不存在"——若照常 prune,整块盘的资产连行带向量、缩略图会被
+// 物理删光。互锁 ①:目录对应挂载点不在当前挂载表时必须跳过 prune。
+func TestPruneMissingUnderSkipsWhenMountVanished(t *testing.T) {
+	db := makeTestDB(t)
+	// 夹具必须用真实机器上不存在的挂载名(见 TestPruneMissingUnderKeepsOfflineAssets
+	// 的说明):/media/devmon 在本机是 0700,stat 报 EACCES 而非 ENOENT,会把
+	// 本用例架空(资产无论互锁存在与否都会保留,断言恒真)。
+	id := insertAsset(t, db, "/media/nimoos-test-V/gone.jpg", "indexed") // 文件在磁盘上不存在
+	ix := NewIndexer(db, &mockML{}, t.TempDir(), 1)
+	ix.mountRoots = func() []string { return []string{"/DATA"} } // /media/nimoos-test-V 已从挂载表消失
+
+	require.NoError(t, ix.pruneMissingUnder("/media/nimoos-test-V"))
+
+	var n int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM assets WHERE id=?`, id).Scan(&n))
+	require.Equal(t, 1, n, "挂载点已消失时禁止 prune,资产必须原样保留")
+}
+
+// TestPruneMissingUnderKeepsOfflineAssets:互锁 ②——offline=1 资产的文件读不到
+// 恰恰是 offline 标记本身记录的状态,不是"文件被删"的证据,prune 必须排除它们;
+// offline=0 且文件确实消失的资产照常清理。
+func TestPruneMissingUnderKeepsOfflineAssets(t *testing.T) {
+	db := makeTestDB(t)
+	// 挂载名刻意用真实机器上不存在的目录:prune 只在 stat 报 ENOENT 时删行,
+	// 而本机真实存在的 /media/devmon 是 0700,stat 会报 EACCES 而非 ENOENT。
+	offID := insertAsset(t, db, "/media/nimoos-test-X/offline.jpg", "indexed")
+	onID := insertAsset(t, db, "/media/nimoos-test-X/deleted.jpg", "indexed")
+	_, err := db.Exec(`UPDATE assets SET offline=1 WHERE id=?`, offID)
+	require.NoError(t, err)
+
+	ix := NewIndexer(db, &mockML{}, t.TempDir(), 1)
+	ix.mountRoots = func() []string { return []string{"/DATA", "/media/nimoos-test-X"} }
+
+	require.NoError(t, ix.pruneMissingUnder("/media/nimoos-test-X"))
+
+	var n int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM assets WHERE id=?`, offID).Scan(&n))
+	require.Equal(t, 1, n, "offline=1 资产必须被 prune 排除")
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM assets WHERE id=?`, onID).Scan(&n))
+	require.Equal(t, 0, n, "offline=0 且文件确实消失的资产应照常清理")
+}
+
+// TestStatusCountsReportsOfflineCount 验证 StatusCounts().Offline 正确统计
+// offline=1 的资产数,且不影响 Indexed 的既有口径(offline 资产仍按 status
+// 计入 Indexed,Offline 是独立叠加的统计维度)。回收站里的 offline 资产
+// (deleted_at 非空 + offline=1 双标)不计入——它已经从图库里消失,不属于
+// "N 张照片在已断开的磁盘上"要提示的对象。
+func TestStatusCountsReportsOfflineCount(t *testing.T) {
+	db := makeTestDB(t)
+	insertAsset(t, db, "/DATA/a.jpg", "indexed")
+	offID := insertAsset(t, db, "/media/X/b.jpg", "indexed")
+	insertAsset(t, db, "/DATA/c.jpg", "pending")
+	_, err := db.Exec(`UPDATE assets SET offline=1 WHERE id=?`, offID)
+	require.NoError(t, err)
+	// 双标资产:先进回收站、后拔盘(或反之)——不应计入 Offline。
+	dualID := insertAsset(t, db, "/media/X/trashed.jpg", "indexed")
+	_, err = db.Exec(`UPDATE assets SET offline=1, deleted_at='2026-01-01 00:00:00' WHERE id=?`, dualID)
+	require.NoError(t, err)
+
+	ix := NewIndexer(db, &mockML{}, t.TempDir(), 1)
+	status := ix.StatusCounts()
+
+	require.Equal(t, 1, status.Offline, "offline=1 计数不得包含回收站双标资产")
+	require.Equal(t, 3, status.Indexed, "Indexed 口径不变:offline 资产仍按 status 计入")
+	require.Equal(t, 1, status.Pending)
+}
+
+// TestPruneMissingUnderLikeMetacharSiblings:`_` 是 LIKE 通配符,真实 U 盘卷标
+// 就含下划线(Kingston_DataTra)。对 …/disk_A 的 prune 不得波及仅 `_` 位不同的
+// 兄弟挂载 …/diskXA——旧的 `LIKE 'disk_A/%'` 会连带匹配并把兄弟盘上
+// "暂时读不到"的资产物理删掉。
+func TestPruneMissingUnderLikeMetacharSiblings(t *testing.T) {
+	db := makeTestDB(t)
+	// 夹具用真实机器上不存在的挂载名,理由同上(EACCES 会架空断言)。
+	siblingID := insertAsset(t, db, "/media/nimoos-test-diskXA/photo.jpg", "indexed") // 文件不存在
+	ix := NewIndexer(db, &mockML{}, t.TempDir(), 1)
+	ix.mountRoots = func() []string {
+		return []string{"/DATA", "/media/nimoos-test-disk_A", "/media/nimoos-test-diskXA"}
+	}
+
+	require.NoError(t, ix.pruneMissingUnder("/media/nimoos-test-disk_A"))
+
+	var n int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM assets WHERE id=?`, siblingID).Scan(&n))
+	require.Equal(t, 1, n, "prune disk_A 不得误删兄弟挂载 diskXA 的资产")
+}
+
+// TestPruneSystemMountAssetsPurgesDevmonAssets:启动清理必须把 devmon(U 盘)
+// 存量资产连 CLIP 向量、人脸行一起硬删,其它路径资产不受影响。
+func TestPruneSystemMountAssetsPurgesDevmonAssets(t *testing.T) {
+	db := makeTestDB(t)
+	usb := insertAsset(t, db, "/media/devmon/stickA/photo.jpg", "indexed")
+	keep := insertAsset(t, db, "/DATA/Gallery/keep.jpg", "indexed")
+	seedFaceAndClip(t, db, usb)
+	seedFaceAndClip(t, db, keep)
+
+	ix := NewIndexer(db, &mockML{}, t.TempDir(), 1)
+	ix.pruneSystemMountAssets()
+
+	var n int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM assets WHERE id=?`, usb).Scan(&n))
+	require.Equal(t, 0, n, "devmon 资产行必须被硬删")
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM asset_clip_idx WHERE asset_id=?`, usb).Scan(&n))
+	require.Equal(t, 0, n, "devmon 资产的 CLIP 映射必须被清")
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM face_detections WHERE asset_id=?`, usb).Scan(&n))
+	require.Equal(t, 0, n, "devmon 资产的人脸行必须被清")
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM assets WHERE id=?`, keep).Scan(&n))
+	require.Equal(t, 1, n, "非 devmon 资产不得被波及")
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM asset_clip_idx WHERE asset_id=?`, keep).Scan(&n))
+	require.Equal(t, 1, n)
 }

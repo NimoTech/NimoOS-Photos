@@ -12,6 +12,34 @@ ML_CACHE="${PHOTOS_DATA}/ml-cache"
 IMAGE_TAR="${HERE}/immich-ml.tar"
 MODELS_TAR="${HERE}/ml-models.tar.gz"
 IMAGE_REF="localhost/nimoos-photos-ml:bundled"
+
+# ── flavor 与核显自动识别 ────────────────────────────────────────────────
+FLAVOR="$(cat "${HERE}/FLAVOR" 2>/dev/null || echo cpu)"
+
+detect_gpu_vendor() {
+  local f v
+  for f in /sys/class/drm/card*/device/vendor; do
+    [[ -r "$f" ]] || continue
+    v="$(cat "$f")"
+    case "$v" in
+      0x8086) echo intel; return ;;
+      0x1002) echo amd;   return ;;
+    esac
+  done
+  echo none
+}
+
+VENDOR="$(detect_gpu_vendor)"
+echo "==> 分发包 flavor=${FLAVOR},检测到核显厂商=${VENDOR}"
+case "${FLAVOR}" in
+  openvino)
+    [[ "${VENDOR}" == intel ]] || { echo "✗ openvino 包需要 Intel 核显(检测到 ${VENDOR}),请使用对应平台的分发包" >&2; exit 1; } ;;
+  rocm)
+    [[ "${VENDOR}" == amd ]]   || { echo "✗ rocm 包需要 AMD 核显(检测到 ${VENDOR}),请使用对应平台的分发包" >&2; exit 1; } ;;
+  cpu) : ;;
+  *) echo "✗ 未知 flavor: ${FLAVOR}" >&2; exit 1 ;;
+esac
+
 PING_URL="http://127.0.0.1:3003/ping"
 PING_TIMEOUT=120   # 秒
 FORCE_MODELS="${FORCE_MODELS:-}"   # =1 强制覆盖已存在的模型缓存
@@ -24,6 +52,14 @@ docker load -i "${IMAGE_TAR}"
 echo "==> [2/5] 部署 compose 到 ${APP_DIR} ..."
 mkdir -p "${APP_DIR}" "${ML_CACHE}"
 cp "${HERE}/docker-compose.yml" "${APP_DIR}/docker-compose.yml"
+
+COMPOSE_FILES=(-f "${APP_DIR}/docker-compose.yml")
+if [[ "${FLAVOR}" != cpu ]]; then
+  cp "${HERE}/overrides/${FLAVOR}.yml" "${APP_DIR}/docker-compose.override.yml"
+  COMPOSE_FILES+=(-f "${APP_DIR}/docker-compose.override.yml")
+else
+  rm -f "${APP_DIR}/docker-compose.override.yml"
+fi
 
 # 模型缓存：包内带 ml-models.tar.gz 则铺进 ml-cache，实现首跑零联网。
 # 已存在模型则跳过（幂等、再跑很快），FORCE_MODELS=1 可强制覆盖。
@@ -42,7 +78,7 @@ fi
 
 # 项目名固定用 APP_ID，容器名才与其它机器一致（nimoos-photos-ml-immich-machine-learning-1）。
 echo "==> [4/5] 启动 ${APP_ID} ..."
-docker compose -p "${APP_ID}" -f "${APP_DIR}/docker-compose.yml" up -d
+docker compose -p "${APP_ID}" "${COMPOSE_FILES[@]}" up -d
 
 echo "==> [5/5] 等待 ML 就绪（最多 ${PING_TIMEOUT}s，轮询 ${PING_URL}）..."
 deadline=$(( SECONDS + PING_TIMEOUT ))
