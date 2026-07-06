@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -25,7 +26,7 @@ func TestHandleCreatedPathsEnqueuesFilesAndWalksDirs(t *testing.T) {
 	defer db.Close()
 	ix := NewIndexer(db, nil, t.TempDir(), 1)
 
-	handleCreatedPaths(ix, []string{album, single, junk, filepath.Join(dir, "gone.jpg")})
+	handleCreatedPaths(context.Background(), ix, []string{album, single, junk, filepath.Join(dir, "gone.jpg")})
 
 	// Enqueue records each accepted path in ix.seen (sync.Map) and never removes
 	// it on the success path (queue is buffered, workers aren't started here), so
