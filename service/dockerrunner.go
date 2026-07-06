@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"fmt"
 	"os/exec"
 	"strings"
 	"time"
@@ -16,6 +17,9 @@ func (dockerRunner) IsRunning(ctx context.Context, name string) (bool, error) {
 	defer cancel()
 	out, err := exec.CommandContext(ctx, "docker", "inspect", "-f", "{{.State.Running}}", name).Output()
 	if err != nil {
+		if ee, ok := err.(*exec.ExitError); ok {
+			return false, fmt.Errorf("docker inspect %s: %w: %s", name, err, ee.Stderr)
+		}
 		return false, err
 	}
 	return strings.TrimSpace(string(out)) == "true", nil
@@ -25,5 +29,9 @@ func (dockerRunner) Restart(ctx context.Context, name string) error {
 	// 给足 90s:停容器 30s 宽限 + 冷启动拉起
 	ctx, cancel := context.WithTimeout(ctx, 90*time.Second)
 	defer cancel()
-	return exec.CommandContext(ctx, "docker", "restart", "-t", "30", name).Run()
+	out, err := exec.CommandContext(ctx, "docker", "restart", "-t", "30", name).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("docker restart %s: %w: %s", name, err, out)
+	}
+	return nil
 }

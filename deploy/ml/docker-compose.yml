@@ -26,7 +26,7 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 180s
+      start_period: 300s # 对齐 MACHINE_LEARNING_WORKER_TIMEOUT,避免冷加载慢时误报 unhealthy
     labels:
       nimoos.system: "true"            # hide from the user-facing App grid
       nimoos.display_name: "Photos AI" # friendly name in UI / container stats

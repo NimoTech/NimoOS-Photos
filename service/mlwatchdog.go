@@ -55,7 +55,12 @@ func (w *MLWatchdog) Tick(ctx context.Context) bool {
 		return false
 	}
 	running, err := w.runner.IsRunning(ctx, w.container)
-	if err != nil || !running {
+	if err != nil {
+		zap.L().Warn("ml watchdog: docker inspect failed, cannot confirm container state",
+			zap.String("container", w.container), zap.Error(err))
+		return false
+	}
+	if !running {
 		// ML 离线包未安装、或用户手动停了容器:不接管,也不刷屏
 		return false
 	}
