@@ -2,12 +2,14 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/fsnotify/fsnotify"
 	"github.com/stretchr/testify/require"
 )
 
@@ -289,6 +291,36 @@ func TestWatcherRestartSwitchesWatchDirs(t *testing.T) {
 		return assetIndexed(t, idx, oldFile2)
 	}, 1500*time.Millisecond, 100*time.Millisecond,
 		"oldDir must not be watched after Restart")
+}
+
+// TestHandleWatchErrorOverflowTriggersRescan verifies fsnotify.ErrEventOverflow
+// (the inotify event queue overflowing, which silently drops events) triggers
+// an async recovery rescan of all watch roots so files whose events were lost
+// still get indexed eventually. A non-overflow error must NOT trigger a
+// rescan (and must not panic).
+func TestHandleWatchErrorOverflowTriggersRescan(t *testing.T) {
+	root := t.TempDir()
+	preFile := filepath.Join(root, "a.jpg")
+	writeFile(t, preFile, "pre-existing")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	w, idx := newWatcherTestHarness(t, ctx, []string{root})
+	w.roots = []string{root}
+
+	// Non-overflow error: must not panic and must not trigger a rescan.
+	w.handleWatchError(context.Background(), errors.New("boom"))
+	require.Never(t, func() bool {
+		return assetIndexed(t, idx, preFile)
+	}, 500*time.Millisecond, 50*time.Millisecond,
+		"a non-overflow watch error must not trigger a rescan")
+
+	w.handleWatchError(context.Background(), fsnotify.ErrEventOverflow)
+	require.Eventually(t, func() bool {
+		return assetIndexed(t, idx, preFile)
+	}, 5*time.Second, 100*time.Millisecond,
+		"queue overflow must trigger a rescan that (re-)enqueues existing files")
 }
 
 func TestWalkSupportedHonorsCtxCancel(t *testing.T) {

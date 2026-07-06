@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 
 	"github.com/fsnotify/fsnotify"
@@ -32,6 +33,16 @@ type Watcher struct {
 	liveDir   string
 	cancel    context.CancelFunc
 	mu        sync.Mutex
+
+	// roots holds the resolved watch roots as of the last Start (see
+	// resolveWatchDirRoot) — the same paths addRecursiveWatch was called
+	// with. handleWatchError re-walks these on an inotify queue overflow.
+	roots []string
+	// overflowRescanning single-flights the overflow recovery rescan:
+	// overflow errors tend to arrive in bursts, and only one rescan needs
+	// to be in flight at a time (walkSupported + Indexer.Enqueue are
+	// idempotent, so a rescan already covers anything a second one would).
+	overflowRescanning atomic.Bool
 }
 
 // NewWatcher creates a new Watcher.
@@ -74,13 +85,18 @@ func (w *Watcher) Start(parentCtx context.Context) {
 	defer wg.Wait()
 
 	totalWatches := 0
+	resolvedRoots := make([]string, 0, len(dirs))
 	for _, dir := range dirs {
 		root, ok := resolveWatchDirRoot(dir)
 		if !ok {
 			continue
 		}
+		resolvedRoots = append(resolvedRoots, root)
 		totalWatches += addRecursiveWatch(ctx, fw, root)
 	}
+	w.mu.Lock()
+	w.roots = resolvedRoots
+	w.mu.Unlock()
 	zap.L().Info("watcher: started",
 		zap.Strings("watchDirs", dirs), zap.Int("watches", totalWatches))
 
@@ -97,9 +113,34 @@ func (w *Watcher) Start(parentCtx context.Context) {
 			if !ok {
 				return
 			}
-			zap.L().Warn("watcher: fsnotify error", zap.Error(watchErr))
+			w.handleWatchError(ctx, watchErr)
 		}
 	}
+}
+
+// handleWatchError:inotify 队列溢出意味着事件已经丢失,唯一可靠的恢复
+// 是对所有根做一次补扫(Enqueue 幂等,重复入队无害)。单飞防抖:溢出
+// 往往连环出现,补扫进行中忽略后续溢出。
+func (w *Watcher) handleWatchError(ctx context.Context, err error) {
+	if !errors.Is(err, fsnotify.ErrEventOverflow) {
+		zap.L().Warn("watcher: fsnotify error", zap.Error(err))
+		return
+	}
+	if !w.overflowRescanning.CompareAndSwap(false, true) {
+		return
+	}
+	zap.L().Warn("watcher: event queue overflow — starting recovery rescan")
+	w.mu.Lock()
+	roots := append([]string(nil), w.roots...)
+	w.mu.Unlock()
+	go func() {
+		defer w.overflowRescanning.Store(false)
+		for _, root := range roots {
+			if err := walkSupported(ctx, root, func(p string) { w.indexer.Enqueue(p) }); err != nil && !errors.Is(err, context.Canceled) {
+				zap.L().Warn("watcher: overflow rescan failed", zap.String("root", root), zap.Error(err))
+			}
+		}
+	}()
 }
 
 // handleEvent processes a single fsnotify event. Create is the only event
