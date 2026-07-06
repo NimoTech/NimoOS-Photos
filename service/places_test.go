@@ -261,6 +261,90 @@ func TestCoverOverridesBatch(t *testing.T) {
 	require.Empty(t, svc.CoverOverrides("nobody"))
 }
 
+// TestTopFacesExcludesLivePhotoCompanionVideo verifies that a live photo's
+// auto-generated companion video (is_live_photo_video=1) does not inflate a
+// person's face count/ranking in a place's "companions" insight. "Live" has a
+// real still photo (1 face) plus a companion video carrying 2 more face rows
+// for the same person — if those video-face rows were still counted, Live's
+// count (3) would beat Competitor's (2) and knock Competitor out of the
+// top-2 companions; once excluded, Live's true count (1) loses to Competitor
+// (2) and Live drops out instead, with no counts tying (deterministic).
+func TestTopFacesExcludesLivePhotoCompanionVideo(t *testing.T) {
+	db, err := sqlite.Open(filepath.Join(t.TempDir(), "t.db"))
+	require.NoError(t, err)
+	defer db.Close()
+	gaz, err := geo.Load()
+	require.NoError(t, err)
+	geoSvc := service.NewGeoService(db, gaz)
+
+	const lat, lon = 35.6895, 139.6917 // Tokyo
+
+	mkAsset := func(id string, isLive bool) {
+		live := 0
+		if isLive {
+			live = 1
+		}
+		_, err := db.Exec(`INSERT INTO assets(id,file_path,status,taken_at,is_live_photo_video)
+			VALUES(?,?, 'indexed', '2026-01-01 00:00:00', ?)`, id, "/x/"+id, live)
+		require.NoError(t, err)
+		_, err = db.Exec(`INSERT INTO asset_exif(asset_id,latitude,longitude) VALUES(?,?,?)`, id, lat, lon)
+		require.NoError(t, err)
+		require.NoError(t, geoSvc.GeocodeAsset(id))
+	}
+	mkFace := func(faceID, assetID, personID string) {
+		_, err := db.Exec(`INSERT INTO face_detections(id,asset_id,bbox,embedding) VALUES(?,?,'{}',X'00000000')`, faceID, assetID)
+		require.NoError(t, err)
+		_, err = db.Exec(`INSERT INTO face_person(face_id,person_id) VALUES(?,?)`, faceID, personID)
+		require.NoError(t, err)
+	}
+
+	_, err = db.Exec(`INSERT INTO persons(id,name) VALUES('p-live','Live'),('p-comp','Competitor'),('p-fill','Filler')`)
+	require.NoError(t, err)
+
+	// Filler: 5 distinct real photos → count=5, always tops the ranking.
+	for i := 1; i <= 5; i++ {
+		id := fmt.Sprintf("fill%d", i)
+		mkAsset(id, false)
+		mkFace("f-fill-"+id, id, "p-fill")
+	}
+	// Competitor: 2 distinct real photos → count=2, stable.
+	for i := 1; i <= 2; i++ {
+		id := fmt.Sprintf("comp%d", i)
+		mkAsset(id, false)
+		mkFace("f-comp-"+id, id, "p-comp")
+	}
+	// Live: 1 real still photo (true count=1) + 1 companion video carrying 2
+	// face rows for the same person (would inflate the count to 3 if counted).
+	mkAsset("live_img", false)
+	mkFace("f-live-img", "live_img", "p-live")
+	mkAsset("live_vid", true)
+	mkFace("f-live-vid-1", "live_vid", "p-live")
+	mkFace("f-live-vid-2", "live_vid", "p-live")
+
+	svc := service.NewPlacesService(db, gaz, geoSvc)
+	resp, err := svc.ListPlaces()
+	require.NoError(t, err)
+	require.NotEmpty(t, resp.Places)
+	cityKey := resp.Places[0].Key
+
+	detail, err := svc.GetPlace(cityKey)
+	require.NoError(t, err)
+
+	var names []string
+	found := false
+	for _, ins := range detail.Insights {
+		if ins.Key == "photos.places.insight.companions" {
+			found = true
+			raw, ok := ins.Params["names"].([]string)
+			require.True(t, ok, "companions insight params must carry a []string names slice")
+			names = raw
+		}
+	}
+	require.True(t, found, "expected a companions insight")
+	require.Equal(t, []string{"Filler", "Competitor"}, names,
+		"Live's companion-video face rows must not inflate its count past Competitor's real count")
+}
+
 func TestCreateAlbumFromPlace(t *testing.T) {
 	db, err := sqlite.Open(filepath.Join(t.TempDir(), "t.db"))
 	require.NoError(t, err)

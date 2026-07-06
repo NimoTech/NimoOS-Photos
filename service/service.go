@@ -193,6 +193,10 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 	// Periodic scans remain the durable safety net; this is a best-effort fast path.
 	go StartMediaDeletedSubscriber(parentCtx, cfg.RuntimePath, idx)
 
+	// Real-time creation subscriber: index newly landed files (upload/copy/move)
+	// the moment NimoOS reports them. 独立连接:主服务未升级时自退避,不连累 deleted。
+	go StartMediaCreatedSubscriber(parentCtx, cfg.RuntimePath, idx)
+
 	// ML 后端自愈：worker 卡死（端口在听但 /ping 不应答）时自动 docker restart
 	mlWatchdog := NewMLWatchdog(ml.IsReady, dockerRunner{})
 	go mlWatchdog.Run(parentCtx)

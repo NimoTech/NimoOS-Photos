@@ -858,6 +858,45 @@ func TestAlbumAssetCountExcludesOfflineAndTrashed(t *testing.T) {
 	require.Len(t, assets, albums[0].AssetCount, "徽章数必须与打开相册看到的张数一致")
 }
 
+// --- Cover fallback chain must exclude offline/deleted assets ---
+
+// TestAlbumCoverFallbackChainExcludesOfflineAssets verifies that when the
+// explicit cover_asset_id points at an offline asset, the cover resolution
+// skips it (rather than surfacing an offline cover), and when falling back
+// to the first-by-position member, that fallback also skips offline members.
+func TestAlbumCoverFallbackChainExcludesOfflineAssets(t *testing.T) {
+	db, err := sqlite.Open(filepath.Join(t.TempDir(), "test.db"))
+	require.NoError(t, err)
+	defer db.Close()
+
+	_, err = db.Exec(`INSERT INTO assets(id, file_path, status) VALUES
+		('offline','/media/X/1.jpg','indexed'),
+		('online','/g/2.jpg','indexed')`)
+	require.NoError(t, err)
+	_, err = db.Exec(`UPDATE assets SET offline=1 WHERE id='offline'`)
+	require.NoError(t, err)
+
+	_, err = db.Exec(`INSERT INTO albums(id, name, cover_asset_id, created_at) VALUES('al','Cover Fallback','offline',CURRENT_TIMESTAMP)`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO album_assets(album_id, asset_id, position) VALUES
+		('al','offline',0),
+		('al','online',1)`)
+	require.NoError(t, err)
+
+	svc := service.NewAlbumService(db)
+
+	got, err := svc.Get("al")
+	require.NoError(t, err)
+	require.Equal(t, "online", got.CoverAssetID,
+		"cover fallback chain must skip the offline explicit cover and the offline first-position member")
+
+	albums, err := svc.List()
+	require.NoError(t, err)
+	require.Len(t, albums, 1)
+	require.Equal(t, "online", albums[0].CoverAssetID,
+		"List cover fallback chain must also skip offline assets")
+}
+
 func TestAlbumListPhotoVideoCountsExcludeLiveAndTrashed(t *testing.T) {
 	db, err := sqlite.Open(filepath.Join(t.TempDir(), "test.db"))
 	require.NoError(t, err)
