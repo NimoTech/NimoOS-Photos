@@ -9,11 +9,20 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
+	"time"
 
 	"github.com/fsnotify/fsnotify"
 	"go.uber.org/zap"
 )
+
+// overflowRescanCooldown 限制两次溢出补扫之间的最小间隔:写入风暴期间
+// inotify 队列会连环溢出,单飞(overflowRescanning)只防止并发,不防止
+// 补扫刚结束、下一次溢出又立刻触发——每次全树补扫都是一次 IO 开销,风暴期
+// 内的连环溢出应合并进冷却期内已完成/正在进行的这一轮,交给周期性
+// ScanDirectory 兜底覆盖剩余未扫到的变更。
+const overflowRescanCooldown = 5 * time.Minute
 
 // Watcher monitors directories for new or modified media files and enqueues
 // them for indexing. It also provides live-photo pairing via PairLivePhotos.
@@ -32,6 +41,27 @@ type Watcher struct {
 	liveDir   string
 	cancel    context.CancelFunc
 	mu        sync.Mutex
+
+	// roots holds the resolved watch roots as of the last Start (see
+	// resolveWatchDirRoot) — the same paths addRecursiveWatch was called
+	// with. handleWatchError re-walks these on an inotify queue overflow.
+	roots []string
+	// overflowRescanning single-flights the overflow recovery rescan:
+	// overflow errors tend to arrive in bursts, and only one rescan needs
+	// to be in flight at a time (walkSupported + Indexer.Enqueue are
+	// idempotent, so a rescan already covers anything a second one would).
+	overflowRescanning atomic.Bool
+	// lastOverflowRescan 记录上一轮溢出补扫结束的 Unix 秒时间戳,配合
+	// overflowRescanCooldown 抑制写入风暴下的连环补扫。
+	lastOverflowRescan atomic.Int64
+	// walkInFlight tracks directories (keyed by withSep) whose trackNewDir
+	// recursive walk is currently running. A dense mkdir burst (e.g. an
+	// entire subtree being copied/moved in) can fire a Create event for
+	// every intermediate directory; without dedup each one spawns its own
+	// full recursive walk of the same subtree via addRecursiveWatch +
+	// walkSupported, multiplying IO for no benefit — the outermost walk
+	// already covers everything beneath it.
+	walkInFlight sync.Map
 }
 
 // NewWatcher creates a new Watcher.
@@ -74,13 +104,19 @@ func (w *Watcher) Start(parentCtx context.Context) {
 	defer wg.Wait()
 
 	totalWatches := 0
+	resolvedRoots := make([]string, 0, len(dirs))
 	for _, dir := range dirs {
 		root, ok := resolveWatchDirRoot(dir)
 		if !ok {
 			continue
 		}
-		totalWatches += addRecursiveWatch(ctx, fw, root)
+		resolvedRoots = append(resolvedRoots, root)
+		added, _ := addRecursiveWatch(ctx, fw, root)
+		totalWatches += added
 	}
+	w.mu.Lock()
+	w.roots = resolvedRoots
+	w.mu.Unlock()
 	zap.L().Info("watcher: started",
 		zap.Strings("watchDirs", dirs), zap.Int("watches", totalWatches))
 
@@ -97,9 +133,42 @@ func (w *Watcher) Start(parentCtx context.Context) {
 			if !ok {
 				return
 			}
-			zap.L().Warn("watcher: fsnotify error", zap.Error(watchErr))
+			w.handleWatchError(ctx, &wg, watchErr)
 		}
 	}
+}
+
+// handleWatchError:inotify 队列溢出意味着事件已经丢失,唯一可靠的恢复
+// 是对所有根做一次补扫(Enqueue 幂等,重复入队无害)。单飞防抖:溢出
+// 往往连环出现,补扫进行中忽略后续溢出。
+func (w *Watcher) handleWatchError(ctx context.Context, wg *sync.WaitGroup, err error) {
+	if !errors.Is(err, fsnotify.ErrEventOverflow) {
+		zap.L().Warn("watcher: fsnotify error", zap.Error(err))
+		return
+	}
+	if time.Now().Unix()-w.lastOverflowRescan.Load() < int64(overflowRescanCooldown/time.Second) {
+		return // 风暴期内的连环溢出合并进上一轮补扫,交给周期扫描兜底
+	}
+	if !w.overflowRescanning.CompareAndSwap(false, true) {
+		return
+	}
+	zap.L().Warn("watcher: event queue overflow — starting recovery rescan")
+	w.mu.Lock()
+	roots := append([]string(nil), w.roots...)
+	w.mu.Unlock()
+	// Tracked by wg (like trackNewDir's goroutines) so Start() cannot return
+	// and close fw while this rescan is still running.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer w.overflowRescanning.Store(false)
+		defer w.lastOverflowRescan.Store(time.Now().Unix())
+		for _, root := range roots {
+			if err := walkSupported(ctx, root, func(p string) { w.indexer.Enqueue(p) }); err != nil && !errors.Is(err, context.Canceled) {
+				zap.L().Warn("watcher: overflow rescan failed", zap.String("root", root), zap.Error(err))
+			}
+		}
+	}()
 }
 
 // handleEvent processes a single fsnotify event. Create is the only event
@@ -160,32 +229,74 @@ func (w *Watcher) trackNewDir(ctx context.Context, fw *fsnotify.Watcher, dir str
 	if strings.HasPrefix(filepath.Base(dir), ".") {
 		return
 	}
-	added := addRecursiveWatch(ctx, fw, dir)
-	if added == 0 {
-		// Nothing was watched: the directory is excluded (scanExcludeDirs /
-		// IsExcludedMount), vanished before the walk ran, or every fw.Add
-		// failed (permissions, inotify quota). Either way there is no watch
-		// coverage, so skip the catch-up scan too — it would only index files
-		// whose future changes we then cannot track.
+	key := withSep(dir)
+	// ancestorCovered must be evaluated BEFORE this directory registers its
+	// own key below — walkCovered does a prefix match, so checking it any
+	// later would trivially match dir against itself (every string is a
+	// prefix of itself) and wrongly report "covered" on every single call,
+	// permanently disabling the catch-up scan. Evaluated here, it only
+	// reflects whether a genuine ANCESTOR walk is already in flight.
+	ancestorCovered := w.walkCovered(dir)
+	w.walkInFlight.Store(key, struct{}{})
+	defer w.walkInFlight.Delete(key)
+
+	// addRecursiveWatch always runs, even when ancestorCovered is true:
+	// filepath.WalkDir is a single pre-order pass, so an ancestor's
+	// in-flight walk may already have snapshotted this directory's parent
+	// before `dir` existed — meaning the ancestor's walk will never revisit
+	// it. Skipping the watch here (as a prior version of this function did)
+	// left such directories permanently unwatched: any file dropped into
+	// them afterward would go undetected until the next full 24h rescan.
+	// fw.Add is cheap and idempotent, so calling it unconditionally is safe.
+	added, enospc := addRecursiveWatch(ctx, fw, dir)
+	if skipCatchupScan(added, enospc) {
+		// 目录被排除(scanExcludeDirs/IsExcludedMount)或 walk 前已消失:
+		// 没有 watch 覆盖也没有内容需要索引。
 		return
+	}
+	if enospc && added == 0 {
+		zap.L().Warn("watcher: no watches added (inotify quota) — indexing catch-up still runs, future changes untracked until quota raised",
+			zap.String("dir", dir))
 	}
 	zap.L().Info("watcher: now watching new directory",
 		zap.String("dir", dir), zap.Int("watches", added))
 
+	// Dedup only applies to the redundant catch-up INDEX scan below: if an
+	// ancestor's walk is already in flight, it will walk this subtree too
+	// and enqueue everything under it, so re-walking here for indexing is
+	// wasted IO. Watch coverage above is never skipped by this dedup.
+	if ancestorCovered {
+		return
+	}
 	// walkSupported (service/indexer.go) already encodes the same
 	// hidden/scanExcludeDirs skip rules used by the full scanner, so the
 	// catch-up scan can't index anything the periodic scan would have
 	// skipped either.
-	if err := walkSupported(dir, func(path string) {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
+	if err := walkSupported(ctx, dir, func(path string) {
 		w.indexer.Enqueue(path)
-	}); err != nil {
+	}); err != nil && !errors.Is(err, context.Canceled) {
 		zap.L().Warn("watcher: catch-up scan failed", zap.String("dir", dir), zap.Error(err))
 	}
+}
+
+// withSep 规整目录键,保证前缀判断不会把 /a/bc 误判为 /a/b 的子目录
+func withSep(dir string) string {
+	return strings.TrimRight(dir, string(filepath.Separator)) + string(filepath.Separator)
+}
+
+// walkCovered reports whether dir itself or any ancestor already has a
+// recursive walk in flight(祖先的 WalkDir 必然覆盖 dir,重复走只是放大 IO)。
+func (w *Watcher) walkCovered(dir string) bool {
+	key := withSep(dir)
+	covered := false
+	w.walkInFlight.Range(func(k, _ any) bool {
+		if strings.HasPrefix(key, k.(string)) {
+			covered = true
+			return false
+		}
+		return true
+	})
+	return covered
 }
 
 // addRecursiveWatch walks root and adds an inotify watch on root itself and
@@ -217,9 +328,12 @@ func (w *Watcher) trackNewDir(ctx context.Context, fw *fsnotify.Watcher, dir str
 // A single directory failing to be added (permission error, or the inotify
 // watch quota being exhausted) is logged as a warning and does not abort the
 // walk — sibling and descendant directories are still attempted. Returns the
-// number of directories successfully added.
-func addRecursiveWatch(ctx context.Context, fw *fsnotify.Watcher, root string) int {
+// number of directories successfully added, and whether any fw.Add call hit
+// ENOSPC (inotify watch quota exhausted). Callers must not treat added==0
+// alone as "nothing to do here" — see skipCatchupScan.
+func addRecursiveWatch(ctx context.Context, fw *fsnotify.Watcher, root string) (int, bool) {
 	added := 0
+	enospc := false
 	enospcWarned := false
 	_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		select {
@@ -250,6 +364,7 @@ func addRecursiveWatch(ctx context.Context, fw *fsnotify.Watcher, root string) i
 		}
 		if addErr := fw.Add(path); addErr != nil {
 			if errors.Is(addErr, syscall.ENOSPC) {
+				enospc = true
 				if !enospcWarned {
 					zap.L().Warn("watcher: inotify watch limit reached — raise fs.inotify.max_user_watches",
 						zap.String("dir", path), zap.Error(addErr))
@@ -264,7 +379,19 @@ func addRecursiveWatch(ctx context.Context, fw *fsnotify.Watcher, root string) i
 		added++
 		return nil
 	})
-	return added
+	return added, enospc
+}
+
+// skipCatchupScan decides whether trackNewDir should skip its one-time
+// catch-up scan after addRecursiveWatch. added==0 is ambiguous by itself: it
+// means either "no watch coverage was ever intended" (directory excluded via
+// scanExcludeDirs/IsExcludedMount, or it vanished before the walk ran — safe
+// to skip, there is nothing to index) or "every fw.Add call hit ENOSPC"
+// (inotify watch quota exhausted, but the directory and its files are real
+// and must still be indexed — only future-change tracking degrades until the
+// quota is raised). Only the former should skip the scan.
+func skipCatchupScan(added int, enospc bool) bool {
+	return added == 0 && !enospc
 }
 
 // resolveWatchDirRoot resolves an explicitly configured WatchDir for use as

@@ -224,3 +224,13 @@ func TestRebuildExcludesOfflineAssets(t *testing.T) {
 	require.Equal(t, int64(1), total, "offline 资产不应计入 rebuild 目标")
 	_ = onlineID
 }
+
+// TestShouldStampModelGen 验证:本轮一个文件都没真正用新模型重跑成功
+// (total>0 且全失败)时不得盖章 ml_model_gen，否则 modelGenStale 判定永远不再
+// 触发，MaybeAutoRebuild 失去自动重试机会（典型场景：模型换代恰逢移动盘整体离线）。
+func TestShouldStampModelGen(t *testing.T) {
+	require.True(t, shouldStampModelGen(10, 0))   // 全成功
+	require.True(t, shouldStampModelGen(10, 3))   // 部分失败:照常盖章
+	require.True(t, shouldStampModelGen(0, 0))    // 空库:盖章合法
+	require.False(t, shouldStampModelGen(10, 10)) // 全失败:不盖章
+}

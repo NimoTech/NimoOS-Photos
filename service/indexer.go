@@ -1071,11 +1071,27 @@ func sha256File(data []byte) string {
 
 // walkSupported recursively walks dir, calling fn for each supported media file.
 // Directories whose names begin with "." (e.g. .trash) are skipped entirely so
-// that soft-deleted files are never re-indexed.
-func walkSupported(dir string, fn func(path string)) error {
+// that soft-deleted files are never re-indexed. ctx is checked before each
+// filesystem entry is visited; if it is cancelled, the walk stops immediately
+// and returns ctx.Err() (context.Canceled / context.DeadlineExceeded).
+func walkSupported(ctx context.Context, dir string, fn func(path string)) error {
 	return filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+		select {
+		case <-ctx.Done():
+			return ctx.Err() // WalkDir 收到非 SkipDir 错误即整体终止
+		default:
+		}
 		if err != nil {
-			return err
+			// 2026-07-06 plan02 审查并入:单个条目不可读(权限/竞态删除/悬空链接)
+			// 只跳过该子树,不中止整棵遍历——此前 return err 会让排在坏条目之后的
+			// 全部文件错过本轮扫描/实时索引;根目录本身出错仍上抛让调用方知晓。
+			if path == dir {
+				return err
+			}
+			if d != nil && d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
 		}
 		if d.IsDir() {
 			if path != dir && strings.HasPrefix(d.Name(), ".") {
@@ -1107,7 +1123,7 @@ func walkSupported(dir string, fn func(path string)) error {
 func (ix *Indexer) ScanDirectory(dir string) error {
 	// First pass: collect all supported file paths to know the total.
 	var paths []string
-	if err := walkSupported(dir, func(p string) { paths = append(paths, p) }); err != nil {
+	if err := walkSupported(context.Background(), dir, func(p string) { paths = append(paths, p) }); err != nil {
 		return err
 	}
 
@@ -1290,6 +1306,11 @@ func (ix *Indexer) pruneMissingUnder(dir string) error {
 	if err := rows.Err(); err != nil {
 		return err
 	}
+	if len(gone) > 0 && !pruneDeleteAllowed(dir, ix.dirUnderMountedRoot) {
+		zap.L().Warn("pruneMissingUnder: mount state changed during scan, aborting prune",
+			zap.String("dir", dir), zap.Int("wouldDelete", len(gone)))
+		return nil
+	}
 	for _, r := range gone {
 		dropClipVector(ix.db, r.id) // before the cascade drops asset_clip_idx
 		if _, err := ix.db.Exec(`DELETE FROM assets WHERE id = ?`, r.id); err != nil {
@@ -1301,6 +1322,19 @@ func (ix *Indexer) pruneMissingUnder(dir string) error {
 		ix.seen.Delete(r.path)
 	}
 	return nil
+}
+
+// pruneDeleteAllowed re-validates right before the destructive pass:
+// stat 循环期间可移动盘可能被拔出,届时所有文件都 stat 失败,若不复核
+// 会把整棵子树的资产/向量/缩略图批量误删。
+func pruneDeleteAllowed(dir string, underMountedRoot func(string) bool) bool {
+	if !underMountedRoot(dir) {
+		return false
+	}
+	if _, err := os.Stat(dir); err != nil {
+		return false
+	}
+	return true
 }
 
 // dirUnderMountedRoot reports whether dir is one of (or lives under one of)

@@ -3,6 +3,7 @@ package service
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"image"
 	"os"
@@ -863,7 +864,7 @@ func (s *PersonService) FaceThumbnail(personID, cacheDir, thumbDir string) (stri
 SELECT fd.id, fd.bbox, a.file_path, COALESCE(a.mime_type,''), a.id, e.width, e.height
 FROM persons p
 JOIN face_detections fd ON fd.id=p.cover_face_id
-JOIN assets a ON a.id=fd.asset_id
+JOIN assets a ON a.id=fd.asset_id AND a.offline=0 AND a.deleted_at IS NULL
 LEFT JOIN asset_exif e ON e.asset_id=a.id
 WHERE p.id=? AND p.hidden=0`, personID).Scan(&faceID, &bbox, &srcPath, &mimeType, &assetID, &origW, &origH)
 	if err == sql.ErrNoRows {
@@ -896,6 +897,9 @@ WHERE p.id=? AND p.hidden=0`, personID).Scan(&faceID, &bbox, &srcPath, &mimeType
 	}
 	img, err := imaging.Open(srcPath, imaging.AutoOrientation(true))
 	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return "", ErrNotFound // 源文件已不在（拔盘/被删）：对外是 404 不是 500
+		}
 		return "", fmt.Errorf("FaceThumbnail open: %w", err)
 	}
 	w := img.Bounds().Dx()

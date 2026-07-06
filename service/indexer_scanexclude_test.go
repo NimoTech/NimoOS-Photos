@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"sort"
@@ -31,7 +32,7 @@ func TestWalkSupportedSkipsDATASystemDirs(t *testing.T) {
 	mk("lost+found/c.png")
 
 	var got []string
-	if err := walkSupported(data, func(p string) {
+	if err := walkSupported(context.Background(), data, func(p string) {
 		rel, _ := filepath.Rel(data, p)
 		got = append(got, rel)
 	}); err != nil {

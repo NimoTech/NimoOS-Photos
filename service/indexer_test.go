@@ -369,7 +369,7 @@ func TestScanDirectorySkipsHiddenDirs(t *testing.T) {
 	}
 
 	var collected []string
-	err := walkSupported(root, func(p string) { collected = append(collected, p) })
+	err := walkSupported(context.Background(), root, func(p string) { collected = append(collected, p) })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -510,17 +510,19 @@ func TestPruneMissingUnderSkipsWhenMountVanished(t *testing.T) {
 // offline=0 且文件确实消失的资产照常清理。
 func TestPruneMissingUnderKeepsOfflineAssets(t *testing.T) {
 	db := makeTestDB(t)
-	// 挂载名刻意用真实机器上不存在的目录:prune 只在 stat 报 ENOENT 时删行,
-	// 而本机真实存在的 /media/devmon 是 0700,stat 会报 EACCES 而非 ENOENT。
-	offID := insertAsset(t, db, "/media/nimoos-test-X/offline.jpg", "indexed")
-	onID := insertAsset(t, db, "/media/nimoos-test-X/deleted.jpg", "indexed")
+	// 挂载点用真实存在的空临时目录:pruneDeleteAllowed 在删除前会 os.Stat(dir)
+	// 复核目录本体仍存在(见 pruneDeleteAllowed),用不存在的虚构路径会让该复核
+	// 恒假、架空本用例;目录下的具体文件仍不创建,以保留"文件消失"语义。
+	mountDir := t.TempDir()
+	offID := insertAsset(t, db, filepath.Join(mountDir, "offline.jpg"), "indexed")
+	onID := insertAsset(t, db, filepath.Join(mountDir, "deleted.jpg"), "indexed")
 	_, err := db.Exec(`UPDATE assets SET offline=1 WHERE id=?`, offID)
 	require.NoError(t, err)
 
 	ix := NewIndexer(db, &mockML{}, t.TempDir(), 1)
-	ix.mountRoots = func() []string { return []string{"/DATA", "/media/nimoos-test-X"} }
+	ix.mountRoots = func() []string { return []string{"/DATA", mountDir} }
 
-	require.NoError(t, ix.pruneMissingUnder("/media/nimoos-test-X"))
+	require.NoError(t, ix.pruneMissingUnder(mountDir))
 
 	var n int
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM assets WHERE id=?`, offID).Scan(&n))
@@ -597,4 +599,13 @@ func TestPruneSystemMountAssetsPurgesDevmonAssets(t *testing.T) {
 	require.Equal(t, 1, n, "非 devmon 资产不得被波及")
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM asset_clip_idx WHERE asset_id=?`, keep).Scan(&n))
 	require.Equal(t, 1, n)
+}
+
+func TestPruneDeleteGuard(t *testing.T) {
+	dir := t.TempDir()
+	require.True(t, pruneDeleteAllowed(dir, func(string) bool { return true }))
+	// 目录本体已消失(拔盘后挂载点残影):禁止批删
+	require.False(t, pruneDeleteAllowed(filepath.Join(dir, "gone"), func(string) bool { return true }))
+	// 挂载复核失败:禁止批删
+	require.False(t, pruneDeleteAllowed(dir, func(string) bool { return false }))
 }
