@@ -1071,9 +1071,16 @@ func sha256File(data []byte) string {
 
 // walkSupported recursively walks dir, calling fn for each supported media file.
 // Directories whose names begin with "." (e.g. .trash) are skipped entirely so
-// that soft-deleted files are never re-indexed.
-func walkSupported(dir string, fn func(path string)) error {
+// that soft-deleted files are never re-indexed. ctx is checked before each
+// filesystem entry is visited; if it is cancelled, the walk stops immediately
+// and returns ctx.Err() (context.Canceled / context.DeadlineExceeded).
+func walkSupported(ctx context.Context, dir string, fn func(path string)) error {
 	return filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+		select {
+		case <-ctx.Done():
+			return ctx.Err() // WalkDir 收到非 SkipDir 错误即整体终止
+		default:
+		}
 		if err != nil {
 			return err
 		}
@@ -1107,7 +1114,7 @@ func walkSupported(dir string, fn func(path string)) error {
 func (ix *Indexer) ScanDirectory(dir string) error {
 	// First pass: collect all supported file paths to know the total.
 	var paths []string
-	if err := walkSupported(dir, func(p string) { paths = append(paths, p) }); err != nil {
+	if err := walkSupported(context.Background(), dir, func(p string) { paths = append(paths, p) }); err != nil {
 		return err
 	}
 

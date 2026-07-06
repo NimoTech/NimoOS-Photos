@@ -176,14 +176,9 @@ func (w *Watcher) trackNewDir(ctx context.Context, fw *fsnotify.Watcher, dir str
 	// hidden/scanExcludeDirs skip rules used by the full scanner, so the
 	// catch-up scan can't index anything the periodic scan would have
 	// skipped either.
-	if err := walkSupported(dir, func(path string) {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
+	if err := walkSupported(ctx, dir, func(path string) {
 		w.indexer.Enqueue(path)
-	}); err != nil {
+	}); err != nil && !errors.Is(err, context.Canceled) {
 		zap.L().Warn("watcher: catch-up scan failed", zap.String("dir", dir), zap.Error(err))
 	}
 }

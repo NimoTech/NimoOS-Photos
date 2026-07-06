@@ -369,7 +369,7 @@ func TestScanDirectorySkipsHiddenDirs(t *testing.T) {
 	}
 
 	var collected []string
-	err := walkSupported(root, func(p string) { collected = append(collected, p) })
+	err := walkSupported(context.Background(), root, func(p string) { collected = append(collected, p) })
 	if err != nil {
 		t.Fatal(err)
 	}

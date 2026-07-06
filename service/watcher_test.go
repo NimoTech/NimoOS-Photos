@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -288,4 +289,17 @@ func TestWatcherRestartSwitchesWatchDirs(t *testing.T) {
 		return assetIndexed(t, idx, oldFile2)
 	}, 1500*time.Millisecond, 100*time.Millisecond,
 		"oldDir must not be watched after Restart")
+}
+
+func TestWalkSupportedHonorsCtxCancel(t *testing.T) {
+	dir := t.TempDir()
+	for i := 0; i < 20; i++ {
+		require.NoError(t, os.WriteFile(filepath.Join(dir, fmt.Sprintf("f%02d.jpg", i)), []byte("x"), 0o644))
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // 进入前已取消:一个文件都不应回调
+	calls := 0
+	err := walkSupported(ctx, dir, func(string) { calls++ })
+	require.ErrorIs(t, err, context.Canceled)
+	require.Equal(t, 0, calls)
 }
