@@ -347,3 +347,22 @@ func TestSkipCatchupScan(t *testing.T) {
 	require.False(t, skipCatchupScan(3, false)) // 正常:不跳过
 	require.False(t, skipCatchupScan(3, true))  // 部分 ENOSPC:不跳过
 }
+
+// TestTrackNewDirDedup pins down walkCovered's semantics: a recursive walk
+// already in flight for an ancestor (or the directory itself) must be treated
+// as covering it, so a dense mkdir burst under that ancestor doesn't spawn
+// redundant overlapping walks.
+func TestTrackNewDirDedup(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w, _ := newWatcherTestHarness(t, ctx, nil) // reuse existing harness; nil watchDirs is fine
+	root := t.TempDir()
+	child := filepath.Join(root, "a", "b")
+	require.NoError(t, os.MkdirAll(child, 0o755))
+
+	// 手动占位:root 的 walk 在途
+	w.walkInFlight.Store(withSep(root), struct{}{})
+	require.True(t, w.walkCovered(child))        // 祖先在途 → 覆盖
+	require.True(t, w.walkCovered(root))         // 自身在途 → 覆盖
+	require.False(t, w.walkCovered(t.TempDir())) // 无关目录 → 不覆盖
+}

@@ -43,6 +43,14 @@ type Watcher struct {
 	// to be in flight at a time (walkSupported + Indexer.Enqueue are
 	// idempotent, so a rescan already covers anything a second one would).
 	overflowRescanning atomic.Bool
+	// walkInFlight tracks directories (keyed by withSep) whose trackNewDir
+	// recursive walk is currently running. A dense mkdir burst (e.g. an
+	// entire subtree being copied/moved in) can fire a Create event for
+	// every intermediate directory; without dedup each one spawns its own
+	// full recursive walk of the same subtree via addRecursiveWatch +
+	// walkSupported, multiplying IO for no benefit — the outermost walk
+	// already covers everything beneath it.
+	walkInFlight sync.Map
 }
 
 // NewWatcher creates a new Watcher.
@@ -202,6 +210,12 @@ func (w *Watcher) trackNewDir(ctx context.Context, fw *fsnotify.Watcher, dir str
 	if strings.HasPrefix(filepath.Base(dir), ".") {
 		return
 	}
+	key := withSep(dir)
+	if w.walkCovered(dir) {
+		return
+	}
+	w.walkInFlight.Store(key, struct{}{})
+	defer w.walkInFlight.Delete(key)
 	added, enospc := addRecursiveWatch(ctx, fw, dir)
 	if skipCatchupScan(added, enospc) {
 		// 目录被排除(scanExcludeDirs/IsExcludedMount)或 walk 前已消失:
@@ -224,6 +238,26 @@ func (w *Watcher) trackNewDir(ctx context.Context, fw *fsnotify.Watcher, dir str
 	}); err != nil && !errors.Is(err, context.Canceled) {
 		zap.L().Warn("watcher: catch-up scan failed", zap.String("dir", dir), zap.Error(err))
 	}
+}
+
+// withSep 规整目录键,保证前缀判断不会把 /a/bc 误判为 /a/b 的子目录
+func withSep(dir string) string {
+	return strings.TrimRight(dir, string(filepath.Separator)) + string(filepath.Separator)
+}
+
+// walkCovered reports whether dir itself or any ancestor already has a
+// recursive walk in flight(祖先的 WalkDir 必然覆盖 dir,重复走只是放大 IO)。
+func (w *Watcher) walkCovered(dir string) bool {
+	key := withSep(dir)
+	covered := false
+	w.walkInFlight.Range(func(k, _ any) bool {
+		if strings.HasPrefix(key, k.(string)) {
+			covered = true
+			return false
+		}
+		return true
+	})
+	return covered
 }
 
 // addRecursiveWatch walks root and adds an inotify watch on root itself and
