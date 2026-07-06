@@ -82,13 +82,19 @@ func TestParseScoreVariantsUnsupported(t *testing.T) {
 	d := parserDB(t)
 	for _, raw := range []string{
 		"score>=80", "score >= 80", "score≥80", "score>80", "score = 80", "SCORE>=80",
+		"score 80", // 无比较符的裸数字写法,曾在旧版 "score " 前缀枚举里被拦下
 	} {
 		got := ParseConditions(d, []string{raw})
 		require.Len(t, got, 1)
 		require.Equal(t, condUnsupported, got[0].Kind, "raw=%q 应被拦截为 unsupported 而非落入语义查询", raw)
 	}
 	// 反例:以 score 开头的正常语义词不应误伤
-	got := ParseConditions(d, []string{"scoreboard at the stadium"})
-	require.Len(t, got, 1)
-	require.NotEqual(t, condUnsupported, got[0].Kind)
+	for _, raw := range []string{
+		"scoreboard at the stadium",
+		"score of the game",
+	} {
+		got := ParseConditions(d, []string{raw})
+		require.Len(t, got, 1)
+		require.NotEqual(t, condUnsupported, got[0].Kind, "raw=%q 不应被误伤为 unsupported", raw)
+	}
 }

@@ -31,10 +31,11 @@ var unsupportedPrefixes = []string{
 	"older than", "amount detected",
 }
 
-// scoreCondRe：score 后跟（可选空白 +）比较符的任意变体。
-// 之前用前缀字面量枚举（"score "/"score≥"/"score >="），漏掉了无空格的
-// "score>=80" 这类写法，导致其落入语义查询产生错乱结果。
-var scoreCondRe = regexp.MustCompile(`^score\s*(>=|<=|==|=|≥|≤|>|<)`)
+// scoreCondRe：score 后跟（可选空白 +）比较符的任意变体，或裸数字（无比较符，
+// 如 "score 80"）。之前用前缀字面量枚举（"score "/"score≥"/"score >="），漏掉了
+// 无空格的 "score>=80" 这类写法；改成比较符正则后又丢了旧版能拦的裸数字写法
+// "score 80"——两者都要拦，同时保留 "score of the game" 这类正常语义词不误伤。
+var scoreCondRe = regexp.MustCompile(`^score(\s*(>=|<=|==|=|≥|≤|>|<)|\s+\d)`)
 
 var (
 	// "year: 2024" 显式前缀，或裸年份 "2024"（与搜索链路的
