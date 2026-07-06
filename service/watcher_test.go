@@ -211,6 +211,48 @@ func TestWatcherWatchDirSymlinkRoot(t *testing.T) {
 		"a WatchDir configured as a symlink must still be watched (resolved)")
 }
 
+// TestWatcherRuntimeSymlinkDirNotTracked is the regression test for the
+// symlink-resolution leak (same shape as the hidden-dir root-exemption leak):
+// EvalSymlinks living inside the shared addRecursiveWatch meant a symlink to
+// a directory created at runtime inside a watched tree got resolved and its
+// ENTIRE external target tree recursively watched and indexed — a symlink
+// pointing at / would watch nearly the whole filesystem, blow the inotify
+// quota, and pull out-of-library content into the DB, diverging from the
+// periodic scan (walkSupported never follows symlinks). Only explicitly
+// configured WatchDir roots may be resolved (in Start); dynamically
+// discovered directories keep WalkDir's lstat semantics and are simply not
+// tracked when they are symlinks.
+func TestWatcherRuntimeSymlinkDirNotTracked(t *testing.T) {
+	root := t.TempDir()
+	external, err := filepath.EvalSymlinks(t.TempDir())
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	w, idx := newWatcherTestHarness(t, ctx, []string{root})
+	go w.Start(ctx)
+
+	// Warmup: prove the watcher is alive before asserting a negative.
+	warmFile := filepath.Join(root, "warmup.jpg")
+	require.Eventually(t, func() bool {
+		writeFile(t, warmFile, "warm")
+		return assetIndexed(t, idx, warmFile)
+	}, 5*time.Second, 100*time.Millisecond, "warmup file must be indexed")
+
+	// Runtime symlink inside the watched tree, pointing at an external dir.
+	linkDir := filepath.Join(root, "linkdir")
+	require.NoError(t, os.Symlink(external, linkDir))
+
+	externalFile := filepath.Join(external, "outside.jpg")
+	linkFile := filepath.Join(linkDir, "outside.jpg")
+	require.Never(t, func() bool {
+		writeFile(t, externalFile, "outside")
+		return assetIndexed(t, idx, externalFile) || assetIndexed(t, idx, linkFile)
+	}, 1500*time.Millisecond, 100*time.Millisecond,
+		"a runtime symlink to an external directory must not pull its tree into the index")
+}
+
 // TestWatcherRestartSwitchesWatchDirs verifies the hot-reload path: after
 // Restart, the new WatchDirs take effect and the old ones stop triggering.
 func TestWatcherRestartSwitchesWatchDirs(t *testing.T) {

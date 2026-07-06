@@ -75,7 +75,11 @@ func (w *Watcher) Start(parentCtx context.Context) {
 
 	totalWatches := 0
 	for _, dir := range dirs {
-		totalWatches += addRecursiveWatch(ctx, fw, dir)
+		root, ok := resolveWatchDirRoot(dir)
+		if !ok {
+			continue
+		}
+		totalWatches += addRecursiveWatch(ctx, fw, root)
 	}
 	zap.L().Info("watcher: started",
 		zap.Strings("watchDirs", dirs), zap.Int("watches", totalWatches))
@@ -198,26 +202,23 @@ func (w *Watcher) trackNewDir(ctx context.Context, fw *fsnotify.Watcher, dir str
 //     /media/devmon/USB1 as a WatchDir would otherwise get it watched even
 //     though the rest of the codebase treats that mount as off-limits.
 //
+// addRecursiveWatch never follows symlinks: filepath.WalkDir uses lstat
+// semantics throughout, so a symlink — whether it is root itself or appears
+// anywhere in the tree — contributes zero watches. This is deliberate and
+// mirrors walkSupported (the periodic scan): resolving symlinks here would
+// let a runtime symlink created inside a watched tree (Create event →
+// trackNewDir → this function) pull its ENTIRE external target tree into
+// watching and indexing — a symlink to / would watch nearly the whole
+// filesystem, exhaust the inotify quota, and index out-of-library content
+// the scan would never touch. Explicitly configured WatchDirs that are
+// symlinks are the one sanctioned exception, resolved by the caller in
+// Start via resolveWatchDirRoot BEFORE this function runs.
+//
 // A single directory failing to be added (permission error, or the inotify
 // watch quota being exhausted) is logged as a warning and does not abort the
 // walk — sibling and descendant directories are still attempted. Returns the
 // number of directories successfully added.
 func addRecursiveWatch(ctx context.Context, fw *fsnotify.Watcher, root string) int {
-	// filepath.WalkDir lstat's root: a WatchDir configured as a symlink to a
-	// directory would be seen as a non-dir entry and silently yield zero
-	// watches. The old non-recursive fw.Add followed the symlink
-	// (inotify_add_watch resolves symlinks), so resolve root first to keep
-	// that behaviour; events (and Enqueue'd paths) then carry the resolved
-	// path, matching what the periodic scan would index.
-	if fi, lerr := os.Lstat(root); lerr == nil && fi.Mode()&os.ModeSymlink != 0 {
-		resolved, rerr := filepath.EvalSymlinks(root)
-		if rerr != nil {
-			zap.L().Warn("watcher: cannot resolve symlinked watch dir",
-				zap.String("dir", root), zap.Error(rerr))
-			return 0
-		}
-		root = resolved
-	}
 	added := 0
 	enospcWarned := false
 	_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
@@ -264,6 +265,36 @@ func addRecursiveWatch(ctx context.Context, fw *fsnotify.Watcher, root string) i
 		return nil
 	})
 	return added
+}
+
+// resolveWatchDirRoot resolves an explicitly configured WatchDir for use as
+// an addRecursiveWatch root. Only configured roots get symlink resolution:
+// the old non-recursive fw.Add followed symlinks (inotify_add_watch resolves
+// them), so a WatchDir configured as a symlink to a real directory must keep
+// working — but filepath.WalkDir lstat's its root and would otherwise
+// silently yield zero watches. Dynamically discovered directories
+// (trackNewDir) must NOT receive this treatment; they keep WalkDir's lstat
+// semantics so a runtime symlink can never pull an external tree into
+// watching (see addRecursiveWatch's doc comment).
+//
+// Returns (resolvedPath, true) on success — events and Enqueue'd paths then
+// carry the resolved path, matching what the periodic scan indexes — or
+// ("", false) when dir is a symlink that cannot be resolved (dangling, loop),
+// which is logged and skipped.
+func resolveWatchDirRoot(dir string) (string, bool) {
+	fi, err := os.Lstat(dir)
+	if err != nil || fi.Mode()&os.ModeSymlink == 0 {
+		// Missing paths fall through unchanged: addRecursiveWatch's walk will
+		// log the error the same way any unreadable WatchDir is reported.
+		return dir, true
+	}
+	resolved, rerr := filepath.EvalSymlinks(dir)
+	if rerr != nil {
+		zap.L().Warn("watcher: cannot resolve symlinked watch dir",
+			zap.String("dir", dir), zap.Error(rerr))
+		return "", false
+	}
+	return resolved, true
 }
 
 // Restart updates the watched directories and restarts the watcher goroutine.
