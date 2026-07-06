@@ -1,0 +1,182 @@
+package service
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
+)
+
+// writeFile writes content to path (creating parent dirs as needed). Used
+// repeatedly inside require.Eventually retry loops below: re-writing the
+// same file on every poll tick is what makes these tests robust against the
+// unavoidable race between spawning the Watcher goroutine and its inotify
+// watches actually being registered — a single unretried write performed
+// before the watch exists produces no event at all, so the assertion would
+// otherwise flake.
+func writeFile(t *testing.T, path string, content string) {
+	t.Helper()
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
+}
+
+// newWatcherTestHarness wires a real Indexer (worker pool running) and a real
+// Watcher over a temp DB, mirroring the construction pattern used throughout
+// indexer_test.go (makeTestDB + mockML + NewIndexer, idx.Start in a
+// goroutine).
+func newWatcherTestHarness(t *testing.T, ctx context.Context, watchDirs []string) (*Watcher, *Indexer) {
+	t.Helper()
+	db := makeTestDB(t)
+	idx := NewIndexer(db, &mockML{}, t.TempDir(), 2)
+	go idx.Start(ctx)
+	w := NewWatcher(db, watchDirs, idx, "")
+	return w, idx
+}
+
+// assetIndexed reports whether path has an asset row with status='indexed'.
+func assetIndexed(t *testing.T, idx *Indexer, path string) bool {
+	t.Helper()
+	var status string
+	err := idx.db.QueryRow(`SELECT status FROM assets WHERE file_path=?`, path).Scan(&status)
+	return err == nil && status == "indexed"
+}
+
+// TestWatcherRecursiveNestedSubdir verifies the core bug fix: a file written
+// into a subdirectory several levels below a WatchDir root — never watched
+// directly, only reachable via recursive Add at Start — is detected.
+func TestWatcherRecursiveNestedSubdir(t *testing.T) {
+	root := t.TempDir()
+	sub := filepath.Join(root, "sub")
+	require.NoError(t, os.MkdirAll(sub, 0o755))
+	// Pre-existing nested file, present before Start ever runs.
+	writeFile(t, filepath.Join(sub, "a.jpg"), "pre-existing")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	w, idx := newWatcherTestHarness(t, ctx, []string{root})
+	go w.Start(ctx)
+
+	newFile := filepath.Join(sub, "b.jpg")
+	require.Eventually(t, func() bool {
+		writeFile(t, newFile, "new")
+		return assetIndexed(t, idx, newFile)
+	}, 5*time.Second, 100*time.Millisecond,
+		"file written into a pre-existing nested subdirectory must be indexed")
+}
+
+// TestWatcherDynamicNewDirectory covers both windows a plain recursive Add at
+// startup cannot: (a) mkdir now, drop a file in shortly after, and (b) an
+// entire directory — with a file already inside it — moved in as one atomic
+// rename.
+func TestWatcherDynamicNewDirectory(t *testing.T) {
+	root := t.TempDir()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	w, idx := newWatcherTestHarness(t, ctx, []string{root})
+	go w.Start(ctx)
+
+	// (a) mkdir after Start, then a file lands inside it.
+	newDir := filepath.Join(root, "newsub")
+	require.NoError(t, os.Mkdir(newDir, 0o755))
+	newFile := filepath.Join(newDir, "c.jpg")
+	require.Eventually(t, func() bool {
+		writeFile(t, newFile, "new")
+		return assetIndexed(t, idx, newFile)
+	}, 5*time.Second, 100*time.Millisecond,
+		"file written into a directory created after Start must be indexed")
+
+	// (b) an entire directory, file already inside it, moved in atomically.
+	// This must be picked up by the catch-up scan (trackNewDir), not by a
+	// live Write/Create event on the file itself, since the file was never
+	// created while anything was watching its original location.
+	srcDir := filepath.Join(t.TempDir(), "movedin")
+	require.NoError(t, os.MkdirAll(srcDir, 0o755))
+	movedFile := filepath.Join(srcDir, "e.jpg")
+	writeFile(t, movedFile, "already-here")
+	destDir := filepath.Join(root, "movedin")
+	require.NoError(t, os.Rename(srcDir, destDir))
+
+	destFile := filepath.Join(destDir, "e.jpg")
+	require.Eventually(t, func() bool {
+		return assetIndexed(t, idx, destFile)
+	}, 5*time.Second, 100*time.Millisecond,
+		"a directory moved in with a file already inside it must be caught up by the scan")
+}
+
+// TestWatcherSkipsHiddenDirectories verifies a hidden directory nested under
+// a WatchDir is never watched, so files inside it (whether present before
+// Start or added afterward) are never indexed by the watcher.
+func TestWatcherSkipsHiddenDirectories(t *testing.T) {
+	root := t.TempDir()
+	hiddenDir := filepath.Join(root, ".hidden")
+	require.NoError(t, os.MkdirAll(hiddenDir, 0o755))
+	preFile := filepath.Join(hiddenDir, "f.jpg")
+	writeFile(t, preFile, "pre-existing")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	w, idx := newWatcherTestHarness(t, ctx, []string{root})
+	go w.Start(ctx)
+
+	// Prove the watcher is actually alive and processing events for the
+	// (non-hidden) root, so a later "nothing happened" observation for
+	// .hidden is meaningful rather than the watcher simply not having
+	// started yet.
+	warmFile := filepath.Join(root, "warmup.jpg")
+	require.Eventually(t, func() bool {
+		writeFile(t, warmFile, "warm")
+		return assetIndexed(t, idx, warmFile)
+	}, 5*time.Second, 100*time.Millisecond, "warmup file must be indexed")
+
+	postFile := filepath.Join(hiddenDir, "g.jpg")
+	writeFile(t, postFile, "post")
+
+	require.Never(t, func() bool {
+		return assetIndexed(t, idx, preFile) || assetIndexed(t, idx, postFile)
+	}, 1500*time.Millisecond, 100*time.Millisecond,
+		"files inside a hidden directory must never be indexed by the watcher")
+}
+
+// TestWatcherRestartSwitchesWatchDirs verifies the hot-reload path: after
+// Restart, the new WatchDirs take effect and the old ones stop triggering.
+func TestWatcherRestartSwitchesWatchDirs(t *testing.T) {
+	oldDir := t.TempDir()
+	newDir := t.TempDir()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	w, idx := newWatcherTestHarness(t, ctx, []string{oldDir})
+	go w.Start(ctx)
+
+	// Prove oldDir is really watched before restarting away from it.
+	beforeFile := filepath.Join(oldDir, "before.jpg")
+	require.Eventually(t, func() bool {
+		writeFile(t, beforeFile, "before")
+		return assetIndexed(t, idx, beforeFile)
+	}, 5*time.Second, 100*time.Millisecond, "oldDir must be watched before Restart")
+
+	w.Restart(ctx, []string{newDir})
+
+	// newDir must now be watched.
+	afterFile := filepath.Join(newDir, "after.jpg")
+	require.Eventually(t, func() bool {
+		writeFile(t, afterFile, "after")
+		return assetIndexed(t, idx, afterFile)
+	}, 5*time.Second, 100*time.Millisecond, "newDir must be watched after Restart")
+
+	// oldDir must no longer be watched.
+	oldFile2 := filepath.Join(oldDir, "old2.jpg")
+	require.Never(t, func() bool {
+		writeFile(t, oldFile2, "old2")
+		return assetIndexed(t, idx, oldFile2)
+	}, 1500*time.Millisecond, 100*time.Millisecond,
+		"oldDir must not be watched after Restart")
+}
