@@ -92,7 +92,8 @@ func (w *Watcher) Start(parentCtx context.Context) {
 			continue
 		}
 		resolvedRoots = append(resolvedRoots, root)
-		totalWatches += addRecursiveWatch(ctx, fw, root)
+		added, _ := addRecursiveWatch(ctx, fw, root)
+		totalWatches += added
 	}
 	w.mu.Lock()
 	w.roots = resolvedRoots
@@ -201,14 +202,15 @@ func (w *Watcher) trackNewDir(ctx context.Context, fw *fsnotify.Watcher, dir str
 	if strings.HasPrefix(filepath.Base(dir), ".") {
 		return
 	}
-	added := addRecursiveWatch(ctx, fw, dir)
-	if added == 0 {
-		// Nothing was watched: the directory is excluded (scanExcludeDirs /
-		// IsExcludedMount), vanished before the walk ran, or every fw.Add
-		// failed (permissions, inotify quota). Either way there is no watch
-		// coverage, so skip the catch-up scan too — it would only index files
-		// whose future changes we then cannot track.
+	added, enospc := addRecursiveWatch(ctx, fw, dir)
+	if skipCatchupScan(added, enospc) {
+		// 目录被排除(scanExcludeDirs/IsExcludedMount)或 walk 前已消失:
+		// 没有 watch 覆盖也没有内容需要索引。
 		return
+	}
+	if enospc && added == 0 {
+		zap.L().Warn("watcher: no watches added (inotify quota) — indexing catch-up still runs, future changes untracked until quota raised",
+			zap.String("dir", dir))
 	}
 	zap.L().Info("watcher: now watching new directory",
 		zap.String("dir", dir), zap.Int("watches", added))
@@ -253,9 +255,12 @@ func (w *Watcher) trackNewDir(ctx context.Context, fw *fsnotify.Watcher, dir str
 // A single directory failing to be added (permission error, or the inotify
 // watch quota being exhausted) is logged as a warning and does not abort the
 // walk — sibling and descendant directories are still attempted. Returns the
-// number of directories successfully added.
-func addRecursiveWatch(ctx context.Context, fw *fsnotify.Watcher, root string) int {
+// number of directories successfully added, and whether any fw.Add call hit
+// ENOSPC (inotify watch quota exhausted). Callers must not treat added==0
+// alone as "nothing to do here" — see skipCatchupScan.
+func addRecursiveWatch(ctx context.Context, fw *fsnotify.Watcher, root string) (int, bool) {
 	added := 0
+	enospc := false
 	enospcWarned := false
 	_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		select {
@@ -286,6 +291,7 @@ func addRecursiveWatch(ctx context.Context, fw *fsnotify.Watcher, root string) i
 		}
 		if addErr := fw.Add(path); addErr != nil {
 			if errors.Is(addErr, syscall.ENOSPC) {
+				enospc = true
 				if !enospcWarned {
 					zap.L().Warn("watcher: inotify watch limit reached — raise fs.inotify.max_user_watches",
 						zap.String("dir", path), zap.Error(addErr))
@@ -300,7 +306,19 @@ func addRecursiveWatch(ctx context.Context, fw *fsnotify.Watcher, root string) i
 		added++
 		return nil
 	})
-	return added
+	return added, enospc
+}
+
+// skipCatchupScan decides whether trackNewDir should skip its one-time
+// catch-up scan after addRecursiveWatch. added==0 is ambiguous by itself: it
+// means either "no watch coverage was ever intended" (directory excluded via
+// scanExcludeDirs/IsExcludedMount, or it vanished before the walk ran — safe
+// to skip, there is nothing to index) or "every fw.Add call hit ENOSPC"
+// (inotify watch quota exhausted, but the directory and its files are real
+// and must still be indexed — only future-change tracking degrades until the
+// quota is raised). Only the former should skip the scan.
+func skipCatchupScan(added int, enospc bool) bool {
+	return added == 0 && !enospc
 }
 
 // resolveWatchDirRoot resolves an explicitly configured WatchDir for use as

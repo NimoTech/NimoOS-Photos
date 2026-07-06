@@ -335,3 +335,15 @@ func TestWalkSupportedHonorsCtxCancel(t *testing.T) {
 	require.ErrorIs(t, err, context.Canceled)
 	require.Equal(t, 0, calls)
 }
+
+// TestSkipCatchupScan pins down skipCatchupScan's semantics: added==0 alone
+// must NOT mean "skip the catch-up scan" — it is ambiguous between "directory
+// excluded/vanished" (safe to skip: no watch coverage was ever intended) and
+// "every fw.Add failed on ENOSPC" (files still exist and must be indexed;
+// only future-change tracking is degraded until the inotify quota is raised).
+func TestSkipCatchupScan(t *testing.T) {
+	require.True(t, skipCatchupScan(0, false))  // 目录被排除/已消失:跳过
+	require.False(t, skipCatchupScan(0, true))  // 全因 ENOSPC 失败:不得跳过
+	require.False(t, skipCatchupScan(3, false)) // 正常:不跳过
+	require.False(t, skipCatchupScan(3, true))  // 部分 ENOSPC:不跳过
+}
