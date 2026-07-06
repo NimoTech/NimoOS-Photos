@@ -37,7 +37,7 @@ func handleCreatedPaths(ctx context.Context, ix *Indexer, paths []string) {
 		if fi.IsDir() {
 			// 已知限制:p 本身是「指向目录的符号链接」时 WalkDir(Lstat 语义)不下钻,
 			// 交给周期全盘扫描兜底;这里不解引用,避免 symlink 环。
-			if werr := walkSupported(p, func(f string) { ix.Enqueue(f) }); werr != nil {
+			if werr := walkSupported(ctx, p, func(f string) { ix.Enqueue(f) }); werr != nil {
 				zap.L().Warn("media:created: walk failed", zap.String("dir", p), zap.Error(werr))
 			}
 			continue
