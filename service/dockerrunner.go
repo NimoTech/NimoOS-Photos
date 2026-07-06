@@ -1,7 +1,9 @@
 package service
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os/exec"
 	"strings"
@@ -17,7 +19,11 @@ func (dockerRunner) IsRunning(ctx context.Context, name string) (bool, error) {
 	defer cancel()
 	out, err := exec.CommandContext(ctx, "docker", "inspect", "-f", "{{.State.Running}}", name).Output()
 	if err != nil {
-		if ee, ok := err.(*exec.ExitError); ok {
+		var ee *exec.ExitError
+		if errors.As(err, &ee) {
+			if bytes.Contains(ee.Stderr, []byte("No such object")) || bytes.Contains(ee.Stderr, []byte("No such container")) {
+				return false, nil // 容器不存在（ML 离线包未安装/未创建）：视作未运行，静默跳过
+			}
 			return false, fmt.Errorf("docker inspect %s: %w: %s", name, err, ee.Stderr)
 		}
 		return false, err
