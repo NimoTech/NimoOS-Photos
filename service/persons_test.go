@@ -375,6 +375,24 @@ func TestFaceThumbnail_HiddenReturnsNotFound(t *testing.T) {
 	require.ErrorIs(t, err, service.ErrNotFound)
 }
 
+func TestFaceThumbnailOfflineCoverReturnsNotFound(t *testing.T) {
+	db := makeTestFaceDB(t)
+	dir := t.TempDir()
+	srcPath := filepath.Join(dir, "src.jpg")
+	writeTestJPEG(t, srcPath, 400, 300)
+	_, err := db.Exec(`INSERT INTO assets(id, file_path, status, offline) VALUES('fo', ?, 'indexed', 1)`, srcPath)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO face_detections(id, asset_id, bbox, embedding) VALUES('face-o','fo',?,?)`,
+		`{"x1":100,"y1":75,"x2":240,"y2":210}`, sqlite.SerializeFloat32(make([]float32, common.FaceDim)))
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO persons(id, name, cover_asset_id, cover_face_id) VALUES('po','','fo','face-o')`)
+	require.NoError(t, err)
+
+	ps := service.NewPersonService(db)
+	_, err = ps.FaceThumbnail("po", filepath.Join(dir, "fo-cache"), "")
+	require.ErrorIs(t, err, service.ErrNotFound)
+}
+
 // 视频源：bbox 基于关键帧（asset_exif W/H = 1920×1080），thumb large.jpg 是 1280×720。
 // FaceThumbnail 必须按 thumb/exif 比例缩放 bbox，否则坐标爆掉。
 func TestFaceThumbnail_VideoScalesBBoxToThumb(t *testing.T) {
