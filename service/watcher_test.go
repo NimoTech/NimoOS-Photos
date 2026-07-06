@@ -144,6 +144,73 @@ func TestWatcherSkipsHiddenDirectories(t *testing.T) {
 		"files inside a hidden directory must never be indexed by the watcher")
 }
 
+// TestWatcherRuntimeHiddenDirNotTracked is the regression test for the
+// root-exemption leak in trackNewDir: a hidden directory created at runtime
+// (the exact shape TrashService produces — .trash/<id>/ under a WatchDir)
+// must NOT be recursively watched, and media files landing inside it must
+// never be enqueued. Without the trackNewDir entry guard, the dynamically
+// discovered directory was passed to addRecursiveWatch as "root" and
+// inherited the hidden-check exemption that is meant only for explicitly
+// configured WatchDirs — every soft-delete would then leak an inotify watch
+// and re-index the trashed file, violating the "soft-deleted files are never
+// re-indexed" invariant (see walkSupported in indexer.go).
+func TestWatcherRuntimeHiddenDirNotTracked(t *testing.T) {
+	root := t.TempDir()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	w, idx := newWatcherTestHarness(t, ctx, []string{root})
+	go w.Start(ctx)
+
+	// Warmup: prove the watcher is alive before asserting a negative.
+	warmFile := filepath.Join(root, "warmup.jpg")
+	require.Eventually(t, func() bool {
+		writeFile(t, warmFile, "warm")
+		return assetIndexed(t, idx, warmFile)
+	}, 5*time.Second, 100*time.Millisecond, "warmup file must be indexed")
+
+	// Runtime mkdir of a hidden directory, then a media file inside it —
+	// mirrors TrashService creating .trash/<id>/ on first soft-delete.
+	trashDir := filepath.Join(root, ".trash", "id1")
+	require.NoError(t, os.MkdirAll(trashDir, 0o755))
+	trashedFile := filepath.Join(trashDir, "deleted.jpg")
+	writeFile(t, trashedFile, "soft-deleted")
+
+	require.Never(t, func() bool {
+		return assetIndexed(t, idx, trashedFile)
+	}, 1500*time.Millisecond, 100*time.Millisecond,
+		"a file inside a runtime-created hidden directory must never be indexed")
+}
+
+// TestWatcherWatchDirSymlinkRoot verifies a WatchDir that is itself a symlink
+// to a real directory still produces watches. The old non-recursive fw.Add
+// followed the symlink (inotify_add_watch resolves symlinks); a naive
+// filepath.WalkDir lstat's the root and would silently yield zero watches —
+// a behaviour regression this test pins down.
+func TestWatcherWatchDirSymlinkRoot(t *testing.T) {
+	// Resolve the temp dir itself first so the expected event path (what the
+	// watcher reports after resolving the symlinked root) matches exactly.
+	realDir, err := filepath.EvalSymlinks(t.TempDir())
+	require.NoError(t, err)
+	linkDir := filepath.Join(t.TempDir(), "gallery-link")
+	require.NoError(t, os.Symlink(realDir, linkDir))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	w, idx := newWatcherTestHarness(t, ctx, []string{linkDir})
+	go w.Start(ctx)
+
+	// Events carry the resolved (real) path since that is what gets watched.
+	newFile := filepath.Join(realDir, "via-symlink.jpg")
+	require.Eventually(t, func() bool {
+		writeFile(t, newFile, "new")
+		return assetIndexed(t, idx, newFile)
+	}, 5*time.Second, 100*time.Millisecond,
+		"a WatchDir configured as a symlink must still be watched (resolved)")
+}
+
 // TestWatcherRestartSwitchesWatchDirs verifies the hot-reload path: after
 // Restart, the new WatchDirs take effect and the old ones stop triggering.
 func TestWatcherRestartSwitchesWatchDirs(t *testing.T) {

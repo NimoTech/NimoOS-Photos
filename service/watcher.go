@@ -145,11 +145,24 @@ func (w *Watcher) handleEvent(ctx context.Context, fw *fsnotify.Watcher, wg *syn
 // subtree — directories and files — moved/copied in as one atomic rename"
 // (nothing under it was ever watched at all until this goroutine runs).
 func (w *Watcher) trackNewDir(ctx context.Context, fw *fsnotify.Watcher, dir string) {
+	// A dynamically discovered directory must NOT inherit addRecursiveWatch's
+	// root exemption from the hidden-dir check: that exemption exists solely
+	// so an explicitly configured WatchDir is honoured as-is. A hidden
+	// directory created at runtime (e.g. TrashService making .trash/<id>/
+	// under /DATA/Gallery on the first soft-delete) must stay invisible —
+	// watching it would leak one inotify watch per deletion, re-enqueue every
+	// trashed file (wasted read + SHA-256), and violate walkSupported's
+	// "soft-deleted files are never re-indexed" invariant (indexer.go).
+	if strings.HasPrefix(filepath.Base(dir), ".") {
+		return
+	}
 	added := addRecursiveWatch(ctx, fw, dir)
 	if added == 0 {
-		// The directory itself was hidden, excluded (scanExcludeDirs), or an
-		// excluded mount (IsExcludedMount) — nothing was watched, so there is
-		// nothing to catch up on either.
+		// Nothing was watched: the directory is excluded (scanExcludeDirs /
+		// IsExcludedMount), vanished before the walk ran, or every fw.Add
+		// failed (permissions, inotify quota). Either way there is no watch
+		// coverage, so skip the catch-up scan too — it would only index files
+		// whose future changes we then cannot track.
 		return
 	}
 	zap.L().Info("watcher: now watching new directory",
@@ -190,6 +203,21 @@ func (w *Watcher) trackNewDir(ctx context.Context, fw *fsnotify.Watcher, dir str
 // walk — sibling and descendant directories are still attempted. Returns the
 // number of directories successfully added.
 func addRecursiveWatch(ctx context.Context, fw *fsnotify.Watcher, root string) int {
+	// filepath.WalkDir lstat's root: a WatchDir configured as a symlink to a
+	// directory would be seen as a non-dir entry and silently yield zero
+	// watches. The old non-recursive fw.Add followed the symlink
+	// (inotify_add_watch resolves symlinks), so resolve root first to keep
+	// that behaviour; events (and Enqueue'd paths) then carry the resolved
+	// path, matching what the periodic scan would index.
+	if fi, lerr := os.Lstat(root); lerr == nil && fi.Mode()&os.ModeSymlink != 0 {
+		resolved, rerr := filepath.EvalSymlinks(root)
+		if rerr != nil {
+			zap.L().Warn("watcher: cannot resolve symlinked watch dir",
+				zap.String("dir", root), zap.Error(rerr))
+			return 0
+		}
+		root = resolved
+	}
 	added := 0
 	enospcWarned := false
 	_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
