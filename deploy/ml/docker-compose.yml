@@ -19,13 +19,23 @@ services:
         bind:
           create_host_path: true
     restart: unless-stopped
+    # 仅可观测性:docker ps / AppManagement 能直接看到 unhealthy。
+    # docker 原生不会因 unhealthy 重启;真正的自愈由 nimoos-photos 内置看门狗负责。
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:3003/ping', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 180s
     labels:
       nimoos.system: "true"            # hide from the user-facing App grid
       nimoos.display_name: "Photos AI" # friendly name in UI / container stats
       icon: "/img/system-apps/photos.svg"
     environment:
       MACHINE_LEARNING_WORKERS: "1"
-      MACHINE_LEARNING_WORKER_TIMEOUT: "120"
+      # 300s:SigLIP2-SO400M 冷加载在低端盘上可能超过 120s,被 gunicorn 中途
+      # 杀掉会留下「端口在听、worker 空壳」的卡死态(2026-07 实际宕机 1.8 天的诱因之一)
+      MACHINE_LEARNING_WORKER_TIMEOUT: "300"
       MACHINE_LEARNING_CACHE_FOLDER: "/cache"
       # 闲置 5 分钟自动卸载模型释放内存(nllb-large + PP-OCRv5_server 常驻很吃内存)
       MACHINE_LEARNING_MODEL_TTL: "300"
