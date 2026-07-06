@@ -45,18 +45,24 @@ func (s *AlbumService) Create(name string) (*Album, error) {
 }
 
 func (s *AlbumService) List() ([]Album, error) {
-	// Cover resolution uses two layers:
+	// Cover resolution uses two layers, both requiring the candidate asset to be
+	// visible (not soft-deleted, not offline):
 	// 1. Membership guard: only honour cover_asset_id when the asset is still a
-	//    member of the album (guards against dangling pointers after removal).
+	//    member of the album (guards against dangling pointers after removal)
+	//    AND still visible (guards against a chosen-but-offline/deleted cover).
 	// 2. Stable implicit fallback: when no valid explicit cover exists, fall back
-	//    to the first item by position (then rowid as tiebreaker), so adding new
-	//    photos never changes an implicit cover.
+	//    to the first visible item by position (then rowid as tiebreaker), so
+	//    adding new photos never changes an implicit cover.
 	rows, err := s.db.Query(`
 		SELECT a.id, a.name, a.created_at,
 		       COALESCE(
 		           (SELECT aa3.asset_id FROM album_assets aa3
+		               JOIN assets av ON av.id = aa3.asset_id
+		                    AND av.deleted_at IS NULL AND av.offline = 0
 		               WHERE aa3.album_id = a.id AND aa3.asset_id = NULLIF(a.cover_asset_id,'')),
 		           (SELECT aa2.asset_id FROM album_assets aa2
+		               JOIN assets av ON av.id = aa2.asset_id
+		                    AND av.deleted_at IS NULL AND av.offline = 0
 		               WHERE aa2.album_id = a.id
 		               ORDER BY aa2.position ASC, aa2.rowid ASC LIMIT 1),
 		           '') AS cover,
@@ -96,15 +102,20 @@ func (s *AlbumService) Get(id string) (*Album, error) {
 	var a Album
 	var dateStart, dateEnd sql.NullString
 	// Cover resolution (same two-layer logic as List):
-	// - Membership guard: only honour cover_asset_id when it is still a member.
-	// - Stable implicit fallback: first item by position/rowid, so adding photos
-	//   never changes an implicit cover.
+	// - Membership guard: only honour cover_asset_id when it is still a member
+	//   AND still visible (not soft-deleted, not offline).
+	// - Stable implicit fallback: first visible item by position/rowid, so
+	//   adding photos never changes an implicit cover.
 	err := s.db.QueryRow(`
 		SELECT id, name, created_at,
 		       COALESCE(
 		           (SELECT aa3.asset_id FROM album_assets aa3
+		               JOIN assets av ON av.id = aa3.asset_id
+		                    AND av.deleted_at IS NULL AND av.offline = 0
 		               WHERE aa3.album_id = albums.id AND aa3.asset_id = NULLIF(albums.cover_asset_id,'')),
 		           (SELECT aa2.asset_id FROM album_assets aa2
+		               JOIN assets av ON av.id = aa2.asset_id
+		                    AND av.deleted_at IS NULL AND av.offline = 0
 		               WHERE aa2.album_id = albums.id
 		               ORDER BY aa2.position ASC, aa2.rowid ASC LIMIT 1),
 		           ''),
