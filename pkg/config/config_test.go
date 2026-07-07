@@ -1,11 +1,31 @@
 package config
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 )
+
+// loadConfigFromINI 写临时 ini 文件并调用 Init，返回加载后的 Cfg。
+func loadConfigFromINI(t *testing.T, ini string) *Config {
+	t.Helper()
+	cf := filepath.Join(t.TempDir(), "photos.conf")
+	require.NoError(t, os.WriteFile(cf, []byte(ini), 0644))
+	require.NoError(t, Init(cf, ini))
+	return Cfg
+}
+
+// TestWatchDirsEmptyMeansAuto：watchdirs 不配置（或置空）⇒ Cfg.WatchDirs 为空，
+// watcher 进入自动模式（范围=EnumerateScanRoots）；显式配置 ⇒ 手工清单原样保留。
+func TestWatchDirsEmptyMeansAuto(t *testing.T) {
+	cfg := loadConfigFromINI(t, "[photos]\nDataPath=/tmp/x\n")
+	require.Empty(t, cfg.WatchDirs, "未配置 watchdirs 必须为空（自动模式），不得回填旧三目录默认")
+
+	cfg = loadConfigFromINI(t, "[photos]\nDataPath=/tmp/x\nWatchDirs=/DATA/Gallery,/DATA/Media\n")
+	require.Equal(t, []string{"/DATA/Gallery", "/DATA/Media"}, cfg.WatchDirs)
+}
 
 // 配置文件无新 key 时，三个新开关默认 true（与 FacesEnabled 同语义）。
 func TestNewFlagsDefaultTrue(t *testing.T) {
