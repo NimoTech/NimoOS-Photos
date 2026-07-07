@@ -66,9 +66,8 @@ func Init(configFile, confSample string) error {
 			watchDirs = append(watchDirs, d)
 		}
 	}
-	if len(watchDirs) == 0 {
-		watchDirs = []string{"/DATA/Gallery", "/DATA/Documents", "/DATA/Downloads"}
-	}
+	// watchDirs 为空 ⇒ watcher 自动模式（范围 = EnumerateScanRoots，即系统盘
+	// + 全部已挂载用户分区，动态跟随挂载）；非空 ⇒ 手工监控清单（向后兼容）。
 	Cfg = &Config{
 		RuntimePath:   v.GetString("common.RuntimePath"),
 		LogPath:       v.GetString("common.LogPath"),

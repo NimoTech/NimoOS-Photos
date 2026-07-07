@@ -401,6 +401,25 @@ func TestRemoveByPathSkipsTrashedAsset(t *testing.T) {
 	require.Equal(t, 1, n, "RemoveByPath must not delete a soft-deleted asset")
 }
 
+// TestScanDirectoryOnceDedups:同一根目录的并发补扫只跑一份——挂载轮询
+// (watcher followMounts)与 MountGuard 插回恢复都可能对同一挂载触发补扫，
+// 重复扫描徒耗 IO。in-flight 标记被占用时直接跳过，释放后可再次扫描。
+func TestScanDirectoryOnceDedups(t *testing.T) {
+	db := makeTestDB(t)
+	ix := NewIndexer(db, &mockML{}, t.TempDir(), 1)
+	dir := t.TempDir()
+
+	ix.scanDirInFlight.Store(dir, struct{}{}) // 模拟另一路补扫在跑
+	started, err := ix.ScanDirectoryOnce(dir)
+	require.NoError(t, err)
+	require.False(t, started, "in-flight 时必须跳过")
+
+	ix.scanDirInFlight.Delete(dir)
+	started, err = ix.ScanDirectoryOnce(dir)
+	require.NoError(t, err)
+	require.True(t, started, "释放后必须真正执行")
+}
+
 // recordingML 记录各 ML 能力被调用的次数，用于开关门控断言。
 type recordingML struct {
 	mockML
@@ -632,4 +651,26 @@ func TestPruneDeleteGuard(t *testing.T) {
 	// 挂载根本体 stat 失败(死挂载残留在挂载表):禁止批删
 	deadRoot := filepath.Join(root, "dead-mount")
 	require.False(t, pruneDeleteAllowed(deadRoot, func(string) (string, bool) { return deadRoot, true }))
+}
+
+// TestPruneRcloneMountAssetsPurges:rclone 云盘挂载点下的历史误入库资产在
+// 启动时防御性硬删;挂载点带下划线(真实命名 /mnt/yu.wu_dropbox_*)不得因
+// LIKE 通配泄漏误删相邻路径资产。
+func TestPruneRcloneMountAssetsPurges(t *testing.T) {
+	db := makeTestDB(t)
+	cloud := insertAsset(t, db, "/mnt/yu.wu_dropbox_178/photo.jpg", "indexed")
+	// `_` 在 LIKE 里是单字符通配:若实现误用 LIKE,前缀 /mnt/yu.wuXdropbox... 也会被命中
+	sibling := insertAsset(t, db, "/mnt/yu.wuXdropbox_178/photo.jpg", "indexed")
+	keep := insertAsset(t, db, "/DATA/Gallery/keep.jpg", "indexed")
+
+	ix := NewIndexer(db, &mockML{}, t.TempDir(), 1)
+	ix.pruneRcloneMountAssets([]string{"/mnt/yu.wu_dropbox_178"})
+
+	var n int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM assets WHERE id=?`, cloud).Scan(&n))
+	require.Equal(t, 0, n, "rclone 挂载下的资产必须被清")
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM assets WHERE id=?`, sibling).Scan(&n))
+	require.Equal(t, 1, n, "相邻相似路径不得被 LIKE 通配误删")
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM assets WHERE id=?`, keep).Scan(&n))
+	require.Equal(t, 1, n)
 }

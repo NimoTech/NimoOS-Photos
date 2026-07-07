@@ -133,12 +133,18 @@ type ingestQueueItem struct {
 
 // Indexer processes media files into the database with a worker pool.
 type Indexer struct {
-	db         *sql.DB
-	ml         MLProvider
-	thumbDir   string
-	workers    int
-	queue      chan ingestQueueItem
-	seen       sync.Map // in-flight dedup: path -> struct{}
+	db       *sql.DB
+	ml       MLProvider
+	thumbDir string
+	workers  int
+	queue    chan ingestQueueItem
+	seen     sync.Map // in-flight dedup: path -> struct{}
+
+	// scanDirInFlight 对整目录级补扫做去重：watcher 挂载轮询(followMounts)与
+	// MountGuard 插回恢复都可能对同一挂载触发补扫，同一 dir 只允许一份
+	// ScanDirectory 在跑，避免重复全量扫描徒耗 IO（见 ScanDirectoryOnce）。
+	scanDirInFlight sync.Map // dir -> struct{}
+
 	taskReg    *TaskRegistry
 	ingest     *ingestTracker // aggregates Enqueue/processFile into a single rolling task
 	scanActive int32          // CAS guard so only one full ScanAllRoots runs at a time
@@ -222,6 +228,23 @@ func (ix *Indexer) pruneSystemMountAssets() {
 		// pattern, not woven INTO the pattern, so it cannot misfire onto a
 		// sibling label the way `LIKE 'disk_A/%'` would match "diskXA".
 		ix.prunePathsMatching(`file_path LIKE ?`, prefix+"%")
+	}
+}
+
+// pruneRcloneMountAssets removes any indexed asset living under an rclone
+// FUSE cloud-drive mount. Cloud drives are excluded from scanning/watching
+// (see parseScanRoots) — this startup purge self-heals whatever an earlier,
+// broader scan may have indexed. mounts 由调用方传 enumerateRcloneMounts(),
+// 注入参数便于测试;未挂载的云盘不猜路径模式、不动。
+// 挂载点名含 `_`(rclone 命名 /mnt/<user>_<provider>_<id>)是 LIKE 单字符
+// 通配,必须用 substr 前缀比较,不能用 LIKE。
+func (ix *Indexer) pruneRcloneMountAssets(mounts []string) {
+	for _, mp := range mounts {
+		prefix := strings.TrimRight(mp, "/") + "/"
+		ix.prunePathsMatching(
+			`file_path = ? OR substr(file_path,1,length(?)) = ?`,
+			mp, prefix, prefix,
+		)
 	}
 }
 
@@ -1197,6 +1220,17 @@ func (ix *Indexer) ScanDirectory(dir string) error {
 	}
 
 	return ix.pruneMissingUnder(dir)
+}
+
+// ScanDirectoryOnce runs ScanDirectory(dir) unless a scan for the same dir is
+// already in flight (watcher 挂载轮询与 MountGuard 插回恢复可能同时对同一
+// 挂载触发补扫)。返回 started=false 表示因去重而跳过。
+func (ix *Indexer) ScanDirectoryOnce(dir string) (bool, error) {
+	if _, loaded := ix.scanDirInFlight.LoadOrStore(dir, struct{}{}); loaded {
+		return false, nil
+	}
+	defer ix.scanDirInFlight.Delete(dir)
+	return true, ix.ScanDirectory(dir)
 }
 
 // RemoveByPath deletes the asset row for path (if any) and removes its
