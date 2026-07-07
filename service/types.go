@@ -69,9 +69,10 @@ type Asset struct {
 	IsNew bool `json:"isNew,omitempty"`
 
 	// MatchedBy marks how a SmartSearch result matched: "ocr" when the query hit
-	// the asset's recognized text (asset_ocr). Empty for CLIP semantic matches
-	// and everywhere outside search. A search-time annotation, not a stored
-	// asset property — the client uses it for the OCR badge and file-type filter.
+	// the asset's recognized text (asset_ocr), "semantic" for CLIP embedding
+	// matches. Empty everywhere outside search. A search-time annotation, not a
+	// stored asset property — the client uses it for the OCR badge and file-type
+	// filter.
 	MatchedBy string `json:"matchedBy,omitempty"`
 }
 
