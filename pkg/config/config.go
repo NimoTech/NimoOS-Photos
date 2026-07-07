@@ -27,6 +27,20 @@ type Config struct {
 	ScenesEnabled    bool
 	OCREnabled       bool
 	SmartViewEnabled bool
+
+	// MinMatchSimilarity, when > 0, drops SmartSearch results whose (display-scale,
+	// post-recalibration) match score is below it. Left at 0 (no filtering) by
+	// default — see service/search.go for the full rationale and calibration
+	// history of this knob.
+	MinMatchSimilarity float64
+	// SimDisplayFloor/SimDisplayCeil linearly rescale the raw CLIP cosine
+	// similarity into the [0,1] display score shown to the UI. Defaults
+	// (0.03/0.13) were empirically calibrated against the current CLIP model
+	// (nllb-clip-large-siglip__v1); see service/scan.go's displayScore for
+	// details. Only override these after a fresh empirical pass following a
+	// model or re-embed change.
+	SimDisplayFloor float64
+	SimDisplayCeil  float64
 }
 
 func Init(configFile, confSample string) error {
@@ -67,6 +81,10 @@ func Init(configFile, confSample string) error {
 		ScenesEnabled:    v.GetBool("photos.ScenesEnabled"),
 		OCREnabled:       v.GetBool("photos.OCREnabled"),
 		SmartViewEnabled: v.GetBool("photos.SmartViewEnabled"),
+
+		MinMatchSimilarity: v.GetFloat64("photos.MinMatchSimilarity"),
+		SimDisplayFloor:    v.GetFloat64("photos.SimDisplayFloor"),
+		SimDisplayCeil:     v.GetFloat64("photos.SimDisplayCeil"),
 	}
 	if Cfg.RuntimePath == "" {
 		Cfg.RuntimePath = "/var/run/nimoos"
@@ -103,6 +121,17 @@ func Init(configFile, confSample string) error {
 	// 扫描间隔（分钟）；配置无此 key 时默认 1440（24h）。0 = 关闭周期重扫。
 	if !v.IsSet("photos.ScanInterval") {
 		Cfg.ScanInterval = 1440
+	}
+	// 语义搜索相关性下限：配置无此 key 时默认 0（不过滤），与改配置化之前的硬编码行为一致。
+	if !v.IsSet("photos.MinMatchSimilarity") {
+		Cfg.MinMatchSimilarity = 0.0
+	}
+	// 展示层标定区间端点：配置无此 key 时使用当前模型的经验默认值。
+	if !v.IsSet("photos.SimDisplayFloor") {
+		Cfg.SimDisplayFloor = 0.03
+	}
+	if !v.IsSet("photos.SimDisplayCeil") {
+		Cfg.SimDisplayCeil = 0.13
 	}
 	return nil
 }

@@ -228,8 +228,8 @@ func TestSemanticScoreCalibration(t *testing.T) {
 	s := svTestService(t)
 	// 种子裸分相对标定端点取值,期望值由 displayScore 现算,换模型重标端点时
 	// 本测试自动跟随,不再硬编码百分比。
-	goodRaw := simDisplayFloor + (simDisplayCeil-simDisplayFloor)*0.9 // 展示分 90%
-	badRaw := simDisplayFloor + (simDisplayCeil-simDisplayFloor)*0.2 // 展示分 20%
+	goodRaw := simDisplayFloor() + (simDisplayCeil()-simDisplayFloor())*0.9 // 展示分 90%
+	badRaw := simDisplayFloor() + (simDisplayCeil()-simDisplayFloor())*0.2 // 展示分 20%
 	seedClipAssetWithSim(t, s, "good", goodRaw, "2024-06-01T00:00:00Z")
 	seedClipAssetWithSim(t, s, "bad", badRaw, "2024-06-01T00:00:00Z")
 
@@ -250,7 +250,7 @@ func TestSemanticScoreCalibration(t *testing.T) {
 // 2024 年的高分照片必须匹配，2023 年的不匹配。
 func TestBareYearPlusSemantic(t *testing.T) {
 	s := svTestService(t)
-	highRaw := simDisplayFloor + (simDisplayCeil-simDisplayFloor)*0.9 // 展示分 90%
+	highRaw := simDisplayFloor() + (simDisplayCeil()-simDisplayFloor())*0.9 // 展示分 90%
 	seedClipAssetWithSim(t, s, "a24", highRaw, "2024-06-01T00:00:00Z")
 	seedClipAssetWithSim(t, s, "a23", highRaw, "2023-06-01T00:00:00Z")
 

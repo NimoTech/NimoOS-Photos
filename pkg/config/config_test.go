@@ -57,6 +57,25 @@ func TestSaveRoundTrip(t *testing.T) {
 	require.False(t, Cfg.SmartViewEnabled)
 }
 
+// 配置文件无新 key 时，三个语义搜索标定值维持改配置化之前的硬编码默认值。
+func TestSearchCalibrationDefaults(t *testing.T) {
+	cf := filepath.Join(t.TempDir(), "photos.conf")
+	require.NoError(t, Init(cf, "[photos]\n"))
+	require.Equal(t, 0.0, Cfg.MinMatchSimilarity)
+	require.Equal(t, 0.03, Cfg.SimDisplayFloor)
+	require.Equal(t, 0.13, Cfg.SimDisplayCeil)
+}
+
+// 配置文件显式给出这三个 key 时按配置值生效。
+func TestSearchCalibrationOverride(t *testing.T) {
+	cf := filepath.Join(t.TempDir(), "photos.conf")
+	sample := "[photos]\nMinMatchSimilarity = 0.2\nSimDisplayFloor = 0.05\nSimDisplayCeil = 0.2\n"
+	require.NoError(t, Init(cf, sample))
+	require.Equal(t, 0.2, Cfg.MinMatchSimilarity)
+	require.Equal(t, 0.05, Cfg.SimDisplayFloor)
+	require.Equal(t, 0.2, Cfg.SimDisplayCeil)
+}
+
 func TestScanIntervalDefaultAndSave(t *testing.T) {
 	dir := t.TempDir()
 	cf := filepath.Join(dir, "photos.conf")

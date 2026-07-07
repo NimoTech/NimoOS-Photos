@@ -61,6 +61,96 @@ func assetIndexed(t *testing.T, idx *Indexer, path string) bool {
 	return err == nil && status == "indexed"
 }
 
+// assetExists reports whether path still has any asset row at all, regardless
+// of status.
+func assetExists(t *testing.T, idx *Indexer, path string) bool {
+	t.Helper()
+	var n int
+	err := idx.db.QueryRow(`SELECT COUNT(*) FROM assets WHERE file_path=?`, path).Scan(&n)
+	return err == nil && n > 0
+}
+
+// TestWatcherHandleEventPrunesDirectoryDelete covers the bug where deleting
+// an entire subdirectory left every asset indexed from it (CLIP vector and
+// thumbnail included) permanently stuck in the DB until the next 24h
+// ScanAllRoots: fsnotify's Remove/Rename event for a directory carries the
+// directory's own path as event.Name, which has no recognised media
+// extension. Before the fix, handleEvent's isSupportedMedia-only branch
+// silently dropped such events.
+//
+// This deliberately drives handleEvent directly with a synthetic event
+// (mirroring TestHandleWatchErrorOverflowTriggersRescan's approach below)
+// rather than deleting real files via a live Watcher + os.RemoveAll: on a
+// plain local filesystem, RemoveAll unlinks every file individually, and
+// each unlink already produces its own per-file Remove event that the
+// PRE-EXISTING isSupportedMedia+RemoveByPath branch handles correctly —
+// making an end-to-end RemoveAll test pass regardless of whether this fix
+// exists, and thus unable to actually prove it. The dropped-event gap this
+// fix closes is about event.Name itself being a bare directory path (e.g. a
+// directory renamed out of the watched tree, or a coarse-grained notification
+// from a network/FUSE watch dir such as NimoOS's rclone cloud mounts) — this
+// test targets exactly that dispatch path, deterministically.
+func TestWatcherHandleEventPrunesDirectoryDelete(t *testing.T) {
+	root := t.TempDir()
+	sub := filepath.Join(root, "sub") // already gone from disk by the time the event is handled
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	db := makeTestDB(t)
+	idx := NewIndexer(db, &mockML{}, t.TempDir(), 2)
+	// t.TempDir() is not a real mount point, so pruneMissingUnder's
+	// dirUnderMountedRoot guard would otherwise refuse to touch it — override
+	// mountRoots the same way indexer_test.go's prune tests do.
+	idx.mountRoots = func() []string { return []string{root} }
+	go idx.Start(ctx)
+
+	fileA := filepath.Join(sub, "a.jpg")
+	fileB := filepath.Join(sub, "b.jpg")
+	insertAsset(t, db, fileA, "indexed")
+	insertAsset(t, db, fileB, "indexed")
+
+	w := NewWatcher(db, []string{root}, idx, "")
+	fw, err := fsnotify.NewWatcher()
+	require.NoError(t, err)
+	defer fw.Close()
+	var wg sync.WaitGroup
+	defer wg.Wait()
+
+	w.handleEvent(ctx, fw, &wg, fsnotify.Event{Name: sub, Op: fsnotify.Remove})
+
+	require.Eventually(t, func() bool {
+		return !assetExists(t, idx, fileA) && !assetExists(t, idx, fileB)
+	}, 5*time.Second, 100*time.Millisecond,
+		"目录删除事件(event.Name 为无扩展名的目录路径)必须清理该目录下所有 asset,而不是被 isSupportedMedia 白名单静默丢弃")
+}
+
+// TestWatcherRemovesAssetOnFileDelete is a regression guard for the existing
+// single-file delete path: a Remove/Rename event whose event.Name carries a
+// supported media extension must keep going through the exact-match
+// RemoveByPath fast path, unaffected by the directory-delete fix above.
+func TestWatcherRemovesAssetOnFileDelete(t *testing.T) {
+	root := t.TempDir()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	w, idx := newWatcherTestHarness(t, ctx, []string{root})
+	go w.Start(ctx)
+
+	file := filepath.Join(root, "solo.jpg")
+	require.Eventually(t, func() bool {
+		writeFile(t, file, "data")
+		return assetIndexed(t, idx, file)
+	}, 5*time.Second, 100*time.Millisecond, "文件应先被索引")
+
+	require.NoError(t, os.Remove(file))
+
+	require.Eventually(t, func() bool {
+		return !assetExists(t, idx, file)
+	}, 5*time.Second, 100*time.Millisecond, "删除单个文件后,对应 asset 记录应被清理")
+}
+
 // TestWatcherRecursiveNestedSubdir verifies the core bug fix: a file written
 // into a subdirectory several levels below a WatchDir root — never watched
 // directly, only reachable via recursive Add at Start — is detected.

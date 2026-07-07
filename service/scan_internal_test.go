@@ -14,8 +14,8 @@ func TestDisplayScore(t *testing.T) {
 		raw  float64
 		want float64
 	}{
-		{"floor maps to 0", simDisplayFloor, 0},
-		{"ceil maps to 1", simDisplayCeil, 1},
+		{"floor maps to 0", simDisplayFloor(), 0},
+		{"ceil maps to 1", simDisplayCeil(), 1},
 		{"OCR exact hit stays 1", 1.0, 1},
 		{"midpoint maps to ~0.5", 0.08, 0.5},
 		{"negative clamps to 0", -0.5, 0},

@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/NimoTech/NimoOS-Photos/pkg/config"
 	"github.com/NimoTech/NimoOS-Photos/pkg/sqlite"
 )
 
@@ -80,10 +81,12 @@ func NewSearchService(db *sql.DB, ml textEmbedder) *SearchService {
 
 // ─── Smart (CLIP) search ─────────────────────────────────────────────────────
 
-// minMatchSimilarity, when > 0, drops SmartSearch results whose cosine similarity
-// is below it. It is compared against Asset.MatchScore, which since scan.go's
-// displayScore is the *recalibrated* [0,1] display score — not the raw CLIP
-// cosine — so this threshold's semantics are display-scale, not raw-cosine-scale.
+// minMatchSimilarity returns the configured relevance floor (photos.MinMatchSimilarity
+// in the config file; config.Config.MinMatchSimilarity). When > 0, SmartSearch drops
+// results whose cosine similarity is below it. It is compared against
+// Asset.MatchScore, which since scan.go's displayScore is the *recalibrated*
+// [0,1] display score — not the raw CLIP cosine — so this threshold's semantics
+// are display-scale, not raw-cosine-scale.
 //
 // Why this knob exists: KNN always returns the k nearest neighbours regardless of
 // absolute similarity, so on a small library every query returns a long tail of
@@ -97,9 +100,16 @@ func NewSearchService(db *sql.DB, ml textEmbedder) *SearchService {
 // A fresh empirical pass against the recalibrated MatchScore is needed after a
 // full library re-embed before reusing this knob.
 //
-// Left at 0 (no filtering) by default — current behaviour (and value) is
-// unchanged by this recalibration. Bump it here to enable a relevance floor.
-const minMatchSimilarity = 0.0
+// Defaults to 0 (no filtering) when unset in the config file or when config is
+// not initialized (e.g. tests constructing SearchService directly) — current
+// behaviour (and value) is unchanged by this recalibration. Set
+// photos.MinMatchSimilarity in the config file to enable a relevance floor.
+func minMatchSimilarity() float64 {
+	if config.Cfg != nil {
+		return config.Cfg.MinMatchSimilarity
+	}
+	return 0.0
+}
 
 // SmartSearch performs KNN vector search on CLIP embeddings filtered by optional
 // year/month, returning at most limit results.
@@ -154,10 +164,18 @@ WHERE vec.embedding MATCH ? AND k = ?
 	if err != nil {
 		return nil, err
 	}
-	if minMatchSimilarity > 0 {
+	// Mark these as pure-CLIP semantic hits. If IncludeOCR is set, mergeOCRFirst
+	// below drops any asset that also has an OCR hit and keeps the OCR entry
+	// (already tagged "ocr" in ocrSearch), so this tag only survives on assets
+	// that matched by semantic similarity alone.
+	for i := range assets {
+		assets[i].MatchedBy = "semantic"
+	}
+	minSim := minMatchSimilarity()
+	if minSim > 0 {
 		kept := assets[:0]
 		for _, a := range assets {
-			if a.MatchScore == nil || *a.MatchScore >= minMatchSimilarity {
+			if a.MatchScore == nil || *a.MatchScore >= minSim {
 				kept = append(kept, a)
 			}
 		}
