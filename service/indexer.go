@@ -225,6 +225,23 @@ func (ix *Indexer) pruneSystemMountAssets() {
 	}
 }
 
+// pruneRcloneMountAssets removes any indexed asset living under an rclone
+// FUSE cloud-drive mount. Cloud drives are excluded from scanning/watching
+// (see parseScanRoots) — this startup purge self-heals whatever an earlier,
+// broader scan may have indexed. mounts 由调用方传 enumerateRcloneMounts(),
+// 注入参数便于测试;未挂载的云盘不猜路径模式、不动。
+// 挂载点名含 `_`(rclone 命名 /mnt/<user>_<provider>_<id>)是 LIKE 单字符
+// 通配,必须用 substr 前缀比较,不能用 LIKE。
+func (ix *Indexer) pruneRcloneMountAssets(mounts []string) {
+	for _, mp := range mounts {
+		prefix := strings.TrimRight(mp, "/") + "/"
+		ix.prunePathsMatching(
+			`file_path = ? OR substr(file_path,1,length(?)) = ?`,
+			mp, prefix, prefix,
+		)
+	}
+}
+
 // prunePathsMatching deletes every asset whose file_path matches the given SQL
 // WHERE fragment (against args), via RemoveByPath. Shared helper for
 // pruneSystemMountAssets' two exclusion kinds (exact system mounts, devmon

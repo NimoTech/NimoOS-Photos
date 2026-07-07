@@ -601,6 +601,28 @@ func TestPruneSystemMountAssetsPurgesDevmonAssets(t *testing.T) {
 	require.Equal(t, 1, n)
 }
 
+// TestPruneRcloneMountAssetsPurges:rclone 云盘挂载点下的历史误入库资产在
+// 启动时防御性硬删;挂载点带下划线(真实命名 /mnt/yu.wu_dropbox_*)不得因
+// LIKE 通配泄漏误删相邻路径资产。
+func TestPruneRcloneMountAssetsPurges(t *testing.T) {
+	db := makeTestDB(t)
+	cloud := insertAsset(t, db, "/mnt/yu.wu_dropbox_178/photo.jpg", "indexed")
+	// `_` 在 LIKE 里是单字符通配:若实现误用 LIKE,前缀 /mnt/yu.wuXdropbox... 也会被命中
+	sibling := insertAsset(t, db, "/mnt/yu.wuXdropbox_178/photo.jpg", "indexed")
+	keep := insertAsset(t, db, "/DATA/Gallery/keep.jpg", "indexed")
+
+	ix := NewIndexer(db, &mockML{}, t.TempDir(), 1)
+	ix.pruneRcloneMountAssets([]string{"/mnt/yu.wu_dropbox_178"})
+
+	var n int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM assets WHERE id=?`, cloud).Scan(&n))
+	require.Equal(t, 0, n, "rclone 挂载下的资产必须被清")
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM assets WHERE id=?`, sibling).Scan(&n))
+	require.Equal(t, 1, n, "相邻相似路径不得被 LIKE 通配误删")
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM assets WHERE id=?`, keep).Scan(&n))
+	require.Equal(t, 1, n)
+}
+
 func TestPruneDeleteGuard(t *testing.T) {
 	dir := t.TempDir()
 	require.True(t, pruneDeleteAllowed(dir, func(string) bool { return true }))

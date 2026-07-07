@@ -182,6 +182,7 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 	go func() {
 		idx.ScanPending()
 		idx.pruneSystemMountAssets()
+		idx.pruneRcloneMountAssets(enumerateRcloneMounts())
 		pruneOrphanClipVectors(db) // sweep any vec0 rows left orphaned by past deletes
 		pruneVideoOCR(db)          // 视频不再做 OCR:清掉历史遗留的视频 OCR 行,使其退出「OCR/文档」分类
 		idx.ScanAllRoots()
