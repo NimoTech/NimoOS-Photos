@@ -39,7 +39,7 @@ NimoOS 的相册服务，提供**照片/视频索引、EXIF 解析、缩略图�
                      ┌──────────────▼──────────────────────────┐
                      │  immich-machine-learning (Docker)       │
                      │  127.0.0.1:3003  /predict               │
-                     │  - CLIP nllb-clip-large-siglip__v1(1152维)│
+                     │  - CLIP ViT-SO400M-16-SigLIP2-384(1152维)│
                      │  - 人脸检测+识别 antelopev2 (512-dim)     │
                      │  - OCR PP-OCRv5_server                  │
                      └───────────────────────────────────────┘
@@ -60,10 +60,12 @@ ML 后端为独立 Docker Compose 栈（`deploy/ml/docker-compose.yml`），绑�
 | GET | `/assets/:id/thumbnail` | 获取缩略图（JWT 豁免） |
 | GET | `/assets/:id/original` | 获取原始文件（JWT 豁免） |
 | GET | `/assets/:id/live` | 获取 Live Photo 视频（JWT 豁免） |
+| GET | `/assets/:id/sprite` | 视频悬停预览雪碧图（JWT 豁免） |
 | GET | `/timeline` | 按年月分组的时间线 |
-| POST | `/search/smart` | CLIP 语义搜索 + OCR 精确匹配（localhost 免 JWT） |
+| POST | `/search/smart` | CLIP 语义搜索 + OCR 精确匹配（localhost MCP 调用免 JWT，见鉴权） |
 | GET | `/search/faces/:person_id` | 按人物查找资产 |
-| GET/POST/DELETE | `/albums[/:id]` | 相册 CRUD |
+| GET/POST/DELETE | `/albums[/:id]` | 相册 CRUD（`GET /albums` 对 localhost MCP 调用免 JWT，见鉴权） |
+| GET | `/albums/:id/summary` | 相册摘要 |
 | POST/DELETE | `/albums/:id/assets[/batch]` | 相册资产添加/删除 |
 | PATCH | `/albums/:id` | 相册元数据更新 |
 | PATCH | `/albums/:id/assets/order` | 手动排序 |
@@ -120,10 +122,15 @@ ML 后端为独立 Docker Compose 栈（`deploy/ml/docker-compose.yml`），绑�
 fsnotify (Watcher)
   Create/Write → isSupportedMedia → Indexer.Enqueue(path)
 
+MessageBus 订阅 nimoos:media:created (service/buscreated.go)
+  落盘即索引：文件直接 Enqueue（seen 去重幂等）、目录 walkSupported 递归展开
+
 ScanDirectory (手动/启动) → walkSupported → processFile (串行)
 
 TUS 上传完成 → MarkAndReserve + rename → SubmitReserved
 ```
+
+`media:created` 订阅用**独立 WS 连接**（主服务 NimoOS 未升级、事件未注册时该订阅被 400 拒绝并退避重试，不连累 `media:deleted` 那条连接）；事件处理 `go` 异步化——大目录 walk 可能跑数十秒，同步执行会停读连接，而 MessageBus 对读慢订阅者是非阻塞发送、直接丢事件。通用订阅循环在 `service/busdelete.go` 的 `runBusPathsSubscriber`。
 
 扫描范围是黑名单而非白名单（`service/scanroots.go` `isUserPartition`）：`/media` 或 `/mnt` 下任意挂载点默认都会被扫描，但 `/media/devmon/<卷标>`（devmon 自动挂载的可移动 U 盘/读卡器）被产品决策整体排除——不扫描、不被 MountGuard 追踪 offline，且启动时会硬删（含 CLIP 向量、缩略图）任何历史遗留的 devmon 资产；RAID（`/media/RAID_*`）、单盘 storage（`/mnt/Disk-*`）、MergerFS 等仍正常纳入。已知限制：若 devmon 被禁用/卸载，同一块 U 盘可能被 LocalStorage 抢挂到 `/mnt/Disk-*`，届时会被当作普通固定盘重新扫描。
 
@@ -136,9 +143,9 @@ TUS 上传完成 → MarkAndReserve + rename → SubmitReserved
 5. INSERT/UPDATE `assets` + `asset_exif`（状态 `'pending'`）
 6. 生成缩略图（small 250px / large 1280px，`disintegration/imaging`）
 7. ML 推理（ML 服务就绪时）：
-   - **CLIP 图像嵌入**：`nllb-clip-large-siglip__v1`（多语言，SigLIP SO400M 图像塔），1152 维，用 small.jpg 缩略图计算（与用户看到的帧一致），写入 `clip_embeddings`（sqlite-vec vec0 虚拟表）
+   - **CLIP 图像嵌入**：`ViT-SO400M-16-SigLIP2-384__webli`（SigLIP2 SO400M，短词/中英混搜判别力优于旧 nllb-clip-large，见 `common/constants.go` 注释），1152 维，用 small.jpg 缩略图计算（与用户看到的帧一致），写入 `clip_embeddings`（sqlite-vec vec0 虚拟表）
    - **人脸检测+识别**：`antelopev2`（InsightFace ResNet100@Glint360K），512 维，写入 `face_detections`
-   - **OCR**：`PP-OCRv5_server`，置信度 ≥0.5 的文字行写入 `asset_ocr`
+   - **OCR**：`PP-OCRv5_server`，置信度 ≥0.5 的文字行写入 `asset_ocr`。**仅图片**——视频不跑 OCR（关键帧 OCR 无意义，还会把录屏/含文字画面误判进「OCR/文档」分类），启动时 `pruneVideoOCR` 清理历史遗留的视频 OCR 行
 8. 更新状态 `'indexed'`
 
 ### 2. 语义搜索（CLIP）
@@ -176,7 +183,7 @@ Smart View 也复用 `SmartSearch` 接口，按自然语言条件定义动态相
 
 ### 6. ML 模型代次自动重建
 
-`common.MLModelGen`（当前 `"2"`）标识当前二进制绑定的模型组合（CLIP/人脸/OCR 三个选型 + 维度）；成功重建后写入 `photos_meta.ml_model_gen`。服务启动时若检测到该键缺失（老库）或与当前 `MLModelGen` 不符，`Rebuilder.MaybeAutoRebuild`（`service/rebuild.go`）会轮询等待 ML 后端就绪（新模型缓存就位）后自动触发一次全量重建：清空 `clip_embeddings`/`asset_clip_idx`、对所有 `status='indexed'` 资产重跑 CLIP/人脸/OCR、重新聚类人脸并清理无脸的空 `persons`，最后写回新代次。空库（无资产）跳过 worker pool，直接完成重聚类并写代次，秒级完成。代次仅在重建成功收尾（`finalize()`）后写入，中途失败或断电会在下次启动时重试。
+`common.MLModelGen`（当前 `"3"` = SigLIP2 SO400M + antelopev2 + PP-OCRv5_server；gen 2 为 nllb-clip-large 时代）标识当前二进制绑定的模型组合（CLIP/人脸/OCR 三个选型 + 维度）；成功重建后写入 `photos_meta.ml_model_gen`。服务启动时若检测到该键缺失（老库）或与当前 `MLModelGen` 不符，`Rebuilder.MaybeAutoRebuild`（`service/rebuild.go`）会轮询等待 ML 后端就绪（新模型缓存就位）后自动触发一次全量重建：清空 `clip_embeddings`/`asset_clip_idx`、对所有 `status='indexed'` 资产重跑 CLIP/人脸/OCR、重新聚类人脸并清理无脸的空 `persons`，最后写回新代次。空库（无资产）跳过 worker pool，直接完成重聚类并写代次，秒级完成。代次仅在重建成功收尾（`finalize()`）后写入，中途失败或断电会在下次启动时重试。
 
 ---
 
@@ -240,9 +247,9 @@ CGO_ENABLED=1 go build -o nimoos-photos .
 
 JWT 校验（ECDSA P-256，公钥从 `/var/run/nimoos/` 读取），以下路径**豁免**：
 - OPTIONS 请求（CORS preflight，TUS 客户端发送）
-- `*/thumbnail`、`*/face-thumbnail`、`*/original`、`*/live`（媒体文件，`<img>` 标签无法附带 Authorization）
+- `*/thumbnail`、`*/face-thumbnail`、`*/original`、`*/live`、`*/sprite`（媒体文件，`<img>` 标签无法附带 Authorization）
 - `*/favorites/export`（同上）
-- `POST */search/smart`，且请求来自 `127.0.0.1.*`（允许 NimoOS-AI Agent 内部调用）
+- **MCP 只读豁免**（`mcpReadSkip`，`route/router.go`）：`POST /search/smart` 和 `GET /albums` 两条只读端点，供 NimoOS-AI（agent / MCP server）内部调用。**fail-closed + 精确匹配**：RealIP 必须 `127.*`（Gateway 会剥掉伪造的 XFF）、`X-NimoOS-User-ID` 头必须非空（缺失则不豁免 → 走 JWT → 401，绝不回落 default 用户）、路径与完整路由精确相等（不用 HasSuffix）
 
 校验通过后，JWT Claims 的用户 ID 以 `X-NimoOS-User-ID` Header 注入后续处理。
 
@@ -279,17 +286,19 @@ SmartViewEnabled = true
 |---|---|
 | **NimoOS-Gateway** | 启动时 `POST /v1/gateway/routes` 注册三个前缀（`/v1/photos`、`/doc/v1/photos`、`/v1/upload-tus`）；从 `RuntimePath` 读取 Gateway 地址 |
 | **NimoOS-UserService** | 从 `/var/run/nimoos/` 读取 ECDSA 公钥校验 JWT |
-| **NimoOS-MessageBus** | systemd `After=nimoos-message-bus.service`；`service/publisher.go` 向 MessageBus 发布事件（索引进度等） |
-| **immich-machine-learning** | Docker 容器，`127.0.0.1:3003`，`pkg/mlclient` 通过 `/predict` + multipart/form-data 调用；ML 不可用时 CLIP/人脸/OCR 步骤跳过，Embedder 检测到恢复后自动补跑 |
-| **NimoOS-AI Agent** | 可无 JWT 从 localhost 调用 `POST /search/smart`，作为 AI Agent 文件搜索后端 |
+| **NimoOS-MessageBus** | systemd `After=nimoos-message-bus.service`；`service/publisher.go` 向 MessageBus 发布事件（索引进度等）；订阅 `nimoos:media:created` / `nimoos:media:deleted`（落盘即索引 / 删除即清理，`service/buscreated.go` / `busdelete.go`，各自独立 WS 连接，周期全盘扫描仍是兜底） |
+| **immich-machine-learning** | Docker 容器，`127.0.0.1:3003`，`pkg/mlclient` 通过 `/predict` + multipart/form-data 调用；ML 不可用时 CLIP/人脸/OCR 步骤跳过，Embedder 检测到恢复后自动补跑；卡死态由内置看门狗 `docker restart`（见已知坑 2） |
+| **NimoOS-AI Agent / MCP server** | 可无 JWT 从 localhost 调用 `POST /search/smart`、`GET /albums`（`mcpReadSkip`，见鉴权），作为 `search_photos` / `list_albums` MCP 工具后端 |
 
 ---
 
 ## 已知坑
 
-1. **inotify 配额放大**：NimoOS-Photos 的 Watcher、Wiki（`NimoOS/`）和 NimoOS-Search 三个 fsnotify 实例都监视 `/DATA/Gallery` 等目录。每个实例独立占用 inotify watches，导致 `/proc/sys/fs/inotify/max_user_watches` 压力叠加。若目录树超大，需手动调高配额（如 `echo 524288 > /proc/sys/fs/inotify/max_user_watches`）。当前维持各自独立监视（方案 A），统一共享监视层为后续待办。
+1. **inotify 配额放大**：NimoOS-Photos 的 Watcher、Wiki（`NimoOS/`）和 NimoOS-Search 三个 fsnotify 实例都监视 `/DATA/Gallery` 等目录。每个实例独立占用 inotify watches，导致 `/proc/sys/fs/inotify/max_user_watches` 压力叠加。若目录树超大，需手动调高配额（如 `echo 524288 > /proc/sys/fs/inotify/max_user_watches`）。当前维持各自独立监视（方案 A），统一共享监视层为后续待办。inotify **事件队列溢出**（`fsnotify.ErrEventOverflow`）时 Watcher 会触发全根恢复补扫（`service/watcher.go`），补扫单飞（`overflowRescanning`）且带 5 分钟冷却（`overflowRescanCooldown`），防止写入风暴期间连环补扫。
 
 2. **ML 服务离线**：ML 容器（immich-machine-learning）为离线镜像捆绑包，首次需通过安装脚本 `docker load`。容器未启动时 CLIP 嵌入、人脸识别、OCR 全部跳过（`ml.IsReady()` 返回 false）；Embedder 检测到 `false→true` 跳变时自动补跑历史资产。
+
+   **ML 卡死自愈**：ML worker 可能陷入「端口在听、worker 空壳」的 hang 态（模型冷加载超时被 gunicorn 中途杀掉的后遗症，compose 的 `restart: unless-stopped` 只救进程退出、救不了 hang）。内置看门狗 `MLWatchdog`（`service/mlwatchdog.go`）每 30s 探测：`/ping` 连续 12 次失败（约 6 分钟，刻意排在 gunicorn 300s 自愈窗口之后，作为第二道防线）且 `docker inspect` 确认容器在运行时才 `docker restart`，10 分钟冷却；容器未运行（未装 ML 包/用户手动停）则静默跳过并清零计数。compose 侧另有 healthcheck，但仅供 `docker ps` / AppManagement 可观测，不驱动重启。
 
 3. **视频缩略图用于 CLIP 嵌入**：视频用 ffmpeg 提取的关键帧生成 CLIP 嵌入（而非关键帧原图），与图片路径统一为 `small.jpg`；这是有意设计——避免高细节关键帧在语义搜索中不当排名高于图片。标记文件 `.clip_reembed_thumb_v1.done` 防止重建索引后的重复嵌入。
 
@@ -319,7 +328,7 @@ ML 后端独立部署（`deploy/ml/`），按核显厂商分 **openvino**（Inte
 
 - **打包**（`script/package-photos-ml.sh <openvino|rocm|cpu> [输出目录]`，在有外网的机器上执行一次）：拉取对应 immich-machine-learning 官方镜像 tag 并重打本地标签、启动临时容器预热 CLIP 图/文塔、人脸、OCR 三个模型缓存（模型名从 `common/constants.go` 用正则抓取，保证打包与代码选型一致），再把镜像 tar、模型缓存 tar、`docker-compose.yml`、`install.sh`、`overrides/` 打成一个分发压缩包。
 - **安装**（`install.sh`，幂等，重复运行=更新到包内镜像版本）：读取包内 `FLAVOR` 文件，用 `/sys/class/drm/card*/device/vendor`（Intel=`0x8086`、AMD=`0x1002`）自动识别本机核显厂商并与 flavor 校验（不匹配则拒绝安装）；按 flavor 把 `overrides/<flavor>.yml` 拷贝为 `docker-compose.override.yml` 叠加设备直通（`/dev/dri`；AMD 再加 `/dev/kfd` + `HSA_OVERRIDE_GFX_VERSION`）；随包模型缓存解压进 `ml-cache`（已存在则跳过，`FORCE_MODELS=1` 强制覆盖）；`docker compose up -d` 后轮询 `/ping` 确认就绪。
-- **运行时环境变量**（`docker-compose.yml`）：`MACHINE_LEARNING_MODEL_TTL=300` 秒闲置自动卸载模型释放内存（nllb-large + PP-OCRv5_server 常驻内存/显存开销较大）、`MACHINE_LEARNING_MODEL_TTL_POLL_S=10`、`HF_HUB_OFFLINE=1` 禁止运行时联网查 HuggingFace（模型缓存已随包预置，离线/内网机器联网查询会卡超时）。
+- **运行时环境变量**（`docker-compose.yml`）：`MACHINE_LEARNING_MODEL_TTL=300` 秒闲置自动卸载模型释放内存（SigLIP2 SO400M + PP-OCRv5_server 常驻内存/显存开销较大）、`MACHINE_LEARNING_MODEL_TTL_POLL_S=10`、`HF_HUB_OFFLINE=1` 禁止运行时联网查 HuggingFace（模型缓存已随包预置，离线/内网机器联网查询会卡超时）、`MACHINE_LEARNING_WORKER_TIMEOUT=300`（SigLIP2 冷加载在低端盘可能超过默认 120s，被 gunicorn 中途杀掉会留下「端口在听、worker 空壳」的卡死态）。另有 healthcheck（30s 探 `/ping`，`start_period: 300s` 对齐 WORKER_TIMEOUT）仅供可观测性，真正自愈由 nimoos-photos 内置看门狗负责（见已知坑 2）。
 
 ```bash
 # 打包（一次性，需要外网）
