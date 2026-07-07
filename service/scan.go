@@ -4,6 +4,8 @@ import (
 	"database/sql"
 	"strings"
 	"time"
+
+	"github.com/NimoTech/NimoOS-Photos/pkg/config"
 )
 
 // enrichPlaceNames fills each asset's PlaceName ("City" or "City, Country") from
@@ -103,17 +105,38 @@ func scanAssets(rows *sql.Rows) ([]Asset, error) {
 // 噪声 ≤0.03,强相关 ~0.09-0.13(本库 7 图 × 8 查询 A/B 实测标定,
 // 换 CLIP 模型后需重标)。展示层把 [simDisplayFloor, simDisplayCeil]
 // 线性映射到 [0,1],OCR 精确命中(sim=1.0)钳到 1 不受影响。
+//
+// 这两个端点现在经 pkg/config(photos.SimDisplayFloor / photos.SimDisplayCeil)
+// 可配置,默认值与上述硬编码经验值一致;config 未初始化(如直接构造
+// SearchService 的单测)或配置显式给出 0 时退回默认值。
 const (
-	simDisplayFloor = 0.03
-	simDisplayCeil  = 0.13
+	defaultSimDisplayFloor = 0.03
+	defaultSimDisplayCeil  = 0.13
 )
 
+// simDisplayFloor returns the currently effective lower calibration endpoint.
+func simDisplayFloor() float64 {
+	if config.Cfg != nil && config.Cfg.SimDisplayFloor != 0 {
+		return config.Cfg.SimDisplayFloor
+	}
+	return defaultSimDisplayFloor
+}
+
+// simDisplayCeil returns the currently effective upper calibration endpoint.
+func simDisplayCeil() float64 {
+	if config.Cfg != nil && config.Cfg.SimDisplayCeil != 0 {
+		return config.Cfg.SimDisplayCeil
+	}
+	return defaultSimDisplayCeil
+}
+
 // displayScore linearly rescales a raw cosine similarity (as produced from the
-// sqlite-vec L2 distance over unit-length vectors) from [simDisplayFloor,
-// simDisplayCeil] into [0,1], clamping outside that band. OCR exact hits pass
-// in raw=1.0, which is above simDisplayCeil and clamps to 1 as intended.
+// sqlite-vec L2 distance over unit-length vectors) from [simDisplayFloor(),
+// simDisplayCeil()] into [0,1], clamping outside that band. OCR exact hits pass
+// in raw=1.0, which is above simDisplayCeil() and clamps to 1 as intended.
 func displayScore(raw float64) float64 {
-	sim := (raw - simDisplayFloor) / (simDisplayCeil - simDisplayFloor)
+	floor, ceil := simDisplayFloor(), simDisplayCeil()
+	sim := (raw - floor) / (ceil - floor)
 	if sim < 0 {
 		sim = 0
 	} else if sim > 1 {

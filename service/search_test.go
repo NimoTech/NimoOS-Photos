@@ -89,12 +89,12 @@ func TestSmartSearchIncludeOCR(t *testing.T) {
 	require.Equal(t, "a2", results[1].ID)
 	require.NotNil(t, results[0].MatchScore)
 	require.InDelta(t, 1.0, *results[0].MatchScore, 1e-9)
-	// OCR 命中带 matchedBy 标记（双路命中时保留 OCR 版本）；纯 CLIP 命中不带
+	// OCR 命中带 matchedBy="ocr" 标记（双路命中时保留 OCR 版本）；纯 CLIP 命中带 "semantic"
 	require.Equal(t, "ocr", results[0].MatchedBy)
 	require.Equal(t, "ocr", results[1].MatchedBy)
 	for _, a := range results {
 		if a.ID == "a1" {
-			require.Empty(t, a.MatchedBy)
+			require.Equal(t, "semantic", a.MatchedBy)
 		}
 	}
 	ids := map[string]int{}
