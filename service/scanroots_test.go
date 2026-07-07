@@ -2,7 +2,10 @@ package service
 
 import (
 	"reflect"
+	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 func TestParseScanRoots(t *testing.T) {
@@ -72,4 +75,33 @@ func TestIsExcludedMountAndUserPartition(t *testing.T) {
 			t.Errorf("isUserPartition(%q) = %v, want %v", c.mp, got, c.user)
 		}
 	}
+}
+
+// TestParseScanRootsExcludesRcloneFuse:rclone 云盘挂载(fuse.rclone)不进
+// 扫描/监控范围——FUSE 上 inotify 不可靠,索引云盘会把远端文件全量拉下来;
+// MergerFS(fuse.mergerfs)是一等用户存储,必须保留。
+func TestParseScanRootsExcludesRcloneFuse(t *testing.T) {
+	mounts := strings.Join([]string{
+		"/dev/sda1 /DATA ext4 rw 0 0",
+		"dropbox: /mnt/yu.wu_dropbox_1782892446 fuse.rclone rw 0 0",
+		"pool /mnt/pool fuse.mergerfs rw 0 0",
+		"/dev/md0 /media/RAID_0 btrfs rw 0 0",
+	}, "\n")
+	roots := parseScanRoots(mounts)
+	require.NotContains(t, roots, "/mnt/yu.wu_dropbox_1782892446", "fuse.rclone 挂载必须被排除")
+	require.Contains(t, roots, "/mnt/pool", "fuse.mergerfs 必须保留")
+	require.Contains(t, roots, "/media/RAID_0")
+	require.Contains(t, roots, "/DATA")
+}
+
+// TestParseRcloneMounts:rclone 挂载点枚举(供启动清理历史误入库资产用)。
+func TestParseRcloneMounts(t *testing.T) {
+	mounts := strings.Join([]string{
+		"/dev/sda1 /DATA ext4 rw 0 0",
+		"dropbox: /mnt/yu.wu_dropbox_1782892446 fuse.rclone rw 0 0",
+		"gdrive: /mnt/a_gdrive_9\\040x fuse.rclone rw 0 0", // 挂载点含空格转义
+		"pool /mnt/pool fuse.mergerfs rw 0 0",
+	}, "\n")
+	require.Equal(t, []string{"/mnt/a_gdrive_9 x", "/mnt/yu.wu_dropbox_1782892446"},
+		parseRcloneMounts(mounts))
 }
