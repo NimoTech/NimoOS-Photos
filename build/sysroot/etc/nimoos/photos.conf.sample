@@ -6,5 +6,6 @@ LogPath = /var/log/nimoos
 DataPath = /DATA/.system_data/photos
 MLEndpoint = http://127.0.0.1:3003
 Workers = 3
-WatchDirs = /DATA/Gallery,/DATA/Documents,/DATA/Downloads
+# WatchDirs 留空 = 自动模式:监控系统盘 + 全部已挂载用户分区(RAID/独立存储),动态跟随挂载
+# 需要手工限定时才取消注释:WatchDirs = /DATA/Gallery,/DATA/Documents,/DATA/Downloads
 FacesEnabled = true

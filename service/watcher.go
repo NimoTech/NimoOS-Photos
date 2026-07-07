@@ -24,6 +24,10 @@ import (
 // ScanDirectory 兜底覆盖剩余未扫到的变更。
 const overflowRescanCooldown = 5 * time.Minute
 
+// watchPollInterval 是自动模式下根集合轮询的默认间隔,与
+// mountguard.go 的 mountGuardPollInterval 同频。
+const watchPollInterval = 30 * time.Second
+
 // Watcher monitors directories for new or modified media files and enqueues
 // them for indexing. It also provides live-photo pairing via PairLivePhotos.
 //
@@ -62,6 +66,14 @@ type Watcher struct {
 	// walkSupported, multiplying IO for no benefit — the outermost walk
 	// already covers everything beneath it.
 	walkInFlight sync.Map
+
+	// enumerateRoots 是自动模式(watchDirs 为空)下的根集合来源;nil 时用
+	// EnumerateScanRoots(生产路径),测试注入以避免依赖真实 /proc/mounts。
+	enumerateRoots func() []string
+
+	// pollInterval 是自动模式下根集合轮询间隔;0 ⇒ watchPollInterval(30s,
+	// 与 mountGuardPollInterval 同频)。测试注入短间隔。
+	pollInterval time.Duration
 }
 
 // NewWatcher creates a new Watcher.
@@ -87,7 +99,17 @@ func (w *Watcher) Start(parentCtx context.Context) {
 	}
 	w.cancel = cancel
 	dirs := append([]string(nil), w.watchDirs...)
+	enumerateRoots := w.enumerateRoots
 	w.mu.Unlock()
+
+	auto := len(dirs) == 0
+	if auto {
+		enum := enumerateRoots
+		if enum == nil {
+			enum = EnumerateScanRoots
+		}
+		dirs = enum()
+	}
 
 	fw, err := fsnotify.NewWatcher()
 	if err != nil {
@@ -118,7 +140,15 @@ func (w *Watcher) Start(parentCtx context.Context) {
 	w.roots = resolvedRoots
 	w.mu.Unlock()
 	zap.L().Info("watcher: started",
-		zap.Strings("watchDirs", dirs), zap.Int("watches", totalWatches))
+		zap.Strings("watchDirs", dirs), zap.Bool("auto", auto), zap.Int("watches", totalWatches))
+
+	if auto {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			w.followMounts(ctx, parentCtx, dirs)
+		}()
+	}
 
 	for {
 		select {
@@ -196,14 +226,47 @@ func (w *Watcher) handleEvent(ctx context.Context, fw *fsnotify.Watcher, wg *syn
 		w.indexer.Enqueue(event.Name)
 	}
 
-	// Directory deletes/renames need no explicit handling here: inotify
-	// automatically drops the watch (IN_IGNORED) when a watched directory is
-	// deleted or moved away, and fsnotify's internal watch-descriptor
-	// bookkeeping follows suit — there is nothing for Watcher to clean up.
-	// For files, RemoveByPath still needs to run as before.
+	// Directory deletes/renames: inotify automatically drops the watch
+	// (IN_IGNORED) when a watched directory is deleted or moved away, and
+	// fsnotify's internal watch-descriptor bookkeeping follows suit — there is
+	// nothing to clean up on that front. But the DB index still needs
+	// explicit cleanup: fsnotify reports the removal with event.Name set to
+	// the directory's own path — not one event per file inside it — so a
+	// directory-shaped path (no recognised media extension) is routed through
+	// shouldHandleDeletedPath + pruneMissingUnder (service/busdelete.go,
+	// service/indexer.go), the same "no extension ⇒ possibly a directory"
+	// handling the MessageBus deletion subscriber uses. Without this, every
+	// asset indexed from under the deleted directory — CLIP vector and
+	// thumbnail included — would linger until the next 24h ScanAllRoots.
+	// For files, RemoveByPath still runs as before (exact-path fast path).
 	if event.Has(fsnotify.Remove) || event.Has(fsnotify.Rename) {
 		if isSupportedMedia(event.Name) {
 			w.indexer.RemoveByPath(event.Name)
+		} else if shouldHandleDeletedPath(event.Name) {
+			// pruneMissingUnder is called with the PARENT of the deleted
+			// directory, not the directory itself. Its own safety interlock
+			// (pruneDeleteAllowed, service/indexer.go) re-validates right
+			// before deleting by os.Stat'ing the "dir" it was given — the
+			// exact directory this event just reported gone will always fail
+			// that stat, since it no longer exists, and pruneMissingUnder
+			// would silently no-op every single time. The parent, in
+			// contrast, is guaranteed to still be on disk: directories are
+			// only ever removable once empty, so an rm -rf (or any other
+			// recursive delete) always rmdir's bottom-up — a directory's own
+			// Remove/Rename event can only fire after everything beneath it
+			// is already gone, and strictly before its parent is touched.
+			// Scanning from the parent still only deletes rows that
+			// individually stat as missing (siblings that still exist are
+			// left untouched), it just widens the query/stat pass to the
+			// parent's subtree instead of only the deleted directory's.
+			wg.Add(1)
+			go func(dir string) {
+				defer wg.Done()
+				if err := w.indexer.pruneMissingUnder(filepath.Dir(dir)); err != nil {
+					zap.L().Warn("watcher: prune after directory delete failed",
+						zap.String("dir", dir), zap.Error(err))
+				}
+			}(event.Name)
 		}
 	}
 }
@@ -430,6 +493,63 @@ func (w *Watcher) Restart(parentCtx context.Context, dirs []string) {
 	w.watchDirs = dirs
 	w.mu.Unlock()
 	go w.Start(parentCtx)
+}
+
+// followMounts 是自动模式的动态跟随:周期性比较根集合快照,发现挂载增减就
+// 触发 Restart 重建监听;新出现的根先补扫一遍(inotify 只看未来事件,存量
+// 文件靠补扫入库,ScanDirectoryOnce 与 MountGuard 恢复补扫天然去重)。
+// 触发重启后本轮询即退出——Restart 会启动新的 Start,新 Start 自带新轮询。
+func (w *Watcher) followMounts(ctx context.Context, parentCtx context.Context, current []string) {
+	interval := w.pollInterval
+	if interval <= 0 {
+		interval = watchPollInterval
+	}
+	enum := w.enumerateRoots
+	if enum == nil {
+		enum = EnumerateScanRoots
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			next := enum()
+			added := diffNewRoots(current, next)
+			removed := diffNewRoots(next, current)
+			if len(added) == 0 && len(removed) == 0 {
+				continue
+			}
+			zap.L().Info("watcher: mount set changed, restarting",
+				zap.Strings("added", added), zap.Strings("removed", removed))
+			for _, root := range added {
+				go func(dir string) {
+					if _, err := w.indexer.ScanDirectoryOnce(dir); err != nil {
+						zap.L().Warn("watcher: catch-up scan failed",
+							zap.String("dir", dir), zap.Error(err))
+					}
+				}(root)
+			}
+			w.Restart(parentCtx, nil) // nil 保持自动模式
+			return
+		}
+	}
+}
+
+// diffNewRoots returns the elements of next that are not in old(顺序无关)。
+func diffNewRoots(old, next []string) []string {
+	seen := make(map[string]bool, len(old))
+	for _, r := range old {
+		seen[r] = true
+	}
+	var out []string
+	for _, r := range next {
+		if !seen[r] {
+			out = append(out, r)
+		}
+	}
+	return out
 }
 
 // PairLivePhotos scans all un-paired MOV files and attempts to match them with

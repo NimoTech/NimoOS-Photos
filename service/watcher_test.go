@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -25,6 +26,18 @@ func writeFile(t *testing.T, path string, content string) {
 	t.Helper()
 	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
 	require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
+}
+
+// seedPhotoFile writes a pre-existing "photo" at path before the watcher/
+// indexer ever start — the same minimal-content recipe writeFile uses
+// elsewhere in this file (assetIndexed only checks the assets row's status,
+// not real image bytes). Named separately from writeFile purely for
+// readability at call sites where the point is "this file already exists
+// before Start runs" (only a catch-up scan, not a live fsnotify event, can
+// discover it).
+func seedPhotoFile(t *testing.T, path string) {
+	t.Helper()
+	writeFile(t, path, "seed")
 }
 
 // newWatcherTestHarness wires a real Indexer (worker pool running) and a real
@@ -46,6 +59,96 @@ func assetIndexed(t *testing.T, idx *Indexer, path string) bool {
 	var status string
 	err := idx.db.QueryRow(`SELECT status FROM assets WHERE file_path=?`, path).Scan(&status)
 	return err == nil && status == "indexed"
+}
+
+// assetExists reports whether path still has any asset row at all, regardless
+// of status.
+func assetExists(t *testing.T, idx *Indexer, path string) bool {
+	t.Helper()
+	var n int
+	err := idx.db.QueryRow(`SELECT COUNT(*) FROM assets WHERE file_path=?`, path).Scan(&n)
+	return err == nil && n > 0
+}
+
+// TestWatcherHandleEventPrunesDirectoryDelete covers the bug where deleting
+// an entire subdirectory left every asset indexed from it (CLIP vector and
+// thumbnail included) permanently stuck in the DB until the next 24h
+// ScanAllRoots: fsnotify's Remove/Rename event for a directory carries the
+// directory's own path as event.Name, which has no recognised media
+// extension. Before the fix, handleEvent's isSupportedMedia-only branch
+// silently dropped such events.
+//
+// This deliberately drives handleEvent directly with a synthetic event
+// (mirroring TestHandleWatchErrorOverflowTriggersRescan's approach below)
+// rather than deleting real files via a live Watcher + os.RemoveAll: on a
+// plain local filesystem, RemoveAll unlinks every file individually, and
+// each unlink already produces its own per-file Remove event that the
+// PRE-EXISTING isSupportedMedia+RemoveByPath branch handles correctly —
+// making an end-to-end RemoveAll test pass regardless of whether this fix
+// exists, and thus unable to actually prove it. The dropped-event gap this
+// fix closes is about event.Name itself being a bare directory path (e.g. a
+// directory renamed out of the watched tree, or a coarse-grained notification
+// from a network/FUSE watch dir such as NimoOS's rclone cloud mounts) — this
+// test targets exactly that dispatch path, deterministically.
+func TestWatcherHandleEventPrunesDirectoryDelete(t *testing.T) {
+	root := t.TempDir()
+	sub := filepath.Join(root, "sub") // already gone from disk by the time the event is handled
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	db := makeTestDB(t)
+	idx := NewIndexer(db, &mockML{}, t.TempDir(), 2)
+	// t.TempDir() is not a real mount point, so pruneMissingUnder's
+	// dirUnderMountedRoot guard would otherwise refuse to touch it — override
+	// mountRoots the same way indexer_test.go's prune tests do.
+	idx.mountRoots = func() []string { return []string{root} }
+	go idx.Start(ctx)
+
+	fileA := filepath.Join(sub, "a.jpg")
+	fileB := filepath.Join(sub, "b.jpg")
+	insertAsset(t, db, fileA, "indexed")
+	insertAsset(t, db, fileB, "indexed")
+
+	w := NewWatcher(db, []string{root}, idx, "")
+	fw, err := fsnotify.NewWatcher()
+	require.NoError(t, err)
+	defer fw.Close()
+	var wg sync.WaitGroup
+	defer wg.Wait()
+
+	w.handleEvent(ctx, fw, &wg, fsnotify.Event{Name: sub, Op: fsnotify.Remove})
+
+	require.Eventually(t, func() bool {
+		return !assetExists(t, idx, fileA) && !assetExists(t, idx, fileB)
+	}, 5*time.Second, 100*time.Millisecond,
+		"目录删除事件(event.Name 为无扩展名的目录路径)必须清理该目录下所有 asset,而不是被 isSupportedMedia 白名单静默丢弃")
+}
+
+// TestWatcherRemovesAssetOnFileDelete is a regression guard for the existing
+// single-file delete path: a Remove/Rename event whose event.Name carries a
+// supported media extension must keep going through the exact-match
+// RemoveByPath fast path, unaffected by the directory-delete fix above.
+func TestWatcherRemovesAssetOnFileDelete(t *testing.T) {
+	root := t.TempDir()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	w, idx := newWatcherTestHarness(t, ctx, []string{root})
+	go w.Start(ctx)
+
+	file := filepath.Join(root, "solo.jpg")
+	require.Eventually(t, func() bool {
+		writeFile(t, file, "data")
+		return assetIndexed(t, idx, file)
+	}, 5*time.Second, 100*time.Millisecond, "文件应先被索引")
+
+	require.NoError(t, os.Remove(file))
+
+	require.Eventually(t, func() bool {
+		return !assetExists(t, idx, file)
+	}, 5*time.Second, 100*time.Millisecond, "删除单个文件后,对应 asset 记录应被清理")
 }
 
 // TestWatcherRecursiveNestedSubdir verifies the core bug fix: a file written
@@ -294,6 +397,30 @@ func TestWatcherRestartSwitchesWatchDirs(t *testing.T) {
 		"oldDir must not be watched after Restart")
 }
 
+// TestWatcherAutoModeWatchesEnumeratedRoots:WatchDirs 为空 ⇒ 根集合来自
+// enumerateRoots(生产=EnumerateScanRoots)。往枚举出的根里丢照片必须被
+// 实时 Enqueue 索引——这是"NAS 全空间实时监控"的核心行为。
+func TestWatcherAutoModeWatchesEnumeratedRoots(t *testing.T) {
+	db := makeTestDB(t)
+	root := t.TempDir()
+	ix := NewIndexer(db, &mockML{}, t.TempDir(), 1)
+	w := NewWatcher(db, nil, ix, "") // 空 watchDirs = 自动模式
+	w.enumerateRoots = func() []string { return []string{root} }
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go ix.Start(ctx)
+	go w.Start(ctx)
+
+	newFile := filepath.Join(root, "photo.jpg")
+	require.Eventually(t, func() bool {
+		writeFile(t, newFile, "new")
+		return assetIndexed(t, ix, newFile)
+	}, 5*time.Second, 100*time.Millisecond,
+		"auto 模式下,enumerateRoots 枚举出的根必须被实时监控")
+}
+
 // TestHandleWatchErrorOverflowTriggersRescan verifies fsnotify.ErrEventOverflow
 // (the inotify event queue overflowing, which silently drops events) triggers
 // an async recovery rescan of all watch roots so files whose events were lost
@@ -469,4 +596,64 @@ func TestTrackNewDirWatchesDespiteAncestorCoverage(t *testing.T) {
 		return assetIndexed(t, idx, newFile)
 	}, 5*time.Second, 100*time.Millisecond,
 		"child directory must still be watched even though an ancestor scan is in flight (walkCovered must gate only the catch-up scan, not addRecursiveWatch)")
+}
+
+// TestWatcherFollowsMountChanges:自动模式下根集合快照变化(新盘挂上)必须
+// 在一个轮询周期内触发重启纳入监控,且对新根做一次补扫让存量文件入库。
+func TestWatcherFollowsMountChanges(t *testing.T) {
+	db := makeTestDB(t)
+	rootA, rootB := t.TempDir(), t.TempDir()
+	// rootB 里预置一张"存量"照片:只有补扫才会发现它(inotify 只看未来事件)。
+	seedPhotoFile(t, filepath.Join(rootB, "existing.jpg"))
+
+	var phase atomic.Int32
+	ix := NewIndexer(db, &mockML{}, t.TempDir(), 1)
+	w := NewWatcher(db, nil, ix, "")
+	w.pollInterval = 20 * time.Millisecond
+	w.enumerateRoots = func() []string {
+		if phase.Load() == 0 {
+			return []string{rootA}
+		}
+		return []string{rootA, rootB}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// 启动方式照抄 TestWatcherAutoModeWatchesEnumeratedRoots。
+	go ix.Start(ctx)
+	go w.Start(ctx)
+
+	// warmup:先证明 watcher 已经用 phase=0 的快照跑起来(rootA 已被实时监
+	// 控),排除"phase.Store(1) 抢在 Start 首次 enumerateRoots() 之前执行"
+	// 的时序竞争——手法与 TestWatcherRestartSwitchesWatchDirs 的 warmup 一致。
+	warmFile := filepath.Join(rootA, "warmup.jpg")
+	require.Eventually(t, func() bool {
+		writeFile(t, warmFile, "warm")
+		return assetIndexed(t, ix, warmFile)
+	}, 5*time.Second, 100*time.Millisecond, "rootA 的 warmup 文件必须先被索引,证明 watcher 已用初始快照跑起来")
+
+	// 模拟新盘挂载:下一轮询周期起,enumerateRoots 会枚举出 rootB。
+	phase.Store(1)
+
+	// 断言 1:existing.jpg 在超时内入库(补扫生效)。
+	existingFile := filepath.Join(rootB, "existing.jpg")
+	require.Eventually(t, func() bool {
+		return assetIndexed(t, ix, existingFile)
+	}, 5*time.Second, 100*time.Millisecond,
+		"新挂载的根里预置的存量文件必须被补扫入库")
+
+	// 断言 2:再往 rootB 丢 new.jpg 也在超时内入库(重启后已在监控)。
+	newFile := filepath.Join(rootB, "new.jpg")
+	require.Eventually(t, func() bool {
+		writeFile(t, newFile, "new")
+		return assetIndexed(t, ix, newFile)
+	}, 5*time.Second, 100*time.Millisecond,
+		"新挂载的根必须在重启后被实时监控")
+}
+
+// TestDiffNewRoots:集合差集,顺序无关。
+func TestDiffNewRoots(t *testing.T) {
+	require.Equal(t, []string{"/b"}, diffNewRoots([]string{"/a"}, []string{"/b", "/a"}))
+	require.Empty(t, diffNewRoots([]string{"/a", "/b"}, []string{"/b", "/a"}))
 }

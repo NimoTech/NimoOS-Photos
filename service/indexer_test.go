@@ -401,6 +401,25 @@ func TestRemoveByPathSkipsTrashedAsset(t *testing.T) {
 	require.Equal(t, 1, n, "RemoveByPath must not delete a soft-deleted asset")
 }
 
+// TestScanDirectoryOnceDedups:同一根目录的并发补扫只跑一份——挂载轮询
+// (watcher followMounts)与 MountGuard 插回恢复都可能对同一挂载触发补扫，
+// 重复扫描徒耗 IO。in-flight 标记被占用时直接跳过，释放后可再次扫描。
+func TestScanDirectoryOnceDedups(t *testing.T) {
+	db := makeTestDB(t)
+	ix := NewIndexer(db, &mockML{}, t.TempDir(), 1)
+	dir := t.TempDir()
+
+	ix.scanDirInFlight.Store(dir, struct{}{}) // 模拟另一路补扫在跑
+	started, err := ix.ScanDirectoryOnce(dir)
+	require.NoError(t, err)
+	require.False(t, started, "in-flight 时必须跳过")
+
+	ix.scanDirInFlight.Delete(dir)
+	started, err = ix.ScanDirectoryOnce(dir)
+	require.NoError(t, err)
+	require.True(t, started, "释放后必须真正执行")
+}
+
 // recordingML 记录各 ML 能力被调用的次数，用于开关门控断言。
 type recordingML struct {
 	mockML
@@ -510,8 +529,8 @@ func TestPruneMissingUnderSkipsWhenMountVanished(t *testing.T) {
 // offline=0 且文件确实消失的资产照常清理。
 func TestPruneMissingUnderKeepsOfflineAssets(t *testing.T) {
 	db := makeTestDB(t)
-	// 挂载点用真实存在的空临时目录:pruneDeleteAllowed 在删除前会 os.Stat(dir)
-	// 复核目录本体仍存在(见 pruneDeleteAllowed),用不存在的虚构路径会让该复核
+	// 挂载点用真实存在的空临时目录:pruneDeleteAllowed 在删除前会 os.Stat 所属
+	// 挂载根复核其仍健在(见 pruneDeleteAllowed),用不存在的虚构路径会让该复核
 	// 恒假、架空本用例;目录下的具体文件仍不创建,以保留"文件消失"语义。
 	mountDir := t.TempDir()
 	offID := insertAsset(t, db, filepath.Join(mountDir, "offline.jpg"), "indexed")
@@ -601,11 +620,57 @@ func TestPruneSystemMountAssetsPurgesDevmonAssets(t *testing.T) {
 	require.Equal(t, 1, n)
 }
 
+// TestPruneMissingUnderDeletedSubdir:挂载根健在、其下子目录被整体删除(Files
+// 删除文件夹 → busdelete 以被删目录路径调 pruneMissingUnder)是"合法删除",
+// 互锁不得把它误判成"拔盘"而放弃清理——否则该目录下所有资产永久残留,
+// 还能被搜索命中(真实故障:/media/RAID_0 各相册目录被删后 81 条资产滞留)。
+func TestPruneMissingUnderDeletedSubdir(t *testing.T) {
+	db := makeTestDB(t)
+	mountDir := t.TempDir() // 挂载根始终存在
+	gonedir := filepath.Join(mountDir, "Miami")
+	id := insertAsset(t, db, filepath.Join(gonedir, "photo.jpg"), "indexed") // 目录连文件已整体消失
+
+	ix := NewIndexer(db, &mockML{}, t.TempDir(), 1)
+	ix.mountRoots = func() []string { return []string{"/DATA", mountDir} }
+
+	require.NoError(t, ix.pruneMissingUnder(gonedir))
+
+	var n int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM assets WHERE id=?`, id).Scan(&n))
+	require.Equal(t, 0, n, "挂载根健在时,被删子目录下的资产必须被清理")
+}
+
 func TestPruneDeleteGuard(t *testing.T) {
-	dir := t.TempDir()
-	require.True(t, pruneDeleteAllowed(dir, func(string) bool { return true }))
-	// 目录本体已消失(拔盘后挂载点残影):禁止批删
-	require.False(t, pruneDeleteAllowed(filepath.Join(dir, "gone"), func(string) bool { return true }))
-	// 挂载复核失败:禁止批删
-	require.False(t, pruneDeleteAllowed(dir, func(string) bool { return false }))
+	root := t.TempDir()
+	underRoot := func(string) (string, bool) { return root, true }
+	require.True(t, pruneDeleteAllowed(root, underRoot))
+	// 挂载根健在、子目录被删:合法删除,允许批删(修复前误判为拔盘)
+	require.True(t, pruneDeleteAllowed(filepath.Join(root, "gone"), underRoot))
+	// 目录不在任何已挂载根之下(挂载已从 /proc/mounts 消失):禁止批删
+	require.False(t, pruneDeleteAllowed(root, func(string) (string, bool) { return "", false }))
+	// 挂载根本体 stat 失败(死挂载残留在挂载表):禁止批删
+	deadRoot := filepath.Join(root, "dead-mount")
+	require.False(t, pruneDeleteAllowed(deadRoot, func(string) (string, bool) { return deadRoot, true }))
+}
+
+// TestPruneRcloneMountAssetsPurges:rclone 云盘挂载点下的历史误入库资产在
+// 启动时防御性硬删;挂载点带下划线(真实命名 /mnt/yu.wu_dropbox_*)不得因
+// LIKE 通配泄漏误删相邻路径资产。
+func TestPruneRcloneMountAssetsPurges(t *testing.T) {
+	db := makeTestDB(t)
+	cloud := insertAsset(t, db, "/mnt/yu.wu_dropbox_178/photo.jpg", "indexed")
+	// `_` 在 LIKE 里是单字符通配:若实现误用 LIKE,前缀 /mnt/yu.wuXdropbox... 也会被命中
+	sibling := insertAsset(t, db, "/mnt/yu.wuXdropbox_178/photo.jpg", "indexed")
+	keep := insertAsset(t, db, "/DATA/Gallery/keep.jpg", "indexed")
+
+	ix := NewIndexer(db, &mockML{}, t.TempDir(), 1)
+	ix.pruneRcloneMountAssets([]string{"/mnt/yu.wu_dropbox_178"})
+
+	var n int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM assets WHERE id=?`, cloud).Scan(&n))
+	require.Equal(t, 0, n, "rclone 挂载下的资产必须被清")
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM assets WHERE id=?`, sibling).Scan(&n))
+	require.Equal(t, 1, n, "相邻相似路径不得被 LIKE 通配误删")
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM assets WHERE id=?`, keep).Scan(&n))
+	require.Equal(t, 1, n)
 }

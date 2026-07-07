@@ -32,10 +32,17 @@ func parseScanRoots(mounts string) []string {
 	set := map[string]bool{"/DATA": true}
 	for _, line := range strings.Split(mounts, "\n") {
 		fields := strings.Fields(line)
-		if len(fields) < 2 {
+		if len(fields) < 3 {
 			continue
 		}
 		mp := unescapeMount(fields[1])
+		// fuse.rclone 云盘挂载既不扫描也不监控:FUSE 上 inotify 事件不可靠,
+		// 全量索引会把云端文件都拉下来(带宽/流量);云盘照片走专门导入功能。
+		// 只点名 fuse.rclone——MergerFS(fuse.mergerfs)等其它 FUSE 是一等
+		// 用户存储,必须保留。
+		if fields[2] == rcloneFSType {
+			continue
+		}
 		if isUserPartition(mp) {
 			set[mp] = true
 		}
@@ -46,6 +53,34 @@ func parseScanRoots(mounts string) []string {
 	}
 	sort.Strings(roots)
 	return roots
+}
+
+// rcloneFSType is the /proc/mounts filesystem type rclone FUSE mounts report.
+const rcloneFSType = "fuse.rclone"
+
+// enumerateRcloneMounts returns the mount points of all currently-mounted
+// rclone FUSE cloud drives, sorted. Used by the startup purge of legacy
+// cloud-drive assets (they must never be indexed; see parseScanRoots).
+func enumerateRcloneMounts() []string {
+	data, err := os.ReadFile(procMountsPath)
+	if err != nil {
+		return nil
+	}
+	return parseRcloneMounts(string(data))
+}
+
+// parseRcloneMounts is the pure, testable core of enumerateRcloneMounts.
+func parseRcloneMounts(mounts string) []string {
+	var out []string
+	for _, line := range strings.Split(mounts, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 3 || fields[2] != rcloneFSType {
+			continue
+		}
+		out = append(out, unescapeMount(fields[1]))
+	}
+	sort.Strings(out)
+	return out
 }
 
 // systemMounts are OS mount points that sit under /media or /mnt (so they'd
