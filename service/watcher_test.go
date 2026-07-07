@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -25,6 +26,18 @@ func writeFile(t *testing.T, path string, content string) {
 	t.Helper()
 	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
 	require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
+}
+
+// seedPhotoFile writes a pre-existing "photo" at path before the watcher/
+// indexer ever start — the same minimal-content recipe writeFile uses
+// elsewhere in this file (assetIndexed only checks the assets row's status,
+// not real image bytes). Named separately from writeFile purely for
+// readability at call sites where the point is "this file already exists
+// before Start runs" (only a catch-up scan, not a live fsnotify event, can
+// discover it).
+func seedPhotoFile(t *testing.T, path string) {
+	t.Helper()
+	writeFile(t, path, "seed")
 }
 
 // newWatcherTestHarness wires a real Indexer (worker pool running) and a real
@@ -493,4 +506,64 @@ func TestTrackNewDirWatchesDespiteAncestorCoverage(t *testing.T) {
 		return assetIndexed(t, idx, newFile)
 	}, 5*time.Second, 100*time.Millisecond,
 		"child directory must still be watched even though an ancestor scan is in flight (walkCovered must gate only the catch-up scan, not addRecursiveWatch)")
+}
+
+// TestWatcherFollowsMountChanges:自动模式下根集合快照变化(新盘挂上)必须
+// 在一个轮询周期内触发重启纳入监控,且对新根做一次补扫让存量文件入库。
+func TestWatcherFollowsMountChanges(t *testing.T) {
+	db := makeTestDB(t)
+	rootA, rootB := t.TempDir(), t.TempDir()
+	// rootB 里预置一张"存量"照片:只有补扫才会发现它(inotify 只看未来事件)。
+	seedPhotoFile(t, filepath.Join(rootB, "existing.jpg"))
+
+	var phase atomic.Int32
+	ix := NewIndexer(db, &mockML{}, t.TempDir(), 1)
+	w := NewWatcher(db, nil, ix, "")
+	w.pollInterval = 20 * time.Millisecond
+	w.enumerateRoots = func() []string {
+		if phase.Load() == 0 {
+			return []string{rootA}
+		}
+		return []string{rootA, rootB}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// 启动方式照抄 TestWatcherAutoModeWatchesEnumeratedRoots。
+	go ix.Start(ctx)
+	go w.Start(ctx)
+
+	// warmup:先证明 watcher 已经用 phase=0 的快照跑起来(rootA 已被实时监
+	// 控),排除"phase.Store(1) 抢在 Start 首次 enumerateRoots() 之前执行"
+	// 的时序竞争——手法与 TestWatcherRestartSwitchesWatchDirs 的 warmup 一致。
+	warmFile := filepath.Join(rootA, "warmup.jpg")
+	require.Eventually(t, func() bool {
+		writeFile(t, warmFile, "warm")
+		return assetIndexed(t, ix, warmFile)
+	}, 5*time.Second, 100*time.Millisecond, "rootA 的 warmup 文件必须先被索引,证明 watcher 已用初始快照跑起来")
+
+	// 模拟新盘挂载:下一轮询周期起,enumerateRoots 会枚举出 rootB。
+	phase.Store(1)
+
+	// 断言 1:existing.jpg 在超时内入库(补扫生效)。
+	existingFile := filepath.Join(rootB, "existing.jpg")
+	require.Eventually(t, func() bool {
+		return assetIndexed(t, ix, existingFile)
+	}, 5*time.Second, 100*time.Millisecond,
+		"新挂载的根里预置的存量文件必须被补扫入库")
+
+	// 断言 2:再往 rootB 丢 new.jpg 也在超时内入库(重启后已在监控)。
+	newFile := filepath.Join(rootB, "new.jpg")
+	require.Eventually(t, func() bool {
+		writeFile(t, newFile, "new")
+		return assetIndexed(t, ix, newFile)
+	}, 5*time.Second, 100*time.Millisecond,
+		"新挂载的根必须在重启后被实时监控")
+}
+
+// TestDiffNewRoots:集合差集,顺序无关。
+func TestDiffNewRoots(t *testing.T) {
+	require.Equal(t, []string{"/b"}, diffNewRoots([]string{"/a"}, []string{"/b", "/a"}))
+	require.Empty(t, diffNewRoots([]string{"/a", "/b"}, []string{"/b", "/a"}))
 }
