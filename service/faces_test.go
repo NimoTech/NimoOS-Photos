@@ -3,6 +3,7 @@ package service_test
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"math"
 	"os"
 	"path/filepath"
@@ -310,6 +311,64 @@ func TestRunPipeline_DetectsAndClusters(t *testing.T) {
 			require.Equal(t, int64(2), e.Total, "done 事件 Total 应为待检测资产数 2")
 		}
 	}
+	require.True(t, sawDone, "应有 face done 事件")
+}
+
+// TestRunPipeline_TailClusteringDoesNotFillCurrentTotal 覆盖终审点名主项:
+// 聚类尾段(检测完成后 95%→100%)的 running 中间态不应填 Current/Total(需置 0)。
+// 若仍填 current=processed、total=len(targets)(此时两者恒等)，前端 NimoTaskBar
+// 在 total>0 时会优先用 current/total 算百分比，导致尾段还在 running 就显示
+// 100%。断言：尾段 running 事件 Total==0、Current==0，且 progress 落在
+// (0.95, 1.0) 区间；done 终态的 Current/Total/Added 语义维持不变。
+func TestRunPipeline_TailClusteringDoesNotFillCurrentTotal(t *testing.T) {
+	db := makeTestFaceDB(t)
+	dir := t.TempDir()
+
+	const n = 12
+	var ids, paths []string
+	for i := 0; i < n; i++ {
+		id := fmt.Sprintf("a%d", i)
+		p := filepath.Join(dir, id+".jpg")
+		require.NoError(t, os.WriteFile(p, []byte("img-"+id), 0o644))
+		ids = append(ids, id)
+		paths = append(paths, p)
+	}
+	for i := range ids {
+		_, err := db.Exec(`INSERT INTO assets(id, file_path, status) VALUES(?, ?, 'indexed')`, ids[i], paths[i])
+		require.NoError(t, err)
+	}
+
+	ml := &pipelineMockML{}
+	s := service.NewFaceService(db)
+	s.SetML(ml)
+
+	var emitted []service.Task
+	var mu sync.Mutex
+	reg := service.NewTaskRegistry(func(tk service.Task) { mu.Lock(); emitted = append(emitted, tk); mu.Unlock() })
+	s.SetTaskRegistry(reg)
+
+	require.NoError(t, s.RunPipeline(context.Background()))
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	var sawTailRunning, sawDone bool
+	for _, e := range emitted {
+		if e.Type != "face" {
+			continue
+		}
+		if e.Status == "running" && e.Progress > 0.95 && e.Progress < 1.0 {
+			sawTailRunning = true
+			require.Equal(t, int64(0), e.Total, "聚类尾段 running 事件 Total 应置 0，不应等于 processed 造成前端提前 100%%")
+			require.Equal(t, int64(0), e.Current, "聚类尾段 running 事件 Current 应置 0")
+		}
+		if e.Status == "done" {
+			sawDone = true
+			require.Equal(t, int64(n), e.Total, "done 事件 Total 语义不变：仍为待检测资产数")
+			require.Equal(t, int64(n), e.Current, "done 事件 Current 语义不变：仍为待检测资产数")
+		}
+	}
+	require.True(t, sawTailRunning, "应观测到聚类尾段(progress 落在 0.95~1.0 之间)的 running 事件")
 	require.True(t, sawDone, "应有 face done 事件")
 }
 

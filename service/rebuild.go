@@ -178,7 +178,7 @@ func (r *Rebuilder) run(taskID string) {
 		}
 	}
 
-	// total=0：空库直接完成，跳过 worker pool，仍走 RunClustering + meta。
+	// total=0：空库直接完成，跳过 worker pool，仍走 finalize() 里的 RunPipeline + meta。
 	if total == 0 {
 		finalize()
 		if r.ctx.Err() != nil {

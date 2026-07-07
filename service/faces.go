@@ -471,8 +471,11 @@ func (s *FaceService) detectFaceScanTarget(ctx context.Context, t faceScanTarget
 		}
 	}
 	data, err := os.ReadFile(src)
-	if err != nil || len(data) == 0 {
+	if err != nil {
 		return fmt.Errorf("读取源文件失败: %w", err)
+	}
+	if len(data) == 0 {
+		return fmt.Errorf("读取源文件失败: 源文件为空")
 	}
 	if s.ml == nil {
 		return fmt.Errorf("ML provider 未注入")
@@ -519,7 +522,14 @@ func (s *FaceService) RunPipeline(ctx context.Context) error {
 	taskID := fmt.Sprintf("face_%d", time.Now().UnixNano())
 	started := time.Now()
 	total := int64(len(targets))
-	pub := func(progress float64, status string, errMsg string, current, added int64) {
+	// pub 的 running 中间态里 current/curTotal 会原样填进 Task.Current/Total；
+	// done/error 终态则统一改填 total(待检测资产数)与 added，语义不变。
+	// 检测阶段(0–95%)传真实 current/curTotal，聚类尾段(95–100%)传 0/0——
+	// 前端 NimoTaskBar 在 total>0 时优先用 current/total 算百分比，尾段处理数
+	// 已经跟 total 相等，若仍填两者会让还在 running 的尾段被计算成 100%；
+	// 置 0 后前端回退到用 progress 字段本身，能看到 95→100% 的真实爬升，
+	// 与 RunClustering 原有的 pub 模式一致。
+	pub := func(progress float64, status string, errMsg string, current, curTotal, added int64) {
 		if s.reg == nil {
 			return
 		}
@@ -531,18 +541,19 @@ func (s *FaceService) RunPipeline(ctx context.Context) error {
 			Status:    status,
 			Error:     errMsg,
 			StartedAt: started,
-			Total:     total,
 		}
 		if status == "running" {
 			t.Current = current
+			t.Total = curTotal
 		}
 		if status == "done" || status == "error" {
 			t.Current = total
+			t.Total = total
 			t.Added = added
 		}
 		s.reg.Upsert(t)
 	}
-	pub(0, "running", "", 0, 0)
+	pub(0, "running", "", 0, total, 0)
 
 	var processed int64
 	for _, tgt := range targets {
@@ -558,7 +569,7 @@ func (s *FaceService) RunPipeline(ctx context.Context) error {
 		if total > 0 {
 			frac = 0.95 * float64(processed) / float64(total)
 		}
-		pub(frac, "running", "", processed, 0)
+		pub(frac, "running", "", processed, total, 0)
 	}
 
 	if ctx.Err() != nil {
@@ -568,18 +579,19 @@ func (s *FaceService) RunPipeline(ctx context.Context) error {
 	_, newFaces, cerr := s.clusterStage(ctx, nil, func(p float64) {
 		if total == 0 {
 			// 没有检测目标(纯聚类尾段场景，如历史遗留的未聚类脸)：没有 0–95%
-			// 的检测阶段可映射，直接把聚类进度铺满整段 0–100%。
-			pub(p, "running", "", processed, 0)
+			// 的检测阶段可映射，直接把聚类进度铺满整段 0–100%；current/curTotal
+			// 同样置 0，理由见上面 pub 定义处的注释。
+			pub(p, "running", "", 0, 0, 0)
 			return
 		}
-		pub(0.95+0.05*p, "running", "", processed, 0)
+		pub(0.95+0.05*p, "running", "", 0, 0, 0)
 	})
 	if cerr != nil {
-		pub(0.95, "error", fmt.Sprintf("识别人物失败：%s", cerr.Error()), processed, 0)
+		pub(0.95, "error", fmt.Sprintf("识别人物失败：%s", cerr.Error()), processed, total, 0)
 		return cerr
 	}
 
-	pub(1, "done", "", processed, newFaces)
+	pub(1, "done", "", processed, total, newFaces)
 	go func() {
 		time.Sleep(taskCleanupDelay)
 		if s.reg != nil {
