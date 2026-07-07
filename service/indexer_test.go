@@ -401,6 +401,25 @@ func TestRemoveByPathSkipsTrashedAsset(t *testing.T) {
 	require.Equal(t, 1, n, "RemoveByPath must not delete a soft-deleted asset")
 }
 
+// TestScanDirectoryOnceDedups:同一根目录的并发补扫只跑一份——挂载轮询
+// (watcher followMounts)与 MountGuard 插回恢复都可能对同一挂载触发补扫，
+// 重复扫描徒耗 IO。in-flight 标记被占用时直接跳过，释放后可再次扫描。
+func TestScanDirectoryOnceDedups(t *testing.T) {
+	db := makeTestDB(t)
+	ix := NewIndexer(db, &mockML{}, t.TempDir(), 1)
+	dir := t.TempDir()
+
+	ix.scanDirInFlight.Store(dir, struct{}{}) // 模拟另一路补扫在跑
+	started, err := ix.ScanDirectoryOnce(dir)
+	require.NoError(t, err)
+	require.False(t, started, "in-flight 时必须跳过")
+
+	ix.scanDirInFlight.Delete(dir)
+	started, err = ix.ScanDirectoryOnce(dir)
+	require.NoError(t, err)
+	require.True(t, started, "释放后必须真正执行")
+}
+
 // recordingML 记录各 ML 能力被调用的次数，用于开关门控断言。
 type recordingML struct {
 	mockML

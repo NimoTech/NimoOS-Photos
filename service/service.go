@@ -143,12 +143,16 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 	// 回调用函数字段注入以避免与 Watcher/Indexer/Embedder 产生导入依赖:
 	//   - watcherRestart 直接闭包捕获 watcher/parentCtx/cfg，重新 Add 配置中
 	//     watch 的目录(对没被配置监听的目录是无副作用的 no-op)；
-	//   - scanDir 复用 Indexer.ScanDirectory 自愈新增/删除的文件；
+	//   - scanDir 复用 Indexer.ScanDirectoryOnce 自愈新增/删除的文件，并与
+	//     watcher 挂载轮询共享同一份 per-root 去重，避免同一挂载被重复补扫；
 	//   - backfill/backfillOCR 复用 Embedder，修复换代次重建期间 offline
 	//     资产恢复后缺失的 CLIP/OCR。
 	mountGuard := NewMountGuard(db)
 	mountGuard.SetWatcherRestart(func() { watcher.Restart(parentCtx, cfg.WatchDirs) })
-	mountGuard.SetScanDir(idx.ScanDirectory)
+	mountGuard.SetScanDir(func(mount string) error {
+		_, err := idx.ScanDirectoryOnce(mount)
+		return err
+	})
 	mountGuard.SetBackfill(embedder.Backfill)
 	mountGuard.SetBackfillOCR(embedder.BackfillOCR)
 	// Run() 由 main.go 与其它后台 worker 一起以 goroutine 启动。
