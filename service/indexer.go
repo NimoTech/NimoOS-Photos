@@ -1306,7 +1306,7 @@ func (ix *Indexer) pruneMissingUnder(dir string) error {
 	if err := rows.Err(); err != nil {
 		return err
 	}
-	if len(gone) > 0 && !pruneDeleteAllowed(dir, ix.dirUnderMountedRoot) {
+	if len(gone) > 0 && !pruneDeleteAllowed(dir, ix.containingMountRoot) {
 		zap.L().Warn("pruneMissingUnder: mount state changed during scan, aborting prune",
 			zap.String("dir", dir), zap.Int("wouldDelete", len(gone)))
 		return nil
@@ -1327,33 +1327,48 @@ func (ix *Indexer) pruneMissingUnder(dir string) error {
 // pruneDeleteAllowed re-validates right before the destructive pass:
 // stat 循环期间可移动盘可能被拔出,届时所有文件都 stat 失败,若不复核
 // 会把整棵子树的资产/向量/缩略图批量误删。
-func pruneDeleteAllowed(dir string, underMountedRoot func(string) bool) bool {
-	if !underMountedRoot(dir) {
+//
+// 复核对象是 dir 所属的**挂载根**,而不是 dir 本身:dir 被整体删除(Files
+// 删除相册文件夹)正是需要 prune 的合法场景,stat dir 必然失败,拿它当判据
+// 会把合法删除误判成拔盘、永久滞留索引。真正的拔盘由两道检查兜住——挂载
+// 从 /proc/mounts 消失时 containingRoot 拿不到根;死挂载残留在挂载表里时
+// stat 挂载根会报错(EIO 等)。
+func pruneDeleteAllowed(dir string, containingRoot func(string) (string, bool)) bool {
+	root, ok := containingRoot(dir)
+	if !ok {
 		return false
 	}
-	if _, err := os.Stat(dir); err != nil {
+	if _, err := os.Stat(root); err != nil {
 		return false
 	}
 	return true
 }
 
-// dirUnderMountedRoot reports whether dir is one of (or lives under one of)
-// the currently-mounted scan roots. Roots always include /DATA, so library
-// directories on the system disk are always eligible; a /media/* mount that
-// has vanished from the mount table is not.
-func (ix *Indexer) dirUnderMountedRoot(dir string) bool {
+// containingMountRoot returns the currently-mounted scan root that dir equals
+// or lives under. Roots always include /DATA, so library directories on the
+// system disk are always eligible; a /media/* mount that has vanished from
+// the mount table is not.
+func (ix *Indexer) containingMountRoot(dir string) (string, bool) {
 	mounts := ix.mountRoots
 	if mounts == nil {
 		mounts = EnumerateScanRoots
 	}
 	cleaned := strings.TrimRight(dir, string(filepath.Separator))
+	best := ""
 	for _, root := range mounts() {
 		r := strings.TrimRight(root, string(filepath.Separator))
-		if cleaned == r || strings.HasPrefix(cleaned, r+string(filepath.Separator)) {
-			return true
+		if (cleaned == r || strings.HasPrefix(cleaned, r+string(filepath.Separator))) && len(r) > len(best) {
+			best = r
 		}
 	}
-	return false
+	return best, best != ""
+}
+
+// dirUnderMountedRoot reports whether dir is one of (or lives under one of)
+// the currently-mounted scan roots.
+func (ix *Indexer) dirUnderMountedRoot(dir string) bool {
+	_, ok := ix.containingMountRoot(dir)
+	return ok
 }
 
 // ScanPending enqueues all assets currently in 'pending' status.

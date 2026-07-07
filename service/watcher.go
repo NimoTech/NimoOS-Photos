@@ -196,14 +196,47 @@ func (w *Watcher) handleEvent(ctx context.Context, fw *fsnotify.Watcher, wg *syn
 		w.indexer.Enqueue(event.Name)
 	}
 
-	// Directory deletes/renames need no explicit handling here: inotify
-	// automatically drops the watch (IN_IGNORED) when a watched directory is
-	// deleted or moved away, and fsnotify's internal watch-descriptor
-	// bookkeeping follows suit — there is nothing for Watcher to clean up.
-	// For files, RemoveByPath still needs to run as before.
+	// Directory deletes/renames: inotify automatically drops the watch
+	// (IN_IGNORED) when a watched directory is deleted or moved away, and
+	// fsnotify's internal watch-descriptor bookkeeping follows suit — there is
+	// nothing to clean up on that front. But the DB index still needs
+	// explicit cleanup: fsnotify reports the removal with event.Name set to
+	// the directory's own path — not one event per file inside it — so a
+	// directory-shaped path (no recognised media extension) is routed through
+	// shouldHandleDeletedPath + pruneMissingUnder (service/busdelete.go,
+	// service/indexer.go), the same "no extension ⇒ possibly a directory"
+	// handling the MessageBus deletion subscriber uses. Without this, every
+	// asset indexed from under the deleted directory — CLIP vector and
+	// thumbnail included — would linger until the next 24h ScanAllRoots.
+	// For files, RemoveByPath still runs as before (exact-path fast path).
 	if event.Has(fsnotify.Remove) || event.Has(fsnotify.Rename) {
 		if isSupportedMedia(event.Name) {
 			w.indexer.RemoveByPath(event.Name)
+		} else if shouldHandleDeletedPath(event.Name) {
+			// pruneMissingUnder is called with the PARENT of the deleted
+			// directory, not the directory itself. Its own safety interlock
+			// (pruneDeleteAllowed, service/indexer.go) re-validates right
+			// before deleting by os.Stat'ing the "dir" it was given — the
+			// exact directory this event just reported gone will always fail
+			// that stat, since it no longer exists, and pruneMissingUnder
+			// would silently no-op every single time. The parent, in
+			// contrast, is guaranteed to still be on disk: directories are
+			// only ever removable once empty, so an rm -rf (or any other
+			// recursive delete) always rmdir's bottom-up — a directory's own
+			// Remove/Rename event can only fire after everything beneath it
+			// is already gone, and strictly before its parent is touched.
+			// Scanning from the parent still only deletes rows that
+			// individually stat as missing (siblings that still exist are
+			// left untouched), it just widens the query/stat pass to the
+			// parent's subtree instead of only the deleted directory's.
+			wg.Add(1)
+			go func(dir string) {
+				defer wg.Done()
+				if err := w.indexer.pruneMissingUnder(filepath.Dir(dir)); err != nil {
+					zap.L().Warn("watcher: prune after directory delete failed",
+						zap.String("dir", dir), zap.Error(err))
+				}
+			}(event.Name)
 		}
 	}
 }
