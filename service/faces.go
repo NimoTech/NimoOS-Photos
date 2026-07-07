@@ -1010,7 +1010,8 @@ func (s *FaceService) recomputePersonStatsTx(ctx context.Context, tx *sql.Tx) er
 	return nil
 }
 
-// StartScheduler runs a background goroutine that triggers RunClustering:
+// StartScheduler runs a background goroutine that triggers RunPipeline
+// (检测+聚类一体，见 RunPipeline)：
 //   - once per hour at 03:xx (minute < 5), or
 //   - when the number of unassigned faces reaches clusterBatchSize.
 func (s *FaceService) StartScheduler(ctx context.Context) {
@@ -1050,8 +1051,8 @@ func (s *FaceService) StartScheduler(ctx context.Context) {
 				}
 
 				if shouldRun {
-					if err := s.RunClustering(ctx); err != nil {
-						zap.L().Error("face clustering failed", zap.Error(err))
+					if err := s.RunPipeline(ctx); err != nil {
+						zap.L().Error("face pipeline failed", zap.Error(err))
 						s.failMu.Lock()
 						s.nextAttempt = time.Now().Add(clusterFailBackoff)
 						s.failMu.Unlock()

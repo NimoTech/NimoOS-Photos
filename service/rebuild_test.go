@@ -159,6 +159,60 @@ func TestRebuildReprocessesAssetsWithoutDuplicatingFaces(t *testing.T) {
 	require.NotEmpty(t, lastBuilt)
 }
 
+// TestRebuildRedetectsFacesViaRunPipeline 验证:人脸检测移出 processFileInternal
+// 后，rebuild 的 finalize() 必须改调 RunPipeline（而非只重新分组的 RunClustering）
+// 才能把 worker 循环里删掉的旧脸重新检测回来——worker 循环删 face_detections 时
+// 已把对应资产的 face_scanned 置回 0，若 finalize 仍调 RunClustering，这批脸会
+// 永久清空、再也不会被检测。
+func TestRebuildRedetectsFacesViaRunPipeline(t *testing.T) {
+	prev := config.Cfg
+	t.Cleanup(func() { config.Cfg = prev })
+	config.Cfg = &config.Config{FacesEnabled: true, ScenesEnabled: true, OCREnabled: true}
+
+	db := makeTestDB(t)
+	thumbDir := t.TempDir()
+	path := makeTestJPEG(t, t.TempDir())
+
+	ml := &oneFaceML{}
+	ix := NewIndexer(db, ml, thumbDir, 1)
+	require.True(t, ix.processFileInternal(path, processOpts{}))
+
+	var assetID string
+	require.NoError(t, db.QueryRow(`SELECT id FROM assets WHERE file_path=?`, path).Scan(&assetID))
+
+	// 人脸检测已移出索引流水线：processFileInternal 之后不应有 face_detections。
+	var faceRows int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM face_detections WHERE asset_id=?`, assetID).Scan(&faceRows))
+	require.Zero(t, faceRows, "人脸检测已移出索引流水线，processFileInternal 不应再写 face_detections")
+
+	// 手工模拟"已经跑过一轮 RunPipeline"：写入一行旧脸 + face_scanned=1。
+	_, err := db.Exec(`INSERT INTO face_detections(id, asset_id, bbox, embedding) VALUES(?,?,?,?)`,
+		"old-face", assetID, "[0,0,1,1]", sqlite.SerializeFloat32(make([]float32, common.FaceDim)))
+	require.NoError(t, err)
+	_, err = db.Exec(`UPDATE assets SET face_scanned=1 WHERE id=?`, assetID)
+	require.NoError(t, err)
+
+	faces := NewFaceService(db)
+	faces.SetML(ml)
+	faces.SetThumbDir(thumbDir)
+	reg := NewTaskRegistry(nil)
+	rb := NewRebuilder(context.Background(), db, ix, faces, reg, 1)
+
+	_, err = rb.Start()
+	require.NoError(t, err)
+	require.Eventually(t, func() bool { return !rb.running.Load() }, 10*time.Second, 50*time.Millisecond)
+
+	// finalize() 里的 faces.RunPipeline 在 run() 的同一 goroutine 内同步执行，
+	// running 复位时它已经跑完。
+	var fs int
+	require.NoError(t, db.QueryRow(`SELECT face_scanned FROM assets WHERE id=?`, assetID).Scan(&fs))
+	require.Equal(t, 1, fs, "重建后应重新检测完成，face_scanned 应回到 1")
+
+	var newFaceRows int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM face_detections WHERE asset_id=?`, assetID).Scan(&newFaceRows))
+	require.Equal(t, 1, newFaceRows, "旧脸被删后应由 RunPipeline 重新检测出 1 张新脸，而不是永久清空")
+}
+
 // TestModelGenStale 验证 modelGenStale 对代次键缺失/匹配/落后三种情况的判断。
 func TestModelGenStale(t *testing.T) {
 	db := makeTestDB(t)

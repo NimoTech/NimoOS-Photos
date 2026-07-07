@@ -136,8 +136,17 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 	faces := NewFaceService(db)
 	faces.SetTaskRegistry(taskReg)
 	faces.SetIndexIdleSource(idx.IdleFor) // 安全网聚类去抖:索引活动安静够久才触发
+	faces.SetML(ml)                       // RunPipeline 检测阶段用
+	faces.SetThumbDir(thumbDir)           // RunPipeline 视频关键帧缩略图用
 	rebuilder := NewRebuilder(parentCtx, db, idx, faces, taskReg, cfg.Workers)
 	embedder := NewEmbedder(db, ml, idx, taskReg)
+	// ML 恢复链尾补跑人脸检测(覆盖掉线期间的检测欠账)：函数字段注入，避免
+	// Embedder 直接依赖 FaceService 类型(同 MountGuard 的注入模式)。
+	embedder.SetOnRecovered(func(ctx context.Context) {
+		if err := faces.RunPipeline(ctx); err != nil {
+			zap.L().Warn("post-recovery face pipeline failed", zap.Error(err))
+		}
+	})
 
 	// MountGuard: 追踪 /media/* 可移动盘的挂载/拔出,维护 assets.offline。
 	// 回调用函数字段注入以避免与 Watcher/Indexer/Embedder 产生导入依赖:
@@ -157,12 +166,13 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 	mountGuard.SetBackfillOCR(embedder.BackfillOCR)
 	// Run() 由 main.go 与其它后台 worker 一起以 goroutine 启动。
 
-	// batch 上传完成后主动触发人脸聚类，让前端能看到从 0% 涨到 100% 的"识别人物" task。
-	// faces.RunClustering 内部用 CAS 防重入，多个 batch 同时 done 也只会跑一次。
+	// batch 上传完成后触发人脸检测+聚类一体任务，让前端能看到从 0% 涨到 100% 的
+	// "识别人物" task（真实进度，而非旧的聚类专属假进度）。
+	// faces.RunPipeline 内部用 CAS 防重入，多个 batch 同时 done 也只会跑一次。
 	idx.SetOnBatchDone(func() {
 		go func() {
-			if err := faces.RunClustering(parentCtx); err != nil {
-				zap.L().Warn("post-batch face clustering failed", zap.Error(err))
+			if err := faces.RunPipeline(parentCtx); err != nil {
+				zap.L().Warn("post-batch face pipeline failed", zap.Error(err))
 			}
 		}()
 		go func() {

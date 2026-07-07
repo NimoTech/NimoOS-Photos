@@ -35,6 +35,13 @@ type Embedder struct {
 	// 结束时重新查询、再跑一轮。
 	rerunPending    atomic.Bool
 	ocrRerunPending atomic.Bool
+
+	// onRecovered 在 ML ready 恢复链尾（Backfill → reembed → BackfillOCR 之后）
+	// 被调用一次，覆盖 ML 掉线期间积压的人脸检测欠账。用函数字段注入而非直接
+	// import FaceService（同 MountGuard 的 SetBackfill/SetBackfillOCR 模式），
+	// 避免 Embedder 与 FaceService 产生类型耦合；service.go 接线为
+	// faces.RunPipeline。为 nil 时（未接线 / 测试）安全跳过。
+	onRecovered func(context.Context)
 }
 
 func NewEmbedder(db *sql.DB, ml MLProvider, idx *Indexer, reg *TaskRegistry) *Embedder {
@@ -45,6 +52,11 @@ func NewEmbedder(db *sql.DB, ml MLProvider, idx *Indexer, reg *TaskRegistry) *Em
 }
 
 func (e *Embedder) SetPollInterval(d time.Duration) { e.pollInterval = d }
+
+// SetOnRecovered injects the callback invoked once at the tail of the ML-ready
+// recovery chain (after Backfill/reembed/BackfillOCR), used to catch up on
+// face detection backlog accumulated while ML was down.
+func (e *Embedder) SetOnRecovered(fn func(context.Context)) { e.onRecovered = fn }
 
 // queryMissing 列出 status='indexed' 但 asset_clip_idx 缺行的 asset 路径。
 func (e *Embedder) queryMissing(ctx context.Context) ([]string, error) {
@@ -390,10 +402,15 @@ func (e *Embedder) tick(ctx context.Context) {
 		go func() {
 			// Backfill first (fills assets that never got an embedding), then the
 			// one-time re-embed of all existing assets from their thumbnails,
-			// then OCR for assets indexed before OCR support existed.
+			// then OCR for assets indexed before OCR support existed, then faces
+			// (RunPipeline，via onRecovered) — covers detection backlog accumulated
+			// while ML was down.
 			_ = e.Backfill(ctx)
 			e.reembedThumbnailsOnce()
 			_ = e.BackfillOCR(ctx)
+			if e.onRecovered != nil {
+				e.onRecovered(ctx)
+			}
 		}()
 	}
 }
