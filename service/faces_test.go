@@ -4,16 +4,57 @@ import (
 	"context"
 	"database/sql"
 	"math"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
 
 	"github.com/NimoTech/NimoOS-Photos/common"
+	"github.com/NimoTech/NimoOS-Photos/pkg/config"
+	"github.com/NimoTech/NimoOS-Photos/pkg/mlclient"
 	"github.com/NimoTech/NimoOS-Photos/pkg/sqlite"
 	"github.com/NimoTech/NimoOS-Photos/service"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 )
+
+// pipelineMockML implements service.MLProvider for RunPipeline tests.
+// DetectAndRecognizeFaces returns one canned face per call unless faceErr is set
+// (simulating an ML failure) or the image data matches a registered "fail" marker.
+type pipelineMockML struct {
+	mu       sync.Mutex
+	calls    []string // image contents seen, in call order
+	faceErr  error    // when set, DetectAndRecognizeFaces always returns this error
+	facesPer int      // faces to return per successful call (default 1 when 0)
+}
+
+func (m *pipelineMockML) CLIPImageEmbed(_ []byte) ([]float32, error) {
+	return make([]float32, common.CLIPDim), nil
+}
+func (m *pipelineMockML) CLIPTextEmbed(_ string) ([]float32, error) {
+	return make([]float32, common.CLIPDim), nil
+}
+func (m *pipelineMockML) DetectAndRecognizeFaces(data []byte) ([]mlclient.FaceResult, error) {
+	m.mu.Lock()
+	m.calls = append(m.calls, string(data))
+	m.mu.Unlock()
+	if m.faceErr != nil {
+		return nil, m.faceErr
+	}
+	n := m.facesPer
+	if n == 0 {
+		n = 1
+	}
+	out := make([]mlclient.FaceResult, n)
+	for i := range out {
+		vec := make([]float32, common.FaceDim)
+		vec[i%common.FaceDim] = 1
+		out[i] = mlclient.FaceResult{BBox: mlclient.BoundingBox{X1: 0, Y1: 0, X2: 1, Y2: 1}, Embedding: vec}
+	}
+	return out, nil
+}
+func (m *pipelineMockML) OCR(_ []byte) ([]mlclient.OCRLine, error) { return nil, nil }
+func (m *pipelineMockML) IsReady() bool                            { return true }
 
 // makeTestFaceDB opens a fresh temp SQLite database for face tests.
 func makeTestFaceDB(t *testing.T) *sql.DB {
@@ -216,6 +257,157 @@ func TestDBSCANWithProgress(t *testing.T) {
 	for i := 1; i < len(calls); i++ {
 		require.GreaterOrEqual(t, calls[i][0], calls[i-1][0], "done 应单调递增")
 	}
+}
+
+// TestRunPipeline_DetectsAndClusters 覆盖 TDD 用例①:两张 face_scanned=0 资产，
+// RunPipeline 后 face_detections 有行、face_scanned=1、任务 done 且 Total=2。
+func TestRunPipeline_DetectsAndClusters(t *testing.T) {
+	db := makeTestFaceDB(t)
+	dir := t.TempDir()
+
+	p1 := filepath.Join(dir, "a1.jpg")
+	p2 := filepath.Join(dir, "a2.jpg")
+	require.NoError(t, os.WriteFile(p1, []byte("img-a1"), 0o644))
+	require.NoError(t, os.WriteFile(p2, []byte("img-a2"), 0o644))
+
+	_, err := db.Exec(`INSERT INTO assets(id, file_path, status) VALUES
+		('a1', ?, 'indexed'), ('a2', ?, 'indexed')`, p1, p2)
+	require.NoError(t, err)
+
+	ml := &pipelineMockML{}
+	s := service.NewFaceService(db)
+	s.SetML(ml)
+
+	var emitted []service.Task
+	var mu sync.Mutex
+	reg := service.NewTaskRegistry(func(tk service.Task) { mu.Lock(); emitted = append(emitted, tk); mu.Unlock() })
+	s.SetTaskRegistry(reg)
+
+	require.NoError(t, s.RunPipeline(context.Background()))
+
+	var faceCount int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM face_detections`).Scan(&faceCount))
+	require.Equal(t, 2, faceCount, "两张资产各检测出 1 张脸")
+
+	scanned := map[string]int{}
+	rows, err := db.Query(`SELECT id, face_scanned FROM assets`)
+	require.NoError(t, err)
+	for rows.Next() {
+		var id string
+		var fs int
+		require.NoError(t, rows.Scan(&id, &fs))
+		scanned[id] = fs
+	}
+	rows.Close()
+	require.Equal(t, map[string]int{"a1": 1, "a2": 1}, scanned)
+
+	mu.Lock()
+	defer mu.Unlock()
+	var sawDone bool
+	for _, e := range emitted {
+		if e.Type == "face" && e.Status == "done" {
+			sawDone = true
+			require.Equal(t, int64(2), e.Total, "done 事件 Total 应为待检测资产数 2")
+		}
+	}
+	require.True(t, sawDone, "应有 face done 事件")
+}
+
+// TestRunPipeline_NothingToDoDoesNotPublish 覆盖 TDD 用例②:全部已扫且无未分配
+// 人脸时不发任务（taskReg 无 face 条目）。
+func TestRunPipeline_NothingToDoDoesNotPublish(t *testing.T) {
+	db := makeTestFaceDB(t)
+	_, err := db.Exec(`INSERT INTO assets(id, file_path, status, face_scanned) VALUES('a1','/g/1.jpg','indexed',1)`)
+	require.NoError(t, err)
+
+	ml := &pipelineMockML{}
+	s := service.NewFaceService(db)
+	s.SetML(ml)
+
+	var emitted []service.Task
+	var mu sync.Mutex
+	reg := service.NewTaskRegistry(func(tk service.Task) { mu.Lock(); emitted = append(emitted, tk); mu.Unlock() })
+	s.SetTaskRegistry(reg)
+
+	require.NoError(t, s.RunPipeline(context.Background()))
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.Empty(t, emitted, "无待检测且无未分配人脸时不应发任何任务")
+	require.Empty(t, ml.calls, "不应调用 ML")
+}
+
+// TestRunPipeline_SkipsUnreadableAssetWithoutInterrupting 覆盖 TDD 用例③:单张
+// 读文件失败跳过不中断，face_scanned 保持 0。
+func TestRunPipeline_SkipsUnreadableAssetWithoutInterrupting(t *testing.T) {
+	db := makeTestFaceDB(t)
+	dir := t.TempDir()
+
+	// a1 的源文件不存在（模拟读取失败）；a2 正常。
+	missing := filepath.Join(dir, "missing.jpg")
+	ok := filepath.Join(dir, "ok.jpg")
+	require.NoError(t, os.WriteFile(ok, []byte("img-ok"), 0o644))
+
+	_, err := db.Exec(`INSERT INTO assets(id, file_path, status) VALUES
+		('a1', ?, 'indexed'), ('a2', ?, 'indexed')`, missing, ok)
+	require.NoError(t, err)
+
+	ml := &pipelineMockML{}
+	s := service.NewFaceService(db)
+	s.SetML(ml)
+	reg := service.NewTaskRegistry(func(service.Task) {})
+	s.SetTaskRegistry(reg)
+
+	require.NoError(t, s.RunPipeline(context.Background()))
+
+	scanned := map[string]int{}
+	rows, err := db.Query(`SELECT id, face_scanned FROM assets`)
+	require.NoError(t, err)
+	for rows.Next() {
+		var id string
+		var fs int
+		require.NoError(t, rows.Scan(&id, &fs))
+		scanned[id] = fs
+	}
+	rows.Close()
+	require.Equal(t, 0, scanned["a1"], "读取失败的资产 face_scanned 应保持 0，供下轮重试")
+	require.Equal(t, 1, scanned["a2"], "正常资产应完成检测")
+
+	var faceCount int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM face_detections WHERE asset_id='a1'`).Scan(&faceCount))
+	require.Equal(t, 0, faceCount)
+}
+
+// TestRunPipeline_FacesDisabledReturnsImmediately 覆盖 TDD 用例④:
+// FacesEnabled=false 直接返回，不查询、不发任务。
+func TestRunPipeline_FacesDisabledReturnsImmediately(t *testing.T) {
+	prev := config.Cfg
+	t.Cleanup(func() { config.Cfg = prev })
+	config.Cfg = &config.Config{FacesEnabled: false}
+
+	db := makeTestFaceDB(t)
+	_, err := db.Exec(`INSERT INTO assets(id, file_path, status) VALUES('a1','/g/1.jpg','indexed')`)
+	require.NoError(t, err)
+
+	ml := &pipelineMockML{}
+	s := service.NewFaceService(db)
+	s.SetML(ml)
+
+	var emitted []service.Task
+	var mu sync.Mutex
+	reg := service.NewTaskRegistry(func(tk service.Task) { mu.Lock(); emitted = append(emitted, tk); mu.Unlock() })
+	s.SetTaskRegistry(reg)
+
+	require.NoError(t, s.RunPipeline(context.Background()))
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.Empty(t, emitted)
+	require.Empty(t, ml.calls)
+
+	var fs int
+	require.NoError(t, db.QueryRow(`SELECT face_scanned FROM assets WHERE id='a1'`).Scan(&fs))
+	require.Equal(t, 0, fs, "关闭时资产不应被检测")
 }
 
 func TestComputeCentroidAndConfidence(t *testing.T) {

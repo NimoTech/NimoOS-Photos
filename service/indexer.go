@@ -910,19 +910,7 @@ func (ix *Indexer) processFileInternal(path string, opts processOpts) (success b
 			// Face detection + recognition（FacesEnabled 关闭时跳过）。
 			if config.Cfg == nil || config.Cfg.FacesEnabled {
 				if faces, faceErr := ix.ml.DetectAndRecognizeFaces(faceData); faceErr == nil {
-					for _, face := range faces {
-						if len(face.Embedding) != common.FaceDim {
-							continue
-						}
-						bboxJSON, _ := json.Marshal(face.BBox)
-						faceID := uuid.NewString()
-						if _, err := ix.db.Exec(
-							`INSERT INTO face_detections(id, asset_id, bbox, embedding) VALUES(?,?,?,?)`,
-							faceID, assetID, string(bboxJSON), sqlite.SerializeFloat32(face.Embedding),
-						); err != nil {
-							fmt.Fprintf(os.Stderr, "[indexer] failed to insert face_detection %s: %v\n", assetID, err)
-						}
-					}
+					insertFaceDetections(ix.db, assetID, faces)
 				}
 			}
 
@@ -950,6 +938,26 @@ func (ix *Indexer) processFileInternal(path string, opts processOpts) (success b
 		return false
 	}
 	return true
+}
+
+// insertFaceDetections writes ML-detected faces for assetID into
+// face_detections. Extracted from processFileInternal's original inline loop
+// so FaceService.RunPipeline's detection stage can reuse the exact same write
+// path (id/bbox/embedding shape, FaceDim guard, best-effort error logging).
+func insertFaceDetections(db *sql.DB, assetID string, faces []mlclient.FaceResult) {
+	for _, face := range faces {
+		if len(face.Embedding) != common.FaceDim {
+			continue
+		}
+		bboxJSON, _ := json.Marshal(face.BBox)
+		faceID := uuid.NewString()
+		if _, err := db.Exec(
+			`INSERT INTO face_detections(id, asset_id, bbox, embedding) VALUES(?,?,?,?)`,
+			faceID, assetID, string(bboxJSON), sqlite.SerializeFloat32(face.Embedding),
+		); err != nil {
+			fmt.Fprintf(os.Stderr, "[indexer] failed to insert face_detection %s: %v\n", assetID, err)
+		}
+	}
 }
 
 // embedClip computes and stores the CLIP vector for assetID from its displayed

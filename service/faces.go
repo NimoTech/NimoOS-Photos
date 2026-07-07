@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"fmt"
 	"math"
+	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -245,6 +247,13 @@ type FaceService struct {
 	reg     *TaskRegistry
 	running atomic.Bool
 
+	// ml 供 RunPipeline 检测阶段调用 DetectAndRecognizeFaces；未注入(nil)时
+	// 每张检测都会失败，走「跳过、留 face_scanned=0 供下轮重试」路径。
+	ml MLProvider
+	// thumbDir 是缩略图根目录：视频资产的检测输入取 <thumbDir>/<id>/large.jpg
+	// （关键帧），缺失回退 small.jpg（取法照 Indexer 的 thumbDir 字段）。
+	thumbDir string
+
 	// 失败 backoff：RunClustering 出错后短期内不再触发，避免每分钟重试风暴。
 	failMu      sync.Mutex
 	nextAttempt time.Time
@@ -274,6 +283,89 @@ func (s *FaceService) SetTaskRegistry(reg *TaskRegistry) { s.reg = reg }
 // activity, used to debounce the safety-net clustering trigger.
 func (s *FaceService) SetIndexIdleSource(fn func() time.Duration) { s.indexIdleFor = fn }
 
+// SetML injects the ML provider used by RunPipeline's detection stage.
+func (s *FaceService) SetML(ml MLProvider) { s.ml = ml }
+
+// SetThumbDir injects the thumbnail root directory (照 Indexer 现有字段取法),
+// used by RunPipeline to locate video keyframe thumbnails for detection.
+func (s *FaceService) SetThumbDir(dir string) { s.thumbDir = dir }
+
+// countUnassignedFaces 返回尚未关联到任何 person 的活跃(未排除)人脸数——即新
+// 上传/检测出、还没被聚类扫到的脸。同时用作:①聚类完成后 Task.Added 的「本次
+// 新增」语义(供前端「有新增才提示、显示新增数而非总数」)；②RunPipeline 判断
+// 「待检测为空时是否还有事可做」的依据。
+func (s *FaceService) countUnassignedFaces(ctx context.Context) (int64, error) {
+	var n int64
+	err := s.db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM face_detections fd
+		JOIN assets a ON a.id = fd.asset_id
+		WHERE fd.excluded = 0
+		  AND NOT EXISTS (SELECT 1 FROM face_person fp WHERE fp.face_id = fd.id)`).Scan(&n)
+	return n, err
+}
+
+// clusterStage 执行一次完整的聚类:读取全部人脸向量、DBSCAN、重建
+// persons/face_person。pub 收到本阶段的局部进度 [0,1](读取 0–0.10、DBSCAN
+// 0.10–0.85、持久化 0.85–1.0)，调用方按需映射进自己的全局进度区间
+// (RunClustering 原样使用 0–1；RunPipeline 折算进检测完成后的 95%–100% 尾段)。
+// total==0(库里彻底没有人脸，例如照片被全删)时清理孤儿 person 并原样返回
+// (0, 0, nil)，既不调用 onStart 也不调用 pub——调用方据此判断"没有可发布的任务"。
+// onStart 在确认 total>0、真正开始工作前调用一次(用于建任务/发首帧 running)。
+func (s *FaceService) clusterStage(ctx context.Context, onStart func(total int64), pub func(p float64)) (total, newFaces int64, err error) {
+	var t int64
+	// 与 loadFacesWithProgress 一致：只算关联到现存 asset 的 face_detections。
+	if err := s.db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM face_detections fd
+		JOIN assets a ON a.id = fd.asset_id
+		WHERE fd.excluded = 0`).Scan(&t); err != nil {
+		return 0, 0, err
+	}
+	if t == 0 {
+		// 没有人脸了(例如照片被全部删除):自动聚类产生的非锚定 person 已无任何成员,
+		// 必须在这里清掉,否则人物表会残留孤儿——清理 persons 的唯一路径
+		// rebuildPersonsWithProgress 正好被这个早退跳过了。
+		return 0, 0, s.purgeAutoPersons(ctx)
+	}
+
+	nf, _ := s.countUnassignedFaces(ctx)
+
+	if onStart != nil {
+		onStart(t)
+	}
+
+	faces, err := s.loadFacesWithProgress(ctx, t, func(loaded int64) {
+		pub(0.10 * float64(loaded) / float64(t))
+	})
+	if err != nil {
+		return 0, 0, err
+	}
+
+	vecs := make([][]float32, len(faces))
+	for i, f := range faces {
+		vecs[i] = f.vec
+	}
+	labels := DBSCANWithProgress(vecs, dbscanEpsilon, dbscanMinPoints,
+		func(done, n int) {
+			if n == 0 {
+				return
+			}
+			pub(0.10 + 0.75*float64(done)/float64(n))
+		})
+
+	if err := s.rebuildPersonsWithProgress(ctx, faces, labels,
+		func(done, n int) {
+			if n == 0 {
+				return
+			}
+			pub(0.85 + 0.15*float64(done)/float64(n))
+		},
+	); err != nil {
+		return 0, 0, err
+	}
+
+	return t, nf, nil
+}
+
 // RunClustering reads all face embeddings, runs DBSCAN, and rebuilds the
 // persons and face_person tables from scratch.
 // Concurrent calls are safe: the second call returns nil immediately (CAS guard).
@@ -283,34 +375,9 @@ func (s *FaceService) RunClustering(ctx context.Context) error {
 	}
 	defer s.running.Store(false)
 
-	var total int64
-	// 与 loadFacesWithProgress 一致：只算关联到现存 asset 的 face_detections。
-	if err := s.db.QueryRowContext(ctx, `
-		SELECT COUNT(*) FROM face_detections fd
-		JOIN assets a ON a.id = fd.asset_id
-		WHERE fd.excluded = 0`).Scan(&total); err != nil {
-		return err
-	}
-	if total == 0 {
-		// 没有人脸了(例如照片被全部删除):自动聚类产生的非锚定 person 已无任何成员,
-		// 必须在这里清掉,否则人物表会残留孤儿——清理 persons 的唯一路径
-		// rebuildPersonsWithProgress 正好被这个早退跳过了。
-		return s.purgeAutoPersons(ctx)
-	}
-
-	// 本次「新增人脸」= 聚类前仍未分配到任何 person 的人脸数(即新上传照片里新检测到、
-	// 尚未聚类的人脸)。供前端「有新增才弹提示、且显示新增数而非总数」。
-	// 没有新增(如上传的是无人脸的文档/OCR 图)时为 0,前端据此不弹人脸提示。
-	var newFaces int64
-	_ = s.db.QueryRowContext(ctx, `
-		SELECT COUNT(*) FROM face_detections fd
-		JOIN assets a ON a.id = fd.asset_id
-		WHERE fd.excluded = 0
-		  AND NOT EXISTS (SELECT 1 FROM face_person fp WHERE fp.face_id = fd.id)`).Scan(&newFaces)
-
 	taskID := fmt.Sprintf("face_%d", time.Now().UnixNano())
 	started := time.Now()
-	pub := func(progress float64, status string, errMsg string) {
+	pub := func(progress float64, status string, errMsg string, total, newFaces int64) {
 		if s.reg == nil {
 			return
 		}
@@ -332,41 +399,187 @@ func (s *FaceService) RunClustering(ctx context.Context) error {
 		}
 		s.reg.Upsert(t)
 	}
-	pub(0, "running", "")
 
-	faces, err := s.loadFacesWithProgress(ctx, total, func(loaded int64) {
-		pub(0.10*float64(loaded)/float64(total), "running", "")
-	})
-	if err != nil {
-		pub(0, "error", fmt.Sprintf("人脸聚类失败：%s", err.Error()))
-		return err
-	}
-
-	vecs := make([][]float32, len(faces))
-	for i, f := range faces {
-		vecs[i] = f.vec
-	}
-	labels := DBSCANWithProgress(vecs, dbscanEpsilon, dbscanMinPoints,
-		func(done, n int) {
-			if n == 0 {
-				return
-			}
-			pub(0.10+0.75*float64(done)/float64(n), "running", "")
-		})
-
-	if err := s.rebuildPersonsWithProgress(ctx, faces, labels,
-		func(done, n int) {
-			if n == 0 {
-				return
-			}
-			pub(0.85+0.15*float64(done)/float64(n), "running", "")
+	var taskStarted bool
+	total, newFaces, err := s.clusterStage(ctx,
+		func(int64) {
+			taskStarted = true
+			pub(0, "running", "", 0, 0)
 		},
-	); err != nil {
-		pub(0, "error", fmt.Sprintf("人脸聚类失败：%s", err.Error()))
+		func(p float64) { pub(p, "running", "", 0, 0) },
+	)
+	if err != nil {
+		if taskStarted {
+			pub(0, "error", fmt.Sprintf("人脸聚类失败：%s", err.Error()), 0, 0)
+		}
 		return err
 	}
+	if !taskStarted {
+		// total==0：没有人脸，clusterStage 已静默清理孤儿 person，不发任务。
+		return nil
+	}
 
-	pub(1, "done", "")
+	pub(1, "done", "", total, newFaces)
+	go func() {
+		time.Sleep(taskCleanupDelay)
+		if s.reg != nil {
+			s.reg.Remove(taskID)
+		}
+	}()
+	return nil
+}
+
+// faceScanTarget is a single asset queued for RunPipeline's detection stage.
+type faceScanTarget struct {
+	id      string
+	path    string
+	isVideo bool
+}
+
+// queryFaceScanTargets 列出待检测人脸的资产:已索引、未删除、非离线、尚未跑过
+// 人脸检测(face_scanned=0)。
+func (s *FaceService) queryFaceScanTargets(ctx context.Context) ([]faceScanTarget, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT a.id, a.file_path, COALESCE(a.mime_type,'') LIKE 'video/%'
+		FROM assets a
+		WHERE a.status = 'indexed' AND a.deleted_at IS NULL AND a.offline = 0 AND a.face_scanned = 0`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []faceScanTarget
+	for rows.Next() {
+		var t faceScanTarget
+		if err := rows.Scan(&t.id, &t.path, &t.isVideo); err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+// detectFaceScanTarget 对单个资产跑检测+识别并写入 face_detections,成功后置
+// face_scanned=1。图片读原文件;视频读 <thumbDir>/<id>/large.jpg(关键帧),
+// 缺失回退 small.jpg。读文件失败或 ML 调用出错都返回 error——调用方据此跳过、
+// 留 face_scanned=0 供下一轮 RunPipeline 重试，不中断整批处理。
+func (s *FaceService) detectFaceScanTarget(ctx context.Context, t faceScanTarget) error {
+	src := t.path
+	if t.isVideo {
+		src = filepath.Join(s.thumbDir, t.id, "large.jpg")
+		if _, statErr := os.Stat(src); statErr != nil {
+			src = filepath.Join(s.thumbDir, t.id, "small.jpg")
+		}
+	}
+	data, err := os.ReadFile(src)
+	if err != nil || len(data) == 0 {
+		return fmt.Errorf("读取源文件失败: %w", err)
+	}
+	if s.ml == nil {
+		return fmt.Errorf("ML provider 未注入")
+	}
+	faces, err := s.ml.DetectAndRecognizeFaces(data)
+	if err != nil {
+		return err
+	}
+	insertFaceDetections(s.db, t.id, faces)
+	if _, err := s.db.ExecContext(ctx, `UPDATE assets SET face_scanned = 1 WHERE id = ?`, t.id); err != nil {
+		return err
+	}
+	return nil
+}
+
+// RunPipeline 是人脸检测+聚类一体任务:先对 status='indexed' AND offline=0 AND
+// face_scanned=0 的资产逐张检测(真实进度 0→95%)，再折算聚类尾段(95%→100%)。
+// CAS 防重入(沿用 RunClustering 的 s.running)；FacesEnabled 关闭时直接跳过；
+// 待检测为空且无未分配人脸时不发任务(避免秒闪空任务)。done 时 Added 沿用
+// 「新增人脸数」语义供前端 toast。
+func (s *FaceService) RunPipeline(ctx context.Context) error {
+	if config.Cfg != nil && !config.Cfg.FacesEnabled {
+		return nil
+	}
+	if !s.running.CompareAndSwap(false, true) {
+		return nil
+	}
+	defer s.running.Store(false)
+
+	targets, err := s.queryFaceScanTargets(ctx)
+	if err != nil {
+		return err
+	}
+	if len(targets) == 0 {
+		unassigned, uerr := s.countUnassignedFaces(ctx)
+		if uerr != nil {
+			return uerr
+		}
+		if unassigned == 0 {
+			return nil
+		}
+	}
+
+	taskID := fmt.Sprintf("face_%d", time.Now().UnixNano())
+	started := time.Now()
+	total := int64(len(targets))
+	pub := func(progress float64, status string, errMsg string, current, added int64) {
+		if s.reg == nil {
+			return
+		}
+		t := Task{
+			ID:        taskID,
+			Type:      "face",
+			Label:     "识别人物",
+			Progress:  progress,
+			Status:    status,
+			Error:     errMsg,
+			StartedAt: started,
+			Total:     total,
+		}
+		if status == "running" {
+			t.Current = current
+		}
+		if status == "done" || status == "error" {
+			t.Current = total
+			t.Added = added
+		}
+		s.reg.Upsert(t)
+	}
+	pub(0, "running", "", 0, 0)
+
+	var processed int64
+	for _, tgt := range targets {
+		if ctx.Err() != nil {
+			break
+		}
+		if derr := s.detectFaceScanTarget(ctx, tgt); derr != nil {
+			zap.L().Warn("人脸检测跳过，下轮重试",
+				zap.String("asset_id", tgt.id), zap.Error(derr))
+		}
+		processed++
+		frac := 0.0
+		if total > 0 {
+			frac = 0.95 * float64(processed) / float64(total)
+		}
+		pub(frac, "running", "", processed, 0)
+	}
+
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+
+	_, newFaces, cerr := s.clusterStage(ctx, nil, func(p float64) {
+		if total == 0 {
+			// 没有检测目标(纯聚类尾段场景，如历史遗留的未聚类脸)：没有 0–95%
+			// 的检测阶段可映射，直接把聚类进度铺满整段 0–100%。
+			pub(p, "running", "", processed, 0)
+			return
+		}
+		pub(0.95+0.05*p, "running", "", processed, 0)
+	})
+	if cerr != nil {
+		pub(0.95, "error", fmt.Sprintf("识别人物失败：%s", cerr.Error()), processed, 0)
+		return cerr
+	}
+
+	pub(1, "done", "", processed, newFaces)
 	go func() {
 		time.Sleep(taskCleanupDelay)
 		if s.reg != nil {
