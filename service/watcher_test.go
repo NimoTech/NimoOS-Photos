@@ -294,6 +294,30 @@ func TestWatcherRestartSwitchesWatchDirs(t *testing.T) {
 		"oldDir must not be watched after Restart")
 }
 
+// TestWatcherAutoModeWatchesEnumeratedRoots:WatchDirs 为空 ⇒ 根集合来自
+// enumerateRoots(生产=EnumerateScanRoots)。往枚举出的根里丢照片必须被
+// 实时 Enqueue 索引——这是"NAS 全空间实时监控"的核心行为。
+func TestWatcherAutoModeWatchesEnumeratedRoots(t *testing.T) {
+	db := makeTestDB(t)
+	root := t.TempDir()
+	ix := NewIndexer(db, &mockML{}, t.TempDir(), 1)
+	w := NewWatcher(db, nil, ix, "") // 空 watchDirs = 自动模式
+	w.enumerateRoots = func() []string { return []string{root} }
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go ix.Start(ctx)
+	go w.Start(ctx)
+
+	newFile := filepath.Join(root, "photo.jpg")
+	require.Eventually(t, func() bool {
+		writeFile(t, newFile, "new")
+		return assetIndexed(t, ix, newFile)
+	}, 5*time.Second, 100*time.Millisecond,
+		"auto 模式下,enumerateRoots 枚举出的根必须被实时监控")
+}
+
 // TestHandleWatchErrorOverflowTriggersRescan verifies fsnotify.ErrEventOverflow
 // (the inotify event queue overflowing, which silently drops events) triggers
 // an async recovery rescan of all watch roots so files whose events were lost

@@ -62,6 +62,10 @@ type Watcher struct {
 	// walkSupported, multiplying IO for no benefit — the outermost walk
 	// already covers everything beneath it.
 	walkInFlight sync.Map
+
+	// enumerateRoots 是自动模式(watchDirs 为空)下的根集合来源;nil 时用
+	// EnumerateScanRoots(生产路径),测试注入以避免依赖真实 /proc/mounts。
+	enumerateRoots func() []string
 }
 
 // NewWatcher creates a new Watcher.
@@ -87,7 +91,17 @@ func (w *Watcher) Start(parentCtx context.Context) {
 	}
 	w.cancel = cancel
 	dirs := append([]string(nil), w.watchDirs...)
+	enumerateRoots := w.enumerateRoots
 	w.mu.Unlock()
+
+	auto := len(dirs) == 0
+	if auto {
+		enum := enumerateRoots
+		if enum == nil {
+			enum = EnumerateScanRoots
+		}
+		dirs = enum()
+	}
 
 	fw, err := fsnotify.NewWatcher()
 	if err != nil {
@@ -118,7 +132,7 @@ func (w *Watcher) Start(parentCtx context.Context) {
 	w.roots = resolvedRoots
 	w.mu.Unlock()
 	zap.L().Info("watcher: started",
-		zap.Strings("watchDirs", dirs), zap.Int("watches", totalWatches))
+		zap.Strings("watchDirs", dirs), zap.Bool("auto", auto), zap.Int("watches", totalWatches))
 
 	for {
 		select {
