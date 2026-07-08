@@ -22,14 +22,26 @@ func searchCutAlpha() float64 {
 // tier. A return value equal to len(scores) means no tiering — every result
 // stays in the best-match tier.
 //
-// Two independent signals are evaluated and the more forward (stricter) one
-// wins:
+// Two independent signals feed the decision, but they are combined by
+// priority rather than by picking whichever cuts earlier ("取严"): a
+// significant cliff is a materially stronger relevance signal than the
+// relative threshold, because a cliff reflects an actual bimodal split in
+// the score distribution, whereas the relative threshold is a fixed
+// fraction of Top-1 that can slice straight through the middle of a single
+// cluster of genuinely relevant hits. Production evidence: a real match
+// scored 0.662 against Top-1 0.953 (alpha 0.7 → relative line 0.667) was
+// folded away by the relative line by a margin of just 0.005, even though
+// the actual cliff sat one position further down (0.662 → 0.131, a gap far
+// larger than anything above it) — the cliff was clearly the correct cut,
+// but the old "take whichever is stricter" rule let the relative line win
+// instead. The rule is now:
 //
-//  1. Relative threshold: the index of the first score below
-//     alpha*scores[0].
-//  2. Cliff detection: the position after the largest adjacent gap
+//  1. Cliff detection: the position after the largest adjacent gap
 //     d_i = scores[i]-scores[i+1], but only when that gap is "significant":
-//     d_g >= max(0.10, 2*mean(d)). An insignificant gap does not cut.
+//     d_g >= max(0.10, 2*mean(d)). When significant, this is the cut — the
+//     relative threshold is not consulted at all.
+//  2. Relative threshold (fallback, only when no cliff is significant): the
+//     index of the first score below alpha*scores[0].
 //
 // Boundary guards: fewer than 3 scores never tier (the KNN long tail needs a
 // minimum sample to be meaningfully bimodal); the best-match tier always
@@ -40,18 +52,9 @@ func semanticCutIndex(scores []float64, alpha float64) int {
 		return n
 	}
 
-	// Signal 1: relative Top-1 threshold.
-	relCut := n
-	threshold := alpha * scores[0]
-	for i := 1; i < n; i++ {
-		if scores[i] < threshold {
-			relCut = i
-			break
-		}
-	}
-
-	// Signal 2: cliff detection, gated on statistical significance.
+	// Signal 1: cliff detection, gated on statistical significance.
 	cliffCut := n
+	significant := false
 	var sum float64
 	maxDiff := -1.0
 	maxIdx := -1
@@ -69,13 +72,24 @@ func semanticCutIndex(scores []float64, alpha float64) int {
 		sigThreshold = 2 * mean
 	}
 	if maxDiff >= sigThreshold {
+		significant = true
 		cliffCut = maxIdx + 1
 	}
 
-	cut := relCut
-	if cliffCut < cut {
-		cut = cliffCut
+	cut := cliffCut
+	if !significant {
+		// Signal 2 (fallback): relative Top-1 threshold.
+		relCut := n
+		threshold := alpha * scores[0]
+		for i := 1; i < n; i++ {
+			if scores[i] < threshold {
+				relCut = i
+				break
+			}
+		}
+		cut = relCut
 	}
+
 	if cut < 1 {
 		cut = 1
 	}
