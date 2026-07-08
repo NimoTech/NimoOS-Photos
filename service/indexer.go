@@ -783,7 +783,12 @@ func (ix *Indexer) processFileInternal(path string, opts processOpts) (success b
 		  original_name = excluded.original_name,
 		  taken_at      = excluded.taken_at,
 		  duration_ms   = excluded.duration_ms,
-		  status        = 'pending'`,
+		  status        = 'pending',
+		  face_scanned  = CASE WHEN excluded.checksum <> checksum THEN 0 ELSE face_scanned END`,
+		// face_scanned 只在内容真的变了(checksum 变化)才置回 0，交给 RunPipeline
+		// 重新检测；纯粹的 force 重跑(如 Embedder/Rebuilder 对未变内容的 CLIP
+		// 补跑,同一 checksum)不应清掉已完成的人脸检测标记——否则每轮 CLIP 补跑
+		// 都会把同一批资产重新扔回人脸检测队列,产生重复的 face_detections 行。
 		assetID, path, fileSize, mime, originalName,
 		nullTime(takenAt), sqlNullInt64(durationMs),
 		checksum,
@@ -907,24 +912,9 @@ func (ix *Indexer) processFileInternal(path string, opts processOpts) (success b
 		}
 
 		if len(faceData) > 0 {
-			// Face detection + recognition（FacesEnabled 关闭时跳过）。
-			if config.Cfg == nil || config.Cfg.FacesEnabled {
-				if faces, faceErr := ix.ml.DetectAndRecognizeFaces(faceData); faceErr == nil {
-					for _, face := range faces {
-						if len(face.Embedding) != common.FaceDim {
-							continue
-						}
-						bboxJSON, _ := json.Marshal(face.BBox)
-						faceID := uuid.NewString()
-						if _, err := ix.db.Exec(
-							`INSERT INTO face_detections(id, asset_id, bbox, embedding) VALUES(?,?,?,?)`,
-							faceID, assetID, string(bboxJSON), sqlite.SerializeFloat32(face.Embedding),
-						); err != nil {
-							fmt.Fprintf(os.Stderr, "[indexer] failed to insert face_detection %s: %v\n", assetID, err)
-						}
-					}
-				}
-			}
+			// Face detection + recognition 已移交独立任务 FaceService.RunPipeline
+			// （检测 0→95% + 聚类尾段 95→100%，真实进度）：新照片先入库可见，
+			// 人物筛选晚几秒~几分钟，换真实进度与更快入库。此处不再内联检测。
 
 			// OCR uses the same full-detail input as faces (original photo or
 			// full keyframe) — small text on receipts/documents is lost at
@@ -950,6 +940,26 @@ func (ix *Indexer) processFileInternal(path string, opts processOpts) (success b
 		return false
 	}
 	return true
+}
+
+// insertFaceDetections writes ML-detected faces for assetID into
+// face_detections. Extracted from processFileInternal's original inline loop
+// so FaceService.RunPipeline's detection stage can reuse the exact same write
+// path (id/bbox/embedding shape, FaceDim guard, best-effort error logging).
+func insertFaceDetections(db *sql.DB, assetID string, faces []mlclient.FaceResult) {
+	for _, face := range faces {
+		if len(face.Embedding) != common.FaceDim {
+			continue
+		}
+		bboxJSON, _ := json.Marshal(face.BBox)
+		faceID := uuid.NewString()
+		if _, err := db.Exec(
+			`INSERT INTO face_detections(id, asset_id, bbox, embedding) VALUES(?,?,?,?)`,
+			faceID, assetID, string(bboxJSON), sqlite.SerializeFloat32(face.Embedding),
+		); err != nil {
+			fmt.Fprintf(os.Stderr, "[indexer] failed to insert face_detection %s: %v\n", assetID, err)
+		}
+	}
 }
 
 // embedClip computes and stores the CLIP vector for assetID from its displayed

@@ -149,9 +149,12 @@ func (r *Rebuilder) run(taskID string) {
 		// 清理孤儿 CLIP 向量（asset 已不存在的 asset_clip_idx/clip_embeddings
 		// 行）：承接以前全库清空里“清孤儿”的目的，见 run() 开头的说明。
 		pruneOrphanClipVectors(r.db)
-		// 人脸重聚类（内部 CAS 防重入）。
-		if err := r.faces.RunClustering(r.ctx); err != nil {
-			zap.L().Warn("rebuild: face reclustering failed", zap.Error(err))
+		// 人脸检测+重聚类（内部 CAS 防重入）。改调 RunPipeline 而非 RunClustering：
+		// 下方 worker 循环删旧 face_detections 时已把对应资产的 face_scanned 置回
+		// 0，必须靠 RunPipeline 的检测阶段重新扫一遍才能把脸补回来——RunClustering
+		// 只会在既有 face_detections 上重新分组，不会触发检测，重建后会永久无脸。
+		if err := r.faces.RunPipeline(r.ctx); err != nil {
+			zap.L().Warn("rebuild: face pipeline failed", zap.Error(err))
 		}
 		// 换模型重聚类后，旧的空 persons（含用户命名）已无意义，清掉。
 		if _, err := r.db.Exec(`DELETE FROM persons WHERE id NOT IN
@@ -175,7 +178,7 @@ func (r *Rebuilder) run(taskID string) {
 		}
 	}
 
-	// total=0：空库直接完成，跳过 worker pool，仍走 RunClustering + meta。
+	// total=0：空库直接完成，跳过 worker pool，仍走 finalize() 里的 RunPipeline + meta。
 	if total == 0 {
 		finalize()
 		if r.ctx.Err() != nil {
@@ -223,8 +226,14 @@ func (r *Rebuilder) run(taskID string) {
 				}
 				// 旧人脸行先删（face_detections 是 INSERT 而非 upsert，
 				// 不删会翻倍；face_person 经 FK CASCADE 一并清理）。
+				// 人脸检测已移出 processFileInternal，ForceReprocess 不会再重新
+				// 检测——必须把 face_scanned 置回 0，交给 finalize() 里的
+				// RunPipeline 重新扫一遍，否则这批脸就永久空了。
 				if _, err := r.db.Exec(`DELETE FROM face_detections WHERE asset_id=?`, t.id); err != nil {
 					zap.L().Warn("rebuild: clear faces failed", zap.String("asset", t.id), zap.Error(err))
+				}
+				if _, err := r.db.Exec(`UPDATE assets SET face_scanned=0 WHERE id=?`, t.id); err != nil {
+					zap.L().Warn("rebuild: reset face_scanned failed", zap.String("asset", t.id), zap.Error(err))
 				}
 				// 旧 CLIP 向量先删：见上方“不再全库清空”的说明 a)。
 				dropClipVector(r.db, t.id)

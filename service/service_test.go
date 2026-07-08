@@ -61,3 +61,49 @@ func TestNewService_TaskPublisherWired(t *testing.T) {
 		return len(got) >= 1
 	}, time.Second, 10*time.Millisecond)
 }
+
+// TestNewService_BatchDoneTriggersFacePipeline 断言批次完成钩子(SetOnBatchDone)
+// 触发的是 FaceService.RunPipeline 而非旧的 RunClustering：跑一个真实的单文件
+// 批次，asset 落地后 face_scanned=0（人脸检测已移出索引流水线），RunClustering
+// 面对 0 条 face_detections 会完全不发任务；只有 RunPipeline 会因为存在
+// face_scanned=0 的待检测资产而发出一个 "face" 任务（哪怕 ML 端点不可用，检测
+// 逐张失败也不影响任务照常创建/完成——可判定区分二者）。
+func TestNewService_BatchDoneTriggersFacePipeline(t *testing.T) {
+	tmp := t.TempDir()
+	imgDir := t.TempDir()
+	imgPath := makeTestJPEGNamed(t, imgDir, "batch1.jpg")
+
+	cfg := &config.Config{
+		DataPath:   tmp,
+		MLEndpoint: "http://127.0.0.1:0", // 不会真的连上，检测阶段逐张失败但不影响任务创建
+		Workers:    1,
+		WatchDirs:  nil,
+	}
+
+	var mu sync.Mutex
+	var got []Task
+	pub := func(t Task) {
+		mu.Lock()
+		defer mu.Unlock()
+		got = append(got, t)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	svc := NewService(ctx, cfg, pub)
+
+	svc.Indexer().SetIngestIdleTimeout(200 * time.Millisecond)
+	go svc.Indexer().Start(ctx)
+	svc.Indexer().EnqueueWithBatch(imgPath, "b1", 1)
+
+	require.Eventually(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		for _, tk := range got {
+			if tk.Type == "face" {
+				return true
+			}
+		}
+		return false
+	}, 10*time.Second, 50*time.Millisecond, "批次完成后应由 RunPipeline 发出 face 任务(RunClustering 面对 0 条 face_detections 会静默不发任务)")
+}

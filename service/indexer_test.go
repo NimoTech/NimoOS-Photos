@@ -63,6 +63,110 @@ func makeTestJPEG(t *testing.T, dir string) string {
 	return path
 }
 
+// oneFaceML 总是报告检测到恰好一张脸——用于区分"ML 没被调用"（因为压根没
+// 调）和"ML 被调用但结果没被持久化"，比返回 0 张脸的 mockML/recordingML 更能
+// 证明人脸检测确实已经移出索引流水线（而不是恰好每次都测不出脸）。
+type oneFaceML struct{ mockML }
+
+func (m *oneFaceML) DetectAndRecognizeFaces(_ []byte) ([]mlclient.FaceResult, error) {
+	vec := make([]float32, common.FaceDim)
+	vec[0] = 1
+	return []mlclient.FaceResult{{BBox: mlclient.BoundingBox{X1: 0, Y1: 0, X2: 1, Y2: 1}, Embedding: vec}}, nil
+}
+
+// writeJPEGAt 把一张纯色 JPEG 写到指定路径，颜色由 seed 决定，用于制造"同一
+// file_path、不同内容(不同 checksum)"的场景。
+func writeJPEGAt(t *testing.T, path string, seed int) {
+	t.Helper()
+	img := image.NewRGBA(image.Rect(0, 0, 40, 40))
+	c := color.RGBA{R: uint8(seed * 37 % 256), G: uint8(seed * 53 % 256), B: uint8(seed * 97 % 256), A: 255}
+	for y := 0; y < 40; y++ {
+		for x := 0; x < 40; x++ {
+			img.Set(x, y, c)
+		}
+	}
+	f, err := os.Create(path)
+	require.NoError(t, err)
+	defer f.Close()
+	require.NoError(t, jpeg.Encode(f, img, nil))
+}
+
+// TestIndexerProcessFile_DoesNotDetectFaces 断言人脸检测已移出索引流水线：
+// processFileInternal 之后 face_detections 为空、face_scanned=0，即便 ML 会
+// 返回真实的人脸结果也不会被调用/写入——检测交给独立的 FaceService.RunPipeline
+// （0→95% 真实进度 + 95→100% 聚类尾段）。
+func TestIndexerProcessFile_DoesNotDetectFaces(t *testing.T) {
+	prev := config.Cfg
+	t.Cleanup(func() { config.Cfg = prev })
+	config.Cfg = &config.Config{FacesEnabled: true, ScenesEnabled: true, OCREnabled: true}
+
+	db := makeTestDB(t)
+	ml := &oneFaceML{}
+	ix := NewIndexer(db, ml, t.TempDir(), 1)
+	path := makeTestJPEG(t, t.TempDir())
+
+	require.True(t, ix.processFileInternal(path, processOpts{}))
+
+	var assetID string
+	require.NoError(t, db.QueryRow(`SELECT id FROM assets WHERE file_path=?`, path).Scan(&assetID))
+
+	var faceCount, faceScanned int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM face_detections WHERE asset_id=?`, assetID).Scan(&faceCount))
+	require.NoError(t, db.QueryRow(`SELECT face_scanned FROM assets WHERE id=?`, assetID).Scan(&faceScanned))
+	require.Zero(t, faceCount, "人脸检测已移出索引流水线，不应再写 face_detections")
+	require.Zero(t, faceScanned, "face_scanned 应保持 0，等待 RunPipeline 处理")
+}
+
+// TestReprocess_ContentChange_ResetsFaceScanned 断言:同一 file_path 内容真的
+// 变了(checksum 变化)时,重新处理会把 face_scanned 置回 0，交给 RunPipeline
+// 重新检测——覆盖"编辑/替换了原图但路径不变"的场景。
+func TestReprocess_ContentChange_ResetsFaceScanned(t *testing.T) {
+	db := makeTestDB(t)
+	ix := NewIndexer(db, &mockML{}, t.TempDir(), 1)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "a.jpg")
+	writeJPEGAt(t, path, 1)
+
+	require.True(t, ix.processFileInternal(path, processOpts{}))
+	var assetID string
+	require.NoError(t, db.QueryRow(`SELECT id FROM assets WHERE file_path=?`, path).Scan(&assetID))
+	_, err := db.Exec(`UPDATE assets SET face_scanned=1 WHERE id=?`, assetID)
+	require.NoError(t, err)
+
+	// 内容真的变了：换一张不同的图片写到同一路径（checksum 必然不同）。
+	writeJPEGAt(t, path, 2)
+	require.True(t, ix.processFileInternal(path, processOpts{}))
+
+	var fs int
+	require.NoError(t, db.QueryRow(`SELECT face_scanned FROM assets WHERE id=?`, assetID).Scan(&fs))
+	require.Equal(t, 0, fs, "内容变化(checksum 不同)应把 face_scanned 置回 0")
+}
+
+// TestForceReprocess_UnchangedContent_PreservesFaceScanned 断言:force
+// 重跑但文件内容(checksum)没变时（如 Embedder/Rebuilder 的纯 CLIP 补跑），
+// face_scanned 不应被清掉——否则每轮 CLIP 补跑都会把同一批资产重新扔回
+// 人脸检测队列，在 face_detections 里产生重复行。
+func TestForceReprocess_UnchangedContent_PreservesFaceScanned(t *testing.T) {
+	db := makeTestDB(t)
+	ix := NewIndexer(db, &mockML{}, t.TempDir(), 1)
+	path := makeTestJPEG(t, t.TempDir())
+
+	require.True(t, ix.processFileInternal(path, processOpts{}))
+	var assetID string
+	require.NoError(t, db.QueryRow(`SELECT id FROM assets WHERE file_path=?`, path).Scan(&assetID))
+	_, err := db.Exec(`UPDATE assets SET face_scanned=1 WHERE id=?`, assetID)
+	require.NoError(t, err)
+
+	// 同一份文件内容，force=true 只是绕过"已 indexed 跳过"短路（照 Embedder
+	// 的 ForceReprocess(processOpts{force:true, skipExif:true, skipThumb:true})用法）。
+	ok := ix.ForceReprocess(path, processOpts{force: true, skipExif: true, skipThumb: true})
+	require.True(t, ok)
+
+	var fs int
+	require.NoError(t, db.QueryRow(`SELECT face_scanned FROM assets WHERE id=?`, assetID).Scan(&fs))
+	require.Equal(t, 1, fs, "内容未变时 force 重跑不应清掉 face_scanned")
+}
+
 // boxedML 返回带文字框的 OCR 结果，用于覆盖率计算测试。
 type boxedML struct{ mockML }
 
@@ -452,14 +556,17 @@ func TestIndexerHonorsFeatureFlags(t *testing.T) {
 	config.Cfg = &config.Config{FacesEnabled: false, ScenesEnabled: false, OCREnabled: false}
 	require.True(t, ix.processFileInternal(path, processOpts{force: true}))
 	require.Zero(t, ml.clipCalls)
-	require.Zero(t, ml.faceCalls)
 	require.Zero(t, ml.ocrCalls)
 
 	config.Cfg = &config.Config{FacesEnabled: true, ScenesEnabled: true, OCREnabled: true}
 	require.True(t, ix.processFileInternal(path, processOpts{force: true}))
 	require.Equal(t, 1, ml.clipCalls)
-	require.Equal(t, 1, ml.faceCalls)
 	require.Equal(t, 1, ml.ocrCalls)
+
+	// 人脸检测已移出索引流水线，交给独立的 FaceService.RunPipeline（真实进度
+	// 任务）：无论 FacesEnabled 取值如何，processFileInternal 都不应再直接调用
+	// DetectAndRecognizeFaces。
+	require.Zero(t, ml.faceCalls, "人脸检测已移交 RunPipeline，索引器不应再直接调用 ML")
 }
 
 // TestResolveMimeType 验证我们为支持的媒体扩展名存储权威的 MIME 类型，而不是

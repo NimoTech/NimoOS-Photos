@@ -385,6 +385,50 @@ func migrate(db *sql.DB) error {
 		return fmt.Errorf("migrate drop index assets_offline: %w", err)
 	}
 
+	// ── assets.face_scanned: 人脸检测独立任务(RunPipeline)的标记列 ──────
+	// face_detections 表无该资产的行 ≠ 未检测过(检测阶段可能确实没脸)。
+	// 用显式标记列区分「已检测」与「待检测」，供 RunPipeline 圈定待检测集
+	// （status='indexed' AND offline=0 AND face_scanned=0）。探测列是否已
+	// 存在，仅在首次新增该列时，于同一事务内把当前已索引的存量资产一次性
+	// 标记为已扫，避免升级后触发全库突发重扫（历史 ML 掉线期漏检的存量不
+	// 会自动补，与现状一致，见规格「取舍」）。
+	var faceScannedExisting bool
+	fsRows, err := db.Query(`PRAGMA table_info(assets)`)
+	if err != nil {
+		return fmt.Errorf("migrate pragma assets face_scanned: %w", err)
+	}
+	for fsRows.Next() {
+		var cid int
+		var name, ctype string
+		var notnull, pk int
+		var dflt sql.NullString
+		if err := fsRows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			fsRows.Close()
+			return fmt.Errorf("migrate pragma scan assets face_scanned: %w", err)
+		}
+		if name == "face_scanned" {
+			faceScannedExisting = true
+		}
+	}
+	fsRows.Close()
+	if !faceScannedExisting {
+		tx, err := db.Begin()
+		if err != nil {
+			return fmt.Errorf("migrate face_scanned begin: %w", err)
+		}
+		if _, err := tx.Exec(`ALTER TABLE assets ADD COLUMN face_scanned INTEGER NOT NULL DEFAULT 0`); err != nil {
+			tx.Rollback()
+			return fmt.Errorf("migrate add column assets.face_scanned: %w", err)
+		}
+		if _, err := tx.Exec(`UPDATE assets SET face_scanned=1 WHERE status='indexed'`); err != nil {
+			tx.Rollback()
+			return fmt.Errorf("migrate backfill assets.face_scanned: %w", err)
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("migrate face_scanned commit: %w", err)
+		}
+	}
+
 	// ── Idempotent column migration: legacy DBs created with CREATE TABLE IF NOT EXISTS
 	//    won't have new columns; ALTER TABLE ADD COLUMN fills them in.
 	//    SQLite raises "duplicate column" when the column already exists — ignore it.

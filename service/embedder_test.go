@@ -529,3 +529,34 @@ func TestEmbedder_Run_DoesNotRetriggerOnSustainedReady(t *testing.T) {
 	defer mu.Unlock()
 	require.Empty(t, embeddingTasks(emitted), "ML 持续 ready 且无活可干时不应反复发 task")
 }
+
+// TestEmbedder_Run_CallsOnRecoveredAtChainTail 断言 ML ready false→true 跳变的
+// 恢复链尾（Backfill → reembed → BackfillOCR 之后）会调用 onRecovered 钩子——
+// service.go 把它接线为 faces.RunPipeline，覆盖 ML 掉线期间积压的人脸检测欠账。
+func TestEmbedder_Run_CallsOnRecoveredAtChainTail(t *testing.T) {
+	db := makeTestDB(t)
+	tog := &togglingML{}
+	reg := NewTaskRegistry(func(Task) {})
+	e := NewEmbedder(db, tog, nil, reg)
+	e.SetPollInterval(50 * time.Millisecond)
+
+	var calls atomic.Int32
+	var lastCtx atomic.Bool // true 一旦收到非 nil ctx
+	e.SetOnRecovered(func(ctx context.Context) {
+		calls.Add(1)
+		lastCtx.Store(ctx != nil)
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go e.Run(ctx)
+
+	// ready 仍为 false 时不应触发。
+	time.Sleep(150 * time.Millisecond)
+	require.Zero(t, calls.Load(), "ML 未就绪时不应调用 onRecovered")
+
+	tog.ready.Store(true)
+	require.Eventually(t, func() bool { return calls.Load() >= 1 }, 5*time.Second, 50*time.Millisecond,
+		"ML ready 跳变后应在恢复链尾调用 onRecovered")
+	require.True(t, lastCtx.Load(), "onRecovered 应收到非 nil ctx")
+}

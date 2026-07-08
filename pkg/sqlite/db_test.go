@@ -552,3 +552,125 @@ func TestMigrateClipDimIdempotent(t *testing.T) {
 		}
 	}
 }
+
+// TestMigrateFaceScannedFreshDB verifies that a brand-new database has the
+// assets.face_scanned column, defaulting to 0 for newly-inserted rows.
+func TestMigrateFaceScannedFreshDB(t *testing.T) {
+	db, err := sqlite.Open(filepath.Join(t.TempDir(), "t.db"))
+	require.NoError(t, err)
+	defer db.Close()
+
+	_, err = db.Exec(`INSERT INTO assets(id, file_path, status) VALUES('a1','/g/1.jpg','pending')`)
+	require.NoError(t, err)
+
+	var scanned int
+	require.NoError(t, db.QueryRow(`SELECT face_scanned FROM assets WHERE id='a1'`).Scan(&scanned))
+	require.Equal(t, 0, scanned, "face_scanned 新资产应默认为 0")
+}
+
+// TestMigrateFaceScannedBackfillOnUpgrade simulates a legacy DB created before
+// assets.face_scanned existed: assets table has no such column. Opening it
+// through sqlite.Open must add the column and, in the same pass, mark
+// already-indexed assets as scanned (smooth upgrade, no mass rescan) while
+// leaving non-indexed assets at 0.
+func TestMigrateFaceScannedBackfillOnUpgrade(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "legacy.db")
+
+	// Phase 1: 手工建一份「旧库」——assets 表没有 face_scanned 列。
+	func() {
+		raw, err := sql.Open("sqlite3", dbPath)
+		require.NoError(t, err)
+		defer raw.Close()
+		_, err = raw.Exec(`CREATE TABLE assets (
+			id                   TEXT PRIMARY KEY,
+			file_path            TEXT UNIQUE NOT NULL,
+			file_size            INTEGER,
+			mime_type            TEXT,
+			original_name        TEXT,
+			taken_at             DATETIME,
+			duration_ms          INTEGER,
+			live_photo_video_id  TEXT,
+			is_live_photo_video  INTEGER NOT NULL DEFAULT 0,
+			indexed_at           DATETIME,
+			status               TEXT NOT NULL DEFAULT 'pending',
+			checksum             TEXT
+		)`)
+		require.NoError(t, err)
+		_, err = raw.Exec(`INSERT INTO assets(id, file_path, status) VALUES
+			('done1', '/g/1.jpg', 'indexed'),
+			('done2', '/g/2.jpg', 'indexed'),
+			('todo1', '/g/3.jpg', 'pending')`)
+		require.NoError(t, err)
+	}()
+
+	// Phase 2: sqlite.Open 触发迁移,应新增列并一次性回填 indexed 资产。
+	db, err := sqlite.Open(dbPath)
+	require.NoError(t, err)
+	defer db.Close()
+
+	got := map[string]int{}
+	rows, err := db.Query(`SELECT id, face_scanned FROM assets`)
+	require.NoError(t, err)
+	for rows.Next() {
+		var id string
+		var fs int
+		require.NoError(t, rows.Scan(&id, &fs))
+		got[id] = fs
+	}
+	require.NoError(t, rows.Err())
+	rows.Close()
+	require.Equal(t, map[string]int{"done1": 1, "done2": 1, "todo1": 0}, got)
+}
+
+// TestMigrateFaceScannedBackfillIsIdempotent verifies that once the column
+// exists, reopening the DB never re-runs the one-time backfill — a
+// face_scanned value that legitimate app logic reset to 0 (e.g. reprocessing)
+// must not be silently flipped back to 1 by a later migrate() pass.
+func TestMigrateFaceScannedBackfillIsIdempotent(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "legacy2.db")
+	func() {
+		raw, err := sql.Open("sqlite3", dbPath)
+		require.NoError(t, err)
+		defer raw.Close()
+		_, err = raw.Exec(`CREATE TABLE assets (
+			id                   TEXT PRIMARY KEY,
+			file_path            TEXT UNIQUE NOT NULL,
+			file_size            INTEGER,
+			mime_type            TEXT,
+			original_name        TEXT,
+			taken_at             DATETIME,
+			duration_ms          INTEGER,
+			live_photo_video_id  TEXT,
+			is_live_photo_video  INTEGER NOT NULL DEFAULT 0,
+			indexed_at           DATETIME,
+			status               TEXT NOT NULL DEFAULT 'pending',
+			checksum             TEXT
+		)`)
+		require.NoError(t, err)
+		_, err = raw.Exec(`INSERT INTO assets(id, file_path, status) VALUES('a1','/g/1.jpg','indexed')`)
+		require.NoError(t, err)
+	}()
+
+	// 第一次打开:列不存在,触发一次性回填(indexed -> face_scanned=1)。
+	func() {
+		db, err := sqlite.Open(dbPath)
+		require.NoError(t, err)
+		defer db.Close()
+	}()
+
+	// 模拟正常业务把 face_scanned 重置为 0(比如重新处理该资产)。
+	raw2, err := sql.Open("sqlite3", dbPath)
+	require.NoError(t, err)
+	_, err = raw2.Exec(`UPDATE assets SET face_scanned=0 WHERE id='a1'`)
+	require.NoError(t, err)
+	require.NoError(t, raw2.Close())
+
+	// 再次打开:列已存在,不应重新触发回填,face_scanned 应保持业务写入的 0。
+	db2, err := sqlite.Open(dbPath)
+	require.NoError(t, err)
+	defer db2.Close()
+
+	var fs int
+	require.NoError(t, db2.QueryRow(`SELECT face_scanned FROM assets WHERE id='a1'`).Scan(&fs))
+	require.Equal(t, 0, fs, "重复迁移不应重新触发回填")
+}
