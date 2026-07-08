@@ -10,6 +10,7 @@ import (
 
 	commonUpload "github.com/NimoTech/NimoOS-Common/upload"
 	"github.com/NimoTech/NimoOS-Common/external"
+	"github.com/NimoTech/NimoOS-Common/middleware"
 	"github.com/NimoTech/NimoOS-Common/utils/jwt"
 	"github.com/NimoTech/NimoOS-Photos/common"
 	v1 "github.com/NimoTech/NimoOS-Photos/route/v1"
@@ -61,6 +62,9 @@ func InitRouter(ctx context.Context, svc service.Services, runtimePath string, t
 			// Media serving endpoints: thumbnail/original/live are already
 			// protected by the Gateway; <img> tags can't send Authorization headers.
 			p := c.Path()
+			if p == common.V1APIPath+"/version" {
+				return true
+			}
 			if strings.HasSuffix(p, "/thumbnail") ||
 				strings.HasSuffix(p, "/face-thumbnail") ||
 				strings.HasSuffix(p, "/original") ||
@@ -98,6 +102,8 @@ func InitRouter(ctx context.Context, svc service.Services, runtimePath string, t
 	})
 
 	g := e.Group(common.V1APIPath)
+
+	middleware.RegisterVersionRoute(e, common.V1APIPath+"/version", "Photos", common.PhotosVersion)
 
 	assets := v1.NewAssetsHandler(svc, thumbDir)
 	search := v1.NewSearchHandler(svc)
