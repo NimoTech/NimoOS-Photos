@@ -924,8 +924,23 @@ func (ix *Indexer) processFileInternal(path string, opts processOpts) (success b
 			// 视觉检索;真正的视频理解(分段 embedding)是后续工作。
 			// OCR（OCREnabled 关闭或视频时跳过）。
 			if !isVideo && (config.Cfg == nil || config.Cfg.OCREnabled) {
-				if err := ix.ocrAsset(assetID, faceData); err != nil {
-					fmt.Fprintf(os.Stderr, "[indexer] OCR failed for %s: %v\n", assetID, err)
+				ocrData := faceData
+				if oversizedForML(ocrData) {
+					// 原图超过 immich-ml/PIL 的 178.9MP 硬上限的安全边际
+					// (maxMLInputPixels),/predict 请求必然 500——降级用已在
+					// 上面第 8 步生成好的 large.jpg 缩略图代替原图。
+					if thumb := readLargeOrSmallThumb(ix.thumbDir, assetID); len(thumb) > 0 {
+						ocrData = thumb
+					} else {
+						zap.L().Warn("原图超过 ML 像素上限且缩略图不可用，跳过 OCR",
+							zap.String("asset_id", assetID))
+						ocrData = nil
+					}
+				}
+				if len(ocrData) > 0 {
+					if err := ix.ocrAsset(assetID, ocrData); err != nil {
+						fmt.Fprintf(os.Stderr, "[indexer] OCR failed for %s: %v\n", assetID, err)
+					}
 				}
 			}
 		}

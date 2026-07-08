@@ -462,6 +462,12 @@ func (s *FaceService) queryFaceScanTargets(ctx context.Context) ([]faceScanTarge
 // face_scanned=1。图片读原文件;视频读 <thumbDir>/<id>/large.jpg(关键帧),
 // 缺失回退 small.jpg。读文件失败或 ML 调用出错都返回 error——调用方据此跳过、
 // 留 face_scanned=0 供下一轮 RunPipeline 重试，不中断整批处理。
+//
+// 图片且原图像素超过 maxMLInputPixels（immich-ml 容器内 PIL 178.9MP 硬上限的
+// 安全边际,真实案例见 16320x12240=199.8MP 的 Pexels 照片）时,改用已生成的
+// large.jpg 缩略图代替原图,避免请求必然 500、face_scanned 永远置不上、
+// RunPipeline 无限重试同一张图。缩略图也取不到时按现有失败路径处理(返回
+// error,跳过、留下轮重试),不会把超限原图硬塞给 ML。
 func (s *FaceService) detectFaceScanTarget(ctx context.Context, t faceScanTarget) error {
 	src := t.path
 	if t.isVideo {
@@ -476,6 +482,13 @@ func (s *FaceService) detectFaceScanTarget(ctx context.Context, t faceScanTarget
 	}
 	if len(data) == 0 {
 		return fmt.Errorf("读取源文件失败: 源文件为空")
+	}
+	if !t.isVideo && oversizedForML(data) {
+		thumb := readLargeOrSmallThumb(s.thumbDir, t.id)
+		if len(thumb) == 0 {
+			return fmt.Errorf("原图超过 ML 像素上限且降级缩略图不可用")
+		}
+		data = thumb
 	}
 	if s.ml == nil {
 		return fmt.Errorf("ML provider 未注入")

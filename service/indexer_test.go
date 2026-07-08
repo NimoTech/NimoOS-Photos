@@ -525,9 +525,12 @@ func TestScanDirectoryOnceDedups(t *testing.T) {
 }
 
 // recordingML 记录各 ML 能力被调用的次数，用于开关门控断言。
+// lastOCRData 额外记录最近一次 OCR 调用收到的字节，用于断言超大原图场景下
+// OCR 收到的是降级缩略图而不是原图。
 type recordingML struct {
 	mockML
 	clipCalls, faceCalls, ocrCalls int
+	lastOCRData                    []byte
 }
 
 func (m *recordingML) CLIPImageEmbed(d []byte) ([]float32, error) {
@@ -540,6 +543,7 @@ func (m *recordingML) DetectAndRecognizeFaces(d []byte) ([]mlclient.FaceResult, 
 }
 func (m *recordingML) OCR(d []byte) ([]mlclient.OCRLine, error) {
 	m.ocrCalls++
+	m.lastOCRData = d
 	return m.mockML.OCR(d)
 }
 
@@ -567,6 +571,68 @@ func TestIndexerHonorsFeatureFlags(t *testing.T) {
 	// 任务）：无论 FacesEnabled 取值如何，processFileInternal 都不应再直接调用
 	// DetectAndRecognizeFaces。
 	require.Zero(t, ml.faceCalls, "人脸检测已移交 RunPipeline，索引器不应再直接调用 ML")
+}
+
+// TestProcessFileInternal_OCRFallsBackToThumbnailForOversizedOriginal 覆盖真实
+// 定位到的 bug：原图超过 immich-ml/PIL 178.9MP 硬上限（真实案例是库里
+// 16320x12240=199.8MP 的 Pexels 照片）时，内联 OCR 必须改用已生成的 large.jpg
+// 缩略图代替原图字节，否则 OCR 请求必然 500 而被永久吞掉。
+//
+// 用一条已知 id 的预置记录让 processFileInternal 走 ON CONFLICT(file_path)
+// UPDATE 分支（不改动已有 id），从而能在调用前就把 large.jpg 缩略图放到
+// 已知路径下——真实的 thumb.Generate 对这段手工构造的 JPEG 头(无真实像素
+// 数据)必然解码失败，不会覆盖预置的缩略图。
+func TestProcessFileInternal_OCRFallsBackToThumbnailForOversizedOriginal(t *testing.T) {
+	db := makeTestDB(t)
+	thumbDir := t.TempDir()
+	imgDir := t.TempDir()
+	const assetID = "asset-ocr-oversized"
+
+	oversizedPath := filepath.Join(imgDir, "big.jpg")
+	require.NoError(t, os.WriteFile(oversizedPath, fakeJPEGHeader(16320, 12240), 0o644))
+
+	_, err := db.Exec(`INSERT INTO assets(id, file_path, status) VALUES(?, ?, 'pending')`, assetID, oversizedPath)
+	require.NoError(t, err)
+
+	require.NoError(t, os.MkdirAll(filepath.Join(thumbDir, assetID), 0o755))
+	generatedThumb := makeTestJPEG(t, t.TempDir())
+	thumbBytes, err := os.ReadFile(generatedThumb)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(thumbDir, assetID, "large.jpg"), thumbBytes, 0o644))
+
+	prev := config.Cfg
+	t.Cleanup(func() { config.Cfg = prev })
+	config.Cfg = &config.Config{FacesEnabled: true, ScenesEnabled: true, OCREnabled: true}
+
+	ml := &recordingML{}
+	ix := NewIndexer(db, ml, thumbDir, 1)
+	require.True(t, ix.processFileInternal(oversizedPath, processOpts{force: true}))
+
+	require.Equal(t, 1, ml.ocrCalls)
+	require.Equal(t, thumbBytes, ml.lastOCRData, "OCR 应收到 large.jpg 缩略图字节而不是超限原图字节")
+}
+
+// TestProcessFileInternal_OCRSkippedWhenOversizedAndNoThumbnail 覆盖降级也拿
+// 不到缩略图的情况：真实的 thumb.Generate 对这段无有效像素数据的手工 JPEG 头
+// 必然解码失败、不产出 large.jpg/small.jpg，此时 OCR 必须被跳过（沿用既有的
+// 吞错风格），而不是把超限原图硬塞给 ML。
+func TestProcessFileInternal_OCRSkippedWhenOversizedAndNoThumbnail(t *testing.T) {
+	db := makeTestDB(t)
+	thumbDir := t.TempDir()
+	imgDir := t.TempDir()
+
+	oversizedPath := filepath.Join(imgDir, "big.jpg")
+	require.NoError(t, os.WriteFile(oversizedPath, fakeJPEGHeader(16320, 12240), 0o644))
+
+	prev := config.Cfg
+	t.Cleanup(func() { config.Cfg = prev })
+	config.Cfg = &config.Config{FacesEnabled: true, ScenesEnabled: true, OCREnabled: true}
+
+	ml := &recordingML{}
+	ix := NewIndexer(db, ml, thumbDir, 1)
+	require.True(t, ix.processFileInternal(oversizedPath, processOpts{force: true}))
+
+	require.Zero(t, ml.ocrCalls, "缩略图不可用时应跳过 OCR，而不是把超限原图传给 ML")
 }
 
 // TestResolveMimeType 验证我们为支持的媒体扩展名存储权威的 MIME 类型，而不是
