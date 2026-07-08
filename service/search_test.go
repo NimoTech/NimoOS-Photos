@@ -361,6 +361,100 @@ func TestSmartSearchOffsetBeyondLibraryReturnsActualCount(t *testing.T) {
 	require.Empty(t, empty)
 }
 
+// markDeleted 软删除给定 id（置 deleted_at），模拟资产被移入回收站——它的 CLIP
+// 向量仍留在 clip_embeddings 里（不像硬删除会 dropClipVector），KNN 依旧会把它
+// 选为候选，但 SmartSearch 的 WHERE deleted_at IS NULL 会在 KNN 之后把它滤掉。
+func markDeleted(t *testing.T, db *sql.DB, id string) {
+	t.Helper()
+	_, err := db.Exec(`UPDATE assets SET deleted_at = CURRENT_TIMESTAMP WHERE id = ?`, id)
+	require.NoError(t, err)
+}
+
+// TestSmartSearchOffsetFullPageDespiteDeletedInWindow 复现真机验收报告的 Critical
+// 缺陷：KNN 窗口内混入一条已被移入回收站（deleted_at 已置）的资产，若不做超取
+// 补齐，过滤后窗口会短一条，分页错位。构造 87 条带向量资产（id0..id86，按分数
+// 严格递减排名），把恰好落在 offset=20,limit=10 窗口内的 id25 标记为已删——修
+// 复前 k=offset+limit=30，KNN 拿到的 30 个候选里 id25 被过滤掉，只剩 9 条；修
+// 复后应超取补齐满 10 条，且内容等于「全量存活列表」对应区段。
+func TestSmartSearchOffsetFullPageDespiteDeletedInWindow(t *testing.T) {
+	db, err := sqlite.Open(filepath.Join(t.TempDir(), "del_window.db"))
+	require.NoError(t, err)
+	defer db.Close()
+	seedRankedSemantic(t, db, 87)
+	markDeleted(t, db, "id25") // 落在 offset=20,limit=10 的 [20,30) 窗口内
+
+	svc := service.NewSearchService(db, &mockTextML{})
+
+	// 全量存活列表（用一次性大 limit 取全部，作为分页结果的对照基准）。
+	full, err := svc.SmartSearch("fish", 200, 0, service.SearchFilters{})
+	require.NoError(t, err)
+	require.Len(t, full, 86, "87 条减去 1 条已删应剩 86 条存活")
+	for _, a := range full {
+		require.NotEqual(t, "id25", a.ID, "已删资产不应出现在存活列表里")
+	}
+
+	page, err := svc.SmartSearch("fish", 10, 20, service.SearchFilters{})
+	require.NoError(t, err)
+	require.Len(t, page, 10, "窗口内混入 1 条已删资产不应让该页少于 limit 条")
+	for i, a := range page {
+		require.Equal(t, full[20+i].ID, a.ID, "第 %d 条应等于全量存活列表第 %d 条", i, 20+i)
+	}
+}
+
+// TestSmartSearchOffsetUnionNoGapsOrDupesWithDeletedMixedIn 验证：库中散布多条
+// 已删资产时，连续翻页（offset 依次 +limit）的并集与全量存活列表完全一致——既
+// 无缺口（某条存活资产在任何页都不出现）也无重复（同一条出现在两页里）。
+func TestSmartSearchOffsetUnionNoGapsOrDupesWithDeletedMixedIn(t *testing.T) {
+	db, err := sqlite.Open(filepath.Join(t.TempDir(), "del_union.db"))
+	require.NoError(t, err)
+	defer db.Close()
+	seedRankedSemantic(t, db, 60)
+	for _, id := range []string{"id3", "id4", "id17", "id18", "id19", "id41"} {
+		markDeleted(t, db, id)
+	}
+
+	svc := service.NewSearchService(db, &mockTextML{})
+	full, err := svc.SmartSearch("fish", 200, 0, service.SearchFilters{})
+	require.NoError(t, err)
+	require.Len(t, full, 54)
+
+	const pageSize = 10
+	var union []service.Asset
+	for offset := 0; offset < len(full); offset += pageSize {
+		page, err := svc.SmartSearch("fish", pageSize, offset, service.SearchFilters{})
+		require.NoError(t, err)
+		require.Len(t, page, min(pageSize, len(full)-offset), "每页应尽量取满，仅末页可短")
+		union = append(union, page...)
+	}
+	require.Len(t, union, len(full), "翻页并集长度应等于全量存活列表长度（无缺口无重复）")
+	for i, a := range union {
+		require.Equal(t, full[i].ID, a.ID, "并集第 %d 条应等于全量存活列表第 %d 条", i, i)
+	}
+}
+
+// TestSmartSearchOffsetTrueBottomReturnsActualCountWithDeletedMixedIn 验证：即使
+// 窗口内有已删资产需要超取补齐，一旦补齐到全局 k 上限仍不足 offset+limit，说明
+// 真到底了，应返回实际剩余数量而不是继续无谓重查或报错。
+func TestSmartSearchOffsetTrueBottomReturnsActualCountWithDeletedMixedIn(t *testing.T) {
+	db, err := sqlite.Open(filepath.Join(t.TempDir(), "del_bottom.db"))
+	require.NoError(t, err)
+	defer db.Close()
+	seedRankedSemantic(t, db, 10)
+	markDeleted(t, db, "id8")
+	markDeleted(t, db, "id9")
+	// 存活：id0..id7，共 8 条。
+
+	svc := service.NewSearchService(db, &mockTextML{})
+	page, err := svc.SmartSearch("fish", 10, 5, service.SearchFilters{})
+	require.NoError(t, err)
+	require.Len(t, page, 3, "存活 8 条，offset=5 时真到底应只剩 3 条")
+	require.Equal(t, []string{"id5", "id6", "id7"}, []string{page[0].ID, page[1].ID, page[2].ID})
+
+	empty, err := svc.SmartSearch("fish", 10, 8, service.SearchFilters{})
+	require.NoError(t, err)
+	require.Empty(t, empty, "offset 本身已越过存活总数应返回空切片而非报错")
+}
+
 // TestSmartSearchNegativeOffsetClampsToZero 验证 service 层对负数 offset 的防御性
 // 归零（路由层已经归零，这里确保 SmartSearch 本身也不会因负数 offset 产生异常行为，
 // 例如切片越界或 k 值被算小）。
