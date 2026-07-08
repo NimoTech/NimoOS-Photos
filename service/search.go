@@ -111,9 +111,30 @@ func minMatchSimilarity() float64 {
 	return 0.0
 }
 
+// maxSmartSearchK is the hard ceiling on the KNN k value regardless of how
+// deep a page offset+limit requests — a global backstop against pathological
+// pagination requests hammering sqlite-vec with an unbounded k.
+const maxSmartSearchK = 2000
+
 // SmartSearch performs KNN vector search on CLIP embeddings filtered by optional
-// year/month, returning at most limit results.
-func (s *SearchService) SmartSearch(query string, limit int, filters SearchFilters) ([]Asset, error) {
+// year/month, returning up to limit results starting at offset (0-based).
+//
+// limit is now a page size rather than a hard top-k: internally the KNN k is
+// offset+limit (capped at maxSmartSearchK), and the page is sliced out of
+// that window. OCR merging and adaptive cut tiering (applyCutTiering) only
+// run on the first page (offset==0) — best matches naturally live at the
+// head of the ranking. Deeper pages (offset>0) skip OCR merging entirely and
+// have every result marked BelowCut=true: a page beyond the first is by
+// definition part of the "more results" tier.
+func (s *SearchService) SmartSearch(query string, limit int, offset int, filters SearchFilters) ([]Asset, error) {
+	if offset < 0 {
+		offset = 0
+	}
+	k := offset + limit
+	if k > maxSmartSearchK {
+		k = maxSmartSearchK
+	}
+
 	queryVec, err := s.ml.CLIPTextEmbed(query)
 	if err != nil {
 		return nil, fmt.Errorf("SmartSearch embed: %w", err)
@@ -136,7 +157,7 @@ WHERE vec.embedding MATCH ? AND k = ?
   AND a.is_live_photo_video = 0
   AND a.deleted_at IS NULL AND a.offline = 0`
 
-	args := []any{blob, limit}
+	args := []any{blob, k}
 
 	var clauses []string
 	if filters.Year > 0 {
@@ -182,21 +203,43 @@ WHERE vec.embedding MATCH ? AND k = ?
 		assets = kept
 	}
 
-	// Exact-text OCR hits outrank semantic guesses: prepend them at score 1.0
-	// and drop the CLIP duplicate when the same asset matched both ways.
-	if filters.IncludeOCR {
-		ocrHits, err := s.ocrSearch(query, limit, filters)
-		if err != nil {
-			return nil, err
+	if offset == 0 {
+		// Exact-text OCR hits outrank semantic guesses: prepend them at score
+		// 1.0 and drop the CLIP duplicate when the same asset matched both
+		// ways. Only meaningful on the first page — OCR hits are pinned to
+		// the head of the ranking, which deeper pages never reach.
+		if filters.IncludeOCR {
+			ocrHits, err := s.ocrSearch(query, limit, filters)
+			if err != nil {
+				return nil, err
+			}
+			assets = mergeOCRFirst(ocrHits, assets, limit)
 		}
-		assets = mergeOCRFirst(ocrHits, assets, limit)
-	}
 
-	// Adaptive cut: mark the long tail of the semantic-hit subsequence as
-	// BelowCut so the client can fold it into a "more results" tier. OCR hits
-	// are excluded from the computation and always stay in the best tier (see
-	// applyCutTiering's doc).
-	applyCutTiering(assets)
+		// Adaptive cut: mark the long tail of the semantic-hit subsequence as
+		// BelowCut so the client can fold it into a "more results" tier. OCR
+		// hits are excluded from the computation and always stay in the best
+		// tier (see applyCutTiering's doc).
+		applyCutTiering(assets)
+	} else {
+		// Deep page: slice the [offset, offset+limit) window out of the KNN
+		// window fetched above (k = offset+limit), skipping OCR merging and
+		// cut-index computation — every deep-page result is definitionally
+		// part of the folded "more results" tier. A library shorter than
+		// offset+limit naturally yields fewer than limit results here.
+		if offset >= len(assets) {
+			assets = assets[:0]
+		} else {
+			end := offset + limit
+			if end > len(assets) {
+				end = len(assets)
+			}
+			assets = assets[offset:end]
+		}
+		for i := range assets {
+			assets[i].BelowCut = true
+		}
+	}
 
 	// Attach named persons so the client can offer a People filter on results.
 	if err := s.attachNamedFaces(assets); err != nil {

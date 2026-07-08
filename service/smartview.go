@@ -483,7 +483,7 @@ func (s *SmartViewService) assetsForOCR(query string) (map[string]struct{}, erro
 }
 
 func (s *SmartViewService) assetsForSemantic(query string) (map[string]float64, error) {
-	results, err := s.search.SmartSearch(query, 500, SearchFilters{})
+	results, err := s.search.SmartSearch(query, 500, 0, SearchFilters{})
 	if err != nil {
 		return nil, err
 	}
