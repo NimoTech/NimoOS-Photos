@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/NimoTech/NimoOS-Photos/pkg/config"
+	"github.com/NimoTech/NimoOS-Photos/pkg/mlclient"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 )
@@ -559,4 +560,43 @@ func TestEmbedder_Run_CallsOnRecoveredAtChainTail(t *testing.T) {
 	require.Eventually(t, func() bool { return calls.Load() >= 1 }, 5*time.Second, 50*time.Millisecond,
 		"ML ready 跳变后应在恢复链尾调用 onRecovered")
 	require.True(t, lastCtx.Load(), "onRecovered 应收到非 nil ctx")
+}
+
+// recordingOCRML 记录最近一次 OCR 收到的输入字节,其余行为同 mockML。
+type recordingOCRML struct {
+	mockML
+	lastOCRData []byte
+}
+
+func (m *recordingOCRML) OCR(data []byte) ([]mlclient.OCRLine, error) {
+	m.lastOCRData = data
+	return []mlclient.OCRLine{}, nil
+}
+
+// TestBackfillOCR_OversizedImageFallsBackToThumbnail:OCR 补跑(embedder 侧)
+// 是超大图守卫的第三个调用点——图片路径直读原图,超过 PIL 上限的图必然 500,
+// 且每次 ML 恢复都重试。守卫后必须换用 large.jpg 缩略图字节喂 ML。
+func TestBackfillOCR_OversizedImageFallsBackToThumbnail(t *testing.T) {
+	db := makeTestDB(t)
+	srcDir := t.TempDir()
+	thumbDir := t.TempDir()
+
+	oversizedPath := filepath.Join(srcDir, "big.jpg")
+	require.NoError(t, os.WriteFile(oversizedPath, fakeJPEGHeader(16320, 12240), 0o644))
+	assetID := insertAsset(t, db, oversizedPath, "indexed")
+
+	require.NoError(t, os.MkdirAll(filepath.Join(thumbDir, assetID), 0o755))
+	generatedThumb := makeTestJPEG(t, filepath.Join(thumbDir, assetID))
+	largePath := filepath.Join(thumbDir, assetID, "large.jpg")
+	require.NoError(t, os.Rename(generatedThumb, largePath))
+	thumbBytes, err := os.ReadFile(largePath)
+	require.NoError(t, err)
+
+	ml := &recordingOCRML{}
+	ix := NewIndexer(db, ml, thumbDir, 1)
+	e := NewEmbedder(db, ml, ix, NewTaskRegistry(nil))
+
+	require.NoError(t, e.BackfillOCR(context.Background()))
+	require.Equal(t, thumbBytes, ml.lastOCRData,
+		"超限原图应换成 large.jpg 缩略图字节喂 OCR,而不是原图字节")
 }
