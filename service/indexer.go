@@ -908,7 +908,12 @@ func (ix *Indexer) processFileInternal(path string, opts processOpts) (success b
 		// CLIP embedding（ScenesEnabled 关闭时跳过——注意嵌入同时是语义搜索的基础，
 		// 关闭后新照片不参与语义搜索）。
 		if config.Cfg == nil || config.Cfg.ScenesEnabled {
-			_ = ix.embedClip(assetID, faceData)
+			// 失败不阻断入库(缩略图/EXIF 照常),但必须留痕:缺向量的资产
+			// 语义搜索完全搜不到,靠批次末尾/ML 恢复链的 Backfill 兜底补齐。
+			if err := ix.embedClip(assetID, faceData); err != nil {
+				zap.L().Warn("CLIP 嵌入失败,待 Backfill 兜底",
+					zap.String("asset_id", assetID), zap.Error(err))
+			}
 		}
 
 		if len(faceData) > 0 {

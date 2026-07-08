@@ -175,6 +175,19 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 				zap.L().Warn("post-batch face pipeline failed", zap.Error(err))
 			}
 		}()
+		// CLIP/OCR 兜底补跑:索引期间 ML 冷加载/worker 回收会让 embedClip/ocrAsset
+		// 偶发失败且被吞(processFile 不因 ML 失败拒绝入库),而 Embedder 的恢复链
+		// 只在 ML「掉线→恢复」跳变时触发——ML 全程在线就永远没人补,资产无限期
+		// 缺向量、语义搜索搜不到(真实故障:两张鱼图撞上模型冷加载窗口)。批次末尾
+		// 补一手,CAS+rerunPending 已防重入,无欠账时两个调用都是秒级空跑。
+		go func() {
+			if err := embedder.Backfill(parentCtx); err != nil {
+				zap.L().Warn("post-batch clip backfill failed", zap.Error(err))
+			}
+			if err := embedder.BackfillOCR(parentCtx); err != nil {
+				zap.L().Warn("post-batch ocr backfill failed", zap.Error(err))
+			}
+		}()
 		go func() {
 			for {
 				n, err := geoSvc.BackfillPending(500)
