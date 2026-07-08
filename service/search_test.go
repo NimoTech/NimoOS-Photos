@@ -286,6 +286,59 @@ func TestSmartSearchOffsetPageAllBelowCutNoOCR(t *testing.T) {
 	}
 }
 
+// TestSmartSearchOCRDoesNotDisplaceSemanticAcrossPages 复现复审发现的 Critical 分页
+// 缺陷构造：8 条语义命中 id0..id7（严格递减）+ 1 条纯 OCR 命中，limit=3。
+//
+// 旧行为（mergeOCRFirst 把 OCR+语义总长截到 limit）：首页 [ocr1,id0,id1]，id2 被
+// OCR 挤出去；次页固定从语义排名 offset=3 处切，得到 [id3,id4,id5]——id2 在任何
+// 页都不出现，永久丢失。
+//
+// 新契约（OCR 不占语义名额）：offset/limit 只作用于语义序列，首页 = 去重后的
+// OCR 前置 + 语义[0:limit]，总长可超 limit；因此首页应为 4 条
+// [ocr1,id0,id1,id2]，次页仍从 id3 起，两页语义部分的并集覆盖 id0..id5 无缺口。
+func TestSmartSearchOCRDoesNotDisplaceSemanticAcrossPages(t *testing.T) {
+	db, err := sqlite.Open(filepath.Join(t.TempDir(), "ocr_page.db"))
+	require.NoError(t, err)
+	defer db.Close()
+	seedRankedSemantic(t, db, 8)
+	_, err = db.Exec(`INSERT INTO assets(id,file_path,status,is_live_photo_video) VALUES('ocr1','/p/ocr1.jpg','indexed',0)`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO asset_ocr(asset_id,text) VALUES('ocr1','fish menu special')`)
+	require.NoError(t, err)
+
+	svc := service.NewSearchService(db, &mockTextML{})
+
+	first, err := svc.SmartSearch("fish", 3, 0, service.SearchFilters{IncludeOCR: true})
+	require.NoError(t, err)
+	require.Len(t, first, 4, "首页应为 OCR 前置 + 语义[0:limit]，不因 OCR 挤占而截短")
+	firstIDs := make([]string, len(first))
+	for i, a := range first {
+		firstIDs[i] = a.ID
+	}
+	require.Equal(t, []string{"ocr1", "id0", "id1", "id2"}, firstIDs, "id2 不应被 OCR 挤出首页")
+
+	second, err := svc.SmartSearch("fish", 3, 3, service.SearchFilters{IncludeOCR: true})
+	require.NoError(t, err)
+	require.Len(t, second, 3)
+	secondIDs := make([]string, len(second))
+	for i, a := range second {
+		secondIDs[i] = a.ID
+	}
+	require.Equal(t, []string{"id3", "id4", "id5"}, secondIDs)
+
+	// 两页并集覆盖语义排名 id0..id5，无缺口（id2 在首页出现过，不会因跨页切割丢失）。
+	seen := map[string]bool{}
+	for _, id := range firstIDs {
+		seen[id] = true
+	}
+	for _, id := range secondIDs {
+		seen[id] = true
+	}
+	for _, id := range []string{"id0", "id1", "id2", "id3", "id4", "id5"} {
+		require.True(t, seen[id], id+" 不应在首页+次页的并集中缺失")
+	}
+}
+
 // TestSmartSearchOffsetBeyondLibraryReturnsActualCount 验证库不足时（offset+limit
 // 超出库存量）返回实际数量而非报错或补齐空结果。
 func TestSmartSearchOffsetBeyondLibraryReturnsActualCount(t *testing.T) {

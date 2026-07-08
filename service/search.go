@@ -126,6 +126,14 @@ const maxSmartSearchK = 2000
 // head of the ranking. Deeper pages (offset>0) skip OCR merging entirely and
 // have every result marked BelowCut=true: a page beyond the first is by
 // definition part of the "more results" tier.
+//
+// offset/limit paginate the SEMANTIC sequence only; OCR does not occupy a
+// semantic slot. The first-page response is therefore deduped-OCR-first +
+// semantic[0:limit], and its total length may exceed limit (up to ~2×limit)
+// — see mergeOCRFirst's doc. Deep pages still slice the semantic ranking
+// starting at offset, so this is what keeps a semantic entry from being
+// permanently lost when an OCR hit would otherwise have pushed it out of the
+// first page.
 func (s *SearchService) SmartSearch(query string, limit int, offset int, filters SearchFilters) ([]Asset, error) {
 	if offset < 0 {
 		offset = 0
@@ -208,12 +216,21 @@ WHERE vec.embedding MATCH ? AND k = ?
 		// 1.0 and drop the CLIP duplicate when the same asset matched both
 		// ways. Only meaningful on the first page — OCR hits are pinned to
 		// the head of the ranking, which deeper pages never reach.
+		//
+		// OCR does NOT occupy a semantic slot: offset/limit apply only to the
+		// semantic sequence (already limit-sized here since k==limit when
+		// offset==0). mergeOCRFirst only dedupes and prepends — it must not
+		// truncate the merged result back to limit, or an OCR hit would push
+		// the last semantic entry out of the first page while deep pages
+		// still slice the *semantic* ranking starting at `offset`, permanently
+		// losing that entry (found in review; see the design doc's "增量修正"
+		// section and TestSmartSearchOCRDoesNotDisplaceSemanticAcrossPages).
 		if filters.IncludeOCR {
 			ocrHits, err := s.ocrSearch(query, limit, filters)
 			if err != nil {
 				return nil, err
 			}
-			assets = mergeOCRFirst(ocrHits, assets, limit)
+			assets = mergeOCRFirst(ocrHits, assets)
 		}
 
 		// Adaptive cut: mark the long tail of the semantic-hit subsequence as
@@ -298,8 +315,12 @@ WHERE instr(lower(o.text), lower(?)) > 0
 }
 
 // mergeOCRFirst concatenates ocr hits before clip results, dropping duplicate
-// asset IDs (the OCR entry wins) and trimming to limit.
-func mergeOCRFirst(ocr, clip []Asset, limit int) []Asset {
+// asset IDs (the OCR entry wins). It deliberately does NOT trim the result to
+// any limit: OCR hits must not occupy semantic pagination slots, so the
+// merged length may exceed limit (bounded by len(ocr)+len(clip), both already
+// individually capped by their callers). See SmartSearch's offset==0 branch
+// for the pagination-correctness rationale.
+func mergeOCRFirst(ocr, clip []Asset) []Asset {
 	seen := make(map[string]struct{}, len(ocr)+len(clip))
 	out := make([]Asset, 0, len(ocr)+len(clip))
 	for _, a := range append(ocr, clip...) {
@@ -308,9 +329,6 @@ func mergeOCRFirst(ocr, clip []Asset, limit int) []Asset {
 		}
 		seen[a.ID] = struct{}{}
 		out = append(out, a)
-	}
-	if limit > 0 && len(out) > limit {
-		out = out[:limit]
 	}
 	return out
 }
