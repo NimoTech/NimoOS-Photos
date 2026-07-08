@@ -76,6 +76,20 @@ func TestSearchCalibrationOverride(t *testing.T) {
 	require.Equal(t, 0.2, Cfg.SimDisplayCeil)
 }
 
+// 配置文件无 SearchCutAlpha key 时默认 0.7（照 MinMatchSimilarity 的兜底模式）。
+func TestSearchCutAlphaDefault(t *testing.T) {
+	cf := filepath.Join(t.TempDir(), "photos.conf")
+	require.NoError(t, Init(cf, "[photos]\n"))
+	require.Equal(t, 0.7, Cfg.SearchCutAlpha)
+}
+
+// 配置文件显式给出 SearchCutAlpha 时按配置值生效。
+func TestSearchCutAlphaOverride(t *testing.T) {
+	cf := filepath.Join(t.TempDir(), "photos.conf")
+	require.NoError(t, Init(cf, "[photos]\nSearchCutAlpha = 0.55\n"))
+	require.Equal(t, 0.55, Cfg.SearchCutAlpha)
+}
+
 func TestScanIntervalDefaultAndSave(t *testing.T) {
 	dir := t.TempDir()
 	cf := filepath.Join(dir, "photos.conf")

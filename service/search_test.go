@@ -2,6 +2,7 @@ package service_test
 
 import (
 	"fmt"
+	"math"
 	"path/filepath"
 	"testing"
 
@@ -108,6 +109,99 @@ func TestSmartSearchIncludeOCR(t *testing.T) {
 	results, err = svc.SmartSearch("RECEIPT", 10, service.SearchFilters{IncludeOCR: true})
 	require.NoError(t, err)
 	require.Equal(t, "a3", results[0].ID)
+}
+
+// TestSmartSearchBelowCutTiering 验证 SmartSearch 集成场景下的自适应断层落点：
+// OCR 命中恒最佳层（不参与断点计算），语义命中的教科书断崖尾部（同规格 §2 的
+// "fish" 示例：4 条真命中 0.86~0.66，随后断崖到 0.13 的噪声）被正确置 BelowCut。
+func TestSmartSearchBelowCutTiering(t *testing.T) {
+	db, err := sqlite.Open(filepath.Join(t.TempDir(), "cut.db"))
+	require.NoError(t, err)
+	defer db.Close()
+
+	// OCR 命中：精确文本子串命中，恒 1.0 分，恒最佳层。
+	_, err = db.Exec(`INSERT INTO assets(id,file_path,status,is_live_photo_video,taken_at)
+		VALUES('ocr1','/p/ocr1.jpg','indexed',0,'2025-07-01 10:00:00')`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO asset_ocr(asset_id,text) VALUES('ocr1','fish menu special')`)
+	require.NoError(t, err)
+
+	// seedSemantic 反解 displayScore 的线性映射（floor=0.03/ceil=0.13 默认值），
+	// 构造出恰好产生目标展示分 ds 的 CLIP 向量（查询向量固定为 e0=[1,0,...]）。
+	seedSemantic := func(id string, ds float64) {
+		x := 0.03 + ds*0.10
+		_, err := db.Exec(`INSERT INTO assets(id,file_path,status,is_live_photo_video) VALUES(?,?,'indexed',0)`, id, "/p/"+id+".jpg")
+		require.NoError(t, err)
+		_, err = db.Exec(`INSERT INTO asset_clip_idx(asset_id) VALUES(?)`, id)
+		require.NoError(t, err)
+		var rowid int64
+		require.NoError(t, db.QueryRow(`SELECT rowid FROM asset_clip_idx WHERE asset_id=?`, id).Scan(&rowid))
+		vec := make([]float32, common.CLIPDim)
+		vec[0] = float32(x)
+		vec[1] = float32(math.Sqrt(1 - x*x))
+		_, err = db.Exec(`INSERT INTO clip_embeddings(rowid,embedding) VALUES(?,?)`, rowid, sqlite.SerializeFloat32(vec))
+		require.NoError(t, err)
+	}
+	seedSemantic("s1", 0.86)
+	seedSemantic("s2", 0.80)
+	seedSemantic("s3", 0.72)
+	seedSemantic("s4", 0.66)
+	seedSemantic("tail1", 0.13)
+	seedSemantic("tail2", 0.13)
+
+	svc := service.NewSearchService(db, &mockTextML{})
+	results, err := svc.SmartSearch("fish", 10, service.SearchFilters{IncludeOCR: true})
+	require.NoError(t, err)
+	require.Len(t, results, 7)
+
+	belowCut := map[string]bool{}
+	matchedBy := map[string]string{}
+	for _, a := range results {
+		belowCut[a.ID] = a.BelowCut
+		matchedBy[a.ID] = a.MatchedBy
+	}
+	require.Equal(t, "ocr", matchedBy["ocr1"])
+	require.False(t, belowCut["ocr1"], "OCR 命中恒最佳层，不参与断点计算")
+	for _, id := range []string{"s1", "s2", "s3", "s4"} {
+		require.Equal(t, "semantic", matchedBy[id])
+		require.False(t, belowCut[id], id+" 应在最佳匹配层")
+	}
+	for _, id := range []string{"tail1", "tail2"} {
+		require.Equal(t, "semantic", matchedBy[id])
+		require.True(t, belowCut[id], id+" 应折入 more-results 折叠层")
+	}
+}
+
+// TestSmartSearchNoBelowCutWhenFewResults 验证边界守卫：语义结果少于 3 条时不分层
+// （全部落在最佳匹配层），即便分差很大。
+func TestSmartSearchNoBelowCutWhenFewResults(t *testing.T) {
+	db, err := sqlite.Open(filepath.Join(t.TempDir(), "few.db"))
+	require.NoError(t, err)
+	defer db.Close()
+
+	seed := func(id string, x float64) {
+		_, err := db.Exec(`INSERT INTO assets(id,file_path,status,is_live_photo_video) VALUES(?,?,'indexed',0)`, id, "/p/"+id+".jpg")
+		require.NoError(t, err)
+		_, err = db.Exec(`INSERT INTO asset_clip_idx(asset_id) VALUES(?)`, id)
+		require.NoError(t, err)
+		var rowid int64
+		require.NoError(t, db.QueryRow(`SELECT rowid FROM asset_clip_idx WHERE asset_id=?`, id).Scan(&rowid))
+		vec := make([]float32, common.CLIPDim)
+		vec[0] = float32(x)
+		vec[1] = float32(math.Sqrt(1 - x*x))
+		_, err = db.Exec(`INSERT INTO clip_embeddings(rowid,embedding) VALUES(?,?)`, rowid, sqlite.SerializeFloat32(vec))
+		require.NoError(t, err)
+	}
+	seed("hi", 0.12)
+	seed("lo", 0.031)
+
+	svc := service.NewSearchService(db, &mockTextML{})
+	results, err := svc.SmartSearch("fish", 10, service.SearchFilters{})
+	require.NoError(t, err)
+	require.Len(t, results, 2)
+	for _, a := range results {
+		require.False(t, a.BelowCut, a.ID+"：语义结果<3 条时不应分层")
+	}
 }
 
 func TestTimeline(t *testing.T) {

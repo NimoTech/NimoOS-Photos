@@ -192,6 +192,12 @@ WHERE vec.embedding MATCH ? AND k = ?
 		assets = mergeOCRFirst(ocrHits, assets, limit)
 	}
 
+	// Adaptive cut: mark the long tail of the semantic-hit subsequence as
+	// BelowCut so the client can fold it into a "more results" tier. OCR hits
+	// are excluded from the computation and always stay in the best tier (see
+	// applyCutTiering's doc).
+	applyCutTiering(assets)
+
 	// Attach named persons so the client can offer a People filter on results.
 	if err := s.attachNamedFaces(assets); err != nil {
 		return nil, err
