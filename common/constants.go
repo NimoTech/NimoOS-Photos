@@ -1,7 +1,7 @@
 package common
 
 const (
-	PhotosVersion = "1.9.0-alpha1"
+	PhotosVersion = "1.9.2-alpha1"
 	URLFileName   = "photos.url"
 	Localhost     = "127.0.0.1"
 	V1APIPath     = "/v1/photos"
