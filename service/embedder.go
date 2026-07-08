@@ -298,6 +298,21 @@ func (e *Embedder) backfillOCROnce(ctx context.Context) error {
 				pubRunning(processed)
 				continue
 			}
+			// 超大原图守卫(与 detectFaceScanTarget / 索引内联 OCR 同一套):
+			// 超过 PIL 上限的图片发原图必然 500 且每次恢复链都重试,降级用缩略图。
+			if !t.isVideo && oversizedForML(data) {
+				if thumb := readLargeOrSmallThumb(e.indexer.thumbDir, t.id); len(thumb) > 0 {
+					data = thumb
+				} else {
+					zap.L().Warn("OCR 补跑:超大图且无缩略图可降级,跳过",
+						zap.String("asset_id", t.id), zap.String("path", t.path))
+					readFail++
+					failed++
+					processed++
+					pubRunning(processed)
+					continue
+				}
+			}
 			if oerr := e.indexer.ocrAsset(t.id, data); oerr != nil {
 				ocrFail++
 				failed++
