@@ -107,3 +107,48 @@ func TestNewService_BatchDoneTriggersFacePipeline(t *testing.T) {
 		return false
 	}, 10*time.Second, 50*time.Millisecond, "批次完成后应由 RunPipeline 发出 face 任务(RunClustering 面对 0 条 face_detections 会静默不发任务)")
 }
+
+// TestNewService_BatchDoneTriggersEmbedBackfill 断言批次完成钩子同时触发
+// Embedder.Backfill 兜底:索引期间 ML 冷加载/worker 回收会让 embedClip 偶发
+// 失败且被吞,恢复链只在 ML 掉线→恢复跳变时触发——ML 全程在线就没人补,
+// 资产无限期缺向量、语义搜索搜不到(真实故障:两张鱼图)。本用例里 ML 端点
+// 不可达,embedClip 必然失败,批次完成后必须出现 "embedding" 补跑任务。
+func TestNewService_BatchDoneTriggersEmbedBackfill(t *testing.T) {
+	tmp := t.TempDir()
+	imgDir := t.TempDir()
+	imgPath := makeTestJPEGNamed(t, imgDir, "batch-embed.jpg")
+
+	cfg := &config.Config{
+		DataPath:   tmp,
+		MLEndpoint: "http://127.0.0.1:0",
+		Workers:    1,
+		WatchDirs:  nil,
+	}
+
+	var mu sync.Mutex
+	var got []Task
+	pub := func(t Task) {
+		mu.Lock()
+		defer mu.Unlock()
+		got = append(got, t)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	svc := NewService(ctx, cfg, pub)
+
+	svc.Indexer().SetIngestIdleTimeout(200 * time.Millisecond)
+	go svc.Indexer().Start(ctx)
+	svc.Indexer().EnqueueWithBatch(imgPath, "b-embed", 1)
+
+	require.Eventually(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		for _, tk := range got {
+			if tk.Type == "embedding" {
+				return true
+			}
+		}
+		return false
+	}, 10*time.Second, 50*time.Millisecond, "批次完成后应触发 CLIP 补跑(embedding 任务),兜住索引期间被吞的 embedClip 失败")
+}
