@@ -74,6 +74,14 @@ type Asset struct {
 	// stored asset property — the client uses it for the OCR badge and file-type
 	// filter.
 	MatchedBy string `json:"matchedBy,omitempty"`
+
+	// BelowCut marks a SmartSearch result as belonging to the "more results"
+	// (folded) tier: a search-time annotation set by applyCutTiering on the
+	// tail of the semantic-hit subsequence per semanticCutIndex. OCR hits and
+	// best-match-tier semantic hits omit this field (false/omitted), so old
+	// clients that ignore it see no behavior change. See
+	// docs/superpowers/specs/2026-07-08-search-cut-tiering-design.md.
+	BelowCut bool `json:"belowCut,omitempty"`
 }
 
 type AssetExif struct {

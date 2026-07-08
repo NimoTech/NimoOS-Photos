@@ -111,9 +111,38 @@ func minMatchSimilarity() float64 {
 	return 0.0
 }
 
+// maxSmartSearchK is the hard ceiling on the KNN k value regardless of how
+// deep a page offset+limit requests — a global backstop against pathological
+// pagination requests hammering sqlite-vec with an unbounded k.
+const maxSmartSearchK = 2000
+
 // SmartSearch performs KNN vector search on CLIP embeddings filtered by optional
-// year/month, returning at most limit results.
-func (s *SearchService) SmartSearch(query string, limit int, filters SearchFilters) ([]Asset, error) {
+// year/month, returning up to limit results starting at offset (0-based).
+//
+// limit is now a page size rather than a hard top-k: internally the KNN k is
+// offset+limit (capped at maxSmartSearchK), and the page is sliced out of
+// that window. OCR merging and adaptive cut tiering (applyCutTiering) only
+// run on the first page (offset==0) — best matches naturally live at the
+// head of the ranking. Deeper pages (offset>0) skip OCR merging entirely and
+// have every result marked BelowCut=true: a page beyond the first is by
+// definition part of the "more results" tier.
+//
+// offset/limit paginate the SEMANTIC sequence only; OCR does not occupy a
+// semantic slot. The first-page response is therefore deduped-OCR-first +
+// semantic[0:limit], and its total length may exceed limit (up to ~2×limit)
+// — see mergeOCRFirst's doc. Deep pages still slice the semantic ranking
+// starting at offset, so this is what keeps a semantic entry from being
+// permanently lost when an OCR hit would otherwise have pushed it out of the
+// first page.
+func (s *SearchService) SmartSearch(query string, limit int, offset int, filters SearchFilters) ([]Asset, error) {
+	if offset < 0 {
+		offset = 0
+	}
+	k := offset + limit
+	if k > maxSmartSearchK {
+		k = maxSmartSearchK
+	}
+
 	queryVec, err := s.ml.CLIPTextEmbed(query)
 	if err != nil {
 		return nil, fmt.Errorf("SmartSearch embed: %w", err)
@@ -136,7 +165,7 @@ WHERE vec.embedding MATCH ? AND k = ?
   AND a.is_live_photo_video = 0
   AND a.deleted_at IS NULL AND a.offline = 0`
 
-	args := []any{blob, limit}
+	args := []any{blob, k}
 
 	var clauses []string
 	if filters.Year > 0 {
@@ -182,14 +211,51 @@ WHERE vec.embedding MATCH ? AND k = ?
 		assets = kept
 	}
 
-	// Exact-text OCR hits outrank semantic guesses: prepend them at score 1.0
-	// and drop the CLIP duplicate when the same asset matched both ways.
-	if filters.IncludeOCR {
-		ocrHits, err := s.ocrSearch(query, limit, filters)
-		if err != nil {
-			return nil, err
+	if offset == 0 {
+		// Exact-text OCR hits outrank semantic guesses: prepend them at score
+		// 1.0 and drop the CLIP duplicate when the same asset matched both
+		// ways. Only meaningful on the first page — OCR hits are pinned to
+		// the head of the ranking, which deeper pages never reach.
+		//
+		// OCR does NOT occupy a semantic slot: offset/limit apply only to the
+		// semantic sequence (already limit-sized here since k==limit when
+		// offset==0). mergeOCRFirst only dedupes and prepends — it must not
+		// truncate the merged result back to limit, or an OCR hit would push
+		// the last semantic entry out of the first page while deep pages
+		// still slice the *semantic* ranking starting at `offset`, permanently
+		// losing that entry (found in review; see the design doc's "增量修正"
+		// section and TestSmartSearchOCRDoesNotDisplaceSemanticAcrossPages).
+		if filters.IncludeOCR {
+			ocrHits, err := s.ocrSearch(query, limit, filters)
+			if err != nil {
+				return nil, err
+			}
+			assets = mergeOCRFirst(ocrHits, assets)
 		}
-		assets = mergeOCRFirst(ocrHits, assets, limit)
+
+		// Adaptive cut: mark the long tail of the semantic-hit subsequence as
+		// BelowCut so the client can fold it into a "more results" tier. OCR
+		// hits are excluded from the computation and always stay in the best
+		// tier (see applyCutTiering's doc).
+		applyCutTiering(assets)
+	} else {
+		// Deep page: slice the [offset, offset+limit) window out of the KNN
+		// window fetched above (k = offset+limit), skipping OCR merging and
+		// cut-index computation — every deep-page result is definitionally
+		// part of the folded "more results" tier. A library shorter than
+		// offset+limit naturally yields fewer than limit results here.
+		if offset >= len(assets) {
+			assets = assets[:0]
+		} else {
+			end := offset + limit
+			if end > len(assets) {
+				end = len(assets)
+			}
+			assets = assets[offset:end]
+		}
+		for i := range assets {
+			assets[i].BelowCut = true
+		}
 	}
 
 	// Attach named persons so the client can offer a People filter on results.
@@ -249,8 +315,12 @@ WHERE instr(lower(o.text), lower(?)) > 0
 }
 
 // mergeOCRFirst concatenates ocr hits before clip results, dropping duplicate
-// asset IDs (the OCR entry wins) and trimming to limit.
-func mergeOCRFirst(ocr, clip []Asset, limit int) []Asset {
+// asset IDs (the OCR entry wins). It deliberately does NOT trim the result to
+// any limit: OCR hits must not occupy semantic pagination slots, so the
+// merged length may exceed limit (bounded by len(ocr)+len(clip), both already
+// individually capped by their callers). See SmartSearch's offset==0 branch
+// for the pagination-correctness rationale.
+func mergeOCRFirst(ocr, clip []Asset) []Asset {
 	seen := make(map[string]struct{}, len(ocr)+len(clip))
 	out := make([]Asset, 0, len(ocr)+len(clip))
 	for _, a := range append(ocr, clip...) {
@@ -259,9 +329,6 @@ func mergeOCRFirst(ocr, clip []Asset, limit int) []Asset {
 		}
 		seen[a.ID] = struct{}{}
 		out = append(out, a)
-	}
-	if limit > 0 && len(out) > limit {
-		out = out[:limit]
 	}
 	return out
 }

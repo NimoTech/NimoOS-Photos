@@ -41,6 +41,14 @@ type Config struct {
 	// model or re-embed change.
 	SimDisplayFloor float64
 	SimDisplayCeil  float64
+
+	// SearchCutAlpha is the relative-threshold multiplier used by SmartSearch's
+	// belowCut tiering: on the semantic-hit subsequence (sorted descending),
+	// the first score below SearchCutAlpha × Top-1 marks (one of the two)
+	// candidate cut points into the "more results" tier. Defaults to 0.7 (see
+	// service/searchcut.go's semanticCutIndex for the full rule, including the
+	// cliff-detection signal it combines with).
+	SearchCutAlpha float64
 }
 
 func Init(configFile, confSample string) error {
@@ -85,6 +93,7 @@ func Init(configFile, confSample string) error {
 		MinMatchSimilarity: v.GetFloat64("photos.MinMatchSimilarity"),
 		SimDisplayFloor:    v.GetFloat64("photos.SimDisplayFloor"),
 		SimDisplayCeil:     v.GetFloat64("photos.SimDisplayCeil"),
+		SearchCutAlpha:     v.GetFloat64("photos.SearchCutAlpha"),
 	}
 	if Cfg.RuntimePath == "" {
 		Cfg.RuntimePath = "/var/run/nimoos"
@@ -132,6 +141,10 @@ func Init(configFile, confSample string) error {
 	}
 	if !v.IsSet("photos.SimDisplayCeil") {
 		Cfg.SimDisplayCeil = 0.13
+	}
+	// 语义搜索自适应断层的相对阈值系数：配置无此 key 时默认 0.7。
+	if !v.IsSet("photos.SearchCutAlpha") {
+		Cfg.SearchCutAlpha = 0.7
 	}
 	return nil
 }

@@ -1,7 +1,9 @@
 package service_test
 
 import (
+	"database/sql"
 	"fmt"
+	"math"
 	"path/filepath"
 	"testing"
 
@@ -43,7 +45,7 @@ func TestSmartSearch(t *testing.T) {
 	db.Exec(`INSERT INTO clip_embeddings(rowid, embedding) VALUES(?,?)`, rowid, sqlite.SerializeFloat32(vec))
 
 	svc := service.NewSearchService(db, &mockTextML{})
-	results, err := svc.SmartSearch("beach", 10, service.SearchFilters{})
+	results, err := svc.SmartSearch("beach", 10, 0, service.SearchFilters{})
 	require.NoError(t, err)
 	require.NotEmpty(t, results)
 	require.Equal(t, "a1", results[0].ID)
@@ -75,14 +77,14 @@ func TestSmartSearchIncludeOCR(t *testing.T) {
 	svc := service.NewSearchService(db, &mockTextML{})
 
 	// 默认关闭：纯 CLIP，OCR-only 的 a2 不出现
-	results, err := svc.SmartSearch("receipt", 10, service.SearchFilters{})
+	results, err := svc.SmartSearch("receipt", 10, 0, service.SearchFilters{})
 	require.NoError(t, err)
 	for _, a := range results {
 		require.NotEqual(t, "a2", a.ID, "IncludeOCR=false 时不应返回 OCR-only 命中")
 	}
 
 	// 开启：a2、a3 以 1.0 分置顶（OCR 组内按拍摄时间倒序 → a3 在前），a1 仍在
-	results, err = svc.SmartSearch("receipt", 10, service.SearchFilters{IncludeOCR: true})
+	results, err = svc.SmartSearch("receipt", 10, 0, service.SearchFilters{IncludeOCR: true})
 	require.NoError(t, err)
 	require.GreaterOrEqual(t, len(results), 3)
 	require.Equal(t, "a3", results[0].ID)
@@ -105,9 +107,278 @@ func TestSmartSearchIncludeOCR(t *testing.T) {
 	require.Equal(t, 1, ids["a1"])
 
 	// 大小写不敏感
-	results, err = svc.SmartSearch("RECEIPT", 10, service.SearchFilters{IncludeOCR: true})
+	results, err = svc.SmartSearch("RECEIPT", 10, 0, service.SearchFilters{IncludeOCR: true})
 	require.NoError(t, err)
 	require.Equal(t, "a3", results[0].ID)
+}
+
+// TestSmartSearchBelowCutTiering 验证 SmartSearch 集成场景下的自适应断层落点：
+// OCR 命中恒最佳层（不参与断点计算），语义命中的教科书断崖尾部（同规格 §2 的
+// "fish" 示例：4 条真命中 0.86~0.66，随后断崖到 0.13 的噪声）被正确置 BelowCut。
+func TestSmartSearchBelowCutTiering(t *testing.T) {
+	db, err := sqlite.Open(filepath.Join(t.TempDir(), "cut.db"))
+	require.NoError(t, err)
+	defer db.Close()
+
+	// OCR 命中：精确文本子串命中，恒 1.0 分，恒最佳层。
+	_, err = db.Exec(`INSERT INTO assets(id,file_path,status,is_live_photo_video,taken_at)
+		VALUES('ocr1','/p/ocr1.jpg','indexed',0,'2025-07-01 10:00:00')`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO asset_ocr(asset_id,text) VALUES('ocr1','fish menu special')`)
+	require.NoError(t, err)
+
+	// seedSemantic 反解 displayScore 的线性映射（floor=0.03/ceil=0.13 默认值），
+	// 构造出恰好产生目标展示分 ds 的 CLIP 向量（查询向量固定为 e0=[1,0,...]）。
+	seedSemantic := func(id string, ds float64) {
+		x := 0.03 + ds*0.10
+		_, err := db.Exec(`INSERT INTO assets(id,file_path,status,is_live_photo_video) VALUES(?,?,'indexed',0)`, id, "/p/"+id+".jpg")
+		require.NoError(t, err)
+		_, err = db.Exec(`INSERT INTO asset_clip_idx(asset_id) VALUES(?)`, id)
+		require.NoError(t, err)
+		var rowid int64
+		require.NoError(t, db.QueryRow(`SELECT rowid FROM asset_clip_idx WHERE asset_id=?`, id).Scan(&rowid))
+		vec := make([]float32, common.CLIPDim)
+		vec[0] = float32(x)
+		vec[1] = float32(math.Sqrt(1 - x*x))
+		_, err = db.Exec(`INSERT INTO clip_embeddings(rowid,embedding) VALUES(?,?)`, rowid, sqlite.SerializeFloat32(vec))
+		require.NoError(t, err)
+	}
+	seedSemantic("s1", 0.86)
+	seedSemantic("s2", 0.80)
+	seedSemantic("s3", 0.72)
+	seedSemantic("s4", 0.66)
+	seedSemantic("tail1", 0.13)
+	seedSemantic("tail2", 0.13)
+
+	svc := service.NewSearchService(db, &mockTextML{})
+	results, err := svc.SmartSearch("fish", 10, 0, service.SearchFilters{IncludeOCR: true})
+	require.NoError(t, err)
+	require.Len(t, results, 7)
+
+	belowCut := map[string]bool{}
+	matchedBy := map[string]string{}
+	for _, a := range results {
+		belowCut[a.ID] = a.BelowCut
+		matchedBy[a.ID] = a.MatchedBy
+	}
+	require.Equal(t, "ocr", matchedBy["ocr1"])
+	require.False(t, belowCut["ocr1"], "OCR 命中恒最佳层，不参与断点计算")
+	for _, id := range []string{"s1", "s2", "s3", "s4"} {
+		require.Equal(t, "semantic", matchedBy[id])
+		require.False(t, belowCut[id], id+" 应在最佳匹配层")
+	}
+	for _, id := range []string{"tail1", "tail2"} {
+		require.Equal(t, "semantic", matchedBy[id])
+		require.True(t, belowCut[id], id+" 应折入 more-results 折叠层")
+	}
+}
+
+// TestSmartSearchNoBelowCutWhenFewResults 验证边界守卫：语义结果少于 3 条时不分层
+// （全部落在最佳匹配层），即便分差很大。
+func TestSmartSearchNoBelowCutWhenFewResults(t *testing.T) {
+	db, err := sqlite.Open(filepath.Join(t.TempDir(), "few.db"))
+	require.NoError(t, err)
+	defer db.Close()
+
+	seed := func(id string, x float64) {
+		_, err := db.Exec(`INSERT INTO assets(id,file_path,status,is_live_photo_video) VALUES(?,?,'indexed',0)`, id, "/p/"+id+".jpg")
+		require.NoError(t, err)
+		_, err = db.Exec(`INSERT INTO asset_clip_idx(asset_id) VALUES(?)`, id)
+		require.NoError(t, err)
+		var rowid int64
+		require.NoError(t, db.QueryRow(`SELECT rowid FROM asset_clip_idx WHERE asset_id=?`, id).Scan(&rowid))
+		vec := make([]float32, common.CLIPDim)
+		vec[0] = float32(x)
+		vec[1] = float32(math.Sqrt(1 - x*x))
+		_, err = db.Exec(`INSERT INTO clip_embeddings(rowid,embedding) VALUES(?,?)`, rowid, sqlite.SerializeFloat32(vec))
+		require.NoError(t, err)
+	}
+	seed("hi", 0.12)
+	seed("lo", 0.031)
+
+	svc := service.NewSearchService(db, &mockTextML{})
+	results, err := svc.SmartSearch("fish", 10, 0, service.SearchFilters{})
+	require.NoError(t, err)
+	require.Len(t, results, 2)
+	for _, a := range results {
+		require.False(t, a.BelowCut, a.ID+"：语义结果<3 条时不应分层")
+	}
+}
+
+// seedRankedSemantic 依次插入 n 条语义资产 id0..id{n-1}，通过反解 displayScore 的
+// 线性映射构造严格递减的分数，从而固定 KNN 排序（id0 分最高排最前）。
+func seedRankedSemantic(t *testing.T, db *sql.DB, n int) {
+	t.Helper()
+	for i := 0; i < n; i++ {
+		id := fmt.Sprintf("id%d", i)
+		ds := 0.95 - float64(i)*0.03 // 严格递减，彼此分差足够避免 cut/顺序歧义
+		x := 0.03 + ds*0.10
+		_, err := db.Exec(`INSERT INTO assets(id,file_path,status,is_live_photo_video) VALUES(?,?,'indexed',0)`, id, "/p/"+id+".jpg")
+		require.NoError(t, err)
+		_, err = db.Exec(`INSERT INTO asset_clip_idx(asset_id) VALUES(?)`, id)
+		require.NoError(t, err)
+		var rowid int64
+		require.NoError(t, db.QueryRow(`SELECT rowid FROM asset_clip_idx WHERE asset_id=?`, id).Scan(&rowid))
+		vec := make([]float32, common.CLIPDim)
+		vec[0] = float32(x)
+		vec[1] = float32(math.Sqrt(1 - x*x))
+		_, err = db.Exec(`INSERT INTO clip_embeddings(rowid,embedding) VALUES(?,?)`, rowid, sqlite.SerializeFloat32(vec))
+		require.NoError(t, err)
+	}
+}
+
+// TestSmartSearchOffsetPaginationMatchesFullList 验证分页切片正确性：offset>0 页
+// 的内容必须等于「一次性取全量列表」对应区段的资产（同一份 KNN 排序上切片）。
+func TestSmartSearchOffsetPaginationMatchesFullList(t *testing.T) {
+	db, err := sqlite.Open(filepath.Join(t.TempDir(), "page.db"))
+	require.NoError(t, err)
+	defer db.Close()
+	seedRankedSemantic(t, db, 12)
+
+	svc := service.NewSearchService(db, &mockTextML{})
+	full, err := svc.SmartSearch("fish", 12, 0, service.SearchFilters{})
+	require.NoError(t, err)
+	require.Len(t, full, 12)
+
+	page, err := svc.SmartSearch("fish", 5, 5, service.SearchFilters{})
+	require.NoError(t, err)
+	require.Len(t, page, 5)
+	for i, a := range page {
+		require.Equal(t, full[5+i].ID, a.ID, "第二页第 %d 条应等于全量列表第 %d 条", i, 5+i)
+	}
+}
+
+// TestSmartSearchOffsetPageAllBelowCutNoOCR 验证 offset>0 时：不做 OCR 前置合并
+// （即便 IncludeOCR=true，纯 OCR 命中也不会出现在深页），且全部结果 BelowCut=true。
+func TestSmartSearchOffsetPageAllBelowCutNoOCR(t *testing.T) {
+	db, err := sqlite.Open(filepath.Join(t.TempDir(), "page_ocr.db"))
+	require.NoError(t, err)
+	defer db.Close()
+	seedRankedSemantic(t, db, 8)
+	// 一条纯 OCR 命中：文本命中但没有 CLIP 向量，首页会被前置合并进来。
+	_, err = db.Exec(`INSERT INTO assets(id,file_path,status,is_live_photo_video) VALUES('ocr1','/p/ocr1.jpg','indexed',0)`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO asset_ocr(asset_id,text) VALUES('ocr1','fish menu special')`)
+	require.NoError(t, err)
+
+	svc := service.NewSearchService(db, &mockTextML{})
+
+	// 首页：OCR 命中应出现且恒最佳层。
+	first, err := svc.SmartSearch("fish", 3, 0, service.SearchFilters{IncludeOCR: true})
+	require.NoError(t, err)
+	var sawOCR bool
+	for _, a := range first {
+		if a.MatchedBy == "ocr" {
+			sawOCR = true
+			require.False(t, a.BelowCut)
+		}
+	}
+	require.True(t, sawOCR, "首页应包含 OCR 前置命中")
+
+	// 深页：跳过 OCR 合并，不应再出现 ocr1；全部结果 BelowCut=true。
+	deep, err := svc.SmartSearch("fish", 3, 3, service.SearchFilters{IncludeOCR: true})
+	require.NoError(t, err)
+	require.NotEmpty(t, deep)
+	for _, a := range deep {
+		require.NotEqual(t, "ocr1", a.ID, "深页不应做 OCR 前置合并")
+		require.Equal(t, "semantic", a.MatchedBy)
+		require.True(t, a.BelowCut, a.ID+"：offset>0 的结果应全部置 belowCut=true")
+	}
+}
+
+// TestSmartSearchOCRDoesNotDisplaceSemanticAcrossPages 复现复审发现的 Critical 分页
+// 缺陷构造：8 条语义命中 id0..id7（严格递减）+ 1 条纯 OCR 命中，limit=3。
+//
+// 旧行为（mergeOCRFirst 把 OCR+语义总长截到 limit）：首页 [ocr1,id0,id1]，id2 被
+// OCR 挤出去；次页固定从语义排名 offset=3 处切，得到 [id3,id4,id5]——id2 在任何
+// 页都不出现，永久丢失。
+//
+// 新契约（OCR 不占语义名额）：offset/limit 只作用于语义序列，首页 = 去重后的
+// OCR 前置 + 语义[0:limit]，总长可超 limit；因此首页应为 4 条
+// [ocr1,id0,id1,id2]，次页仍从 id3 起，两页语义部分的并集覆盖 id0..id5 无缺口。
+func TestSmartSearchOCRDoesNotDisplaceSemanticAcrossPages(t *testing.T) {
+	db, err := sqlite.Open(filepath.Join(t.TempDir(), "ocr_page.db"))
+	require.NoError(t, err)
+	defer db.Close()
+	seedRankedSemantic(t, db, 8)
+	_, err = db.Exec(`INSERT INTO assets(id,file_path,status,is_live_photo_video) VALUES('ocr1','/p/ocr1.jpg','indexed',0)`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO asset_ocr(asset_id,text) VALUES('ocr1','fish menu special')`)
+	require.NoError(t, err)
+
+	svc := service.NewSearchService(db, &mockTextML{})
+
+	first, err := svc.SmartSearch("fish", 3, 0, service.SearchFilters{IncludeOCR: true})
+	require.NoError(t, err)
+	require.Len(t, first, 4, "首页应为 OCR 前置 + 语义[0:limit]，不因 OCR 挤占而截短")
+	firstIDs := make([]string, len(first))
+	for i, a := range first {
+		firstIDs[i] = a.ID
+	}
+	require.Equal(t, []string{"ocr1", "id0", "id1", "id2"}, firstIDs, "id2 不应被 OCR 挤出首页")
+
+	second, err := svc.SmartSearch("fish", 3, 3, service.SearchFilters{IncludeOCR: true})
+	require.NoError(t, err)
+	require.Len(t, second, 3)
+	secondIDs := make([]string, len(second))
+	for i, a := range second {
+		secondIDs[i] = a.ID
+	}
+	require.Equal(t, []string{"id3", "id4", "id5"}, secondIDs)
+
+	// 两页并集覆盖语义排名 id0..id5，无缺口（id2 在首页出现过，不会因跨页切割丢失）。
+	seen := map[string]bool{}
+	for _, id := range firstIDs {
+		seen[id] = true
+	}
+	for _, id := range secondIDs {
+		seen[id] = true
+	}
+	for _, id := range []string{"id0", "id1", "id2", "id3", "id4", "id5"} {
+		require.True(t, seen[id], id+" 不应在首页+次页的并集中缺失")
+	}
+}
+
+// TestSmartSearchOffsetBeyondLibraryReturnsActualCount 验证库不足时（offset+limit
+// 超出库存量）返回实际数量而非报错或补齐空结果。
+func TestSmartSearchOffsetBeyondLibraryReturnsActualCount(t *testing.T) {
+	db, err := sqlite.Open(filepath.Join(t.TempDir(), "short.db"))
+	require.NoError(t, err)
+	defer db.Close()
+	seedRankedSemantic(t, db, 4)
+
+	svc := service.NewSearchService(db, &mockTextML{})
+
+	// offset 落在库存量内，但 offset+limit 超出：只应拿到剩余的那几条。
+	partial, err := svc.SmartSearch("fish", 10, 3, service.SearchFilters{})
+	require.NoError(t, err)
+	require.Len(t, partial, 1)
+	require.Equal(t, "id3", partial[0].ID)
+
+	// offset 本身就超出库存量：返回空切片，不报错。
+	empty, err := svc.SmartSearch("fish", 10, 100, service.SearchFilters{})
+	require.NoError(t, err)
+	require.Empty(t, empty)
+}
+
+// TestSmartSearchNegativeOffsetClampsToZero 验证 service 层对负数 offset 的防御性
+// 归零（路由层已经归零，这里确保 SmartSearch 本身也不会因负数 offset 产生异常行为，
+// 例如切片越界或 k 值被算小）。
+func TestSmartSearchNegativeOffsetClampsToZero(t *testing.T) {
+	db, err := sqlite.Open(filepath.Join(t.TempDir(), "negoff.db"))
+	require.NoError(t, err)
+	defer db.Close()
+	seedRankedSemantic(t, db, 5)
+
+	svc := service.NewSearchService(db, &mockTextML{})
+	withNeg, err := svc.SmartSearch("fish", 5, -3, service.SearchFilters{})
+	require.NoError(t, err)
+	withZero, err := svc.SmartSearch("fish", 5, 0, service.SearchFilters{})
+	require.NoError(t, err)
+	require.Equal(t, len(withZero), len(withNeg))
+	for i := range withZero {
+		require.Equal(t, withZero[i].ID, withNeg[i].ID)
+	}
 }
 
 func TestTimeline(t *testing.T) {
@@ -186,7 +457,7 @@ func TestSmartSearchExcludesOffline(t *testing.T) {
 	require.NoError(t, err)
 
 	svc := service.NewSearchService(db, &mockTextML{})
-	results, err := svc.SmartSearch("beach", 10, service.SearchFilters{})
+	results, err := svc.SmartSearch("beach", 10, 0, service.SearchFilters{})
 	require.NoError(t, err)
 	ids := map[string]bool{}
 	for _, a := range results {
