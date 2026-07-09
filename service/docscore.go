@@ -175,7 +175,8 @@ func docGeoScore(boxes [][]float64) float64 {
 }
 
 // docVerdict 把语义边际线性归一后与几何规整度加权,过 docScoreFloor 判为文档。
-// 只在密度候选闸(coverage/line_count)已通过的资产上调用——本函数不重复判密度。
+// 对所有有 OCR 行的资产都会计算——密度候选闸由查询层 hasOcrExpr 把守,本函数
+// 不重复判密度。
 func docVerdict(semMargin, geo float64) bool {
 	floor, ceil := docSemFloor(), docSemCeil()
 	sem := 0.5
@@ -188,7 +189,14 @@ func docVerdict(semMargin, geo float64) bool {
 }
 
 // hasOcrExpr 是「OCR/文档」分类的唯一判据 SQL 片段(SELECT 列位置,依赖外层
-// 别名 a)。is_doc 已算(0/1)时直接采用——0 表示密度候选闸通过但被混合判据
-// 否决;NULL(未算/补算中/ML 长期离线)回退旧密度双阈值,行为与本功能上线前
-// 逐张一致,平滑降级。11 处查询共用本常量;调阈值只改 docscore.go 一处。
-const hasOcrExpr = `EXISTS(SELECT 1 FROM asset_ocr ocr WHERE ocr.asset_id=a.id AND COALESCE(ocr.is_doc, CASE WHEN ocr.text<>'' AND COALESCE(ocr.coverage,1)>=0.05 AND COALESCE(ocr.line_count,0)>=8 THEN 1 ELSE 0 END)=1)`
+// 别名 a)。密度闸(coverage/line_count)在外层、无条件生效,is_doc 只做否决,
+// 不能绕过闸(无拯救路径):
+//   - 密度闸不过 → 恒 false,不看 is_doc。
+//   - 密度闸过 + is_doc IS NULL(未算/补算中/ML 长期离线)→ 回退旧密度双阈值
+//     (此时密度闸已保证 text 非空、coverage、line_count 达标,等价于旧判据本身),
+//     行为与本功能上线前逐张一致,平滑降级。
+//   - 密度闸过 + is_doc=0 → 被混合判据否决,不算 OCR 类。
+//   - 密度闸过 + is_doc=1 → 混合判据确认,算 OCR 类。
+//
+// 11 处查询共用本常量;调阈值只改 docscore.go 一处。
+const hasOcrExpr = `EXISTS(SELECT 1 FROM asset_ocr ocr WHERE ocr.asset_id=a.id AND ocr.text<>'' AND COALESCE(ocr.coverage,1)>=0.05 AND COALESCE(ocr.line_count,0)>=8 AND COALESCE(ocr.is_doc,1)=1)`

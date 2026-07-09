@@ -1069,7 +1069,8 @@ func (ix *Indexer) ocrAsset(assetID string, imageData []byte) error {
 		VALUES(?,?,?,?,1,CURRENT_TIMESTAMP)
 		ON CONFLICT(asset_id) DO UPDATE SET
 		  text=excluded.text, coverage=excluded.coverage,
-		  line_count=excluded.line_count, boxes_ver=1, ocr_at=excluded.ocr_at`,
+		  line_count=excluded.line_count, boxes_ver=1, ocr_at=excluded.ocr_at,
+		  doc_ver=0`,
 		assetID, strings.Join(texts, "\n"), coverage, len(texts)); err != nil {
 		return err
 	}

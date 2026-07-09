@@ -244,6 +244,16 @@ func TestOcrAssetStoresLineBoxes(t *testing.T) {
 	// 重跑覆盖:第二次结果替换第一次,不残留旧行。
 	require.NoError(t, ix.ocrAsset("a1", []byte("img")))
 	require.Len(t, readLines(), 2)
+
+	// 重 OCR 必须重置 doc_ver,让上层重新算 doc 判定;is_doc 保留旧值,
+	// 重算前查询平滑沿用(见 hasOcrExpr NULL 回退,此处非 NULL 故仍看旧值)。
+	_, err = db.Exec(`UPDATE asset_ocr SET doc_ver=1, is_doc=1 WHERE asset_id='a1'`)
+	require.NoError(t, err)
+	require.NoError(t, ix.ocrAsset("a1", []byte("img")))
+	var docVer, isDoc int
+	require.NoError(t, db.QueryRow(`SELECT doc_ver, is_doc FROM asset_ocr WHERE asset_id='a1'`).Scan(&docVer, &isDoc))
+	require.Equal(t, 0, docVer, "重 OCR 必须重置 doc_ver 触发重算")
+	require.Equal(t, 1, isDoc, "is_doc 保留旧值,重算前平滑沿用")
 }
 
 // TestOcrAssetNilBoxStored 验证 ML 未返回几何(Box=nil)时行仍入库,box 存 '[]'。

@@ -197,7 +197,7 @@ func (e *Embedder) backfillOnce(ctx context.Context) error {
 }
 
 // queryMissingOCR 列出 status='indexed' 但 OCR 数据不完整的 asset：
-// 要么 asset_ocr 缺行（从未跑过 OCR——即使没识别到文字也会写 text='' 行），
+// 要么 asset_ocr 缺行（从未跑过 OCR——即使没识别到文字也会写 text 为空字符串的行），
 // 要么 coverage 为 NULL（旧版跑的 OCR 没存文字框面积，需要重跑补齐），
 // 要么 boxes_ver=0（旧版没把逐行坐标存进 asset_ocr_lines，需重跑供搜索命中高亮）。
 func (e *Embedder) queryMissingOCR(ctx context.Context) ([]ocrTarget, error) {
@@ -459,9 +459,10 @@ func (e *Embedder) tick(ctx context.Context) {
 		go func() {
 			// Backfill first (fills assets that never got an embedding), then the
 			// one-time re-embed of all existing assets from their thumbnails,
-			// then OCR for assets indexed before OCR support existed, then faces
-			// (RunPipeline，via onRecovered) — covers detection backlog accumulated
-			// while ML was down.
+			// then OCR for assets indexed before OCR support existed, then doc
+			// verdicts for OCR'd assets missing the mixed-criteria judgment
+			// (BackfillDocVerdicts), then faces (RunPipeline，via onRecovered) —
+			// covers detection backlog accumulated while ML was down.
 			_ = e.Backfill(ctx)
 			e.reembedThumbnailsOnce()
 			_ = e.BackfillOCR(ctx)

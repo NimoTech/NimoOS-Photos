@@ -84,6 +84,7 @@ func TestHasOcrExprTriState(t *testing.T) {
 	mk("vetoed", 0.1, 20, 0)        // 密度过但被语义否决
 	mk("legacyDoc", 0.1, 20, nil)   // 未算 → 旧判据:过
 	mk("legacyPhoto", 0.01, 2, nil) // 未算 → 旧判据:不过
+	mk("rescued", 0.01, 2, 1)       // is_doc=1 但密度闸未过 → 不得进 OCR 类(闸不可绕过)
 
 	assets, err := s.ListAssets("", 100, 0)
 	require.NoError(t, err)
@@ -95,4 +96,5 @@ func TestHasOcrExprTriState(t *testing.T) {
 	require.False(t, got["vetoed"], "被否决的不进 OCR 类——本功能的核心目标")
 	require.True(t, got["legacyDoc"], "未算回退旧密度判据")
 	require.False(t, got["legacyPhoto"])
+	require.False(t, got["rescued"], "is_doc=1 不能绕过密度闸(无拯救路径)")
 }
