@@ -146,7 +146,7 @@ TUS 上传完成 → MarkAndReserve + rename → SubmitReserved
 7. ML 推理（ML 服务就绪时）：
    - **CLIP 图像嵌入**：`ViT-SO400M-16-SigLIP2-384__webli`（SigLIP2 SO400M，短词/中英混搜判别力优于旧 nllb-clip-large，见 `common/constants.go` 注释），1152 维，用 small.jpg 缩略图计算（与用户看到的帧一致），写入 `clip_embeddings`（sqlite-vec vec0 虚拟表）
    - **人脸检测+识别**：`antelopev2`（InsightFace ResNet100@Glint360K），512 维，写入 `face_detections`
-   - **OCR**：`PP-OCRv5_server`，置信度 ≥0.5 的文字行写入 `asset_ocr`，并在同一事务把每行文本+归一化四角坐标写入 `asset_ocr_lines`（先删后插，`boxes_ver=1`；供搜索命中高亮）。**仅图片**——视频不跑 OCR（关键帧 OCR 无意义，还会把录屏/含文字画面误判进「OCR/文档」分类），启动时 `pruneVideoOCR` 清理历史遗留的视频 OCR 行
+   - **OCR**：`PP-OCRv5_server`，置信度 ≥0.5 的文字行写入 `asset_ocr`，并在同一事务把每行文本+归一化四角坐标写入 `asset_ocr_lines`（先删后插，`boxes_ver=1`；供搜索命中高亮）。随后 `computeDocVerdict` 计算「OCR/文档」分类混合判据（CLIP 零样本语义边际 + 行几何规整度，密度候选闸恒在查询层 `hasOcrExpr` 外层,is_doc 只做否决;权重与标定见 photos.conf 的 Doc* 五项,默认值经 2026-07-09 真实库校准）。**仅图片**——视频不跑 OCR（关键帧 OCR 无意义，还会把录屏/含文字画面误判进「OCR/文档」分类），启动时 `pruneVideoOCR` 清理历史遗留的视频 OCR 行
 8. 更新状态 `'indexed'`
 
 ### 2. 语义搜索（CLIP）
@@ -216,8 +216,9 @@ Smart View 也复用 `SmartSearch` 接口，按自然语言条件定义动态相
 | `face_detections` | 人脸检测结果（bbox、512 维嵌入、excluded 标志） |
 | `persons` | 人脸聚类结果（名称、封面、质心、置信度） |
 | `face_person` | 人脸 → 人物映射 |
-| `asset_ocr` | OCR 文本（coverage、line_count 区分文档与普通照片；boxes_ver=0 表示逐行坐标未存、由 OCR 补跑重跑） |
-| `asset_ocr_lines` | OCR 逐行文本+归一化四角坐标（JSON 8 浮点，[0,1]），line_no 与 asset_ocr.text 拼接同序;唯一写入口 ocrAsset()，随 assets 外键级联删除;供 GET /assets/:id/ocr 搜索命中高亮 |
+| `asset_ocr` | OCR 文本（coverage、line_count 密度候选闸；boxes_ver=0 表示逐行坐标未存;doc_sem/doc_geo/is_doc 为混合判据的语义边际/几何规整度/最终判定（NULL=未算,查询回退纯密度）,doc_ver=0 待补算,唯一写入口 computeDocVerdict()） |
+| `asset_ocr_lines` | OCR 逐行文本+归一化四角坐标（JSON 8 浮点，[0,1]），line_no 与 asset_ocr.text 拼接同序;唯一写入口 ocrAsset()，随 assets 外键级联删除;供 GET /assets/:id/ocr 搜索命中高亮与 doc 几何规整度 |
+| `clip_text_cache` | CLIP 文本提示词向量缓存（key=提示词, gen=MLModelGen）,doc 分类零样本判据用;换模型代次自动失效重嵌 |
 | `asset_geo` | 反编码地理信息（城市、国家、geonameid） |
 | `albums` + `album_assets` | 手动相册（支持排序） |
 | `asset_favorites` | 按用户收藏 |
