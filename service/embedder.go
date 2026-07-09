@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync/atomic"
 	"time"
 
@@ -178,7 +179,7 @@ func (e *Embedder) backfillOnce(ctx context.Context) error {
 	}
 	if success == 0 && failed > 0 {
 		final.Status = "error"
-		final.Error = "ML 服务在补跑过程中失联，请检查服务状态"
+		final.SetError(TaskErrMLLostDuringBackfill, nil)
 	} else {
 		final.Status = "done"
 		final.Progress = 1
@@ -362,11 +363,14 @@ func (e *Embedder) backfillOCROnce(ctx context.Context) error {
 		final.Status = "error"
 		switch {
 		case ocrFail == 0 && readFail > 0:
-			final.Error = fmt.Sprintf("%d 张照片的源文件无法读取，已跳过文字识别", readFail)
+			final.SetError(TaskErrOCRSourceReadFailed, map[string]string{"readFail": strconv.FormatInt(readFail, 10)})
 		case ocrFail > 0 && readFail == 0:
-			final.Error = "ML 服务在补跑过程中失联，请检查服务状态"
+			final.SetError(TaskErrMLLostDuringBackfill, nil)
 		default:
-			final.Error = fmt.Sprintf("文字识别补跑失败(源文件读取失败 %d 张、ML 失败 %d 张)", readFail, ocrFail)
+			final.SetError(TaskErrOCRBackfillFailed, map[string]string{
+				"readFail": strconv.FormatInt(readFail, 10),
+				"ocrFail":  strconv.FormatInt(ocrFail, 10),
+			})
 		}
 	} else {
 		final.Status = "done"

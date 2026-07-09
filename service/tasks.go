@@ -4,8 +4,29 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"time"
+)
+
+// 任务错误的结构化 i18n key 契约:英文原文本身即 key(含 {参数} 占位),
+// 前端按 key 查字典翻译、用 ErrorParams 填充占位;Error 字段只是英文 fallback。
+// 新增/改动 key 文案需与前端 i18n 字典同步(前端另行维护，此处不引用)。
+const (
+	// TaskErrMLLostDuringBackfill 无参数。
+	TaskErrMLLostDuringBackfill = "ML service was lost during backfill; please check the service status"
+	// TaskErrOCRSourceReadFailed 参数: readFail。
+	TaskErrOCRSourceReadFailed = "Source files for {readFail} photos could not be read; text recognition skipped"
+	// TaskErrOCRBackfillFailed 参数: readFail, ocrFail。
+	TaskErrOCRBackfillFailed = "Text recognition backfill failed (source read failed: {readFail}, ML failed: {ocrFail})"
+	// TaskErrFaceClusterFailed 参数: detail。
+	TaskErrFaceClusterFailed = "Face clustering failed: {detail}"
+	// TaskErrPeopleRecognitionFailed 参数: detail。
+	TaskErrPeopleRecognitionFailed = "People recognition failed: {detail}"
+	// TaskErrQueryAssetsFailed 参数: detail。
+	TaskErrQueryAssetsFailed = "Failed to query assets: {detail}"
+	// TaskErrReadAssetListFailed 参数: detail。
+	TaskErrReadAssetListFailed = "Failed to read asset list: {detail}"
 )
 
 // 任务停滞阈值:running 任务超过这么久没有任何更新,视为僵尸(漏发 done、
@@ -32,6 +53,22 @@ type Task struct {
 	ETASeconds int       `json:"eta_seconds,omitempty"`
 	StartedAt  time.Time `json:"started_at"`
 	Error      string    `json:"error,omitempty"`
+	// ErrorKey / ErrorParams 承载结构化 i18n 错误:ErrorKey 是上面契约里的英文原文
+	// (含 {参数} 占位),ErrorParams 是占位替换值。Error 字段随之降级为英文 fallback,
+	// 供没有走 i18n 字典的旧前端/日志兜底展示。均由 SetError 统一设置。
+	ErrorKey    string            `json:"errorKey,omitempty"`
+	ErrorParams map[string]string `json:"errorParams,omitempty"`
+}
+
+// SetError 设置结构化 i18n 错误(key + 参数),并生成英文 fallback 到 Error。
+func (t *Task) SetError(key string, params map[string]string) {
+	t.ErrorKey = key
+	t.ErrorParams = params
+	s := key
+	for k, v := range params {
+		s = strings.ReplaceAll(s, "{"+k+"}", v)
+	}
+	t.Error = s
 }
 
 // TaskPublisher emits task updates onto MessageBus.
