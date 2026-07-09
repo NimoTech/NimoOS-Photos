@@ -202,6 +202,70 @@ func TestOcrAssetStoresCoverageAndLines(t *testing.T) {
 	require.InDelta(t, 0.05, coverage, 1e-9) // 4% + 1%
 }
 
+// TestOcrAssetStoresLineBoxes 验证 ocrAsset 把保留行的文本+坐标+置信度逐行
+// 写入 asset_ocr_lines(低置信度行不写),boxes_ver 置 1;重跑覆盖旧行。
+func TestOcrAssetStoresLineBoxes(t *testing.T) {
+	db := makeTestDB(t)
+	_, err := db.Exec(`INSERT INTO assets(id,file_path,status) VALUES('a1','/p/a1.jpg','indexed')`)
+	require.NoError(t, err)
+
+	ix := NewIndexer(db, &boxedML{}, t.TempDir(), 1)
+	require.NoError(t, ix.ocrAsset("a1", []byte("img")))
+
+	var ver int
+	require.NoError(t, db.QueryRow(`SELECT boxes_ver FROM asset_ocr WHERE asset_id='a1'`).Scan(&ver))
+	require.Equal(t, 1, ver)
+
+	type row struct {
+		text, box string
+		score     float64
+	}
+	readLines := func() []row {
+		rows, err := db.Query(`SELECT text, box, score FROM asset_ocr_lines WHERE asset_id='a1' ORDER BY line_no`)
+		require.NoError(t, err)
+		defer rows.Close()
+		var out []row
+		for rows.Next() {
+			var r row
+			require.NoError(t, rows.Scan(&r.text, &r.box, &r.score))
+			out = append(out, r)
+		}
+		require.NoError(t, rows.Err())
+		return out
+	}
+
+	got := readLines()
+	require.Len(t, got, 2, "低置信度行(noise)不应入库")
+	require.Equal(t, "TOTAL $42.00", got[0].text)
+	require.Equal(t, "[0.1,0.1,0.5,0.1,0.5,0.2,0.1,0.2]", got[0].box)
+	require.InDelta(t, 0.97, got[0].score, 1e-9)
+	require.Equal(t, "Invoice #1", got[1].text)
+
+	// 重跑覆盖:第二次结果替换第一次,不残留旧行。
+	require.NoError(t, ix.ocrAsset("a1", []byte("img")))
+	require.Len(t, readLines(), 2)
+}
+
+// TestOcrAssetNilBoxStored 验证 ML 未返回几何(Box=nil)时行仍入库,box 存 '[]'。
+type nilBoxML struct{ mockML }
+
+func (m *nilBoxML) OCR(_ []byte) ([]mlclient.OCRLine, error) {
+	return []mlclient.OCRLine{{Text: "no geometry", Score: 0.9, Box: nil}}, nil
+}
+
+func TestOcrAssetNilBoxStored(t *testing.T) {
+	db := makeTestDB(t)
+	_, err := db.Exec(`INSERT INTO assets(id,file_path,status) VALUES('a1','/p/a1.jpg','indexed')`)
+	require.NoError(t, err)
+
+	ix := NewIndexer(db, &nilBoxML{}, t.TempDir(), 1)
+	require.NoError(t, ix.ocrAsset("a1", []byte("img")))
+
+	var box string
+	require.NoError(t, db.QueryRow(`SELECT box FROM asset_ocr_lines WHERE asset_id='a1' AND line_no=0`).Scan(&box))
+	require.Equal(t, "[]", box)
+}
+
 // TestIndexerProcessesImage tests the full pipeline for a single image.
 func TestIndexerProcessesImage(t *testing.T) {
 	db := makeTestDB(t)
