@@ -68,7 +68,7 @@ func (r *Rebuilder) run(taskID string) {
 	// left over from a model-generation rebuild that ran while they were away.
 	rows, err := r.db.Query(`SELECT id, file_path FROM assets WHERE status='indexed' AND deleted_at IS NULL AND offline=0`)
 	if err != nil {
-		r.failTask(taskID, started, "查询资产失败: "+err.Error())
+		r.failTask(taskID, started, TaskErrQueryAssetsFailed, map[string]string{"detail": err.Error()})
 		return
 	}
 	var targets []rebuildTarget
@@ -76,14 +76,14 @@ func (r *Rebuilder) run(taskID string) {
 		var t rebuildTarget
 		if err := rows.Scan(&t.id, &t.path); err != nil {
 			rows.Close()
-			r.failTask(taskID, started, "读取资产列表失败: "+err.Error())
+			r.failTask(taskID, started, TaskErrReadAssetListFailed, map[string]string{"detail": err.Error()})
 			return
 		}
 		targets = append(targets, t)
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
-		r.failTask(taskID, started, "读取资产列表失败: "+err.Error())
+		r.failTask(taskID, started, TaskErrReadAssetListFailed, map[string]string{"detail": err.Error()})
 		return
 	}
 
@@ -308,12 +308,15 @@ func (r *Rebuilder) MaybeAutoRebuild(ready func() bool) {
 
 // failTask publishes a terminal error state for the rebuild task and
 // schedules its removal, mirroring the Embedder error convention.
-func (r *Rebuilder) failTask(taskID string, started time.Time, msg string) {
-	zap.L().Error("rebuild failed", zap.String("task", taskID), zap.String("reason", msg))
-	r.reg.Upsert(Task{
+// errKey/errParams 是结构化 i18n 错误(见 Task.SetError);msg 仅用于日志。
+func (r *Rebuilder) failTask(taskID string, started time.Time, errKey string, errParams map[string]string) {
+	t := Task{
 		ID: taskID, Type: "rebuild", Label: "重建 AI 索引",
-		Status: "error", Error: msg, StartedAt: started,
-	})
+		Status: "error", StartedAt: started,
+	}
+	t.SetError(errKey, errParams)
+	zap.L().Error("rebuild failed", zap.String("task", taskID), zap.String("reason", t.Error))
+	r.reg.Upsert(t)
 	go func() {
 		time.Sleep(taskCleanupDelay)
 		r.reg.Remove(taskID)
