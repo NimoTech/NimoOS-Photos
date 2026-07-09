@@ -377,7 +377,7 @@ func (s *FaceService) RunClustering(ctx context.Context) error {
 
 	taskID := fmt.Sprintf("face_%d", time.Now().UnixNano())
 	started := time.Now()
-	pub := func(progress float64, status string, errMsg string, total, newFaces int64) {
+	pub := func(progress float64, status string, errKey string, errParams map[string]string, total, newFaces int64) {
 		if s.reg == nil {
 			return
 		}
@@ -387,8 +387,10 @@ func (s *FaceService) RunClustering(ctx context.Context) error {
 			Label:     "识别人物",
 			Progress:  progress,
 			Status:    status,
-			Error:     errMsg,
 			StartedAt: started,
+		}
+		if errKey != "" {
+			t.SetError(errKey, errParams)
 		}
 		// 终态填入 current/total（总人脸数）与 added（本次新增数）。
 		// running 中间态不填，避免节流 publish 把 0 错带到前端造成数字闪。
@@ -404,13 +406,13 @@ func (s *FaceService) RunClustering(ctx context.Context) error {
 	total, newFaces, err := s.clusterStage(ctx,
 		func(int64) {
 			taskStarted = true
-			pub(0, "running", "", 0, 0)
+			pub(0, "running", "", nil, 0, 0)
 		},
-		func(p float64) { pub(p, "running", "", 0, 0) },
+		func(p float64) { pub(p, "running", "", nil, 0, 0) },
 	)
 	if err != nil {
 		if taskStarted {
-			pub(0, "error", fmt.Sprintf("人脸聚类失败：%s", err.Error()), 0, 0)
+			pub(0, "error", TaskErrFaceClusterFailed, map[string]string{"detail": err.Error()}, 0, 0)
 		}
 		return err
 	}
@@ -419,7 +421,7 @@ func (s *FaceService) RunClustering(ctx context.Context) error {
 		return nil
 	}
 
-	pub(1, "done", "", total, newFaces)
+	pub(1, "done", "", nil, total, newFaces)
 	go func() {
 		time.Sleep(taskCleanupDelay)
 		if s.reg != nil {
@@ -542,7 +544,7 @@ func (s *FaceService) RunPipeline(ctx context.Context) error {
 	// 已经跟 total 相等，若仍填两者会让还在 running 的尾段被计算成 100%；
 	// 置 0 后前端回退到用 progress 字段本身，能看到 95→100% 的真实爬升，
 	// 与 RunClustering 原有的 pub 模式一致。
-	pub := func(progress float64, status string, errMsg string, current, curTotal, added int64) {
+	pub := func(progress float64, status string, errKey string, errParams map[string]string, current, curTotal, added int64) {
 		if s.reg == nil {
 			return
 		}
@@ -552,8 +554,10 @@ func (s *FaceService) RunPipeline(ctx context.Context) error {
 			Label:     "识别人物",
 			Progress:  progress,
 			Status:    status,
-			Error:     errMsg,
 			StartedAt: started,
+		}
+		if errKey != "" {
+			t.SetError(errKey, errParams)
 		}
 		if status == "running" {
 			t.Current = current
@@ -566,7 +570,7 @@ func (s *FaceService) RunPipeline(ctx context.Context) error {
 		}
 		s.reg.Upsert(t)
 	}
-	pub(0, "running", "", 0, total, 0)
+	pub(0, "running", "", nil, 0, total, 0)
 
 	var processed int64
 	for _, tgt := range targets {
@@ -582,7 +586,7 @@ func (s *FaceService) RunPipeline(ctx context.Context) error {
 		if total > 0 {
 			frac = 0.95 * float64(processed) / float64(total)
 		}
-		pub(frac, "running", "", processed, total, 0)
+		pub(frac, "running", "", nil, processed, total, 0)
 	}
 
 	if ctx.Err() != nil {
@@ -594,17 +598,17 @@ func (s *FaceService) RunPipeline(ctx context.Context) error {
 			// 没有检测目标(纯聚类尾段场景，如历史遗留的未聚类脸)：没有 0–95%
 			// 的检测阶段可映射，直接把聚类进度铺满整段 0–100%；current/curTotal
 			// 同样置 0，理由见上面 pub 定义处的注释。
-			pub(p, "running", "", 0, 0, 0)
+			pub(p, "running", "", nil, 0, 0, 0)
 			return
 		}
-		pub(0.95+0.05*p, "running", "", 0, 0, 0)
+		pub(0.95+0.05*p, "running", "", nil, 0, 0, 0)
 	})
 	if cerr != nil {
-		pub(0.95, "error", fmt.Sprintf("识别人物失败：%s", cerr.Error()), processed, total, 0)
+		pub(0.95, "error", TaskErrPeopleRecognitionFailed, map[string]string{"detail": cerr.Error()}, processed, total, 0)
 		return cerr
 	}
 
-	pub(1, "done", "", processed, total, newFaces)
+	pub(1, "done", "", nil, processed, total, newFaces)
 	go func() {
 		time.Sleep(taskCleanupDelay)
 		if s.reg != nil {

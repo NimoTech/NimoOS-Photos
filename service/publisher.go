@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 
 	"github.com/NimoTech/NimoOS-Common/external"
@@ -45,6 +46,16 @@ func taskToProps(t Task) map[string]string {
 	}
 	if t.Error != "" {
 		props["error"] = t.Error
+	}
+	if t.ErrorKey != "" {
+		props["errorKey"] = t.ErrorKey
+	}
+	if len(t.ErrorParams) > 0 {
+		// MessageBus Properties 只收 map[string]string，errorParams 本身是
+		// map[string]string，序列化成 JSON 字符串塞进去，前端反序列化还原。
+		if b, err := json.Marshal(t.ErrorParams); err == nil {
+			props["errorParams"] = string(b)
+		}
 	}
 	return props
 }
