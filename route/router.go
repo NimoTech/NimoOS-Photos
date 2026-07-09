@@ -125,6 +125,7 @@ func InitRouter(ctx context.Context, svc service.Services, runtimePath string, t
 	g.GET("/assets/:id/original", assets.Original)
 	g.GET("/assets/:id/live", assets.Live)
 	g.GET("/assets/:id/sprite", assets.Sprite)
+	g.GET("/assets/:id/ocr", assets.OCRLines)
 
 	// Search endpoints
 	g.POST("/search/smart", search.Smart)

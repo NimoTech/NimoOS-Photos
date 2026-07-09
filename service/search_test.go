@@ -800,3 +800,48 @@ func TestUpdateDurationMs(t *testing.T) {
 	require.NoError(t, db.QueryRow(`SELECT duration_ms FROM assets WHERE id='v1'`).Scan(&got))
 	require.Equal(t, int64(62000), got)
 }
+
+// TestOCRLinesMatchAndAll 验证 GET /assets/:id/ocr 背后的服务方法:
+// 带 query 时按 ocrSearch 同款规则(大小写不敏感子串)过滤行,
+// 不带 query 返回全部行(Live Text 预留);行序按 line_no;缺资产 ErrNotFound。
+func TestOCRLinesMatchAndAll(t *testing.T) {
+	db, err := sqlite.Open(filepath.Join(t.TempDir(), "ocr.db"))
+	require.NoError(t, err)
+	defer db.Close()
+	s := service.NewSearchService(db, &mockTextML{})
+
+	_, err = db.Exec(`INSERT INTO assets(id, file_path, mime_type, status) VALUES
+		('a1', '/g/a1.jpg', 'image/jpeg', 'indexed')`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO asset_ocr_lines(asset_id, line_no, text, box, score) VALUES
+		('a1', 0, 'XX公司发票代开', '[0.1,0.1,0.9,0.1,0.9,0.2,0.1,0.2]', 0.98),
+		('a1', 1, 'TOTAL $42.00',   '[0.1,0.3,0.5,0.3,0.5,0.4,0.1,0.4]', 0.95)`)
+	require.NoError(t, err)
+
+	// 命中过滤:中文子串。
+	hits, err := s.OCRLines("a1", "发票")
+	require.NoError(t, err)
+	require.Len(t, hits, 1)
+	require.Equal(t, "XX公司发票代开", hits[0].Text)
+	require.Equal(t, []float64{0.1, 0.1, 0.9, 0.1, 0.9, 0.2, 0.1, 0.2}, hits[0].Box)
+
+	// 大小写不敏感(与 ocrSearch 的 instr(lower,lower) 同款)。
+	hits, err = s.OCRLines("a1", "total")
+	require.NoError(t, err)
+	require.Len(t, hits, 1)
+
+	// 不带 query → 全部行,按 line_no 排序。
+	all, err := s.OCRLines("a1", "")
+	require.NoError(t, err)
+	require.Len(t, all, 2)
+	require.Equal(t, "XX公司发票代开", all[0].Text)
+
+	// 无命中 → 空切片(非 nil 语义由 handler JSON 保证)。
+	none, err := s.OCRLines("a1", "不存在的词")
+	require.NoError(t, err)
+	require.Len(t, none, 0)
+
+	// 资产不存在 → ErrNotFound。
+	_, err = s.OCRLines("ghost", "x")
+	require.ErrorIs(t, err, service.ErrNotFound)
+}

@@ -2,6 +2,7 @@ package service
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strconv"
@@ -378,6 +379,63 @@ WHERE instr(lower(o.text), lower(?)) > 0
 		assets[i].MatchedBy = "ocr"
 	}
 	return assets, nil
+}
+
+// OCRLineHit is one stored OCR line of an asset, exposed by GET
+// /assets/:id/ocr for search-hit highlighting. Box is the raw normalized
+// quadrilateral ([x1,y1,…,x4,y4] in [0,1] of the image dimensions, straight
+// from immich-ml); empty when the ML service omitted geometry.
+type OCRLineHit struct {
+	Text  string    `json:"text"`
+	Box   []float64 `json:"box"`
+	Score float64   `json:"score"`
+}
+
+// OCRLines returns an asset's stored OCR lines ordered by line_no. A
+// non-empty query filters to lines containing it as a case-insensitive
+// substring — deliberately the same instr(lower(),lower()) rule as
+// ocrSearch, so every search hit is guaranteed to highlight. Returns
+// ErrNotFound when the asset does not exist (or is trashed); assets whose
+// OCR predates line storage (boxes_ver=0) simply yield an empty slice until
+// the backfill reaches them.
+func (s *SearchService) OCRLines(assetID, query string) ([]OCRLineHit, error) {
+	var one int
+	err := s.db.QueryRow(
+		`SELECT 1 FROM assets WHERE id = ? AND deleted_at IS NULL`, assetID).Scan(&one)
+	if err == sql.ErrNoRows {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("OCRLines asset lookup: %w", err)
+	}
+
+	q := `SELECT text, box, COALESCE(score, 0) FROM asset_ocr_lines WHERE asset_id = ?`
+	args := []any{assetID}
+	if t := strings.TrimSpace(query); t != "" {
+		q += ` AND instr(lower(text), lower(?)) > 0`
+		args = append(args, t)
+	}
+	q += ` ORDER BY line_no`
+
+	rows, err := s.db.Query(q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("OCRLines query: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]OCRLineHit, 0, 8)
+	for rows.Next() {
+		var h OCRLineHit
+		var boxJSON string
+		if err := rows.Scan(&h.Text, &boxJSON, &h.Score); err != nil {
+			return nil, fmt.Errorf("OCRLines scan: %w", err)
+		}
+		if err := json.Unmarshal([]byte(boxJSON), &h.Box); err != nil || h.Box == nil {
+			h.Box = []float64{}
+		}
+		out = append(out, h)
+	}
+	return out, rows.Err()
 }
 
 // mergeOCRFirst concatenates ocr hits before clip results, dropping duplicate

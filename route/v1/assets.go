@@ -225,6 +225,21 @@ func (h *AssetsHandler) Thumbnail(c echo.Context) error {
 	return c.File(path)
 }
 
+// OCRLines serves an asset's stored OCR lines with normalized quadrilaterals.
+// Query param q filters to lines containing it (case-insensitive substring,
+// same rule as smart-search OCR matching) — the search-hit highlight path.
+// GET /v1/photos/assets/:id/ocr?q=
+func (h *AssetsHandler) OCRLines(c echo.Context) error {
+	lines, err := h.svc.Search().OCRLines(c.Param("id"), c.QueryParam("q"))
+	if errors.Is(err, service.ErrNotFound) {
+		return echo.NewHTTPError(http.StatusNotFound)
+	}
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	}
+	return c.JSON(http.StatusOK, map[string]any{"lines": lines})
+}
+
 // Original streams the full-resolution original file.
 func (h *AssetsHandler) Original(c echo.Context) error {
 	asset, err := h.svc.Search().GetAsset(JWTUserID(c), c.Param("id"))
