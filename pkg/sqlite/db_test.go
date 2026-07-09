@@ -738,3 +738,31 @@ func TestMigrateOCRLinesUpgrade(t *testing.T) {
 	require.NoError(t, err)
 	db2.Close()
 }
+
+// TestMigrateDocClassifyColumns 验证 doc 分类迁移:asset_ocr 新四列默认值、
+// clip_text_cache 可写、重复 Open 幂等。
+func TestMigrateDocClassifyColumns(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "doc.db")
+	db, err := sqlite.Open(dbPath)
+	require.NoError(t, err)
+
+	_, err = db.Exec(`INSERT INTO assets(id, file_path, status) VALUES('a1','/g/1.jpg','indexed')`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO asset_ocr(asset_id, text) VALUES('a1','hello')`)
+	require.NoError(t, err)
+
+	var docVer int
+	var isDoc sql.NullInt64
+	require.NoError(t, db.QueryRow(
+		`SELECT doc_ver, is_doc FROM asset_ocr WHERE asset_id='a1'`).Scan(&docVer, &isDoc))
+	require.Equal(t, 0, docVer, "doc_ver 默认 0(待算)")
+	require.False(t, isDoc.Valid, "is_doc 默认 NULL(未算,区别于 0=判非文档)")
+
+	_, err = db.Exec(`INSERT INTO clip_text_cache(key, gen, vec) VALUES('a scan of a document','3',x'00000000')`)
+	require.NoError(t, err)
+	db.Close()
+
+	db2, err := sqlite.Open(dbPath)
+	require.NoError(t, err)
+	db2.Close()
+}

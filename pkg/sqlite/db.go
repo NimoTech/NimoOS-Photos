@@ -286,6 +286,18 @@ func migrate(db *sql.DB) error {
 			value TEXT NOT NULL
 		)`,
 
+		// ── CLIP text-prompt embedding cache ─────────────────────────────
+		// Keyed by (prompt text, MLModelGen) so a model-generation bump
+		// invalidates entries automatically. Lets the OCR doc-classifier
+		// score assets with pure local math — the text tower runs once per
+		// prompt per generation, not per asset.
+		`CREATE TABLE IF NOT EXISTS clip_text_cache (
+			key TEXT NOT NULL,
+			gen TEXT NOT NULL,
+			vec BLOB NOT NULL,
+			PRIMARY KEY (key, gen)
+		)`,
+
 		// ── 可恢复上传任务表（与 Common upload.UploadTask gorm column 对应）────
 		`CREATE TABLE IF NOT EXISTS o_upload_tasks (
 			id TEXT PRIMARY KEY,
@@ -473,6 +485,14 @@ func migrate(db *sql.DB) error {
 		// boxes_ver=0 → OCR text predates line-geometry storage; the OCR
 		// backfill (queryMissingOCR) re-runs these to populate asset_ocr_lines.
 		`ALTER TABLE asset_ocr ADD COLUMN boxes_ver INTEGER NOT NULL DEFAULT 0`,
+		// OCR doc-classifier hybrid verdict (see docs: density gate + CLIP
+		// zero-shot margin + line-geometry regularity). is_doc NULL = not yet
+		// scored (queries fall back to the legacy density rule); doc_ver=0
+		// marks rows for the pure-math backfill.
+		`ALTER TABLE asset_ocr ADD COLUMN doc_sem REAL`,
+		`ALTER TABLE asset_ocr ADD COLUMN doc_geo REAL`,
+		`ALTER TABLE asset_ocr ADD COLUMN is_doc INTEGER`,
+		`ALTER TABLE asset_ocr ADD COLUMN doc_ver INTEGER NOT NULL DEFAULT 0`,
 	}
 	for _, stmt := range alters {
 		if _, err := db.Exec(stmt); err != nil &&
