@@ -844,4 +844,10 @@ func TestOCRLinesMatchAndAll(t *testing.T) {
 	// 资产不存在 → ErrNotFound。
 	_, err = s.OCRLines("ghost", "x")
 	require.ErrorIs(t, err, service.ErrNotFound)
+
+	// 软删资产(deleted_at 非空)视同不存在 → ErrNotFound。
+	_, err = db.Exec(`UPDATE assets SET deleted_at = CURRENT_TIMESTAMP WHERE id='a1'`)
+	require.NoError(t, err)
+	_, err = s.OCRLines("a1", "发票")
+	require.ErrorIs(t, err, service.ErrNotFound)
 }
