@@ -187,6 +187,9 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 			if err := embedder.BackfillOCR(parentCtx); err != nil {
 				zap.L().Warn("post-batch ocr backfill failed", zap.Error(err))
 			}
+			if err := embedder.BackfillDocVerdicts(parentCtx); err != nil {
+				zap.L().Warn("post-batch doc verdict backfill failed", zap.Error(err))
+			}
 		}()
 		go func() {
 			for {

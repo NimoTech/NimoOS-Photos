@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"testing"
@@ -109,4 +110,27 @@ func TestComputeDocVerdictNoVector(t *testing.T) {
 	var docVer int
 	require.NoError(t, db.QueryRow(`SELECT doc_ver FROM asset_ocr WHERE asset_id='a1'`).Scan(&docVer))
 	require.Equal(t, 0, docVer, "无向量留待补算")
+}
+
+func TestBackfillDocVerdicts(t *testing.T) {
+	db := makeTestDB(t)
+	ix := NewIndexer(db, &semML{}, t.TempDir(), 1)
+	seedDocAsset(t, ix, "doc1", 0, regularBoxes(10))
+	// 无向量资产:不应入选,也不应阻塞
+	_, err := db.Exec(`INSERT INTO assets(id,file_path,status) VALUES('novec','/p/n.jpg','indexed')`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO asset_ocr(asset_id,text,coverage,line_count,boxes_ver) VALUES('novec','x',0.1,5,1)`)
+	require.NoError(t, err)
+
+	e := NewEmbedder(db, &semML{}, ix, nil)
+	require.NoError(t, e.BackfillDocVerdicts(context.Background()))
+
+	var docVer int
+	require.NoError(t, db.QueryRow(`SELECT doc_ver FROM asset_ocr WHERE asset_id='doc1'`).Scan(&docVer))
+	require.Equal(t, 1, docVer, "有向量的补算收敛")
+	require.NoError(t, db.QueryRow(`SELECT doc_ver FROM asset_ocr WHERE asset_id='novec'`).Scan(&docVer))
+	require.Equal(t, 0, docVer, "无向量的不入选,留待向量补齐后下一轮")
+
+	// 幂等:再跑一轮无变化不报错
+	require.NoError(t, e.BackfillDocVerdicts(context.Background()))
 }

@@ -317,6 +317,8 @@ func (e *Embedder) backfillOCROnce(ctx context.Context) error {
 			if oerr := e.indexer.ocrAsset(t.id, data); oerr != nil {
 				ocrFail++
 				failed++
+			} else if derr := e.indexer.computeDocVerdict(t.id); derr != nil {
+				zap.L().Warn("doc verdict after ocr backfill failed", zap.String("asset_id", t.id), zap.Error(derr))
 			}
 			processed++
 			pubRunning(processed)
@@ -389,6 +391,45 @@ func (e *Embedder) backfillOCROnce(ctx context.Context) error {
 	return nil
 }
 
+// BackfillDocVerdicts 为「OCR 行坐标已存(boxes_ver=1)、doc 判定未算(doc_ver=0)、
+// 图向量已就绪」的资产补算 doc 分类混合判定。纯本地数学(提示词向量最多一次文本
+// 嵌入),毫秒级/张,因此不挂 TaskRegistry、不发任务事件(与跑推理的 BackfillOCR
+// 不同)。无向量的资产不入选,等 CLIP Backfill 补齐向量后的下一轮钩子再收敛。
+func (e *Embedder) BackfillDocVerdicts(ctx context.Context) error {
+	rows, err := e.db.QueryContext(ctx, `
+        SELECT o.asset_id
+        FROM asset_ocr o
+        JOIN assets a ON a.id = o.asset_id
+        JOIN asset_clip_idx ci ON ci.asset_id = o.asset_id
+        WHERE o.doc_ver = 0 AND o.boxes_ver = 1
+          AND a.status = 'indexed' AND a.deleted_at IS NULL AND a.offline = 0`)
+	if err != nil {
+		return err
+	}
+	ids := make([]string, 0, 32)
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return err
+		}
+		ids = append(ids, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, id := range ids {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if err := e.indexer.computeDocVerdict(id); err != nil {
+			zap.L().Warn("doc verdict backfill failed", zap.String("asset_id", id), zap.Error(err))
+		}
+	}
+	return nil
+}
+
 // Run 主循环：每隔 pollInterval 检查 ML ready 状态，
 // 检测到 false→true 跳变时触发一次 Backfill（goroutine 异步执行）。
 // 服务启动时如果 ML 已经就绪，第一次 tick 的 prev=false 也会触发——符合 spec §5.2。
@@ -424,6 +465,7 @@ func (e *Embedder) tick(ctx context.Context) {
 			_ = e.Backfill(ctx)
 			e.reembedThumbnailsOnce()
 			_ = e.BackfillOCR(ctx)
+			_ = e.BackfillDocVerdicts(ctx)
 			if e.onRecovered != nil {
 				e.onRecovered(ctx)
 			}

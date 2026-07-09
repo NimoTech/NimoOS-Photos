@@ -950,6 +950,8 @@ func (ix *Indexer) processFileInternal(path string, opts processOpts) (success b
 				if len(ocrData) > 0 {
 					if err := ix.ocrAsset(assetID, ocrData); err != nil {
 						fmt.Fprintf(os.Stderr, "[indexer] OCR failed for %s: %v\n", assetID, err)
+					} else if derr := ix.computeDocVerdict(assetID); derr != nil {
+						fmt.Fprintf(os.Stderr, "[indexer] doc verdict failed for %s: %v\n", assetID, derr)
 					}
 				}
 			}
