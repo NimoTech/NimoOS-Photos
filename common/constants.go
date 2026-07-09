@@ -1,11 +1,13 @@
 package common
 
+// PhotosVersion is injected at build time via -ldflags; defaults to "dev".
+var PhotosVersion = "dev"
+
 const (
-	PhotosVersion = "1.9.2-alpha1"
-	URLFileName   = "photos.url"
-	Localhost     = "127.0.0.1"
-	V1APIPath     = "/v1/photos"
-	V1DocPath     = "/doc/v1/photos"
+	URLFileName = "photos.url"
+	Localhost   = "127.0.0.1"
+	V1APIPath   = "/v1/photos"
+	V1DocPath   = "/doc/v1/photos"
 
 	DefaultMLEndpoint = "http://127.0.0.1:3003"
 	DefaultWorkers    = 3
