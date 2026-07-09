@@ -674,3 +674,95 @@ func TestMigrateFaceScannedBackfillIsIdempotent(t *testing.T) {
 	require.NoError(t, db2.QueryRow(`SELECT face_scanned FROM assets WHERE id='a1'`).Scan(&fs))
 	require.Equal(t, 0, fs, "重复迁移不应重新触发回填")
 }
+
+// TestMigrateOCRLinesUpgrade 验证:旧库(有 asset_ocr 无 boxes_ver 列、无
+// asset_ocr_lines 表)经 Open 迁移后,新列默认 0、新表可写,且删 assets 行
+// 时 asset_ocr_lines 随外键级联清除;重复 Open 幂等。
+func TestMigrateOCRLinesUpgrade(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "legacy.db")
+
+	// Phase 1: 手工造旧库——asset_ocr 只有旧列。
+	func() {
+		raw, err := sql.Open("sqlite3", dbPath)
+		require.NoError(t, err)
+		defer raw.Close()
+		_, err = raw.Exec(`CREATE TABLE assets (
+			id                   TEXT PRIMARY KEY,
+			file_path            TEXT UNIQUE NOT NULL,
+			file_size            INTEGER,
+			mime_type            TEXT,
+			original_name        TEXT,
+			taken_at             DATETIME,
+			duration_ms          INTEGER,
+			live_photo_video_id  TEXT,
+			is_live_photo_video  INTEGER NOT NULL DEFAULT 0,
+			indexed_at           DATETIME,
+			status               TEXT NOT NULL DEFAULT 'pending',
+			checksum             TEXT
+		)`)
+		require.NoError(t, err)
+		_, err = raw.Exec(`CREATE TABLE asset_ocr (
+			asset_id TEXT PRIMARY KEY REFERENCES assets(id) ON DELETE CASCADE,
+			text     TEXT NOT NULL DEFAULT '',
+			ocr_at   DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+		)`)
+		require.NoError(t, err)
+		_, err = raw.Exec(`INSERT INTO assets(id, file_path, status) VALUES('a1','/g/1.jpg','indexed')`)
+		require.NoError(t, err)
+		_, err = raw.Exec(`INSERT INTO asset_ocr(asset_id, text) VALUES('a1','hello world')`)
+		require.NoError(t, err)
+	}()
+
+	// Phase 2: Open 触发迁移。
+	db, err := sqlite.Open(dbPath)
+	require.NoError(t, err)
+
+	var ver int
+	require.NoError(t, db.QueryRow(`SELECT boxes_ver FROM asset_ocr WHERE asset_id='a1'`).Scan(&ver))
+	require.Equal(t, 0, ver, "旧数据 boxes_ver 应默认 0(待补跑)")
+
+	_, err = db.Exec(`INSERT INTO asset_ocr_lines(asset_id, line_no, text, box, score)
+		VALUES('a1', 0, 'hello world', '[0.1,0.1,0.5,0.1,0.5,0.2,0.1,0.2]', 0.97)`)
+	require.NoError(t, err)
+
+	// 外键级联:删 assets 行,行表应清空。
+	_, err = db.Exec(`DELETE FROM assets WHERE id='a1'`)
+	require.NoError(t, err)
+	var n int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM asset_ocr_lines`).Scan(&n))
+	require.Equal(t, 0, n, "删除资产后 asset_ocr_lines 应级联清除")
+	db.Close()
+
+	// Phase 3: 二次 Open 幂等。
+	db2, err := sqlite.Open(dbPath)
+	require.NoError(t, err)
+	db2.Close()
+}
+
+// TestMigrateDocClassifyColumns 验证 doc 分类迁移:asset_ocr 新四列默认值、
+// clip_text_cache 可写、重复 Open 幂等。
+func TestMigrateDocClassifyColumns(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "doc.db")
+	db, err := sqlite.Open(dbPath)
+	require.NoError(t, err)
+
+	_, err = db.Exec(`INSERT INTO assets(id, file_path, status) VALUES('a1','/g/1.jpg','indexed')`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO asset_ocr(asset_id, text) VALUES('a1','hello')`)
+	require.NoError(t, err)
+
+	var docVer int
+	var isDoc sql.NullInt64
+	require.NoError(t, db.QueryRow(
+		`SELECT doc_ver, is_doc FROM asset_ocr WHERE asset_id='a1'`).Scan(&docVer, &isDoc))
+	require.Equal(t, 0, docVer, "doc_ver 默认 0(待算)")
+	require.False(t, isDoc.Valid, "is_doc 默认 NULL(未算,区别于 0=判非文档)")
+
+	_, err = db.Exec(`INSERT INTO clip_text_cache(key, gen, vec) VALUES('a scan of a document','3',x'00000000')`)
+	require.NoError(t, err)
+	db.Close()
+
+	db2, err := sqlite.Open(dbPath)
+	require.NoError(t, err)
+	db2.Close()
+}

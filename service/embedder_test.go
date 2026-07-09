@@ -89,6 +89,34 @@ func TestEmbedder_QueryMissingOCRExcludesOffline(t *testing.T) {
 	require.False(t, ids[offline], "offline 资产必须被排除出 OCR 补跑")
 }
 
+// TestQueryMissingOCRIncludesLegacyBoxless 验证补跑筛选覆盖「有 OCR 文本但
+// boxes_ver=0(坐标缺失)」的旧资产,且 boxes_ver=1 后出队。
+func TestQueryMissingOCRIncludesLegacyBoxless(t *testing.T) {
+	db := makeTestDB(t)
+	_, err := db.Exec(`INSERT INTO assets(id, file_path, mime_type, status) VALUES
+		('legacy', '/g/legacy.jpg', 'image/jpeg', 'indexed'),
+		('fresh',  '/g/fresh.jpg',  'image/jpeg', 'indexed')`)
+	require.NoError(t, err)
+	// legacy: 旧版 OCR——有文本有 coverage,但 boxes_ver=0。
+	_, err = db.Exec(`INSERT INTO asset_ocr(asset_id, text, coverage, line_count, boxes_ver)
+		VALUES('legacy', 'hello', 0.05, 1, 0)`)
+	require.NoError(t, err)
+	// fresh: 新版 OCR——boxes_ver=1,不应入队。
+	_, err = db.Exec(`INSERT INTO asset_ocr(asset_id, text, coverage, line_count, boxes_ver)
+		VALUES('fresh', 'world', 0.05, 1, 1)`)
+	require.NoError(t, err)
+
+	e := NewEmbedder(db, &mockML{}, nil, nil)
+	targets, err := e.queryMissingOCR(context.Background())
+	require.NoError(t, err)
+
+	ids := make([]string, 0, len(targets))
+	for _, tg := range targets {
+		ids = append(ids, tg.id)
+	}
+	require.Equal(t, []string{"legacy"}, ids)
+}
+
 // 视频不参与 OCR:既不进补跑目标,历史遗留的视频 OCR 行也被 pruneVideoOCR 清掉。
 func TestVideoOCRExcludedAndPruned(t *testing.T) {
 	db := makeTestDB(t)

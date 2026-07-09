@@ -255,6 +255,22 @@ func migrate(db *sql.DB) error {
 			ocr_at   DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 		)`,
 
+		// ── OCR line geometry per asset ──────────────────────────────────────
+		// One row per kept OCR line, in the same order (line_no) as the lines
+		// joined into asset_ocr.text. box is the raw immich-ml quadrilateral:
+		// a JSON array of 8 floats (x1,y1,…,x4,y4) normalized to [0,1] of the
+		// image dimensions — resolution-independent, so the frontend can map
+		// it onto any rendition. Used by GET /assets/:id/ocr (search-hit
+		// highlighting); rows cascade with the asset.
+		`CREATE TABLE IF NOT EXISTS asset_ocr_lines (
+			asset_id TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+			line_no  INTEGER NOT NULL,
+			text     TEXT NOT NULL,
+			box      TEXT NOT NULL DEFAULT '[]',
+			score    REAL,
+			PRIMARY KEY (asset_id, line_no)
+		)`,
+
 		`CREATE TABLE IF NOT EXISTS smart_view_activity (
 			id            TEXT PRIMARY KEY,
 			smart_view_id TEXT NOT NULL REFERENCES smart_views(id) ON DELETE CASCADE,
@@ -268,6 +284,18 @@ func migrate(db *sql.DB) error {
 		`CREATE TABLE IF NOT EXISTS photos_meta (
 			key   TEXT PRIMARY KEY,
 			value TEXT NOT NULL
+		)`,
+
+		// ── CLIP text-prompt embedding cache ─────────────────────────────
+		// Keyed by (prompt text, MLModelGen) so a model-generation bump
+		// invalidates entries automatically. Lets the OCR doc-classifier
+		// score assets with pure local math — the text tower runs once per
+		// prompt per generation, not per asset.
+		`CREATE TABLE IF NOT EXISTS clip_text_cache (
+			key TEXT NOT NULL,
+			gen TEXT NOT NULL,
+			vec BLOB NOT NULL,
+			PRIMARY KEY (key, gen)
 		)`,
 
 		// ── 可恢复上传任务表（与 Common upload.UploadTask gorm column 对应）────
@@ -454,6 +482,17 @@ func migrate(db *sql.DB) error {
 		`ALTER TABLE persons ADD COLUMN cover_locked INTEGER NOT NULL DEFAULT 0`,
 		// hero_asset_id: user-chosen hero/background photo for this person (must have a valid face).
 		`ALTER TABLE persons ADD COLUMN hero_asset_id TEXT`,
+		// boxes_ver=0 → OCR text predates line-geometry storage; the OCR
+		// backfill (queryMissingOCR) re-runs these to populate asset_ocr_lines.
+		`ALTER TABLE asset_ocr ADD COLUMN boxes_ver INTEGER NOT NULL DEFAULT 0`,
+		// OCR doc-classifier hybrid verdict (see docs: density gate + CLIP
+		// zero-shot margin + line-geometry regularity). is_doc NULL = not yet
+		// scored (queries fall back to the legacy density rule); doc_ver=0
+		// marks rows for the pure-math backfill.
+		`ALTER TABLE asset_ocr ADD COLUMN doc_sem REAL`,
+		`ALTER TABLE asset_ocr ADD COLUMN doc_geo REAL`,
+		`ALTER TABLE asset_ocr ADD COLUMN is_doc INTEGER`,
+		`ALTER TABLE asset_ocr ADD COLUMN doc_ver INTEGER NOT NULL DEFAULT 0`,
 	}
 	for _, stmt := range alters {
 		if _, err := db.Exec(stmt); err != nil &&

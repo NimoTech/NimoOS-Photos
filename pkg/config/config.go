@@ -49,6 +49,16 @@ type Config struct {
 	// service/searchcut.go's semanticCutIndex for the full rule, including the
 	// cliff-detection signal it combines with).
 	SearchCutAlpha float64
+
+	// Doc 分类混合判据(OCR 类)的权重与标定(见 service/docscore.go):
+	// DocWSem/DocWGeo 语义与几何权重;DocScoreFloor 判文档的加权分下限;
+	// DocSemFloor/DocSemCeil 语义边际线性归一的两个标定端点。
+	// 默认值为当前库校准的经验值,换 CLIP 模型代次后需复核。
+	DocWSem       float64
+	DocWGeo       float64
+	DocScoreFloor float64
+	DocSemFloor   float64
+	DocSemCeil    float64
 }
 
 func Init(configFile, confSample string) error {
@@ -94,6 +104,12 @@ func Init(configFile, confSample string) error {
 		SimDisplayFloor:    v.GetFloat64("photos.SimDisplayFloor"),
 		SimDisplayCeil:     v.GetFloat64("photos.SimDisplayCeil"),
 		SearchCutAlpha:     v.GetFloat64("photos.SearchCutAlpha"),
+
+		DocWSem:       v.GetFloat64("photos.DocWSem"),
+		DocWGeo:       v.GetFloat64("photos.DocWGeo"),
+		DocScoreFloor: v.GetFloat64("photos.DocScoreFloor"),
+		DocSemFloor:   v.GetFloat64("photos.DocSemFloor"),
+		DocSemCeil:    v.GetFloat64("photos.DocSemCeil"),
 	}
 	if Cfg.RuntimePath == "" {
 		Cfg.RuntimePath = "/var/run/nimoos"
@@ -146,6 +162,8 @@ func Init(configFile, confSample string) error {
 	if !v.IsSet("photos.SearchCutAlpha") {
 		Cfg.SearchCutAlpha = 0.7
 	}
+	// Doc 分类判据五项(DocWSem/DocWGeo/DocScoreFloor/DocSemFloor/DocSemCeil)
+	// 不在此兜底：0 值由 service/docscore.go 的访问器回退经验默认值(simDisplayFloor 同款)。
 	return nil
 }
 

@@ -173,6 +173,11 @@ type Indexer struct {
 	// albumAssigner is called after an asset record is successfully written,
 	// with the asset's DB id and the album id from pendingAlbum.
 	albumAssigner func(assetID, albumID string)
+
+	// doc 分类的提示词向量进程内缓存(见 docverdict.go loadPromptVecs)。
+	promptMu    sync.Mutex
+	promptDoc   [][]float32
+	promptPhoto [][]float32
 }
 
 // touch marks index activity (enqueue or a processed result) at the current time.
@@ -945,6 +950,8 @@ func (ix *Indexer) processFileInternal(path string, opts processOpts) (success b
 				if len(ocrData) > 0 {
 					if err := ix.ocrAsset(assetID, ocrData); err != nil {
 						fmt.Fprintf(os.Stderr, "[indexer] OCR failed for %s: %v\n", assetID, err)
+					} else if derr := ix.computeDocVerdict(assetID); derr != nil {
+						fmt.Fprintf(os.Stderr, "[indexer] doc verdict failed for %s: %v\n", assetID, derr)
 					}
 				}
 			}
@@ -1029,31 +1036,62 @@ func quadArea(c []float64) float64 {
 // category: line_count (kept lines) and coverage (total text-box area as a
 // fraction of the image). A row is written even when no text is found
 // (text=”), so the backfill can tell "OCR done, empty" apart from "not yet
-// OCR'd".
+// OCR'd". Kept lines are also written one-per-row into asset_ocr_lines with
+// their normalized quadrilaterals (search-hit highlighting); boxes_ver=1
+// marks the geometry as stored so the backfill skips this asset.
 func (ix *Indexer) ocrAsset(assetID string, imageData []byte) error {
 	lines, err := ix.ml.OCR(imageData)
 	if err != nil {
 		return err
 	}
-	kept := make([]string, 0, len(lines))
+	kept := make([]mlclient.OCRLine, 0, len(lines))
+	texts := make([]string, 0, len(lines))
 	coverage := 0.0
 	for _, l := range lines {
 		if l.Score >= minOCRScore && strings.TrimSpace(l.Text) != "" {
-			kept = append(kept, l.Text)
+			kept = append(kept, l)
+			texts = append(texts, l.Text)
 			coverage += quadArea(l.Box)
 		}
 	}
 	if coverage > 1 {
 		coverage = 1
 	}
-	_, err = ix.db.Exec(`
-		INSERT INTO asset_ocr(asset_id, text, coverage, line_count, ocr_at)
-		VALUES(?,?,?,?,CURRENT_TIMESTAMP)
+
+	tx, err := ix.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	if _, err := tx.Exec(`
+		INSERT INTO asset_ocr(asset_id, text, coverage, line_count, boxes_ver, ocr_at)
+		VALUES(?,?,?,?,1,CURRENT_TIMESTAMP)
 		ON CONFLICT(asset_id) DO UPDATE SET
 		  text=excluded.text, coverage=excluded.coverage,
-		  line_count=excluded.line_count, ocr_at=excluded.ocr_at`,
-		assetID, strings.Join(kept, "\n"), coverage, len(kept))
-	return err
+		  line_count=excluded.line_count, boxes_ver=1, ocr_at=excluded.ocr_at,
+		  doc_ver=0`,
+		assetID, strings.Join(texts, "\n"), coverage, len(texts)); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM asset_ocr_lines WHERE asset_id = ?`, assetID); err != nil {
+		return err
+	}
+	for i, l := range kept {
+		boxJSON := []byte("[]")
+		if len(l.Box) == 8 {
+			if b, merr := json.Marshal(l.Box); merr == nil {
+				boxJSON = b
+			}
+		}
+		if _, err := tx.Exec(`
+			INSERT INTO asset_ocr_lines(asset_id, line_no, text, box, score)
+			VALUES(?,?,?,?,?)`,
+			assetID, i, l.Text, string(boxJSON), l.Score); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // ReembedAllClip recomputes the CLIP embedding for every indexed asset from its
