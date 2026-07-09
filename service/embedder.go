@@ -198,7 +198,8 @@ func (e *Embedder) backfillOnce(ctx context.Context) error {
 
 // queryMissingOCR 列出 status='indexed' 但 OCR 数据不完整的 asset：
 // 要么 asset_ocr 缺行（从未跑过 OCR——即使没识别到文字也会写 text='' 行），
-// 要么 coverage 为 NULL（旧版跑的 OCR 没存文字框面积，需要重跑补齐）。
+// 要么 coverage 为 NULL（旧版跑的 OCR 没存文字框面积，需要重跑补齐），
+// 要么 boxes_ver=0（旧版没把逐行坐标存进 asset_ocr_lines，需重跑供搜索命中高亮）。
 func (e *Embedder) queryMissingOCR(ctx context.Context) ([]ocrTarget, error) {
 	// a.offline=0: same reasoning as queryMissing above — skip assets whose
 	// source is unreachable because their removable drive is unplugged.
@@ -208,7 +209,7 @@ func (e *Embedder) queryMissingOCR(ctx context.Context) ([]ocrTarget, error) {
         LEFT JOIN asset_ocr o ON o.asset_id = a.id
         WHERE a.status = 'indexed' AND a.deleted_at IS NULL AND a.offline = 0
           AND COALESCE(a.mime_type,'') NOT LIKE 'video/%'
-          AND (o.asset_id IS NULL OR o.coverage IS NULL)`)
+          AND (o.asset_id IS NULL OR o.coverage IS NULL OR COALESCE(o.boxes_ver,0) = 0)`)
 	if err != nil {
 		return nil, err
 	}
