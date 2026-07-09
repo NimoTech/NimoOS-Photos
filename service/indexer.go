@@ -173,6 +173,11 @@ type Indexer struct {
 	// albumAssigner is called after an asset record is successfully written,
 	// with the asset's DB id and the album id from pendingAlbum.
 	albumAssigner func(assetID, albumID string)
+
+	// doc 分类的提示词向量进程内缓存(见 docverdict.go loadPromptVecs)。
+	promptMu    sync.Mutex
+	promptDoc   [][]float32
+	promptPhoto [][]float32
 }
 
 // touch marks index activity (enqueue or a processed result) at the current time.
