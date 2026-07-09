@@ -66,3 +66,33 @@ func TestDocVerdict(t *testing.T) {
 	// 语义明确照片(归一 0)拉不回:0.65*0 + 0.35*0.5 = 0.175 < 0.5
 	require.False(t, docVerdict(-0.01, 0.5))
 }
+
+// TestHasOcrExprTriState 验证共享判据片段的三态语义(经 ListAssets 真实查询):
+// is_doc=1 → hasOcr;is_doc=0(密度过但被否决)→ 非 hasOcr;
+// is_doc NULL → 回退旧密度判据。
+func TestHasOcrExprTriState(t *testing.T) {
+	db := makeTestDB(t)
+	s := NewSearchService(db, nil)
+
+	mk := func(id string, coverage float64, lines int, isDoc any) {
+		_, err := db.Exec(`INSERT INTO assets(id,file_path,mime_type,status) VALUES(?,?, 'image/jpeg','indexed')`, id, "/p/"+id+".jpg")
+		require.NoError(t, err)
+		_, err = db.Exec(`INSERT INTO asset_ocr(asset_id,text,coverage,line_count,is_doc) VALUES(?,'x',?,?,?)`, id, coverage, lines, isDoc)
+		require.NoError(t, err)
+	}
+	mk("verdict1", 0.1, 20, 1)      // 判文档
+	mk("vetoed", 0.1, 20, 0)        // 密度过但被语义否决
+	mk("legacyDoc", 0.1, 20, nil)   // 未算 → 旧判据:过
+	mk("legacyPhoto", 0.01, 2, nil) // 未算 → 旧判据:不过
+
+	assets, err := s.ListAssets("", 100, 0)
+	require.NoError(t, err)
+	got := map[string]bool{}
+	for _, a := range assets {
+		got[a.ID] = a.HasOCR
+	}
+	require.True(t, got["verdict1"])
+	require.False(t, got["vetoed"], "被否决的不进 OCR 类——本功能的核心目标")
+	require.True(t, got["legacyDoc"], "未算回退旧密度判据")
+	require.False(t, got["legacyPhoto"])
+}

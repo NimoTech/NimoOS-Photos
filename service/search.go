@@ -274,7 +274,7 @@ func (s *SearchService) knnSemanticFetch(blob []byte, k int, filters SearchFilte
 	baseSQL := `
 SELECT a.id, a.file_path, a.file_size, COALESCE(a.mime_type,''),
        COALESCE(a.original_name,''), a.taken_at, a.duration_ms,
-       COALESCE(a.live_photo_video_id,''), a.is_live_photo_video, EXISTS(SELECT 1 FROM asset_ocr ocr WHERE ocr.asset_id=a.id AND ocr.text<>'' AND COALESCE(ocr.coverage,1)>=0.05 AND COALESCE(ocr.line_count,0)>=8),
+       COALESCE(a.live_photo_video_id,''), a.is_live_photo_video, ` + hasOcrExpr + `,
        a.indexed_at, a.status, e.latitude, e.longitude, vec.distance
 FROM clip_embeddings AS vec
 JOIN asset_clip_idx AS idx ON idx.rowid = vec.rowid
@@ -345,7 +345,7 @@ func (s *SearchService) ocrSearch(query string, limit int, filters SearchFilters
 	q := `
 SELECT a.id, a.file_path, a.file_size, COALESCE(a.mime_type,''),
        COALESCE(a.original_name,''), a.taken_at, a.duration_ms,
-       COALESCE(a.live_photo_video_id,''), a.is_live_photo_video, EXISTS(SELECT 1 FROM asset_ocr ocr WHERE ocr.asset_id=a.id AND ocr.text<>'' AND COALESCE(ocr.coverage,1)>=0.05 AND COALESCE(ocr.line_count,0)>=8),
+       COALESCE(a.live_photo_video_id,''), a.is_live_photo_video, ` + hasOcrExpr + `,
        a.indexed_at, a.status, e.latitude, e.longitude, 0.0 AS distance
 FROM asset_ocr o
 JOIN assets a ON a.id = o.asset_id
@@ -515,7 +515,7 @@ func (s *SearchService) Timeline(userID string) ([]TimelineGroup, error) {
 	rows, err := s.db.Query(`
 SELECT a.id, a.file_path, a.file_size, COALESCE(a.mime_type,''),
        COALESCE(a.original_name,''), a.taken_at, a.duration_ms,
-       COALESCE(a.live_photo_video_id,''), a.is_live_photo_video, EXISTS(SELECT 1 FROM asset_ocr ocr WHERE ocr.asset_id=a.id AND ocr.text<>'' AND COALESCE(ocr.coverage,1)>=0.05 AND COALESCE(ocr.line_count,0)>=8),
+       COALESCE(a.live_photo_video_id,''), a.is_live_photo_video, ` + hasOcrExpr + `,
        a.indexed_at, a.status,
        e.width, e.height, e.latitude, e.longitude, e.make, e.model,
        e.iso, e.shutter_speed, e.aperture, e.focal_length, e.orientation,
@@ -570,7 +570,7 @@ func (s *SearchService) PersonAssets(personID string, limit, offset int) ([]Asse
 	rows, err := s.db.Query(`
 SELECT DISTINCT a.id, a.file_path, a.file_size, COALESCE(a.mime_type,''),
        COALESCE(a.original_name,''), a.taken_at, a.duration_ms,
-       COALESCE(a.live_photo_video_id,''), a.is_live_photo_video, EXISTS(SELECT 1 FROM asset_ocr ocr WHERE ocr.asset_id=a.id AND ocr.text<>'' AND COALESCE(ocr.coverage,1)>=0.05 AND COALESCE(ocr.line_count,0)>=8),
+       COALESCE(a.live_photo_video_id,''), a.is_live_photo_video, ` + hasOcrExpr + `,
        a.indexed_at, a.status
 FROM assets a
 JOIN face_detections fd ON fd.asset_id = a.id
@@ -701,7 +701,7 @@ func (s *SearchService) ListAssets(userID string, limit, offset int, filters ...
 	q := `
 SELECT a.id, a.file_path, a.file_size, COALESCE(a.mime_type,''),
        COALESCE(a.original_name,''), a.taken_at, a.duration_ms,
-       COALESCE(a.live_photo_video_id,''), a.is_live_photo_video, EXISTS(SELECT 1 FROM asset_ocr ocr WHERE ocr.asset_id=a.id AND ocr.text<>'' AND COALESCE(ocr.coverage,1)>=0.05 AND COALESCE(ocr.line_count,0)>=8),
+       COALESCE(a.live_photo_video_id,''), a.is_live_photo_video, ` + hasOcrExpr + `,
        a.indexed_at, a.status,
        e.width, e.height, e.latitude, e.longitude, e.make, e.model,
        e.iso, e.shutter_speed, e.aperture, e.focal_length, e.orientation,
@@ -741,7 +741,7 @@ func (s *SearchService) listAssetsByIDs(userID string, ids []string) ([]Asset, e
 	q := `
 SELECT a.id, a.file_path, a.file_size, COALESCE(a.mime_type,''),
        COALESCE(a.original_name,''), a.taken_at, a.duration_ms,
-       COALESCE(a.live_photo_video_id,''), a.is_live_photo_video, EXISTS(SELECT 1 FROM asset_ocr ocr WHERE ocr.asset_id=a.id AND ocr.text<>'' AND COALESCE(ocr.coverage,1)>=0.05 AND COALESCE(ocr.line_count,0)>=8),
+       COALESCE(a.live_photo_video_id,''), a.is_live_photo_video, ` + hasOcrExpr + `,
        a.indexed_at, a.status,
        e.width, e.height, e.latitude, e.longitude, e.make, e.model,
        e.iso, e.shutter_speed, e.aperture, e.focal_length, e.orientation,
@@ -779,7 +779,7 @@ func (s *SearchService) GetAsset(userID, id string) (*Asset, error) {
 	rows, err := s.db.Query(`
 SELECT a.id, a.file_path, a.file_size, COALESCE(a.mime_type,''),
        COALESCE(a.original_name,''), a.taken_at, a.duration_ms,
-       COALESCE(a.live_photo_video_id,''), a.is_live_photo_video, EXISTS(SELECT 1 FROM asset_ocr ocr WHERE ocr.asset_id=a.id AND ocr.text<>'' AND COALESCE(ocr.coverage,1)>=0.05 AND COALESCE(ocr.line_count,0)>=8),
+       COALESCE(a.live_photo_video_id,''), a.is_live_photo_video, ` + hasOcrExpr + `,
        a.indexed_at, a.status,
        e.width, e.height, e.latitude, e.longitude, e.make, e.model,
        e.iso, e.shutter_speed, e.aperture, e.focal_length, e.orientation,

@@ -271,7 +271,7 @@ func (s *SmartViewService) MatchedAssets(id string, limit, offset int, recent bo
 	// ISO "T...Z" / "+00:00" (driver-written time.Time) datetime encodings.
 	q := `SELECT a.id, a.file_path, a.file_size, COALESCE(a.mime_type,''),
 	       COALESCE(a.original_name,''), a.taken_at, a.duration_ms,
-	       COALESCE(a.live_photo_video_id,''), a.is_live_photo_video, EXISTS(SELECT 1 FROM asset_ocr ocr WHERE ocr.asset_id=a.id AND ocr.text<>'' AND COALESCE(ocr.coverage,1)>=0.05 AND COALESCE(ocr.line_count,0)>=8),
+	       COALESCE(a.live_photo_video_id,''), a.is_live_photo_video, ` + hasOcrExpr + `,
 	       a.indexed_at, a.status, m.match_score,
 	       (v.last_viewed_at IS NULL OR julianday(v.last_viewed_at) < julianday(m.matched_at))
 	FROM smart_view_matches m JOIN assets a ON a.id=m.asset_id

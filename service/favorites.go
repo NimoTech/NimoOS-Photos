@@ -85,7 +85,7 @@ func (s *FavoritesService) List(userID string, opts ListFavoritesOpts) ([]Asset,
 	q := `
 SELECT a.id, a.file_path, a.file_size, COALESCE(a.mime_type,''),
        COALESCE(a.original_name,''), a.taken_at, a.duration_ms,
-       COALESCE(a.live_photo_video_id,''), a.is_live_photo_video, EXISTS(SELECT 1 FROM asset_ocr ocr WHERE ocr.asset_id=a.id AND ocr.text<>'' AND COALESCE(ocr.coverage,1)>=0.05 AND COALESCE(ocr.line_count,0)>=8),
+       COALESCE(a.live_photo_video_id,''), a.is_live_photo_video, ` + hasOcrExpr + `,
        a.indexed_at, a.status,
        e.width, e.height, e.latitude, e.longitude, e.make, e.model,
        e.iso, e.shutter_speed, e.aperture, e.focal_length, e.orientation,
@@ -193,7 +193,7 @@ func (s *FavoritesService) Top(userID string, limit int) ([]Asset, error) {
 	q := `
 SELECT a.id, a.file_path, a.file_size, COALESCE(a.mime_type,''),
        COALESCE(a.original_name,''), a.taken_at, a.duration_ms,
-       COALESCE(a.live_photo_video_id,''), a.is_live_photo_video, EXISTS(SELECT 1 FROM asset_ocr ocr WHERE ocr.asset_id=a.id AND ocr.text<>'' AND COALESCE(ocr.coverage,1)>=0.05 AND COALESCE(ocr.line_count,0)>=8),
+       COALESCE(a.live_photo_video_id,''), a.is_live_photo_video, ` + hasOcrExpr + `,
        a.indexed_at, a.status,
        e.width, e.height, e.latitude, e.longitude, e.make, e.model,
        e.iso, e.shutter_speed, e.aperture, e.focal_length, e.orientation,

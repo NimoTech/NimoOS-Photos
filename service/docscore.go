@@ -186,3 +186,9 @@ func docVerdict(semMargin, geo float64) bool {
 	// 不改变判定语义——真正明确低于 floor 的分数差距远超此容差。
 	return docWSem()*sem+docWGeo()*geo >= docScoreFloor()-1e-9
 }
+
+// hasOcrExpr 是「OCR/文档」分类的唯一判据 SQL 片段(SELECT 列位置,依赖外层
+// 别名 a)。is_doc 已算(0/1)时直接采用——0 表示密度候选闸通过但被混合判据
+// 否决;NULL(未算/补算中/ML 长期离线)回退旧密度双阈值,行为与本功能上线前
+// 逐张一致,平滑降级。11 处查询共用本常量;调阈值只改 docscore.go 一处。
+const hasOcrExpr = `EXISTS(SELECT 1 FROM asset_ocr ocr WHERE ocr.asset_id=a.id AND COALESCE(ocr.is_doc, CASE WHEN ocr.text<>'' AND COALESCE(ocr.coverage,1)>=0.05 AND COALESCE(ocr.line_count,0)>=8 THEN 1 ELSE 0 END)=1)`
