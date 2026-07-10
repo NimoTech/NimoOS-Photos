@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/NimoTech/NimoOS-Photos/pkg/geo"
@@ -80,7 +81,7 @@ ORDER BY cnt DESC`)
 		if p.Trips > maxTrips {
 			maxTrips = p.Trips
 		}
-		p.Thumbs = s.recentThumbs(cityID, 12)
+		p.Thumbs = s.coverThumbs(cityID, 12)
 		regionCounts[region]++
 		countries[country] = struct{}{}
 		tmps = append(tmps, tmp{p: p})
@@ -117,6 +118,30 @@ SELECT a.id FROM asset_geo g
 JOIN assets a ON a.id=g.asset_id AND a.deleted_at IS NULL AND a.offline=0 AND a.is_live_photo_video=0
 WHERE g.city_id=?
 ORDER BY a.taken_at DESC
+LIMIT ?`, cityID, n)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var id string
+		if rows.Scan(&id) == nil {
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
+// coverThumbs 返回一个城市用于卡片封面/马赛克的资产 id:美学分优先,
+// 未打分的排最后按时间倒序兜底。用户手动覆盖(place_cover_overrides)在路由层
+// 另行叠加,不经过这里。
+func (s *PlacesService) coverThumbs(cityID int32, n int) []string {
+	rows, err := s.db.Query(`
+SELECT a.id FROM asset_geo g
+JOIN assets a ON a.id=g.asset_id AND a.deleted_at IS NULL AND a.offline=0 AND a.is_live_photo_video=0
+WHERE g.city_id=?
+ORDER BY (a.aesthetic_score IS NULL) ASC, a.aesthetic_score DESC, a.taken_at DESC
 LIMIT ?`, cityID, n)
 	if err != nil {
 		return nil
@@ -360,6 +385,30 @@ ORDER BY a.taken_at DESC`, cityID)
 	return clusters
 }
 
+// bestByAesthetic 在给定资产 id 集中选美学分最高者;全 NULL/查询失败返回 ""。
+func (s *PlacesService) bestByAesthetic(ids []string) string {
+	if len(ids) == 0 {
+		return ""
+	}
+	// 簇成员通常几十以内;超长时只取前 500 防止 SQL 变量上限。
+	if len(ids) > 500 {
+		ids = ids[:500]
+	}
+	ph := strings.Repeat("?,", len(ids)-1) + "?"
+	args := make([]any, len(ids))
+	for i, id := range ids {
+		args[i] = id
+	}
+	var best string
+	err := s.db.QueryRow(`SELECT id FROM assets WHERE id IN (`+ph+`)
+	    AND aesthetic_score IS NOT NULL
+	    ORDER BY aesthetic_score DESC LIMIT 1`, args...).Scan(&best)
+	if err != nil {
+		return ""
+	}
+	return best
+}
+
 func (s *PlacesService) spots(cityID int32) []Spot {
 	clusters := s.clusterCity(cityID)
 
@@ -374,6 +423,10 @@ func (s *PlacesService) spots(cityID int32) []Spot {
 			n++
 			name = fmt.Sprintf("Spot %d", n)
 		}
+		thumb := s.bestByAesthetic(c.ids)
+		if thumb == "" {
+			thumb = c.firstID // 全未打分:退回最新一张(原行为)
+		}
 		spots = append(spots, Spot{
 			// Key derived from the centroid rounded to spotGrid so it stays stable
 			// across recomputes (used for spot dialogs and name overrides).
@@ -382,7 +435,7 @@ func (s *PlacesService) spots(cityID int32) []Spot {
 			Lat:   c.cLat,
 			Lon:   c.cLon,
 			Count: c.count,
-			Thumb: c.firstID,
+			Thumb: thumb,
 		})
 	}
 	sort.Slice(spots, func(i, j int) bool { return spots[i].Count > spots[j].Count })
