@@ -917,11 +917,11 @@ func (ix *Indexer) processFileInternal(path string, opts processOpts) (success b
 	// 及启动补跑并发安全。
 	if isVideo && durationMs > 0 {
 		spritePath := filepath.Join(ix.thumbDir, assetID, "sprite.jpg")
-		go func(src, out string, dur int64) {
+		go func(src, out string, dur int64, id string) {
 			if _, err := ix.sprites.Ensure(src, out, dur); err != nil {
-				zap.L().Warn("sprite 预生成失败", zap.String("asset_id", assetID), zap.Error(err))
+				zap.L().Warn("sprite 预生成失败", zap.String("asset_id", id), zap.Error(err))
 			}
-		}(path, spritePath, durationMs)
+		}(path, spritePath, durationMs, assetID)
 	}
 
 	// 9. ML inference (only when ML service is ready).
