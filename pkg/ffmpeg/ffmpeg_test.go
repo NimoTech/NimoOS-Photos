@@ -79,6 +79,44 @@ func TestGenerateSpriteRejectsZeroDuration(t *testing.T) {
 	require.Error(t, ffmpeg.GenerateSprite("/any.mp4", "/tmp/x.jpg", 10, 0))
 }
 
+func TestGeneratePreviewProducesLowBitrateH264(t *testing.T) {
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		t.Skip("ffmpeg not found in PATH")
+	}
+	if _, err := exec.LookPath("ffprobe"); err != nil {
+		t.Skip("ffprobe not found in PATH")
+	}
+	dir := t.TempDir()
+	// 造一个带音轨的 3 秒测试视频，这样才能断言 -an 真的去掉了音频。
+	src := filepath.Join(dir, "src.mp4")
+	mk := exec.Command("ffmpeg", "-hide_banner", "-loglevel", "error",
+		"-f", "lavfi", "-i", "testsrc=duration=3:size=640x480:rate=25",
+		"-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
+		"-shortest", "-y", src)
+	require.NoError(t, mk.Run())
+	srcInfo, err := ffmpeg.Probe(src)
+	require.NoError(t, err)
+	require.NotEmpty(t, srcInfo.AudioCodec, "fixture source should carry an audio stream")
+
+	out := filepath.Join(dir, "sub", "preview.mp4") // 子目录不存在，验证自动建目录
+	require.NoError(t, ffmpeg.GeneratePreview(src, out))
+
+	info, err := ffmpeg.Probe(out)
+	require.NoError(t, err)
+	require.Equal(t, "h264", info.VideoCodec)
+	require.Empty(t, info.AudioCodec, "-an should strip the audio track")
+	require.True(t, info.Width == 240 || info.Height == 240,
+		"one side should be 240 (short-edge scale): got %dx%d", info.Width, info.Height)
+	require.InDelta(t, 15, info.FrameRate, 1.0)
+}
+
+func TestGeneratePreviewNonexistentSource(t *testing.T) {
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		t.Skip("ffmpeg not found in PATH")
+	}
+	require.Error(t, ffmpeg.GeneratePreview("/nonexistent/path/video.mp4", filepath.Join(t.TempDir(), "preview.mp4")))
+}
+
 func TestParseISO6709(t *testing.T) {
 	cases := []struct {
 		in       string

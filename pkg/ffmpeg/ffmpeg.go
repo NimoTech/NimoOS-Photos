@@ -156,6 +156,54 @@ const (
 	spriteJPEGQuality = 90
 )
 
+// GeneratePreview transcodes videoPath into a low-bitrate, real-playback
+// hover preview: 240p short edge, 15fps, H.264, no audio, muxed into an MP4
+// with a faststart moov atom. Unlike the sprite (a frame-tile JPEG for
+// scrubbing without a video element), this is a real `<video>` source, so the
+// -g 15 (1s keyframe interval) matters — the frontend seeks into it while
+// scrubbing and needs every second to be a keyframe to stay responsive.
+// yuv420p normalizes chroma subsampling for browser compatibility (HEVC/10bit
+// sources are transcoded to H.264 8bit alongside). CPU software encode
+// (libx264 veryfast) — measured ~15x realtime on a modest desktop CPU, so
+// QSV/VAAPI hardware encode is unneeded (and on this hardware's driver,
+// outright broken for 240p output).
+//
+// Like GenerateSprite, the file is written to a temp path and atomically
+// renamed, so concurrent generations and crashes never leave a partial
+// preview.
+func GeneratePreview(videoPath, outPath string) error {
+	if err := os.MkdirAll(filepath.Dir(outPath), 0o755); err != nil {
+		return fmt.Errorf("GeneratePreview: mkdir: %w", err)
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(outPath), ".preview-*.mp4")
+	if err != nil {
+		return fmt.Errorf("GeneratePreview: temp: %w", err)
+	}
+	tmpPath := tmp.Name()
+	tmp.Close()
+	defer os.Remove(tmpPath) // no-op after a successful rename
+
+	cmd := exec.Command("ffmpeg",
+		"-y", "-v", "error",
+		"-i", videoPath,
+		"-vf", "scale=w=240:h=240:force_original_aspect_ratio=increase:force_divisible_by=2",
+		"-r", "15",
+		"-an",
+		"-c:v", "libx264",
+		"-preset", "veryfast",
+		"-crf", "30",
+		"-g", "15",
+		"-pix_fmt", "yuv420p",
+		"-movflags", "+faststart",
+		tmpPath,
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("ffmpeg GeneratePreview: %w — %s", err, string(out)) // wraps exec.ErrNotFound when ffmpeg is missing
+	}
+	return os.Rename(tmpPath, outPath)
+}
+
 // extractFrameAt fast-seeks to ts seconds and returns one frame scaled to
 // width 240 (height auto, native aspect, autorotated). It pipes a PNG out of
 // ffmpeg (lossless, so the only lossy step is the final sprite JPEG encode).

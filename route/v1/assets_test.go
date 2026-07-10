@@ -5,15 +5,23 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/NimoTech/NimoOS-Photos/service"
 	"github.com/labstack/echo/v4"
 )
 
 // assetsStubServices embeds service.Services (nil) so only the methods
 // actually called by the tested code paths need to be implemented.
 // For invalid-key tests the handler returns before calling Search(), so
-// we do not need a real SearchService.
+// we do not need a real SearchService. Indexer() must still return a real
+// *service.Indexer (rather than falling through to the nil embed) because
+// NewAssetsHandler now sources its SpriteGenerator from svc.Indexer().Sprites()
+// (the generator is shared with the Indexer to dedupe concurrent ffmpeg runs).
 type assetsStubServices struct {
 	placesStubServices // reuse the embedded service.Services nil stub
+}
+
+func (s assetsStubServices) Indexer() *service.Indexer {
+	return service.NewIndexer(nil, nil, "", 1)
 }
 
 func newAssetsHandler(t *testing.T) *AssetsHandler {

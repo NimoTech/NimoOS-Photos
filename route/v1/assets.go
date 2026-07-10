@@ -25,11 +25,14 @@ type AssetsHandler struct {
 
 // NewAssetsHandler constructs an AssetsHandler.
 // thumbDir is the filesystem directory that contains <id>/small.jpg and <id>/large.jpg.
+// sprites is shared with the Indexer (index-time inline pregeneration and the
+// startup backfill) so all three writers dedupe through one in-flight table
+// and never race on the same output file.
 func NewAssetsHandler(svc service.Services, thumbDir string) *AssetsHandler {
 	return &AssetsHandler{
 		svc:      svc,
 		thumbDir: thumbDir,
-		sprites:  service.NewSpriteGenerator(),
+		sprites:  svc.Indexer().Sprites(),
 	}
 }
 
@@ -82,6 +85,40 @@ func (h *AssetsHandler) Sprite(c echo.Context) error {
 	hdr.Set("X-Sprite-Duration-Ms", strconv.FormatInt(durationMs, 10))
 	hdr.Set("Cache-Control", "max-age=604800")
 	return c.File(spritePath)
+}
+
+// Preview serves (and lazily generates) the low-bitrate real-playback hover
+// preview (240p/15fps/H.264, no audio) for a video. Mirrors Sprite's
+// structure but needs no duration (GeneratePreview has no fps expression
+// that depends on it). c.File's underlying http.ServeContent gives the
+// <video> element Range support for free — do not read the file into memory
+// and write it out manually, that would drop Range/206 handling.
+func (h *AssetsHandler) Preview(c echo.Context) error {
+	asset, err := h.svc.Search().GetAsset(JWTUserID(c), c.Param("id"))
+	if errors.Is(err, service.ErrNotFound) {
+		return echo.NewHTTPError(http.StatusNotFound)
+	}
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	}
+	if !strings.HasPrefix(asset.MimeType, "video/") {
+		return echo.NewHTTPError(http.StatusNotFound, "not a video")
+	}
+
+	if _, serr := os.Stat(asset.FilePath); serr != nil {
+		return echo.NewHTTPError(http.StatusNotFound, "source missing")
+	}
+
+	previewPath := filepath.Join(h.thumbDir, asset.ID, "preview.mp4")
+	if perr := h.sprites.EnsurePreview(asset.FilePath, previewPath); perr != nil {
+		if errors.Is(perr, exec.ErrNotFound) {
+			return echo.NewHTTPError(http.StatusServiceUnavailable, "ffmpeg unavailable")
+		}
+		return echo.NewHTTPError(http.StatusServiceUnavailable, perr.Error())
+	}
+
+	c.Response().Header().Set("Cache-Control", "max-age=604800")
+	return c.File(previewPath)
 }
 
 // List returns a paginated list of assets.

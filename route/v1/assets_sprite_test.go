@@ -15,22 +15,31 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// fakeSpriteSvc embeds service.Services and overrides only Search(), the one
-// method the Sprite handler uses. (Same pattern as favorites_test.go; named
+// fakeSpriteSvc embeds service.Services and overrides Search() (the one method
+// the Sprite handler calls directly) and Indexer() (source of the shared
+// SpriteGenerator: NewAssetsHandler now takes sprites from svc.Indexer().Sprites()
+// instead of self-constructing, so the harness must supply a real Indexer whose
+// thumbDir matches the handler's thumbDir — same instance, no duplicate
+// generator/no dedup-table split). (Same pattern as favorites_test.go; named
 // differently to avoid colliding with that file's fakeServices in package v1_test.)
 type fakeSpriteSvc struct {
 	service.Services
-	search *service.SearchService
+	search  *service.SearchService
+	indexer *service.Indexer
 }
 
 func (f *fakeSpriteSvc) Search() *service.SearchService { return f.search }
+func (f *fakeSpriteSvc) Indexer() *service.Indexer      { return f.indexer }
 
 func newSpriteHarness(t *testing.T) (*v1.AssetsHandler, *sql.DB, func()) {
 	t.Helper()
 	thumb := t.TempDir()
 	db, err := sqlite.Open(filepath.Join(t.TempDir(), "t.db"))
 	require.NoError(t, err)
-	svc := &fakeSpriteSvc{search: service.NewSearchService(db, nil)}
+	svc := &fakeSpriteSvc{
+		search:  service.NewSearchService(db, nil),
+		indexer: service.NewIndexer(db, nil, thumb, 1),
+	}
 	h := v1.NewAssetsHandler(svc, thumb)
 	return h, db, func() { db.Close() }
 }
