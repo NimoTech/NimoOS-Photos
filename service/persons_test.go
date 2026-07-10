@@ -1304,3 +1304,43 @@ func TestPersonHeroAestheticFallback(t *testing.T) {
 	require.Len(t, list2, 1)
 	require.Equal(t, "hf-a1", list2[0].HeroAssetID)
 }
+
+// TestRecomputeOneCentroid_AllFacesIncomparable_FallbackPicksValidFace 是一个回归测试:
+// 封面选优主路径(混合分)全不可比时,会退回质心最近的兜底循环。构造两张完全反向的
+// 单位向量脸——质心因此退化为零向量,cosDist(v, centroid) 对零向量恒返回 1.0——
+// 验证兜底循环最终仍落在合法脸索引上而不 panic(修复前 best 初值为 -1,理论边界下
+// 若循环体一次都不更新 best,会以 -1 越界访问 faceIDs/assetIDs)。
+func TestRecomputeOneCentroid_AllFacesIncomparable_FallbackPicksValidFace(t *testing.T) {
+	db := makeTestFaceDB(t)
+	dim := 512
+
+	// f1: 沿 dim0 的单位向量。
+	v1 := make([]float32, dim)
+	v1[0] = 1.0
+	// f2: 与 f1 完全反向的单位向量;二者质心退化为零向量。
+	v2 := make([]float32, dim)
+	v2[0] = -1.0
+
+	f1 := insertAssetFace(t, db, "rc-a1", v1)
+	f2 := insertAssetFace(t, db, "rc-a2", v2)
+
+	// 手动建人物 + 成员关系,跳过 RunClustering:两张脸 cosDist=2.0,远超 DBSCAN
+	// epsilon,天然不会被聚成同一人物,这里直接用 SQL 拼出「同一人物下全不可比」场景。
+	personID := "rc-person"
+	_, err := db.Exec(`INSERT INTO persons(id, name) VALUES(?, '')`, personID)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO face_person(face_id, person_id) VALUES(?, ?), (?, ?)`,
+		f1, personID, f2, personID)
+	require.NoError(t, err)
+
+	// 两张脸均无美学分/EXIF 尺寸 → hybridCoverScore 全部返回 -1,全不可比,
+	// 触发质心兜底循环。
+	ps := service.NewPersonService(db)
+	newFace, err := ps.UnlockPersonCover(personID)
+	require.NoError(t, err, "全不可比场景下不应 panic 或报错")
+	require.Contains(t, []string{f1, f2}, newFace, "应落在成员脸之一,而非越界索引")
+
+	var coverAsset string
+	require.NoError(t, db.QueryRow(`SELECT cover_asset_id FROM persons WHERE id=?`, personID).Scan(&coverAsset))
+	require.Contains(t, []string{"rc-a1", "rc-a2"}, coverAsset)
+}

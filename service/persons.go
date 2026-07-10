@@ -877,6 +877,9 @@ WHERE fp.person_id=? AND fd.excluded=0`, personID)
 		}
 	}
 	if bestHybrid < 0 {
+		// best 先置 0 兜底：理论边界下若所有脸 cosDist 恰好等于初始 bestDist(2.0)（严格小于判断永不成立），
+		// 循环体不会再更新 best，此时仍需落在合法脸索引上，避免下方 faceIDs[best] 越界 panic。
+		best = 0
 		bestDist := 2.0
 		for i, v := range vecs {
 			if d := cosDist(v, centroid); d < bestDist {
