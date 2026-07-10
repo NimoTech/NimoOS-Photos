@@ -70,6 +70,7 @@ func InitRouter(ctx context.Context, svc service.Services, runtimePath string, t
 				strings.HasSuffix(p, "/original") ||
 				strings.HasSuffix(p, "/live") ||
 				strings.HasSuffix(p, "/sprite") ||
+				strings.HasSuffix(p, "/preview") ||
 				strings.HasSuffix(p, "/favorites/export") {
 				return true
 			}
@@ -125,6 +126,7 @@ func InitRouter(ctx context.Context, svc service.Services, runtimePath string, t
 	g.GET("/assets/:id/original", assets.Original)
 	g.GET("/assets/:id/live", assets.Live)
 	g.GET("/assets/:id/sprite", assets.Sprite)
+	g.GET("/assets/:id/preview", assets.Preview)
 	g.GET("/assets/:id/ocr", assets.OCRLines)
 
 	// Search endpoints

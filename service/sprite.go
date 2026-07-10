@@ -77,8 +77,12 @@ func SpriteFrameCountFromFile(path string) (int, error) {
 	return fc, err
 }
 
-// SpriteGenerator lazily generates hover-preview sprites with a global
-// concurrency cap and per-output deduplication.
+// SpriteGenerator lazily generates hover-preview artifacts — the frame-tile
+// sprite JPEG and the low-bitrate real-playback preview MP4 — with a global
+// concurrency cap and per-output deduplication. The semaphore is shared
+// across both artifact kinds (global concurrent ffmpeg processes stay ≤2
+// regardless of which one is being built); letting both run unbounded would
+// let ffmpeg starve the rest of the box.
 type SpriteGenerator struct {
 	sem      chan struct{}
 	mu       sync.Mutex
@@ -92,12 +96,14 @@ func NewSpriteGenerator() *SpriteGenerator {
 	}
 }
 
-// Ensure makes sure outPath holds a sprite for srcPath, generating it on demand.
-// durationMs must be > 0 (caller resolves it). Returns the frame count used.
-func (g *SpriteGenerator) Ensure(srcPath, outPath string, durationMs int64) (int, error) {
-	fc := SpriteFrameCount(durationMs)
+// ensure is the common core shared by Ensure and EnsurePreview: outPath
+// already existing is a fast success; otherwise the first caller for a given
+// outPath runs build() while later callers for the same outPath wait on it
+// (per-output in-flight dedup), all gated by the shared semaphore so global
+// concurrent ffmpeg invocations stay bounded.
+func (g *SpriteGenerator) ensure(outPath string, build func() error) error {
 	if _, err := os.Stat(outPath); err == nil {
-		return fc, nil
+		return nil
 	}
 
 	// Per-output dedup: the first caller leads generation; others wait, then
@@ -107,9 +113,9 @@ func (g *SpriteGenerator) Ensure(srcPath, outPath string, durationMs int64) (int
 		g.mu.Unlock()
 		<-ch
 		if _, err := os.Stat(outPath); err == nil {
-			return fc, nil
+			return nil
 		}
-		return 0, errors.New("sprite generation failed (joined leader)")
+		return errors.New("generation failed (joined leader)")
 	}
 	ch := make(chan struct{})
 	g.inflight[outPath] = ch
@@ -124,8 +130,28 @@ func (g *SpriteGenerator) Ensure(srcPath, outPath string, durationMs int64) (int
 	g.sem <- struct{}{}
 	defer func() { <-g.sem }()
 
-	if err := ffmpeg.GenerateSprite(srcPath, outPath, fc, float64(durationMs)/1000.0); err != nil {
+	return build()
+}
+
+// Ensure makes sure outPath holds a sprite for srcPath, generating it on demand.
+// durationMs must be > 0 (caller resolves it). Returns the frame count used.
+func (g *SpriteGenerator) Ensure(srcPath, outPath string, durationMs int64) (int, error) {
+	fc := SpriteFrameCount(durationMs)
+	err := g.ensure(outPath, func() error {
+		return ffmpeg.GenerateSprite(srcPath, outPath, fc, float64(durationMs)/1000.0)
+	})
+	if err != nil {
 		return 0, err
 	}
 	return fc, nil
+}
+
+// EnsurePreview makes sure outPath holds a low-bitrate real-playback preview
+// (240p/15fps/H.264, no audio) for srcPath, generating it on demand. Unlike
+// Ensure it needs no duration — GeneratePreview has no fps expression that
+// depends on it.
+func (g *SpriteGenerator) EnsurePreview(srcPath, outPath string) error {
+	return g.ensure(outPath, func() error {
+		return ffmpeg.GeneratePreview(srcPath, outPath)
+	})
 }
