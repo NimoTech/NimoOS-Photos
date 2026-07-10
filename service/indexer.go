@@ -1578,13 +1578,16 @@ func (ix *Indexer) BackfillSprites(ctx context.Context) {
 		return
 	}
 
-	var spritesGenerated, previewsGenerated, skipped int
+	// sourceMissing 仅统计"源视频文件缺失"（os.Stat 失败）而整条候选被跳过的
+	// 数量；sprite.jpg / preview.mp4 是否已存在则各自在下面独立 os.Stat 判断，
+	// 不计入这个计数器（对应 spritesGenerated / previewsGenerated 未增长的隐含语义）。
+	var spritesGenerated, previewsGenerated, sourceMissing int
 	for _, c := range candidates {
 		if ctx.Err() != nil {
 			return
 		}
 		if _, statErr := os.Stat(c.filePath); statErr != nil {
-			skipped++
+			sourceMissing++
 			continue
 		}
 
@@ -1618,7 +1621,7 @@ func (ix *Indexer) BackfillSprites(ctx context.Context) {
 		zap.L().Info("sprite/preview 补跑完成",
 			zap.Int("sprites_generated", spritesGenerated),
 			zap.Int("previews_generated", previewsGenerated),
-			zap.Int("skipped", skipped))
+			zap.Int("source_missing", sourceMissing))
 	}
 }
 

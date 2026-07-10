@@ -8,9 +8,9 @@ import (
 	"strconv"
 	"strings"
 
-	commonUpload "github.com/NimoTech/NimoOS-Common/upload"
 	"github.com/NimoTech/NimoOS-Common/external"
 	"github.com/NimoTech/NimoOS-Common/middleware"
+	commonUpload "github.com/NimoTech/NimoOS-Common/upload"
 	"github.com/NimoTech/NimoOS-Common/utils/jwt"
 	"github.com/NimoTech/NimoOS-Photos/common"
 	v1 "github.com/NimoTech/NimoOS-Photos/route/v1"
@@ -20,6 +20,29 @@ import (
 	echo_middleware "github.com/labstack/echo/v4/middleware"
 	"go.uber.org/zap"
 )
+
+// mediaGetSkip reports whether a request may skip JWT because it targets a
+// read-only media-serving endpoint that <img>/<video> tags load without an
+// Authorization header (thumbnail/face-thumbnail/original/live/sprite/
+// preview/favorites/export). These are matched by PATH SUFFIX ONLY (Echo's
+// c.Path() is the route pattern, e.g. "/v1/photos/assets/:id/preview", and
+// does not encode the HTTP method), so this check MUST be GET-only:
+// method 前置校验不可省略 —— 否则会连带放行同后缀的写接口，例如
+// POST /v1/photos/smart-views/preview 会被误判命中 "/preview" 后缀而整体
+// 绕过 JWT 鉴权（复现过：无 Authorization 头的该 POST 请求返回 200）。
+// 媒体豁免名单里注册的路由全部是 GET，因此这里显式加 GET 前置条件兜底。
+func mediaGetSkip(method, path string) bool {
+	if method != http.MethodGet {
+		return false
+	}
+	return strings.HasSuffix(path, "/thumbnail") ||
+		strings.HasSuffix(path, "/face-thumbnail") ||
+		strings.HasSuffix(path, "/original") ||
+		strings.HasSuffix(path, "/live") ||
+		strings.HasSuffix(path, "/sprite") ||
+		strings.HasSuffix(path, "/preview") ||
+		strings.HasSuffix(path, "/favorites/export")
+}
 
 // mcpReadSkip reports whether a localhost caller may skip JWT on the read-only
 // photos endpoints the NimoOS-AI MCP server uses. Fail-closed + exact-match:
@@ -65,13 +88,7 @@ func InitRouter(ctx context.Context, svc service.Services, runtimePath string, t
 			if p == common.V1APIPath+"/version" {
 				return true
 			}
-			if strings.HasSuffix(p, "/thumbnail") ||
-				strings.HasSuffix(p, "/face-thumbnail") ||
-				strings.HasSuffix(p, "/original") ||
-				strings.HasSuffix(p, "/live") ||
-				strings.HasSuffix(p, "/sprite") ||
-				strings.HasSuffix(p, "/preview") ||
-				strings.HasSuffix(p, "/favorites/export") {
+			if mediaGetSkip(c.Request().Method, p) {
 				return true
 			}
 			// Allow localhost internal callers (NimoOS-AI MCP server) to skip JWT on

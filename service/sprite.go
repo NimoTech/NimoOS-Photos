@@ -1,7 +1,6 @@
 package service
 
 import (
-	"errors"
 	"fmt"
 	"image"
 	_ "image/jpeg" // register JPEG decoder for image.DecodeConfig
@@ -115,7 +114,7 @@ func (g *SpriteGenerator) ensure(outPath string, build func() error) error {
 		if _, err := os.Stat(outPath); err == nil {
 			return nil
 		}
-		return errors.New("generation failed (joined leader)")
+		return fmt.Errorf("generation failed (joined leader): %s", outPath)
 	}
 	ch := make(chan struct{})
 	g.inflight[outPath] = ch
