@@ -111,14 +111,6 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 	go taskReg.StartStaleSweeper(parentCtx, taskStaleTimeout, taskSweepInterval)
 	idx := NewIndexer(db, ml, thumbDir, cfg.Workers)
 	idx.SetTaskRegistry(taskReg)
-	// 美学评分头:加载失败只告警降级(功能整体不可用,分数留 NULL)。
-	if cfg.AestheticEnabled {
-		if head, err := aesthetic.Load(); err != nil {
-			zap.L().Warn("aesthetic: 内嵌头加载失败,评分功能停用", zap.Error(err))
-		} else {
-			idx.SetAestheticHead(head)
-		}
-	}
 	watcher := NewWatcher(db, cfg.WatchDirs, idx, liveDir)
 	albums := NewAlbumService(db)
 	// Wire post-index album assignment: uploads carrying an albumId join the
@@ -156,6 +148,24 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 			zap.L().Warn("post-recovery face pipeline failed", zap.Error(err))
 		}
 	})
+	// 美学评分头:加载失败只告警降级(功能整体不可用,分数留 NULL)。
+	if cfg.AestheticEnabled {
+		if head, err := aesthetic.Load(); err != nil {
+			zap.L().Warn("aesthetic: 内嵌头加载失败,评分功能停用", zap.Error(err))
+		} else {
+			idx.SetAestheticHead(head)
+			embedder.SetAestheticHead(head)
+			if err := EnsureAestheticHeadVer(db, head.Version()); err != nil {
+				zap.L().Warn("aesthetic: 头版本对齐失败", zap.Error(err))
+			}
+			// 启动即补扫:纯本地计算不等 ML 就绪(与 OCR 的关键差异)。
+			go func() {
+				if err := embedder.BackfillAesthetic(parentCtx); err != nil {
+					zap.L().Warn("aesthetic: 启动补扫失败", zap.Error(err))
+				}
+			}()
+		}
+	}
 
 	// MountGuard: 追踪 /media/* 可移动盘的挂载/拔出,维护 assets.offline。
 	// 回调用函数字段注入以避免与 Watcher/Indexer/Embedder 产生导入依赖:
@@ -198,6 +208,9 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 			}
 			if err := embedder.BackfillDocVerdicts(parentCtx); err != nil {
 				zap.L().Warn("post-batch doc verdict backfill failed", zap.Error(err))
+			}
+			if err := embedder.BackfillAesthetic(parentCtx); err != nil {
+				zap.L().Warn("post-batch aesthetic backfill failed", zap.Error(err))
 			}
 		}()
 		go func() {
