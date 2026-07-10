@@ -245,8 +245,12 @@ func (s *SmartViewService) fillStats(sv *SmartView) {
 		}
 	}
 
-	srows, err := s.db.Query(`SELECT asset_id FROM smart_view_matches
-		WHERE smart_view_id=? ORDER BY match_score DESC LIMIT 6`, sv.ID)
+	// Seeds 预览优先展示美学分高的资产(NULL 排最后),同美学分档次内再按匹配分排序。
+	srows, err := s.db.Query(`SELECT m.asset_id FROM smart_view_matches m
+		JOIN assets a ON a.id = m.asset_id
+		WHERE m.smart_view_id=?
+		ORDER BY (a.aesthetic_score IS NULL) ASC, a.aesthetic_score DESC,
+		         m.match_score DESC LIMIT 6`, sv.ID)
 	if err == nil {
 		for srows.Next() {
 			var aid string
