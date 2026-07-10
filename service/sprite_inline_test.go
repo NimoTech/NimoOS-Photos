@@ -12,9 +12,10 @@ import (
 )
 
 // TestProcessFileInternal_InlineSpritePregen 通过真实索引管线（Enqueue→Start
-// 的完整异步流程）验证 processFileInternal 第 8 步后触发的雪碧图预生成
-// goroutine：视频入库后应异步落地 <thumbDir>/<assetID>/sprite.jpg，不必等到
-// /sprite 路由的首次 hover 现场生成，也不依赖 BackfillSprites 补跑。
+// 的完整异步流程）验证 processFileInternal 第 8 步后触发的悬浮预览预生成
+// goroutine：视频入库后应异步落地 <thumbDir>/<assetID>/sprite.jpg 与
+// <thumbDir>/<assetID>/preview.mp4，不必等到 /sprite、/preview 路由的首次
+// hover 现场生成，也不依赖 BackfillSprites 补跑。
 //
 // 这条路径此前完全没有测试覆盖——sprite_backfill_test.go 只测 BackfillSprites
 // 补跑逻辑，sprite_test.go 只测生成器本身；indexer.go 里 fire-and-forget 的
@@ -54,4 +55,10 @@ func TestProcessFileInternal_InlineSpritePregen(t *testing.T) {
 		fi, err := os.Stat(spritePath)
 		return err == nil && fi.Size() > 0
 	}, 10*time.Second, 100*time.Millisecond, "视频入库应异步预生成悬浮雪碧图 sprite.jpg")
+
+	previewPath := filepath.Join(thumbDir, assetID, "preview.mp4")
+	require.Eventually(t, func() bool {
+		fi, err := os.Stat(previewPath)
+		return err == nil && fi.Size() > 0
+	}, 10*time.Second, 100*time.Millisecond, "视频入库应异步预生成悬浮预览视频 preview.mp4")
 }

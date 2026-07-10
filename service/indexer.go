@@ -911,17 +911,25 @@ func (ix *Indexer) processFileInternal(path string, opts processOpts) (success b
 		thumb.Generate(imagePath, assetID, ix.thumbDir) //nolint:errcheck
 	}
 
-	// 视频入库即异步预生成悬浮预览雪碧图:消除首次 hover 的 1-2 秒现场生成
-	// 空窗。best-effort,goroutine 阻塞在生成器信号量(并发≤2)上排队,失败
-	// 只记日志;Ensure 幂等(已存在秒退)且 in-flight 去重,与 /sprite 路由
-	// 及启动补跑并发安全。
-	if isVideo && durationMs > 0 {
+	// 视频入库即异步预生成悬浮预览产物(雪碧图 + 低码率预览视频):消除首次
+	// hover 的现场生成空窗。best-effort,goroutine 阻塞在生成器信号量(并发
+	// ≤2,两类产物共享)上排队,失败只记日志;ensure 核心幂等(已存在秒退)
+	// 且 in-flight 去重,与 /sprite、/preview 路由及启动补跑并发安全。
+	// sprite 仍以 dur>0 为前提(fps 表达式需要时长);preview 无此依赖,启动
+	// 条件放宽为 isVideo。
+	if isVideo {
+		previewPath := filepath.Join(ix.thumbDir, assetID, "preview.mp4")
 		spritePath := filepath.Join(ix.thumbDir, assetID, "sprite.jpg")
-		go func(src, out string, dur int64, id string) {
-			if _, err := ix.sprites.Ensure(src, out, dur); err != nil {
-				zap.L().Warn("sprite 预生成失败", zap.String("asset_id", id), zap.Error(err))
+		go func(src, previewOut, spriteOut string, dur int64, id string) {
+			if dur > 0 {
+				if _, err := ix.sprites.Ensure(src, spriteOut, dur); err != nil {
+					zap.L().Warn("sprite 预生成失败", zap.String("asset_id", id), zap.Error(err))
+				}
 			}
-		}(path, spritePath, durationMs, assetID)
+			if err := ix.sprites.EnsurePreview(src, previewOut); err != nil {
+				zap.L().Warn("preview 预生成失败", zap.String("asset_id", id), zap.Error(err))
+			}
+		}(path, previewPath, spritePath, durationMs, assetID)
 	}
 
 	// 9. ML inference (only when ML service is ready).
@@ -1552,9 +1560,12 @@ func spriteBackfillCandidates(db *sql.DB) ([]spriteCandidate, error) {
 	return out, rows.Err()
 }
 
-// BackfillSprites 为存量视频补生成悬浮预览雪碧图(启动时调用一次)。
-// CAS 防重入;顺序逐个生成(生成器信号量另有并发≤2 的全局上限);
-// ffmpeg 不存在(exec.ErrNotFound)时立即放弃整轮,避免逐条刷错误日志。
+// BackfillSprites 为存量视频补雪碧图与预览视频(启动时调用一次)。
+// CAS 防重入;顺序逐个生成(生成器信号量另有并发≤2 的全局上限,两类产物
+// 共享);ffmpeg 不存在(exec.ErrNotFound)时立即放弃整轮,避免逐条刷错误日志。
+// 候选查询仍以 duration_ms>0 过滤(时长未知的破损视频极罕见,交由路由端
+// 惰性兜底),两类产物在循环体内各自 os.Stat 判存在跳过(省函数调用,与
+// sprite 既有写法对齐;preview 侧 ensure 核心本身也天然幂等)。
 func (ix *Indexer) BackfillSprites(ctx context.Context) {
 	if !ix.spriteBackfillRunning.CompareAndSwap(false, true) {
 		return
@@ -1567,32 +1578,47 @@ func (ix *Indexer) BackfillSprites(ctx context.Context) {
 		return
 	}
 
-	var generated, skipped int
+	var spritesGenerated, previewsGenerated, skipped int
 	for _, c := range candidates {
 		if ctx.Err() != nil {
 			return
-		}
-		spritePath := filepath.Join(ix.thumbDir, c.id, "sprite.jpg")
-		if _, statErr := os.Stat(spritePath); statErr == nil {
-			skipped++
-			continue
 		}
 		if _, statErr := os.Stat(c.filePath); statErr != nil {
 			skipped++
 			continue
 		}
-		if _, err := ix.sprites.Ensure(c.filePath, spritePath, c.durationMs); err != nil {
-			if errors.Is(err, exec.ErrNotFound) {
-				zap.L().Warn("ffmpeg 不可用,放弃本轮 sprite 补跑", zap.Error(err))
-				return
+
+		spritePath := filepath.Join(ix.thumbDir, c.id, "sprite.jpg")
+		if _, statErr := os.Stat(spritePath); statErr != nil {
+			if _, err := ix.sprites.Ensure(c.filePath, spritePath, c.durationMs); err != nil {
+				if errors.Is(err, exec.ErrNotFound) {
+					zap.L().Warn("ffmpeg 不可用,放弃本轮 sprite/preview 补跑", zap.Error(err))
+					return
+				}
+				zap.L().Warn("sprite 补跑失败", zap.String("asset_id", c.id), zap.Error(err))
+			} else {
+				spritesGenerated++
 			}
-			zap.L().Warn("sprite 补跑失败", zap.String("asset_id", c.id), zap.Error(err))
-			continue
 		}
-		generated++
+
+		previewPath := filepath.Join(ix.thumbDir, c.id, "preview.mp4")
+		if _, statErr := os.Stat(previewPath); statErr != nil {
+			if err := ix.sprites.EnsurePreview(c.filePath, previewPath); err != nil {
+				if errors.Is(err, exec.ErrNotFound) {
+					zap.L().Warn("ffmpeg 不可用,放弃本轮 sprite/preview 补跑", zap.Error(err))
+					return
+				}
+				zap.L().Warn("preview 补跑失败", zap.String("asset_id", c.id), zap.Error(err))
+			} else {
+				previewsGenerated++
+			}
+		}
 	}
-	if generated > 0 {
-		zap.L().Info("sprite 补跑完成", zap.Int("generated", generated), zap.Int("skipped", skipped))
+	if spritesGenerated > 0 || previewsGenerated > 0 {
+		zap.L().Info("sprite/preview 补跑完成",
+			zap.Int("sprites_generated", spritesGenerated),
+			zap.Int("previews_generated", previewsGenerated),
+			zap.Int("skipped", skipped))
 	}
 }
 
