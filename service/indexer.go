@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"image"
 	_ "image/gif"
@@ -15,6 +16,7 @@ import (
 	"io/fs"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -179,10 +181,14 @@ type Indexer struct {
 	promptDoc   [][]float32
 	promptPhoto [][]float32
 
-	// sprites 是进程内共享的悬浮预览雪碧图生成器：索引管线内联预生成与
-	// /sprite 路由的现场生成必须共用同一实例，其 in-flight 去重才能防止
-	// 并发 ffmpeg 写同一输出文件。
+	// sprites 是进程内共享的悬浮预览雪碧图生成器：索引管线内联预生成、启动
+	// 补跑（BackfillSprites）与 /sprite 路由的现场生成必须共用同一实例，
+	// 其 in-flight 去重才能防止并发 ffmpeg 写同一输出文件。
 	sprites *SpriteGenerator
+
+	// spriteBackfillRunning 是 BackfillSprites 的 CAS 重入门闩：一次只允许
+	// 一轮存量补跑在跑，避免服务重启风暴或误触发导致多轮并发扫同一批候选。
+	spriteBackfillRunning atomic.Bool
 }
 
 // touch marks index activity (enqueue or a processed result) at the current time.
@@ -494,8 +500,9 @@ func NewIndexer(db *sql.DB, ml MLProvider, thumbDir string, workers int) *Indexe
 	}
 }
 
-// Sprites 返回进程内共享的雪碧图生成器：索引内联预生成与 /sprite 路由必须
-// 共用同一实例，其 in-flight 去重才能防止并发 ffmpeg 写同一输出文件。
+// Sprites 返回进程内共享的雪碧图生成器：索引内联预生成、启动补跑与
+// /sprite 路由必须共用同一实例，其 in-flight 去重才能防止并发 ffmpeg
+// 写同一输出文件。
 func (ix *Indexer) Sprites() *SpriteGenerator { return ix.sprites }
 
 // SetPendingAlbum registers that the file at path should be added to albumID
@@ -1511,6 +1518,82 @@ func (ix *Indexer) ScanPending() error {
 		ix.Enqueue(path)
 	}
 	return rows.Err()
+}
+
+// spriteCandidate is one row of the sprite-backfill candidate set: an indexed,
+// non-deleted video with a known duration.
+type spriteCandidate struct {
+	id         string
+	filePath   string
+	durationMs int64
+}
+
+// spriteBackfillCandidates selects existing videos still missing a hover-preview
+// sprite. Pure SQL filtering only — no stat, no generation — so it can be
+// exercised independently of ffmpeg/filesystem state in tests.
+func spriteBackfillCandidates(db *sql.DB) ([]spriteCandidate, error) {
+	rows, err := db.Query(`
+		SELECT id, file_path, COALESCE(duration_ms,0) FROM assets
+		WHERE mime_type LIKE 'video/%' AND status='indexed' AND deleted_at IS NULL
+		  AND COALESCE(duration_ms,0) > 0`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []spriteCandidate
+	for rows.Next() {
+		var c spriteCandidate
+		if err := rows.Scan(&c.id, &c.filePath, &c.durationMs); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// BackfillSprites 为存量视频补生成悬浮预览雪碧图(启动时调用一次)。
+// CAS 防重入;顺序逐个生成(生成器信号量另有并发≤2 的全局上限);
+// ffmpeg 不存在(exec.ErrNotFound)时立即放弃整轮,避免逐条刷错误日志。
+func (ix *Indexer) BackfillSprites(ctx context.Context) {
+	if !ix.spriteBackfillRunning.CompareAndSwap(false, true) {
+		return
+	}
+	defer ix.spriteBackfillRunning.Store(false)
+
+	candidates, err := spriteBackfillCandidates(ix.db)
+	if err != nil {
+		zap.L().Warn("sprite 补跑候选查询失败", zap.Error(err))
+		return
+	}
+
+	var generated, skipped int
+	for _, c := range candidates {
+		if ctx.Err() != nil {
+			return
+		}
+		spritePath := filepath.Join(ix.thumbDir, c.id, "sprite.jpg")
+		if _, statErr := os.Stat(spritePath); statErr == nil {
+			skipped++
+			continue
+		}
+		if _, statErr := os.Stat(c.filePath); statErr != nil {
+			skipped++
+			continue
+		}
+		if _, err := ix.sprites.Ensure(c.filePath, spritePath, c.durationMs); err != nil {
+			if errors.Is(err, exec.ErrNotFound) {
+				zap.L().Warn("ffmpeg 不可用,放弃本轮 sprite 补跑", zap.Error(err))
+				return
+			}
+			zap.L().Warn("sprite 补跑失败", zap.String("asset_id", c.id), zap.Error(err))
+			continue
+		}
+		generated++
+	}
+	if generated > 0 {
+		zap.L().Info("sprite 补跑完成", zap.Int("generated", generated), zap.Int("skipped", skipped))
+	}
 }
 
 // MLReady reports whether the ML backend (immich-machine-learning) is reachable.
