@@ -1573,10 +1573,13 @@ func spriteBackfillCandidates(db *sql.DB) ([]spriteCandidate, error) {
 // 预览」任务——单条上传的内联预生成秒级完成,不会被这里捕获(prescan 时已经
 // 齐备),维持不发任务的现状。current 每处理完一条候选(无论生成、跳过还是
 // join 复用)就 +1 并 Upsert,由 registry 自身节流发布频率。ffmpeg 缺失时整
-// 轮放弃并把任务标为 error 终态;个别视频生成失败不中断整轮,结束时若有失败
-// 则任务终态同样标为 error(TaskErrPreviewPartialFailed),否则 done。ctx 取消
-// 时不发任何终态,任务留在 running,交给 registry 的停滞清扫器兜底收尾——与
-// faces.go RunPipeline 对中断的处理方式一致。
+// 轮放弃并把任务标为 error 终态;个别视频生成失败不中断整轮,对齐 BackfillOCR
+// 的既有惯例(见 embedder.go backfillOCROnce):只有全部候选都处理失败才把任务
+// 终态标为 error(TaskErrPreviewPartialFailed),否则(含部分失败)终态为 done、
+// 失败数计入汇总日志——一条永久损坏的视频每轮补跑都会失败,若按"出现失败就
+// error"处理,任务栏会持续弹 Failed 造成噪音。ctx 取消时不发任何终态,任务留在
+// running,交给 registry 的停滞清扫器兜底收尾——与 faces.go RunPipeline 对中断
+// 的处理方式一致。
 func (ix *Indexer) BackfillSprites(ctx context.Context) {
 	if !ix.spriteBackfillRunning.CompareAndSwap(false, true) {
 		return
@@ -1697,14 +1700,18 @@ func (ix *Indexer) BackfillSprites(ctx context.Context) {
 		current++
 		pub(current, "running", "", nil)
 	}
-	if spritesGenerated > 0 || previewsGenerated > 0 {
+	if spritesGenerated > 0 || previewsGenerated > 0 || failed > 0 {
 		zap.L().Info("sprite/preview 补跑完成",
 			zap.Int("sprites_generated", spritesGenerated),
 			zap.Int("previews_generated", previewsGenerated),
-			zap.Int("source_missing", sourceMissing))
+			zap.Int("source_missing", sourceMissing),
+			zap.Int64("failed", failed))
 	}
 
-	if failed > 0 {
+	if failed > 0 && failed == total {
+		// 对齐 BackfillOCR 惯例(backfillOCROnce):只有全部候选都失败才判整批
+		// error;个别失败(哪怕反复出现,例如一条永久损坏的视频)只记日志,任务
+		// 终态照常 done,避免任务栏每轮都弹 Failed 造成噪音。
 		pub(current, "error", TaskErrPreviewPartialFailed, map[string]string{"failed": strconv.FormatInt(failed, 10)})
 	} else {
 		pub(current, "done", "", nil)

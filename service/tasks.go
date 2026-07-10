@@ -29,7 +29,9 @@ const (
 	TaskErrReadAssetListFailed = "Failed to read asset list: {detail}"
 	// TaskErrPreviewFfmpegMissing 无参数。
 	TaskErrPreviewFfmpegMissing = "ffmpeg is unavailable; video preview generation skipped"
-	// TaskErrPreviewPartialFailed 参数: failed。
+	// TaskErrPreviewPartialFailed 参数: failed。仅在本轮候选全部生成失败时使用
+	// (对齐 BackfillOCR 惯例);出现部分失败但仍有成功项时任务终态为 done,失败
+	// 数只记入日志,不占用这个 error key,避免个别损坏视频反复刷 Failed。
 	TaskErrPreviewPartialFailed = "Failed to generate previews for {failed} videos"
 )
 

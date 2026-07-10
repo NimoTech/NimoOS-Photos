@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 // TestSpriteBackfillCandidates 验证候选筛选 SQL 只挑出「已索引、未软删、
@@ -235,6 +237,116 @@ func TestBackfillSprites_NilRegistryDoesNotPanic(t *testing.T) {
 
 	require.FileExists(t, filepath.Join(thumbDir, "v1", "sprite.jpg"))
 	require.FileExists(t, filepath.Join(thumbDir, "v1", "preview.mp4"))
+}
+
+// TestBackfillSprites_PartialFailureStaysDone 覆盖裁决用例:3 条候选中仅 1 条
+// 生成失败(损坏视频)时,任务终态应仍为 done、不带 errorKey,失败数只计入汇总
+// 日志——对齐 BackfillOCR "只有全部候选都失败才 error" 的惯例,避免一条永久
+// 损坏的视频每轮补跑都把任务栏刷成 Failed。
+func TestBackfillSprites_PartialFailureStaysDone(t *testing.T) {
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		t.Skip("ffmpeg not found")
+	}
+	db := makeTestDB(t)
+	thumbDir := t.TempDir()
+	ix := NewIndexer(db, &mockML{}, thumbDir, 1)
+
+	srcDir := t.TempDir()
+	src1 := makeTestVideo(t, srcDir, "v1.mp4")
+	src2 := makeTestVideo(t, srcDir, "v2.mp4")
+	// v3 是损坏视频(非法字节但文件存在):ffmpeg 能被找到,只是解码会失败,
+	// 命中"个别失败"分支,而非 exec.ErrNotFound 触发的整轮放弃分支。
+	src3 := filepath.Join(srcDir, "v3.mp4")
+	require.NoError(t, os.WriteFile(src3, []byte("not a real video"), 0o644))
+
+	_, err := db.Exec(`INSERT INTO assets(id,file_path,mime_type,duration_ms,status,is_live_photo_video)
+		VALUES('v1',?,'video/mp4',6000,'indexed',0), ('v2',?,'video/mp4',6000,'indexed',0), ('v3',?,'video/mp4',6000,'indexed',0)`,
+		src1, src2, src3)
+	require.NoError(t, err)
+
+	obsCore, logs := observer.New(zap.InfoLevel)
+	restore := zap.ReplaceGlobals(zap.New(obsCore))
+	defer restore()
+
+	var emitted []Task
+	var mu sync.Mutex
+	reg := NewTaskRegistry(func(tk Task) { mu.Lock(); emitted = append(emitted, tk); mu.Unlock() })
+	ix.SetTaskRegistry(reg)
+
+	ix.BackfillSprites(context.Background())
+
+	mu.Lock()
+	var final Task
+	var sawFinal bool
+	for _, e := range emitted {
+		if e.Status == "done" || e.Status == "error" {
+			final = e
+			sawFinal = true
+		}
+	}
+	mu.Unlock()
+
+	require.True(t, sawFinal, "应有终态事件")
+	require.Equal(t, "done", final.Status, "3 条候选仅 1 条失败,任务终态应仍为 done")
+	require.Empty(t, final.ErrorKey, "部分失败不应携带 errorKey")
+
+	var loggedFailed bool
+	for _, entry := range logs.All() {
+		if entry.Message != "sprite/preview 补跑完成" {
+			continue
+		}
+		for _, f := range entry.Context {
+			if f.Key == "failed" && f.Integer == 1 {
+				loggedFailed = true
+			}
+		}
+	}
+	require.True(t, loggedFailed, "汇总日志应记录失败数=1")
+}
+
+// TestBackfillSprites_AllFailedSetsErrorTask 覆盖裁决用例:候选全部生成失败时,
+// 任务终态应为 error 并携带 TaskErrPreviewPartialFailed——对齐 BackfillOCR
+// "全部失败才 error"的惯例,而非出现任意失败就 error。
+func TestBackfillSprites_AllFailedSetsErrorTask(t *testing.T) {
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		t.Skip("ffmpeg not found")
+	}
+	db := makeTestDB(t)
+	thumbDir := t.TempDir()
+	ix := NewIndexer(db, &mockML{}, thumbDir, 1)
+
+	srcDir := t.TempDir()
+	src1 := filepath.Join(srcDir, "v1.mp4")
+	src2 := filepath.Join(srcDir, "v2.mp4")
+	require.NoError(t, os.WriteFile(src1, []byte("not a real video 1"), 0o644))
+	require.NoError(t, os.WriteFile(src2, []byte("not a real video 2"), 0o644))
+
+	_, err := db.Exec(`INSERT INTO assets(id,file_path,mime_type,duration_ms,status,is_live_photo_video)
+		VALUES('v1',?,'video/mp4',6000,'indexed',0), ('v2',?,'video/mp4',6000,'indexed',0)`, src1, src2)
+	require.NoError(t, err)
+
+	var emitted []Task
+	var mu sync.Mutex
+	reg := NewTaskRegistry(func(tk Task) { mu.Lock(); emitted = append(emitted, tk); mu.Unlock() })
+	ix.SetTaskRegistry(reg)
+
+	ix.BackfillSprites(context.Background())
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	var final Task
+	var sawFinal bool
+	for _, e := range emitted {
+		if e.Status == "done" || e.Status == "error" {
+			final = e
+			sawFinal = true
+		}
+	}
+	require.True(t, sawFinal, "应有终态事件")
+	require.Equal(t, "error", final.Status, "候选全部失败时任务终态应为 error")
+	require.Equal(t, TaskErrPreviewPartialFailed, final.ErrorKey)
+	require.Equal(t, "2", final.ErrorParams["failed"])
 }
 
 // TestBackfillSpritesCASReentrant 并发两次调用 BackfillSprites，断言不 panic
