@@ -766,3 +766,27 @@ func TestMigrateDocClassifyColumns(t *testing.T) {
 	require.NoError(t, err)
 	db2.Close()
 }
+
+// TestMigrateAssetsAestheticScore 验证:assets 表带 aesthetic_score 列,新资产
+// 默认 NULL(未打分);重复 Open 幂等,不报错、不清空既有值。
+func TestMigrateAssetsAestheticScore(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "photos.db")
+
+	db, err := sqlite.Open(path)
+	require.NoError(t, err)
+
+	_, err = db.Exec(`INSERT INTO assets(id, file_path, checksum, status) VALUES('a1','/x','c1','indexed')`)
+	require.NoError(t, err)
+	var score sql.NullFloat64
+	require.NoError(t, db.QueryRow(`SELECT aesthetic_score FROM assets WHERE id='a1'`).Scan(&score))
+	require.False(t, score.Valid, "新列默认应为 NULL")
+	require.NoError(t, db.Close())
+
+	// 重复打开应幂等,不报错、不清空既有 NULL 值。
+	db2, err := sqlite.Open(path)
+	require.NoError(t, err)
+	defer db2.Close()
+	require.NoError(t, db2.QueryRow(`SELECT aesthetic_score FROM assets WHERE id='a1'`).Scan(&score))
+	require.False(t, score.Valid, "重复迁移不应改变既有 NULL 值")
+}

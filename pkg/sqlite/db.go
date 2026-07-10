@@ -378,6 +378,9 @@ func migrate(db *sql.DB) error {
 		decl string
 	}{
 		{"offline", "INTEGER NOT NULL DEFAULT 0"},
+		// aesthetic_score: 美学评分(NULL=未打分,由内联打分/BackfillAesthetic 填充;
+		// 换头版本或 ML 代次重建时置回 NULL 重打)。
+		{"aesthetic_score", "REAL"},
 	}
 	assetsExisting := map[string]bool{}
 	aRows, err := db.Query(`PRAGMA table_info(assets)`)
