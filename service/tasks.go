@@ -27,6 +27,10 @@ const (
 	TaskErrQueryAssetsFailed = "Failed to query assets: {detail}"
 	// TaskErrReadAssetListFailed 参数: detail。
 	TaskErrReadAssetListFailed = "Failed to read asset list: {detail}"
+	// TaskErrPreviewFfmpegMissing 无参数。
+	TaskErrPreviewFfmpegMissing = "ffmpeg is unavailable; video preview generation skipped"
+	// TaskErrPreviewPartialFailed 参数: failed。
+	TaskErrPreviewPartialFailed = "Failed to generate previews for {failed} videos"
 )
 
 // 任务停滞阈值:running 任务超过这么久没有任何更新,视为僵尸(漏发 done、

@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -87,6 +88,153 @@ func TestBackfillSpritesGeneratesAndIdempotent(t *testing.T) {
 	fp2, err := os.Stat(previewPath)
 	require.NoError(t, err)
 	require.Equal(t, fp1.ModTime(), fp2.ModTime(), "preview second run must be idempotent (no re-generation)")
+}
+
+// makeTestVideo 用 ffmpeg lavfi 生成一段固定时长的测试视频，供任务栏相关测试
+// 复用（避免每个测试重复这段样板）。
+func makeTestVideo(t *testing.T, dir, name string) string {
+	t.Helper()
+	src := filepath.Join(dir, name)
+	require.NoError(t, exec.Command("ffmpeg", "-hide_banner", "-loglevel", "error",
+		"-f", "lavfi", "-i", "testsrc=duration=6:size=320x240:rate=25", "-y", src).Run())
+	return src
+}
+
+// TestBackfillSprites_AllReadyEmitsNoTask 覆盖 TDD 用例①:候选视频的 sprite/preview
+// 都已就绪(无欠账)时，BackfillSprites 不应发出任何任务事件——即使注入了 registry。
+func TestBackfillSprites_AllReadyEmitsNoTask(t *testing.T) {
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		t.Skip("ffmpeg not found")
+	}
+	db := makeTestDB(t)
+	thumbDir := t.TempDir()
+	ix := NewIndexer(db, &mockML{}, thumbDir, 1)
+
+	srcDir := t.TempDir()
+	src := makeTestVideo(t, srcDir, "v1.mp4")
+	_, err := db.Exec(`INSERT INTO assets(id,file_path,mime_type,duration_ms,status,is_live_photo_video)
+		VALUES('v1',?,'video/mp4',6000,'indexed',0)`, src)
+	require.NoError(t, err)
+
+	// 先跑一轮把 sprite/preview 都补齐，让候选处于"无欠账"状态。
+	ix.BackfillSprites(context.Background())
+	require.FileExists(t, filepath.Join(thumbDir, "v1", "sprite.jpg"))
+	require.FileExists(t, filepath.Join(thumbDir, "v1", "preview.mp4"))
+
+	var emitted []Task
+	var mu sync.Mutex
+	reg := NewTaskRegistry(func(tk Task) { mu.Lock(); emitted = append(emitted, tk); mu.Unlock() })
+	ix.SetTaskRegistry(reg)
+
+	ix.BackfillSprites(context.Background())
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.Empty(t, emitted, "候选全部已就绪时不应发出任何任务事件")
+}
+
+// TestBackfillSprites_PendingEmitsTaskWithRealProgress 覆盖 TDD 用例②:存在欠账
+// 视频时应出现「生成视频预览」任务，label/type 正确，total=欠账数，current 随
+// 处理推进到 total，终态 done。
+func TestBackfillSprites_PendingEmitsTaskWithRealProgress(t *testing.T) {
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		t.Skip("ffmpeg not found")
+	}
+	db := makeTestDB(t)
+	thumbDir := t.TempDir()
+	ix := NewIndexer(db, &mockML{}, thumbDir, 1)
+
+	srcDir := t.TempDir()
+	src1 := makeTestVideo(t, srcDir, "v1.mp4")
+	src2 := makeTestVideo(t, srcDir, "v2.mp4")
+	_, err := db.Exec(`INSERT INTO assets(id,file_path,mime_type,duration_ms,status,is_live_photo_video)
+		VALUES('v1',?,'video/mp4',6000,'indexed',0), ('v2',?,'video/mp4',6000,'indexed',0)`, src1, src2)
+	require.NoError(t, err)
+
+	var emitted []Task
+	var mu sync.Mutex
+	reg := NewTaskRegistry(func(tk Task) { mu.Lock(); emitted = append(emitted, tk); mu.Unlock() })
+	ix.SetTaskRegistry(reg)
+
+	ix.BackfillSprites(context.Background())
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.NotEmpty(t, emitted, "存在欠账视频时应发出任务事件")
+
+	var sawDone bool
+	var maxCurrent int64
+	for _, e := range emitted {
+		require.Equal(t, "preview-backfill", e.Type)
+		require.Equal(t, "Generating video previews", e.Label)
+		require.Equal(t, int64(2), e.Total, "total 应为欠账候选数(v1、v2 两条)")
+		if e.Current > maxCurrent {
+			maxCurrent = e.Current
+		}
+		if e.Status == "done" {
+			sawDone = true
+		}
+	}
+	require.True(t, sawDone, "应有 done 终态事件")
+	require.Equal(t, int64(2), maxCurrent, "current 应随处理推进到 total")
+}
+
+// TestBackfillSprites_FfmpegMissingSetsErrorTask 覆盖 TDD 用例③:ffmpeg 不可用
+// (PATH 置空模拟 exec.ErrNotFound)时，任务应带 TaskErrPreviewFfmpegMissing 错误终态。
+func TestBackfillSprites_FfmpegMissingSetsErrorTask(t *testing.T) {
+	db := makeTestDB(t)
+	thumbDir := t.TempDir()
+	ix := NewIndexer(db, &mockML{}, thumbDir, 1)
+
+	// 源文件本身只需通过第一层 os.Stat(源文件)检查，随后触发 ffmpeg 调用即可
+	// 命中 exec.ErrNotFound,不要求是可解码的真实视频。
+	src := filepath.Join(t.TempDir(), "v1.mp4")
+	require.NoError(t, os.WriteFile(src, []byte("fake video bytes"), 0o644))
+	_, err := db.Exec(`INSERT INTO assets(id,file_path,mime_type,duration_ms,status,is_live_photo_video)
+		VALUES('v1',?,'video/mp4',6000,'indexed',0)`, src)
+	require.NoError(t, err)
+
+	var emitted []Task
+	var mu sync.Mutex
+	reg := NewTaskRegistry(func(tk Task) { mu.Lock(); emitted = append(emitted, tk); mu.Unlock() })
+	ix.SetTaskRegistry(reg)
+
+	t.Setenv("PATH", "") // 模拟 ffmpeg 不可用：exec.Command 查不到可执行文件
+
+	ix.BackfillSprites(context.Background())
+
+	mu.Lock()
+	defer mu.Unlock()
+	var sawError bool
+	for _, e := range emitted {
+		if e.Status == "error" {
+			sawError = true
+			require.Equal(t, TaskErrPreviewFfmpegMissing, e.ErrorKey)
+		}
+	}
+	require.True(t, sawError, "ffmpeg 不可用时应有 error 终态事件,带 TaskErrPreviewFfmpegMissing")
+}
+
+// TestBackfillSprites_NilRegistryDoesNotPanic 覆盖 TDD 用例④:未注入 registry 时
+// BackfillSprites 必须照常工作，不 panic——回归既有全部 sprite/preview 测试路径。
+func TestBackfillSprites_NilRegistryDoesNotPanic(t *testing.T) {
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		t.Skip("ffmpeg not found")
+	}
+	db := makeTestDB(t)
+	thumbDir := t.TempDir()
+	ix := NewIndexer(db, &mockML{}, thumbDir, 1) // 未调用 SetTaskRegistry，taskReg 保持 nil
+
+	srcDir := t.TempDir()
+	src := makeTestVideo(t, srcDir, "v1.mp4")
+	_, err := db.Exec(`INSERT INTO assets(id,file_path,mime_type,duration_ms,status,is_live_photo_video)
+		VALUES('v1',?,'video/mp4',6000,'indexed',0)`, src)
+	require.NoError(t, err)
+
+	require.NotPanics(t, func() { ix.BackfillSprites(context.Background()) })
+
+	require.FileExists(t, filepath.Join(thumbDir, "v1", "sprite.jpg"))
+	require.FileExists(t, filepath.Join(thumbDir, "v1", "preview.mp4"))
 }
 
 // TestBackfillSpritesCASReentrant 并发两次调用 BackfillSprites，断言不 panic

@@ -18,6 +18,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1560,12 +1561,22 @@ func spriteBackfillCandidates(db *sql.DB) ([]spriteCandidate, error) {
 	return out, rows.Err()
 }
 
-// BackfillSprites 为存量视频补雪碧图与预览视频(启动时调用一次)。
-// CAS 防重入;顺序逐个生成(生成器信号量另有并发≤2 的全局上限,两类产物
-// 共享);ffmpeg 不存在(exec.ErrNotFound)时立即放弃整轮,避免逐条刷错误日志。
-// 候选查询仍以 duration_ms>0 过滤(时长未知的破损视频极罕见,交由路由端
-// 惰性兜底),两类产物在循环体内各自 os.Stat 判存在跳过(省函数调用,与
-// sprite 既有写法对齐;preview 侧 ensure 核心本身也天然幂等)。
+// BackfillSprites 为存量视频补雪碧图与预览视频(启动时调用一次,批次完成钩子
+// 也会追加触发)。CAS 防重入;顺序逐个生成(生成器信号量另有并发≤2 的全局上限,
+// 两类产物共享);ffmpeg 不存在(exec.ErrNotFound)时立即放弃整轮,避免逐条刷
+// 错误日志。候选查询仍以 duration_ms>0 过滤(时长未知的破损视频极罕见,交由
+// 路由端惰性兜底),两类产物在循环体内各自 os.Stat 判存在跳过(省函数调用,
+// 与 sprite 既有写法对齐;preview 侧 ensure 核心本身也天然幂等)。
+//
+// 任务栏接入(沿用 faces.go RunPipeline 的生命周期模式):先对候选逐条预扫描
+// sprite.jpg/preview.mp4 是否缺失,只有真正有欠账(total>0)才发「生成视频
+// 预览」任务——单条上传的内联预生成秒级完成,不会被这里捕获(prescan 时已经
+// 齐备),维持不发任务的现状。current 每处理完一条候选(无论生成、跳过还是
+// join 复用)就 +1 并 Upsert,由 registry 自身节流发布频率。ffmpeg 缺失时整
+// 轮放弃并把任务标为 error 终态;个别视频生成失败不中断整轮,结束时若有失败
+// 则任务终态同样标为 error(TaskErrPreviewPartialFailed),否则 done。ctx 取消
+// 时不发任何终态,任务留在 running,交给 registry 的停滞清扫器兜底收尾——与
+// faces.go RunPipeline 对中断的处理方式一致。
 func (ix *Indexer) BackfillSprites(ctx context.Context) {
 	if !ix.spriteBackfillRunning.CompareAndSwap(false, true) {
 		return
@@ -1578,27 +1589,87 @@ func (ix *Indexer) BackfillSprites(ctx context.Context) {
 		return
 	}
 
+	// 预扫描:逐条候选判 sprite.jpg / preview.mp4 是否缺失,只有任一缺失的才
+	// 算一个待处理项,得到 total。两者都已齐备的候选不计入 total、也不进入
+	// 下面的处理循环(本轮它无事可做)。total==0 直接返回,不发任务。
+	var pending []spriteCandidate
+	for _, c := range candidates {
+		spritePath := filepath.Join(ix.thumbDir, c.id, "sprite.jpg")
+		previewPath := filepath.Join(ix.thumbDir, c.id, "preview.mp4")
+		_, spriteErr := os.Stat(spritePath)
+		_, previewErr := os.Stat(previewPath)
+		if spriteErr != nil || previewErr != nil {
+			pending = append(pending, c)
+		}
+	}
+	total := int64(len(pending))
+	if total == 0 {
+		return
+	}
+
+	taskID := fmt.Sprintf("preview_%d", time.Now().UnixNano())
+	started := time.Now()
+	pub := func(current int64, status, errKey string, errParams map[string]string) {
+		if ix.taskReg == nil {
+			return
+		}
+		t := Task{
+			ID:        taskID,
+			Type:      "preview-backfill",
+			Label:     "Generating video previews",
+			Current:   current,
+			Total:     total,
+			Progress:  float64(current) / float64(total),
+			Status:    status,
+			StartedAt: started,
+		}
+		if errKey != "" {
+			t.SetError(errKey, errParams)
+		}
+		ix.taskReg.Upsert(t)
+	}
+	// scheduleRemove 是终态收尾:沿用 faces.go 的模式,done/error 后延迟
+	// taskCleanupDelay 再从注册表摘除,给前端留出展示终态的窗口。
+	scheduleRemove := func() {
+		go func() {
+			time.Sleep(taskCleanupDelay)
+			if ix.taskReg != nil {
+				ix.taskReg.Remove(taskID)
+			}
+		}()
+	}
+
+	pub(0, "running", "", nil)
+
 	// sourceMissing 仅统计"源视频文件缺失"（os.Stat 失败）而整条候选被跳过的
 	// 数量；sprite.jpg / preview.mp4 是否已存在则各自在下面独立 os.Stat 判断，
 	// 不计入这个计数器（对应 spritesGenerated / previewsGenerated 未增长的隐含语义）。
 	var spritesGenerated, previewsGenerated, sourceMissing int
-	for _, c := range candidates {
+	var current, failed int64
+	for _, c := range pending {
 		if ctx.Err() != nil {
 			return
 		}
 		if _, statErr := os.Stat(c.filePath); statErr != nil {
 			sourceMissing++
+			current++
+			pub(current, "running", "", nil)
 			continue
 		}
+
+		var itemFailed bool
 
 		spritePath := filepath.Join(ix.thumbDir, c.id, "sprite.jpg")
 		if _, statErr := os.Stat(spritePath); statErr != nil {
 			if _, err := ix.sprites.Ensure(c.filePath, spritePath, c.durationMs); err != nil {
 				if errors.Is(err, exec.ErrNotFound) {
 					zap.L().Warn("ffmpeg 不可用,放弃本轮 sprite/preview 补跑", zap.Error(err))
+					pub(current, "error", TaskErrPreviewFfmpegMissing, nil)
+					scheduleRemove()
 					return
 				}
 				zap.L().Warn("sprite 补跑失败", zap.String("asset_id", c.id), zap.Error(err))
+				itemFailed = true
 			} else {
 				spritesGenerated++
 			}
@@ -1609,13 +1680,22 @@ func (ix *Indexer) BackfillSprites(ctx context.Context) {
 			if err := ix.sprites.EnsurePreview(c.filePath, previewPath); err != nil {
 				if errors.Is(err, exec.ErrNotFound) {
 					zap.L().Warn("ffmpeg 不可用,放弃本轮 sprite/preview 补跑", zap.Error(err))
+					pub(current, "error", TaskErrPreviewFfmpegMissing, nil)
+					scheduleRemove()
 					return
 				}
 				zap.L().Warn("preview 补跑失败", zap.String("asset_id", c.id), zap.Error(err))
+				itemFailed = true
 			} else {
 				previewsGenerated++
 			}
 		}
+
+		if itemFailed {
+			failed++
+		}
+		current++
+		pub(current, "running", "", nil)
 	}
 	if spritesGenerated > 0 || previewsGenerated > 0 {
 		zap.L().Info("sprite/preview 补跑完成",
@@ -1623,6 +1703,13 @@ func (ix *Indexer) BackfillSprites(ctx context.Context) {
 			zap.Int("previews_generated", previewsGenerated),
 			zap.Int("source_missing", sourceMissing))
 	}
+
+	if failed > 0 {
+		pub(current, "error", TaskErrPreviewPartialFailed, map[string]string{"failed": strconv.FormatInt(failed, 10)})
+	} else {
+		pub(current, "done", "", nil)
+	}
+	scheduleRemove()
 }
 
 // MLReady reports whether the ML backend (immich-machine-learning) is reachable.

@@ -204,6 +204,12 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 				zap.L().Warn("smart view incremental evaluate failed", zap.Error(err))
 			}
 		}()
+		// 批量导入视频后补漏 + 借任务栏展示转码进度;CAS 防与启动补跑/多批次并发重入。
+		// (内联预生成已在索引时逐条排队,批次末尾多数已就绪,该轮只处理剩余欠账,
+		// total 反映真实剩余量——正是任务栏该显示的。)
+		go func() {
+			idx.BackfillSprites(parentCtx)
+		}()
 	})
 
 	// 5. Kick off the initial directory scan in the background so startup is
