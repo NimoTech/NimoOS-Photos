@@ -1116,3 +1116,191 @@ func TestMergePersons_LockedCoverPreserved(t *testing.T) {
 	require.Equal(t, intoCoverAsset, coverAsset, "locked cover must be preserved after merge")
 	require.Equal(t, 1, locked, "cover_locked must remain 1 after merge")
 }
+
+// ---------------------------------------------------------------------------
+// 封面混合分 + hero 兜底
+// ---------------------------------------------------------------------------
+
+// setAssetAesthetic 更新指定 asset 的 aesthetic_score（nil 表示置 NULL）。
+func setAssetAesthetic(t *testing.T, db *sql.DB, assetID string, score *float64) {
+	t.Helper()
+	var err error
+	if score == nil {
+		_, err = db.Exec(`UPDATE assets SET aesthetic_score=NULL WHERE id=?`, assetID)
+	} else {
+		_, err = db.Exec(`UPDATE assets SET aesthetic_score=? WHERE id=?`, *score, assetID)
+	}
+	require.NoError(t, err)
+}
+
+// setAssetExifSize 写入/更新 asset 的 EXIF 宽高（用于混合分的脸面积占比计算）。
+func setAssetExifSize(t *testing.T, db *sql.DB, assetID string, w, h int) {
+	t.Helper()
+	_, err := db.Exec(`INSERT INTO asset_exif(asset_id, width, height) VALUES(?,?,?)
+ON CONFLICT(asset_id) DO UPDATE SET width=excluded.width, height=excluded.height`, assetID, w, h)
+	require.NoError(t, err)
+}
+
+func setFaceBBox(t *testing.T, db *sql.DB, faceID, bboxJSON string) {
+	t.Helper()
+	_, err := db.Exec(`UPDATE face_detections SET bbox=? WHERE id=?`, bboxJSON, faceID)
+	require.NoError(t, err)
+}
+
+func f64(v float64) *float64 { return &v }
+
+// TestPersonCoverHybridSelection 验证封面选取从"质心最近"改为"混合分最高"：
+// 混合分 = clamp01((score-1)/9) × min(1, faceArea/imageArea)。
+// 三张脸同属一个 person（f1/f2/f3embedding 互相靠近可聚为一簇）：
+//
+//	f1: asset 分 9.0，脸占比 0.01 → hybrid = 0.8889*0.01 ≈ 0.0089
+//	f2: asset 分 7.0，脸占比 0.30 → hybrid = 0.6667*0.30 = 0.20  ← 应当选
+//	f3: asset 分 NULL（无分）      → 不可比（-1）
+//
+// 把 f2 的 asset 分置 NULL 后重算：f2/f3 都不可比，只剩 f1 可比 → 应选 f1。
+// 再把 f1 的 asset 分也置 NULL（全 NULL）→ 退回质心最近（原有行为）；
+// 三个 embedding 特意构造为 f1 恰好与质心方向重合，距离为 0，验证退回后选中 f1。
+func TestPersonCoverHybridSelection(t *testing.T) {
+	db := makeTestFaceDB(t)
+	dim := 512
+
+	// f1: 沿 dim0 的单位向量。
+	v1 := make([]float32, dim)
+	v1[0] = 1.0
+	// f2: dim0=1, dim1=0.3，归一化后与 f1 靠近但不重合。
+	v2raw := make([]float32, dim)
+	v2raw[0] = 1.0
+	v2raw[1] = 0.3
+	// f3: dim0=1, dim1=-0.3，归一化后与 f2 对称。
+	v3raw := make([]float32, dim)
+	v3raw[0] = 1.0
+	v3raw[1] = -0.3
+
+	f1 := insertAssetFace(t, db, "hy-a1", normalize(v1))
+	f2 := insertAssetFace(t, db, "hy-a2", normalize(v2raw))
+	f3 := insertAssetFace(t, db, "hy-a3", normalize(v3raw))
+	require.NoError(t, service.NewFaceService(db).RunClustering(context.Background()))
+	personID := mustFirstPersonID(t, db)
+
+	// 三张 asset 统一 1000x1000 图幅。
+	for _, aid := range []string{"hy-a1", "hy-a2", "hy-a3"} {
+		setAssetExifSize(t, db, aid, 1000, 1000)
+	}
+	// f1: 脸占比 0.01（100x100=10000/1e6），分 9.0。
+	setFaceBBox(t, db, f1, `{"x1":0,"y1":0,"x2":100,"y2":100}`)
+	setAssetAesthetic(t, db, "hy-a1", f64(9.0))
+	// f2: 脸占比 0.30（约 547.72^2=300000/1e6），分 7.0。
+	setFaceBBox(t, db, f2, `{"x1":0,"y1":0,"x2":547.7226,"y2":547.7226}`)
+	setAssetAesthetic(t, db, "hy-a2", f64(7.0))
+	// f3: 脸占比 0.50，但 asset 分 NULL → 不可比。
+	setFaceBBox(t, db, f3, `{"x1":0,"y1":0,"x2":707.1068,"y2":707.1068}`)
+	setAssetAesthetic(t, db, "hy-a3", nil)
+
+	ps := service.NewPersonService(db)
+
+	// UnlockPersonCover 触发 recomputeOneCentroidTx；person 此时未锁，不受影响。
+	newFace, err := ps.UnlockPersonCover(personID)
+	require.NoError(t, err)
+	require.Equal(t, f2, newFace, "混合分最高的 f2 应被选为封面")
+
+	var coverAsset string
+	require.NoError(t, db.QueryRow(`SELECT cover_asset_id FROM persons WHERE id=?`, personID).Scan(&coverAsset))
+	require.Equal(t, "hy-a2", coverAsset)
+
+	// 把 f2 的分置 NULL：f2/f3 都不可比，只剩 f1 可比 → 应选 f1。
+	setAssetAesthetic(t, db, "hy-a2", nil)
+	newFace, err = ps.UnlockPersonCover(personID)
+	require.NoError(t, err)
+	require.Equal(t, f1, newFace, "f2 不可比后应回退到唯一可比的 f1")
+
+	// 全 NULL：退回质心最近。质心方向与 f1 完全重合（cosDist=0），应选 f1。
+	setAssetAesthetic(t, db, "hy-a1", nil)
+	newFace, err = ps.UnlockPersonCover(personID)
+	require.NoError(t, err)
+	require.Equal(t, f1, newFace, "全部不可比时应退回质心最近，此处质心与 f1 方向重合")
+}
+
+// TestPersonCoverLockedUnaffected 验证 cover_locked=1 且锁脸仍有效时，
+// 混合分选优不得改写封面 —— 即便另一张脸的混合分明显更高。
+func TestPersonCoverLockedUnaffected(t *testing.T) {
+	db := makeTestFaceDB(t)
+	dim := 512
+	v := make([]float32, dim)
+	v[0] = 1.0
+	f1 := insertAssetFace(t, db, "lkh-a1", normalize(v))
+	f2 := insertAssetFace(t, db, "lkh-a2", normalize(v))
+	f3 := insertAssetFace(t, db, "lkh-a3", normalize(v)) // 用于触发一次与锁无关的 detach 重算
+	require.NoError(t, service.NewFaceService(db).RunClustering(context.Background()))
+	personID := mustFirstPersonID(t, db)
+
+	for _, aid := range []string{"lkh-a1", "lkh-a2", "lkh-a3"} {
+		setAssetExifSize(t, db, aid, 1000, 1000)
+	}
+	// f1（将被锁定）混合分很低：小脸 + 低分。
+	setFaceBBox(t, db, f1, `{"x1":0,"y1":0,"x2":50,"y2":50}`)
+	setAssetAesthetic(t, db, "lkh-a1", f64(2.0))
+	// f2 混合分远高于 f1：大脸 + 满分。
+	setFaceBBox(t, db, f2, `{"x1":0,"y1":0,"x2":900,"y2":900}`)
+	setAssetAesthetic(t, db, "lkh-a2", f64(10.0))
+	_ = f3
+
+	ps := service.NewPersonService(db)
+	// 锁定封面到 f1 所在的 asset。
+	lockedFaceID, err := ps.SetPersonCover(personID, "lkh-a1")
+	require.NoError(t, err)
+	require.Equal(t, f1, lockedFaceID)
+
+	// 触发一次与锁无关的 recompute（detach 一个不相关的 asset），不应改写锁定的封面。
+	_, err = ps.DetachAssetsFromPerson(personID, []string{"lkh-a3"})
+	require.NoError(t, err)
+
+	var coverAsset, coverFace string
+	var locked int
+	require.NoError(t, db.QueryRow(
+		`SELECT COALESCE(cover_asset_id,''), COALESCE(cover_face_id,''), cover_locked FROM persons WHERE id=?`, personID,
+	).Scan(&coverAsset, &coverFace, &locked))
+	require.Equal(t, "lkh-a1", coverAsset, "锁定封面不应被混合分更高的 f2 改写")
+	require.Equal(t, f1, coverFace)
+	require.Equal(t, 1, locked)
+}
+
+// TestPersonHeroAestheticFallback 验证 hero 未手动设置时回退为该人物照片中
+// 美学分最高者；已手动设置时保持不变（即便其他照片分更高）。
+func TestPersonHeroAestheticFallback(t *testing.T) {
+	db := makeTestFaceDB(t)
+	dim := 512
+	v := make([]float32, dim)
+	v[0] = 1.0
+	insertAssetFace(t, db, "hf-a1", normalize(v))
+	insertAssetFace(t, db, "hf-a2", normalize(v))
+	require.NoError(t, service.NewFaceService(db).RunClustering(context.Background()))
+	personID := mustFirstPersonID(t, db)
+
+	setAssetAesthetic(t, db, "hf-a1", f64(5.0))
+	setAssetAesthetic(t, db, "hf-a2", f64(9.0))
+
+	ps := service.NewPersonService(db)
+
+	// 未设置 hero：应回退为分数最高的 hf-a2。
+	p, err := ps.GetPerson(personID)
+	require.NoError(t, err)
+	require.Equal(t, "hf-a2", p.HeroAssetID, "hero 未设置时应回退到美学分最高的照片")
+
+	list, err := ps.ListPersons()
+	require.NoError(t, err)
+	require.Len(t, list, 1)
+	require.Equal(t, "hf-a2", list[0].HeroAssetID, "ListPersons 的 hero 兜底同样应生效")
+
+	// 手动设置 hero 为分数较低的 hf-a1：应保持不变，不被兜底覆盖。
+	heroVal := "hf-a1"
+	require.NoError(t, ps.UpdatePerson(personID, service.PersonPatch{HeroAssetID: &heroVal}))
+
+	p2, err := ps.GetPerson(personID)
+	require.NoError(t, err)
+	require.Equal(t, "hf-a1", p2.HeroAssetID, "已手动设置的 hero 不应被美学兜底覆盖")
+
+	list2, err := ps.ListPersons()
+	require.NoError(t, err)
+	require.Len(t, list2, 1)
+	require.Equal(t, "hf-a1", list2[0].HeroAssetID)
+}
