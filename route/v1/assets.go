@@ -25,11 +25,14 @@ type AssetsHandler struct {
 
 // NewAssetsHandler constructs an AssetsHandler.
 // thumbDir is the filesystem directory that contains <id>/small.jpg and <id>/large.jpg.
+// sprites is shared with the Indexer (index-time inline pregeneration and the
+// startup backfill) so all three writers dedupe through one in-flight table
+// and never race on the same output file.
 func NewAssetsHandler(svc service.Services, thumbDir string) *AssetsHandler {
 	return &AssetsHandler{
 		svc:      svc,
 		thumbDir: thumbDir,
-		sprites:  service.NewSpriteGenerator(),
+		sprites:  svc.Indexer().Sprites(),
 	}
 }
 

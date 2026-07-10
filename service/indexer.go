@@ -178,6 +178,11 @@ type Indexer struct {
 	promptMu    sync.Mutex
 	promptDoc   [][]float32
 	promptPhoto [][]float32
+
+	// sprites 是进程内共享的悬浮预览雪碧图生成器：索引管线内联预生成与
+	// /sprite 路由的现场生成必须共用同一实例，其 in-flight 去重才能防止
+	// 并发 ffmpeg 写同一输出文件。
+	sprites *SpriteGenerator
 }
 
 // touch marks index activity (enqueue or a processed result) at the current time.
@@ -485,8 +490,13 @@ func NewIndexer(db *sql.DB, ml MLProvider, thumbDir string, workers int) *Indexe
 		ingest:       newIngestTracker(),
 		pendingAlbum: make(map[string]string),
 		mountRoots:   EnumerateScanRoots,
+		sprites:      NewSpriteGenerator(),
 	}
 }
+
+// Sprites 返回进程内共享的雪碧图生成器：索引内联预生成与 /sprite 路由必须
+// 共用同一实例，其 in-flight 去重才能防止并发 ffmpeg 写同一输出文件。
+func (ix *Indexer) Sprites() *SpriteGenerator { return ix.sprites }
 
 // SetPendingAlbum registers that the file at path should be added to albumID
 // after it is indexed. A no-op when albumID is empty. Must be called before
@@ -892,6 +902,19 @@ func (ix *Indexer) processFileInternal(path string, opts processOpts) (success b
 
 	if !opts.skipThumb && imagePath != "" {
 		thumb.Generate(imagePath, assetID, ix.thumbDir) //nolint:errcheck
+	}
+
+	// 视频入库即异步预生成悬浮预览雪碧图:消除首次 hover 的 1-2 秒现场生成
+	// 空窗。best-effort,goroutine 阻塞在生成器信号量(并发≤2)上排队,失败
+	// 只记日志;Ensure 幂等(已存在秒退)且 in-flight 去重,与 /sprite 路由
+	// 及启动补跑并发安全。
+	if isVideo && durationMs > 0 {
+		spritePath := filepath.Join(ix.thumbDir, assetID, "sprite.jpg")
+		go func(src, out string, dur int64) {
+			if _, err := ix.sprites.Ensure(src, out, dur); err != nil {
+				zap.L().Warn("sprite 预生成失败", zap.String("asset_id", assetID), zap.Error(err))
+			}
+		}(path, spritePath, durationMs)
 	}
 
 	// 9. ML inference (only when ML service is ready).
