@@ -78,6 +78,10 @@ func main() {
 	go svc.Rebuilder().MaybeAutoRebuild(svc.Indexer().MLReady)
 	go svc.MountGuard().Run(ctx)
 
+	// 存量视频悬浮预览雪碧图补跑(启动一次,CAS 防重入):覆盖升级前索引、
+	// 未走新版内联预生成的历史视频。
+	go svc.Indexer().BackfillSprites(ctx)
+
 	// Prune orphaned TUS staging files at startup (one-shot) and then daily.
 	go func() {
 		if n, err := service.PruneStaging(common.StagingDir, time.Duration(common.StagingMaxAge)*time.Hour); err != nil {
