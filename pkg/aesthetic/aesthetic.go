@@ -1,5 +1,5 @@
 // Package aesthetic 在现成 CLIP(SigLIP2)图向量上跑一个小线性头计算美学分。
-// 纯本地矩阵乘、微秒级/张,不依赖 ML 服务。权重格式见本包 doc.go/计划文档。
+// 纯本地矩阵乘、微秒级/张,不依赖 ML 服务。权重格式见 LoadFrom 函数注释。
 package aesthetic
 
 import (
@@ -7,6 +7,17 @@ import (
 	"fmt"
 	"io"
 	"math"
+)
+
+const (
+	// maxVerLen 是版本字符串长度的防御性上限,字节数,远大于任何真实版本号(如 "v-test"、"v2.5")。
+	maxVerLen = 128
+	// maxLayers 是线性头层数的防御性上限,远大于真实结构(1152→1024→128→64→16→1,共 5 层)。
+	maxLayers = 16
+	// maxDim 是单层输入/输出维度的防御性上限。真实头维度链为 1152→1024→128→64→16→1,
+	// 远小于此值;设上限是为了在读取权重字节前挡住畸形/截断文件声明的超大维度,
+	// 避免 make([]float32, in*out) 触发单层 GiB 级内存分配。
+	maxDim = 4096
 )
 
 type layer struct {
@@ -25,6 +36,20 @@ func (h *Head) Version() string { return h.ver }
 func (h *Head) InDim() int      { return h.layers[0].in }
 
 // LoadFrom 解析权重字节流。任何结构不符都返回错误。
+//
+// 权重文件格式(小端):
+//
+//	magic   [4]byte   固定 "NAES"
+//	verLen  uint32    版本字符串字节数,上限 maxVerLen
+//	ver     [verLen]byte  版本字符串,如 "v2.5"
+//	nLayers uint32    层数,范围 [1, maxLayers]
+//	layers  按 nLayers 重复:
+//	    in      uint32        本层输入维度,范围 (0, maxDim]
+//	    out     uint32        本层输出维度,范围 (0, maxDim]
+//	    weights [in*out]float32  行主序 [out][in]
+//	    bias    [out]float32
+//
+// 约束:相邻层 in/out 必须首尾衔接(前一层 out == 下一层 in),末层 out 必须为 1。
 func LoadFrom(r io.Reader) (*Head, error) {
 	var magic [4]byte
 	if _, err := io.ReadFull(r, magic[:]); err != nil {
@@ -37,7 +62,7 @@ func LoadFrom(r io.Reader) (*Head, error) {
 	if err := binary.Read(r, binary.LittleEndian, &verLen); err != nil {
 		return nil, fmt.Errorf("aesthetic: read verLen: %w", err)
 	}
-	if verLen > 128 {
+	if verLen > maxVerLen {
 		return nil, fmt.Errorf("aesthetic: verLen %d too large", verLen)
 	}
 	verBuf := make([]byte, verLen)
@@ -48,7 +73,7 @@ func LoadFrom(r io.Reader) (*Head, error) {
 	if err := binary.Read(r, binary.LittleEndian, &nLayers); err != nil {
 		return nil, fmt.Errorf("aesthetic: read nLayers: %w", err)
 	}
-	if nLayers == 0 || nLayers > 16 {
+	if nLayers == 0 || nLayers > maxLayers {
 		return nil, fmt.Errorf("aesthetic: bad layer count %d", nLayers)
 	}
 	h := &Head{ver: string(verBuf)}
@@ -60,7 +85,7 @@ func LoadFrom(r io.Reader) (*Head, error) {
 		if err := binary.Read(r, binary.LittleEndian, &out); err != nil {
 			return nil, fmt.Errorf("aesthetic: layer %d out: %w", i, err)
 		}
-		if in == 0 || out == 0 || in > 1<<14 || out > 1<<14 {
+		if in == 0 || out == 0 || in > maxDim || out > maxDim {
 			return nil, fmt.Errorf("aesthetic: layer %d bad dims %dx%d", i, in, out)
 		}
 		l := layer{in: int(in), out: int(out),
