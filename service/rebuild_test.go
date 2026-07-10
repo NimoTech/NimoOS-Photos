@@ -213,6 +213,40 @@ func TestRebuildRedetectsFacesViaRunPipeline(t *testing.T) {
 	require.Equal(t, 1, newFaceRows, "旧脸被删后应由 RunPipeline 重新检测出 1 张新脸，而不是永久清空")
 }
 
+// TestRebuildClearsAestheticScore 验证:换代重建时旧美学分(基于旧模型向量算出)
+// 必须被清成 NULL——测试用的 recordingML 没有注入 aestheticHead，
+// writeClipEmbedding 内联打分会跳过，不会把分数重写回来，因此可以单独断言
+// “清空”这一步本身，不与内联补分的路径耦合。
+func TestRebuildClearsAestheticScore(t *testing.T) {
+	prev := config.Cfg
+	t.Cleanup(func() { config.Cfg = prev })
+	config.Cfg = &config.Config{FacesEnabled: true, ScenesEnabled: true, OCREnabled: true}
+
+	db := makeTestDB(t)
+	ml := &recordingML{}
+	ix := NewIndexer(db, ml, t.TempDir(), 1)
+	path := makeTestJPEG(t, t.TempDir())
+	require.True(t, ix.processFileInternal(path, processOpts{}))
+
+	var assetID string
+	require.NoError(t, db.QueryRow(`SELECT id FROM assets WHERE file_path=?`, path).Scan(&assetID))
+	// 手工写入一个旧美学分，模拟“换模型前已经打过分”的状态。
+	_, err := db.Exec(`UPDATE assets SET aesthetic_score=0.75 WHERE id=?`, assetID)
+	require.NoError(t, err)
+
+	faces := NewFaceService(db)
+	reg := NewTaskRegistry(nil)
+	rb := NewRebuilder(context.Background(), db, ix, faces, reg, 2)
+
+	_, err = rb.Start()
+	require.NoError(t, err)
+	require.Eventually(t, func() bool { return !rb.running.Load() }, 10*time.Second, 50*time.Millisecond)
+
+	var score sql.NullFloat64
+	require.NoError(t, db.QueryRow(`SELECT aesthetic_score FROM assets WHERE id=?`, assetID).Scan(&score))
+	require.False(t, score.Valid, "换代重建后旧美学分应被清成 NULL，靠内联打分（若启用）自动补回")
+}
+
 // TestModelGenStale 验证 modelGenStale 对代次键缺失/匹配/落后三种情况的判断。
 func TestModelGenStale(t *testing.T) {
 	db := makeTestDB(t)
