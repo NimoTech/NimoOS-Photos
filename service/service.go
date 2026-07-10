@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/NimoTech/NimoOS-Photos/common"
+	"github.com/NimoTech/NimoOS-Photos/pkg/aesthetic"
 	"github.com/NimoTech/NimoOS-Photos/pkg/config"
 	"github.com/NimoTech/NimoOS-Photos/pkg/geo"
 	"github.com/NimoTech/NimoOS-Photos/pkg/mlclient"
@@ -110,6 +111,14 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 	go taskReg.StartStaleSweeper(parentCtx, taskStaleTimeout, taskSweepInterval)
 	idx := NewIndexer(db, ml, thumbDir, cfg.Workers)
 	idx.SetTaskRegistry(taskReg)
+	// 美学评分头:加载失败只告警降级(功能整体不可用,分数留 NULL)。
+	if cfg.AestheticEnabled {
+		if head, err := aesthetic.Load(); err != nil {
+			zap.L().Warn("aesthetic: 内嵌头加载失败,评分功能停用", zap.Error(err))
+		} else {
+			idx.SetAestheticHead(head)
+		}
+	}
 	watcher := NewWatcher(db, cfg.WatchDirs, idx, liveDir)
 	albums := NewAlbumService(db)
 	// Wire post-index album assignment: uploads carrying an albumId join the
