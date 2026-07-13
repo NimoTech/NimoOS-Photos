@@ -22,14 +22,19 @@ func (h *ConfigHandler) GetConfig(c echo.Context) error {
 	if retention <= 0 {
 		retention = 30
 	}
+	effective := dirs
+	if len(effective) == 0 {
+		effective = service.EnumerateScanRoots()
+	}
 	return c.JSON(http.StatusOK, map[string]interface{}{
-		"watchDirs":        dirs,
-		"retentionDays":    retention,
-		"facesEnabled":     config.Cfg.FacesEnabled,
-		"scenesEnabled":    config.Cfg.ScenesEnabled,
-		"ocrEnabled":       config.Cfg.OCREnabled,
-		"smartViewEnabled": config.Cfg.SmartViewEnabled,
-		"scanInterval":     config.Cfg.ScanInterval,
+		"watchDirs":          dirs,
+		"effectiveWatchDirs": effective,
+		"retentionDays":      retention,
+		"facesEnabled":       config.Cfg.FacesEnabled,
+		"scenesEnabled":      config.Cfg.ScenesEnabled,
+		"ocrEnabled":         config.Cfg.OCREnabled,
+		"smartViewEnabled":   config.Cfg.SmartViewEnabled,
+		"scanInterval":       config.Cfg.ScanInterval,
 	})
 }
 
