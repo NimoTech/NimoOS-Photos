@@ -4,16 +4,46 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
 	"sync/atomic"
 	"time"
 
+	"github.com/NimoTech/NimoOS-Photos/pkg/aesthetic"
 	"go.uber.org/zap"
 )
 
 const defaultEmbedderPollInterval = 30 * time.Second
+
+// aestheticHeadVerKey 是 photos_meta 中登记美学头版本的键。
+const aestheticHeadVerKey = "aesthetic_head_ver"
+
+// EnsureAestheticHeadVer 对齐库内头版本:不符时同一事务内全库分数置 NULL 并盖章。
+// 与 ml_model_gen 的「成功后盖章」不同:置 NULL 已原子清除全部旧分,无脏数据窗口,
+// 提前盖章安全;重打靠 BackfillAesthetic 的 NULL 查询自恢复。
+func EnsureAestheticHeadVer(db *sql.DB, ver string) error {
+	var cur string
+	_ = db.QueryRow(`SELECT value FROM photos_meta WHERE key=?`, aestheticHeadVerKey).Scan(&cur)
+	if cur == ver {
+		return nil
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`UPDATE assets SET aesthetic_score=NULL`); err != nil {
+		tx.Rollback()
+		return err
+	}
+	if _, err := tx.Exec(`INSERT INTO photos_meta(key, value) VALUES(?,?)
+	    ON CONFLICT(key) DO UPDATE SET value=excluded.value`, aestheticHeadVerKey, ver); err != nil {
+		tx.Rollback()
+		return err
+	}
+	return tx.Commit()
+}
 
 // ocrBackfillRetryDelay 是 OCR 补跑「首遍因 ML 全失败」后重试前的等待,给重启瞬间
 // 尚未热好的 ML OCR 模型一点时间,避免把暂时性失败当成真失败弹给用户。
@@ -28,6 +58,12 @@ type Embedder struct {
 	running      atomic.Bool
 	ocrRunning   atomic.Bool
 	pollInterval time.Duration
+
+	// aestheticRunning / aestheticRerunPending / aestheticHead 支撑 BackfillAesthetic
+	// 的并发防重与 rerun 语义,与 ocrRunning/ocrRerunPending 同款(见下方字段注释)。
+	aestheticRunning      atomic.Bool
+	aestheticRerunPending atomic.Bool
+	aestheticHead         *aesthetic.Head
 
 	// rerunPending / ocrRerunPending 记录「补跑运行中又收到了一次触发」。
 	// 不能像以前那样让撞上 CAS 的第二次调用静默返回 nil:进行中的那轮可能早已
@@ -434,6 +470,113 @@ func (e *Embedder) BackfillDocVerdicts(ctx context.Context) error {
 	return nil
 }
 
+// SetAestheticHead 注入美学评分头;nil 时 BackfillAesthetic 是 no-op。
+func (e *Embedder) SetAestheticHead(h *aesthetic.Head) { e.aestheticHead = h }
+
+// BackfillAesthetic 为「有 CLIP 向量但 aesthetic_score IS NULL」的资产补算美学分。
+// 纯本地矩阵乘,不依赖 ML 在线;不过滤 offline(打分只读库内向量,不碰文件)。
+// 并发防重与 rerun 语义同 BackfillOCR。
+func (e *Embedder) BackfillAesthetic(ctx context.Context) error {
+	if e.aestheticHead == nil {
+		return nil
+	}
+	if !e.aestheticRunning.CompareAndSwap(false, true) {
+		e.aestheticRerunPending.Store(true)
+		return nil
+	}
+	defer e.aestheticRunning.Store(false)
+	for {
+		if err := e.backfillAestheticOnce(ctx); err != nil {
+			return err
+		}
+		if !e.aestheticRerunPending.CompareAndSwap(true, false) {
+			return nil
+		}
+	}
+}
+
+// backfillAestheticOnce 是 BackfillAesthetic 的单轮主体,不含并发防重与 rerun 循环。
+func (e *Embedder) backfillAestheticOnce(ctx context.Context) error {
+	rows, err := e.db.QueryContext(ctx, `
+        SELECT a.id FROM assets a
+        JOIN asset_clip_idx ci ON ci.asset_id = a.id
+        WHERE a.aesthetic_score IS NULL AND a.deleted_at IS NULL AND a.status = 'indexed'`)
+	if err != nil {
+		return err
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return err
+		}
+		ids = append(ids, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+
+	taskID := fmt.Sprintf("aesthetic_%d", time.Now().UnixNano())
+	started := time.Now()
+	total := int64(len(ids))
+	pubRunning := func(processed int64) {
+		e.reg.Upsert(Task{
+			ID: taskID, Type: "aesthetic", Label: "评估照片美学分",
+			Total: total, Current: processed,
+			Progress: float64(processed) / float64(total),
+			Status:   "running", StartedAt: started,
+		})
+	}
+	pubRunning(0)
+
+	var processed, failed int64
+	for _, id := range ids {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		vec := readClipVector(e.db, id)
+		if vec == nil {
+			// 查询和读取之间向量被删(如 rebuild 竞态):跳过,留 NULL 下轮收敛。
+			processed++
+			failed++
+			pubRunning(processed)
+			continue
+		}
+		s := e.aestheticHead.Score(vec)
+		if math.IsNaN(s) || math.IsInf(s, 0) {
+			processed++
+			failed++
+			pubRunning(processed)
+			continue
+		}
+		if _, err := e.db.Exec(`UPDATE assets SET aesthetic_score=? WHERE id=?`, s, id); err != nil {
+			zap.L().Warn("aesthetic backfill: 写分失败", zap.String("asset_id", id), zap.Error(err))
+			failed++
+		}
+		processed++
+		pubRunning(processed)
+	}
+
+	final := Task{
+		ID: taskID, Type: "aesthetic", Label: "评估照片美学分",
+		Total: total, Current: processed - failed,
+		Status: "done", Progress: 1, StartedAt: started,
+	}
+	e.reg.Upsert(final)
+	go func() {
+		time.Sleep(6 * time.Second)
+		if e.reg != nil {
+			e.reg.Remove(taskID)
+		}
+	}()
+	return nil
+}
+
 // Run 主循环：每隔 pollInterval 检查 ML ready 状态，
 // 检测到 false→true 跳变时触发一次 Backfill（goroutine 异步执行）。
 // 服务启动时如果 ML 已经就绪，第一次 tick 的 prev=false 也会触发——符合 spec §5.2。
@@ -465,12 +608,16 @@ func (e *Embedder) tick(ctx context.Context) {
 			// one-time re-embed of all existing assets from their thumbnails,
 			// then OCR for assets indexed before OCR support existed, then doc
 			// verdicts for OCR'd assets missing the mixed-criteria judgment
-			// (BackfillDocVerdicts), then faces (RunPipeline，via onRecovered) —
-			// covers detection backlog accumulated while ML was down.
+			// (BackfillDocVerdicts), then aesthetic scores for assets whose CLIP
+			// vector arrived while ML was down (BackfillAesthetic，纯本地计算，
+			// 不依赖 ML，但仍挂在同一条恢复链上顺带收敛)，最后 faces
+			// (RunPipeline，via onRecovered) — covers detection backlog
+			// accumulated while ML was down.
 			_ = e.Backfill(ctx)
 			e.reembedThumbnailsOnce()
 			_ = e.BackfillOCR(ctx)
 			_ = e.BackfillDocVerdicts(ctx)
+			_ = e.BackfillAesthetic(ctx)
 			if e.onRecovered != nil {
 				e.onRecovered(ctx)
 			}

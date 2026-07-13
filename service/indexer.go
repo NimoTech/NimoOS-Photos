@@ -14,6 +14,7 @@ import (
 	_ "image/jpeg"
 	_ "image/png"
 	"io/fs"
+	"math"
 	"net/http"
 	"os"
 	"os/exec"
@@ -27,6 +28,7 @@ import (
 	_ "golang.org/x/image/webp"
 
 	"github.com/NimoTech/NimoOS-Photos/common"
+	"github.com/NimoTech/NimoOS-Photos/pkg/aesthetic"
 	"github.com/NimoTech/NimoOS-Photos/pkg/config"
 	"github.com/NimoTech/NimoOS-Photos/pkg/exif"
 	"github.com/NimoTech/NimoOS-Photos/pkg/ffmpeg"
@@ -181,6 +183,10 @@ type Indexer struct {
 	promptMu    sync.Mutex
 	promptDoc   [][]float32
 	promptPhoto [][]float32
+
+	// aestheticHead 非 nil 时,writeClipEmbedding 成功后内联计算美学分写库
+	// (纯本地矩阵乘,微秒级)。经 SetAestheticHead 注入,AestheticEnabled=false 时为 nil。
+	aestheticHead *aesthetic.Head
 
 	// sprites 是进程内共享的悬浮预览雪碧图生成器：索引管线内联预生成、启动
 	// 补跑（BackfillSprites）与 /sprite 路由的现场生成必须共用同一实例，
@@ -1184,13 +1190,34 @@ func (ix *Indexer) writeClipEmbedding(assetID string, vec []float32) error {
 		return err
 	}
 	if n, _ := res.RowsAffected(); n > 0 {
+		// 向量已落库:内联美学打分。失败只记日志不影响向量写入结果。
+		ix.scoreAesthetic(assetID, vec)
 		return nil
 	}
 	if _, err := ix.db.Exec(`INSERT INTO clip_embeddings(rowid, embedding) VALUES(?,?)`, rowid, blob); err != nil {
 		fmt.Fprintf(os.Stderr, "[indexer] insert clip_embeddings %s: %v\n", assetID, err)
 		return err
 	}
+	// 向量已落库:内联美学打分。失败只记日志不影响向量写入结果。
+	ix.scoreAesthetic(assetID, vec)
 	return nil
+}
+
+// SetAestheticHead 注入美学评分头;nil 表示关闭内联打分。
+func (ix *Indexer) SetAestheticHead(h *aesthetic.Head) { ix.aestheticHead = h }
+
+// scoreAesthetic 对已写入向量的资产计算美学分。头未注入 / 维度不符(NaN)时静默跳过。
+func (ix *Indexer) scoreAesthetic(assetID string, vec []float32) {
+	if ix.aestheticHead == nil {
+		return
+	}
+	s := ix.aestheticHead.Score(vec)
+	if math.IsNaN(s) || math.IsInf(s, 0) {
+		return
+	}
+	if _, err := ix.db.Exec(`UPDATE assets SET aesthetic_score=? WHERE id=?`, s, assetID); err != nil {
+		zap.L().Warn("aesthetic: 写分失败", zap.String("asset_id", assetID), zap.Error(err))
+	}
 }
 
 // sha256File returns the hex-encoded SHA-256 hash of data.

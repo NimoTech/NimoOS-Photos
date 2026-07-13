@@ -235,6 +235,11 @@ func (r *Rebuilder) run(taskID string) {
 				if _, err := r.db.Exec(`UPDATE assets SET face_scanned=0 WHERE id=?`, t.id); err != nil {
 					zap.L().Warn("rebuild: reset face_scanned failed", zap.String("asset", t.id), zap.Error(err))
 				}
+				// 旧美学分基于旧模型向量,一并清掉;ForceReprocess 重写向量时由
+				// 内联打分(writeClipEmbedding 出口)自动补回,无需单独任务。
+				if _, err := r.db.Exec(`UPDATE assets SET aesthetic_score=NULL WHERE id=?`, t.id); err != nil {
+					zap.L().Warn("rebuild: reset aesthetic_score failed", zap.String("asset", t.id), zap.Error(err))
+				}
 				// 旧 CLIP 向量先删：见上方“不再全库清空”的说明 a)。
 				dropClipVector(r.db, t.id)
 				ok := r.indexer.ForceReprocess(t.path, processOpts{force: true, skipExif: true, skipThumb: true})

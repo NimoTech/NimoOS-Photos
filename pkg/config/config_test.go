@@ -27,13 +27,14 @@ func TestWatchDirsEmptyMeansAuto(t *testing.T) {
 	require.Equal(t, []string{"/DATA/Gallery", "/DATA/Media"}, cfg.WatchDirs)
 }
 
-// 配置文件无新 key 时，三个新开关默认 true（与 FacesEnabled 同语义）。
+// 配置文件无新 key 时，新开关默认 true（与 FacesEnabled 同语义）。
 func TestNewFlagsDefaultTrue(t *testing.T) {
 	cf := filepath.Join(t.TempDir(), "photos.conf")
 	require.NoError(t, Init(cf, "[photos]\n"))
 	require.True(t, Cfg.ScenesEnabled)
 	require.True(t, Cfg.OCREnabled)
 	require.True(t, Cfg.SmartViewEnabled)
+	require.True(t, Cfg.AestheticEnabled)
 }
 
 // Save 写盘后重新 Init 能读回完全一致的值（含 false）。

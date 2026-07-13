@@ -469,6 +469,39 @@ func TestSmartViewStats(t *testing.T) {
 	require.Len(t, sv.Seeds, 5)
 }
 
+// TestFillStatsSeedsPreferAestheticScore 验证:fillStats 生成的 Seeds 优先按
+// 美学分排序(NULL 排在最后),同美学分档次内再按 match_score 排序。
+func TestFillStatsSeedsPreferAestheticScore(t *testing.T) {
+	s := svTestService(t)
+	db := s.db
+	_, _ = db.Exec(`INSERT INTO smart_views(id,name,conds_raw,conds_parsed,threshold) VALUES('sv-aes','A','[]','[]',50)`)
+
+	// a-null: match_score 最高(0.9)但美学分为 NULL —— 应排最后
+	// a-high: match_score 0.8,美学分 9 —— 应排第一
+	// a-mid:  match_score 0.7,美学分 5 —— 应排第二
+	rows := []struct {
+		id    string
+		score float64
+		aes   any
+	}{
+		{"a-null", 0.9, nil},
+		{"a-high", 0.8, 9.0},
+		{"a-mid", 0.7, 5.0},
+	}
+	for _, r := range rows {
+		_, err := db.Exec(`INSERT INTO assets(id,file_path,status,file_size,aesthetic_score) VALUES(?,?,?,?,?)`,
+			r.id, "/p/"+r.id, "indexed", 100, r.aes)
+		require.NoError(t, err)
+		_, err = db.Exec(`INSERT INTO smart_view_matches(smart_view_id,asset_id,match_score,matched_at) VALUES(?,?,?,?)`,
+			"sv-aes", r.id, r.score, time.Now().UTC().Format("2006-01-02T15:04:05Z"))
+		require.NoError(t, err)
+	}
+
+	sv, err := s.Get("sv-aes")
+	require.NoError(t, err)
+	require.Equal(t, []string{"a-high", "a-mid", "a-null"}, sv.Seeds)
+}
+
 func sumInts(a []int) int {
 	s := 0
 	for _, v := range a {

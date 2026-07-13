@@ -897,6 +897,70 @@ func TestAlbumCoverFallbackChainExcludesOfflineAssets(t *testing.T) {
 		"List cover fallback chain must also skip offline assets")
 }
 
+// --- Implicit cover prefers the highest aesthetic_score member ---
+
+// TestAlbumCoverPrefersAesthetic verifies that when no valid explicit cover
+// exists, the implicit fallback picks the member with the highest
+// aesthetic_score (NULL scores last, position/rowid as stable tiebreaker),
+// and that an explicit cover (via SetCover/UpdateCover) still wins over it.
+func TestAlbumCoverPrefersAesthetic(t *testing.T) {
+	db, err := sqlite.Open(filepath.Join(t.TempDir(), "test.db"))
+	require.NoError(t, err)
+	defer db.Close()
+
+	_, err = db.Exec(`INSERT INTO assets(id, file_path, status) VALUES
+		('a1','/g/a1.jpg','indexed'),
+		('a2','/g/a2.jpg','indexed'),
+		('a3','/g/a3.jpg','indexed')`)
+	require.NoError(t, err)
+	_, err = db.Exec(`UPDATE assets SET aesthetic_score=8.1 WHERE id='a2'`)
+	require.NoError(t, err)
+	_, err = db.Exec(`UPDATE assets SET aesthetic_score=3.0 WHERE id='a3'`)
+	require.NoError(t, err)
+
+	svc := service.NewAlbumService(db)
+	al, err := svc.Create("Aesthetic Cover")
+	require.NoError(t, err)
+	// a1 position=0 score=NULL, a2 position=1 score=8.1, a3 position=2 score=3.0
+	require.NoError(t, svc.AddAsset(al.ID, "a1"))
+	require.NoError(t, svc.AddAsset(al.ID, "a2"))
+	require.NoError(t, svc.AddAsset(al.ID, "a3"))
+
+	got, err := svc.Get(al.ID)
+	require.NoError(t, err)
+	require.Equal(t, "a2", got.CoverAssetID, "Get implicit cover must be the highest-scoring member a2")
+
+	albums, err := svc.List()
+	require.NoError(t, err)
+	require.Len(t, albums, 1)
+	require.Equal(t, "a2", albums[0].CoverAssetID, "List implicit cover must be the highest-scoring member a2")
+
+	// Clear all scores back to NULL; fallback must revert to position order
+	// (a1, position=0) — a non-null score always beats a NULL one, so this
+	// case is only well-defined once every member is NULL again.
+	_, err = db.Exec(`UPDATE assets SET aesthetic_score=NULL WHERE id IN ('a2','a3')`)
+	require.NoError(t, err)
+
+	got, err = svc.Get(al.ID)
+	require.NoError(t, err)
+	require.Equal(t, "a1", got.CoverAssetID, "with all scores NULL, cover must fall back to first-position a1")
+
+	albums, err = svc.List()
+	require.NoError(t, err)
+	require.Equal(t, "a1", albums[0].CoverAssetID, "List must also fall back to first-position a1")
+
+	// Explicit cover (SetCover semantics via UpdateCover) still wins over aesthetic fallback.
+	require.NoError(t, svc.UpdateCover(al.ID, "a3"))
+
+	got, err = svc.Get(al.ID)
+	require.NoError(t, err)
+	require.Equal(t, "a3", got.CoverAssetID, "explicit cover a3 must win over aesthetic fallback")
+
+	albums, err = svc.List()
+	require.NoError(t, err)
+	require.Equal(t, "a3", albums[0].CoverAssetID, "List explicit cover a3 must win over aesthetic fallback")
+}
+
 func TestAlbumListPhotoVideoCountsExcludeLiveAndTrashed(t *testing.T) {
 	db, err := sqlite.Open(filepath.Join(t.TempDir(), "test.db"))
 	require.NoError(t, err)

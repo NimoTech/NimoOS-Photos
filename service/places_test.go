@@ -525,6 +525,92 @@ func TestSpotMemberIDsAtPinsExactCluster(t *testing.T) {
 	require.Empty(t, ids)
 }
 
+// TestPlacesCoverThumbsPrefersAesthetic 验证城市卡 Thumbs 按美学分优先排序(未打分的
+// 兜底按拍摄时间倒序),而详情页 Detail.Recent(「最近」区块)仍保持纯时间语义,不受
+// 美学分影响。
+func TestPlacesCoverThumbsPrefersAesthetic(t *testing.T) {
+	db, err := sqlite.Open(filepath.Join(t.TempDir(), "t.db"))
+	require.NoError(t, err)
+	defer db.Close()
+	gaz, err := geo.Load()
+	require.NoError(t, err)
+	geoSvc := service.NewGeoService(db, gaz)
+
+	seed := func(id string, daysAgo int) {
+		taken := time.Now().AddDate(0, 0, -daysAgo).UTC().Format("2006-01-02 15:04:05")
+		_, err := db.Exec(`INSERT INTO assets(id,file_path,status,taken_at,is_live_photo_video)
+			VALUES(?,?, 'indexed', ?, 0)`, id, "/x/"+id, taken)
+		require.NoError(t, err)
+		_, err = db.Exec(`INSERT INTO asset_exif(asset_id,latitude,longitude) VALUES(?,35.6895,139.6917)`, id)
+		require.NoError(t, err)
+		require.NoError(t, geoSvc.GeocodeAsset(id))
+	}
+	// t1 最新但未打分;t2 打分最高但拍摄较早;t3 打分较低;t4 最旧且未打分。
+	seed("t1", 1)
+	seed("t2", 5)
+	seed("t3", 3)
+	seed("t4", 10)
+	_, err = db.Exec(`UPDATE assets SET aesthetic_score=9.0 WHERE id='t2'`)
+	require.NoError(t, err)
+	_, err = db.Exec(`UPDATE assets SET aesthetic_score=2.0 WHERE id='t3'`)
+	require.NoError(t, err)
+
+	svc := service.NewPlacesService(db, gaz, geoSvc)
+	resp, err := svc.ListPlaces()
+	require.NoError(t, err)
+	require.Len(t, resp.Places, 1)
+	cityID := resp.Places[0].Key
+
+	// 城市卡 Thumbs:美学分优先(t2 最高在前、t3 次之),未打分的兜底按时间倒序(t1 比 t4 新)。
+	require.Equal(t, []string{"t2", "t3", "t1", "t4"}, resp.Places[0].Thumbs,
+		"城市卡封面应美学分优先,未打分资产兜底按拍摄时间倒序")
+
+	// 详情页 Recent 仍是纯时间倒序,不受美学分影响。
+	detail, err := svc.GetPlace(cityID)
+	require.NoError(t, err)
+	require.Equal(t, []string{"t1", "t3", "t2", "t4"}, detail.Recent,
+		"详情页「最近」区块必须保持纯时间语义,不被美学分打乱")
+}
+
+// TestSpotsCoverPrefersAesthetic 验证 spot 封面取簇内美学分最高的资产;当簇内全部未打分
+// 时退回原行为(最新一张,即 firstID)。
+func TestSpotsCoverPrefersAesthetic(t *testing.T) {
+	db, err := sqlite.Open(filepath.Join(t.TempDir(), "t.db"))
+	require.NoError(t, err)
+	defer db.Close()
+	gaz, _ := geo.Load()
+	geoSvc := service.NewGeoService(db, gaz)
+	mk := func(id string, lat, lon float64) {
+		db.Exec(`INSERT INTO assets(id,file_path,status,taken_at,is_live_photo_video) VALUES(?,?, 'indexed', '2026-03-01 10:00:00', 0)`, id, "/x/"+id)
+		db.Exec(`INSERT INTO asset_exif(asset_id,latitude,longitude) VALUES(?,?,?)`, id, lat, lon)
+		geoSvc.GeocodeAsset(id)
+	}
+	// 单个簇,3 张照片,刚好达到 spotMinPhotos(=3)阈值。
+	mk("s1", 35.6579, 139.7036)
+	mk("s2", 35.6569, 139.7046)
+	mk("s3", 35.6589, 139.7036)
+
+	svc := service.NewPlacesService(db, gaz, geoSvc)
+	resp, _ := svc.ListPlaces()
+	require.NotEmpty(t, resp.Places)
+	cityID := resp.Places[0].Key
+
+	// 全未打分:退回原行为(firstID,即簇内最新一张)。
+	spotsBefore := svc.Spots(cityID)
+	require.Len(t, spotsBefore, 1)
+	require.NotEmpty(t, spotsBefore[0].Thumb, "全未打分应退回 firstID 兜底")
+
+	// s2 打分最高:封面应切到 s2,即便 s2 不是簇内最新的一张。
+	_, err = db.Exec(`UPDATE assets SET aesthetic_score=7.5 WHERE id='s2'`)
+	require.NoError(t, err)
+	_, err = db.Exec(`UPDATE assets SET aesthetic_score=1.0 WHERE id='s1'`)
+	require.NoError(t, err)
+
+	spotsAfter := svc.Spots(cityID)
+	require.Len(t, spotsAfter, 1)
+	require.Equal(t, "s2", spotsAfter[0].Thumb, "簇内美学分最高的资产应作为 spot 封面")
+}
+
 // TestSpotJumpSmallerClusterByCentroid is the end-to-end guard for the bug
 // report: tapping the SMALLER of two key-colliding spots must surface that
 // spot's own photos. (Mirrors how route/v1/assets.go calls SpotMemberIDsAt.)

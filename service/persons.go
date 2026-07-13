@@ -52,7 +52,14 @@ SELECT p.id, p.name,
           WHERE fp.person_id=p.id AND a.deleted_at IS NULL AND a.offline=0 AND a.is_live_photo_video=0
             AND e.latitude IS NOT NULL AND e.longitude IS NOT NULL
             AND NOT (e.latitude=0 AND e.longitude=0)) AS places,
-       COALESCE((SELECT a.id FROM assets a WHERE a.id=p.hero_asset_id AND a.deleted_at IS NULL AND a.offline=0),'') AS hero
+       COALESCE(
+           (SELECT a.id FROM assets a WHERE a.id=p.hero_asset_id AND a.deleted_at IS NULL AND a.offline=0),
+           (SELECT a2.id FROM face_person fp2
+               JOIN face_detections fd2 ON fd2.id=fp2.face_id AND fd2.excluded=0
+               JOIN assets a2 ON a2.id=fd2.asset_id AND a2.deleted_at IS NULL AND a2.offline=0
+               WHERE fp2.person_id=p.id AND a2.aesthetic_score IS NOT NULL
+               ORDER BY a2.aesthetic_score DESC LIMIT 1),
+           '') AS hero
 FROM persons p
 WHERE p.hidden=0
 ORDER BY cnt DESC, p.rowid`)
@@ -94,7 +101,14 @@ SELECT p.id, p.name,
            '') AS cover,
        COALESCE(p.cover_face_id,''),
        p.favorite, COALESCE(p.relation,''), p.confidence,
-       COALESCE((SELECT a.id FROM assets a WHERE a.id=p.hero_asset_id AND a.deleted_at IS NULL AND a.offline=0),'') AS hero
+       COALESCE(
+           (SELECT a.id FROM assets a WHERE a.id=p.hero_asset_id AND a.deleted_at IS NULL AND a.offline=0),
+           (SELECT a2.id FROM face_person fp2
+               JOIN face_detections fd2 ON fd2.id=fp2.face_id AND fd2.excluded=0
+               JOIN assets a2 ON a2.id=fd2.asset_id AND a2.deleted_at IS NULL AND a2.offline=0
+               WHERE fp2.person_id=p.id AND a2.aesthetic_score IS NOT NULL
+               ORDER BY a2.aesthetic_score DESC LIMIT 1),
+           '') AS hero
 FROM persons p WHERE p.id=? AND p.hidden=0`, id).Scan(
 		&p.ID, &p.Name, &p.CoverAssetID, &p.CoverFaceID, &fav, &p.Relation, &p.Confidence, &p.HeroAssetID)
 	if err == sql.ErrNoRows {
@@ -778,26 +792,40 @@ func suggestionReason(name string, conf float64) string {
 // is no longer in the person's excluded=0 face set (e.g. it was detached), the lock
 // is cleared and cover is reselected by centroid distance.
 func recomputeOneCentroidTx(tx *sql.Tx, personID string) error {
-	// Load all active (excluded=0) faces for centroid computation.
+	// Load all active (excluded=0) faces for centroid computation，同时取封面混合分
+	// 所需的 asset 美学分与 EXIF 宽高（JOIN assets 取分，LEFT JOIN asset_exif 取宽高，
+	// 缺失时 hybridCoverScore 会记该脸为不可比）。
 	rows, err := tx.Query(`
-SELECT fd.id, fd.asset_id, fd.embedding
-FROM face_person fp JOIN face_detections fd ON fd.id=fp.face_id
+SELECT fd.id, fd.asset_id, fd.embedding, fd.bbox,
+       a.aesthetic_score, e.width, e.height
+FROM face_person fp
+JOIN face_detections fd ON fd.id=fp.face_id
+JOIN assets a ON a.id=fd.asset_id
+LEFT JOIN asset_exif e ON e.asset_id=fd.asset_id
 WHERE fp.person_id=? AND fd.excluded=0`, personID)
 	if err != nil {
 		return err
 	}
-	var faceIDs, assetIDs []string
+	var faceIDs, assetIDs, bboxes []string
 	var vecs [][]float32
+	var scores []sql.NullFloat64
+	var ws, hs []sql.NullInt64
 	for rows.Next() {
-		var fid, aid string
+		var fid, aid, bbox string
 		var blob []byte
-		if err := rows.Scan(&fid, &aid, &blob); err != nil {
+		var score sql.NullFloat64
+		var w, h sql.NullInt64
+		if err := rows.Scan(&fid, &aid, &blob, &bbox, &score, &w, &h); err != nil {
 			rows.Close()
 			return err
 		}
 		faceIDs = append(faceIDs, fid)
 		assetIDs = append(assetIDs, aid)
+		bboxes = append(bboxes, bbox)
 		vecs = append(vecs, sqlite.DeserializeFloat32(blob))
+		scores = append(scores, score)
+		ws = append(ws, w)
+		hs = append(hs, h)
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
@@ -839,18 +867,63 @@ WHERE fp.person_id=? AND fd.excluded=0`, personID)
 			return err
 		}
 	}
-	// Select cover by centroid distance.
-	best, bestDist := 0, 2.0
-	for i, v := range vecs {
-		if d := cosDist(v, centroid); d < bestDist {
-			bestDist = d
+	// 混合分选优:整图美学分 × 脸面积占比;不可比(无分/无 EXIF/bbox 退化)记 -1。
+	// 全部不可比时退回质心最近(原行为,也覆盖存量库尚未打分的过渡期)。
+	best, bestHybrid := -1, -1.0
+	for i := range vecs {
+		if h := hybridCoverScore(scores[i], bboxes[i], ws[i], hs[i]); h > bestHybrid {
+			bestHybrid = h
 			best = i
+		}
+	}
+	if bestHybrid < 0 {
+		// best 先置 0 兜底：理论边界下若所有脸 cosDist 恰好等于初始 bestDist(2.0)（严格小于判断永不成立），
+		// 循环体不会再更新 best，此时仍需落在合法脸索引上，避免下方 faceIDs[best] 越界 panic。
+		best = 0
+		bestDist := 2.0
+		for i, v := range vecs {
+			if d := cosDist(v, centroid); d < bestDist {
+				bestDist = d
+				best = i
+			}
 		}
 	}
 	_, err = tx.Exec(
 		`UPDATE persons SET centroid=?, confidence=?, cover_face_id=?, cover_asset_id=?, updated_at=CURRENT_TIMESTAMP WHERE id=?`,
 		sqlite.SerializeFloat32(centroid), conf, faceIDs[best], assetIDs[best], personID)
 	return err
+}
+
+// hybridCoverScore 计算人物封面混合分(整图美学分 × 脸面积占比);不可比返回 -1。
+// 不可比场景:asset 未打分、EXIF 缺失宽高、bbox 无法解析或退化(面积<=0)。
+func hybridCoverScore(score sql.NullFloat64, bboxJSON string, w, h sql.NullInt64) float64 {
+	if !score.Valid || !w.Valid || !h.Valid || w.Int64 <= 0 || h.Int64 <= 0 {
+		return -1
+	}
+	var bb struct {
+		X1 float64 `json:"x1"`
+		Y1 float64 `json:"y1"`
+		X2 float64 `json:"x2"`
+		Y2 float64 `json:"y2"`
+	}
+	if json.Unmarshal([]byte(bboxJSON), &bb) != nil {
+		return -1
+	}
+	area := (bb.X2 - bb.X1) * (bb.Y2 - bb.Y1)
+	if area <= 0 {
+		return -1
+	}
+	ratio := area / float64(w.Int64*h.Int64)
+	if ratio > 1 {
+		ratio = 1 // 视频 bbox 基于关键帧、EXIF 是原视频尺寸,比例可能溢出,截断即可
+	}
+	aest := (score.Float64 - 1) / 9
+	if aest < 0 {
+		aest = 0
+	} else if aest > 1 {
+		aest = 1
+	}
+	return aest * ratio
 }
 
 // FaceThumbnail 按 cover_face 的 bbox 从原图裁出方形人脸缓存到 cacheDir，返回文件路径。

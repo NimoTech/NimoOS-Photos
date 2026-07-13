@@ -50,9 +50,10 @@ func (s *AlbumService) List() ([]Album, error) {
 	// 1. Membership guard: only honour cover_asset_id when the asset is still a
 	//    member of the album (guards against dangling pointers after removal)
 	//    AND still visible (guards against a chosen-but-offline/deleted cover).
-	// 2. Stable implicit fallback: when no valid explicit cover exists, fall back
-	//    to the first visible item by position (then rowid as tiebreaker), so
-	//    adding new photos never changes an implicit cover.
+	// 2. Aesthetic implicit fallback: when no valid explicit cover exists, pick the
+	//    member with the highest aesthetic_score (NULL scores last, then position/rowid
+	//    as the stable tiebreaker). 用户知情取舍:未手动选封面时,新入高分照片会
+	//    顶掉旧隐式封面(spec 2026-07-10)。
 	rows, err := s.db.Query(`
 		SELECT a.id, a.name, a.created_at,
 		       COALESCE(
@@ -64,7 +65,8 @@ func (s *AlbumService) List() ([]Album, error) {
 		               JOIN assets av ON av.id = aa2.asset_id
 		                    AND av.deleted_at IS NULL AND av.offline = 0
 		               WHERE aa2.album_id = a.id
-		               ORDER BY aa2.position ASC, aa2.rowid ASC LIMIT 1),
+		               ORDER BY (av.aesthetic_score IS NULL) ASC, av.aesthetic_score DESC,
+		                        aa2.position ASC, aa2.rowid ASC LIMIT 1),
 		           '') AS cover,
 		       SUM(CASE WHEN sp.is_live_photo_video = 0 AND sp.deleted_at IS NULL AND sp.offline = 0
 		                 THEN 1 ELSE 0 END) AS cnt,
@@ -104,8 +106,10 @@ func (s *AlbumService) Get(id string) (*Album, error) {
 	// Cover resolution (same two-layer logic as List):
 	// - Membership guard: only honour cover_asset_id when it is still a member
 	//   AND still visible (not soft-deleted, not offline).
-	// - Stable implicit fallback: first visible item by position/rowid, so
-	//   adding photos never changes an implicit cover.
+	// - Aesthetic implicit fallback: when no valid explicit cover exists, pick the
+	//   member with the highest aesthetic_score (NULL scores last, then position/rowid
+	//   as the stable tiebreaker). 用户知情取舍:未手动选封面时,新入高分照片会
+	//   顶掉旧隐式封面(spec 2026-07-10)。
 	err := s.db.QueryRow(`
 		SELECT id, name, created_at,
 		       COALESCE(
@@ -117,7 +121,8 @@ func (s *AlbumService) Get(id string) (*Album, error) {
 		               JOIN assets av ON av.id = aa2.asset_id
 		                    AND av.deleted_at IS NULL AND av.offline = 0
 		               WHERE aa2.album_id = albums.id
-		               ORDER BY aa2.position ASC, aa2.rowid ASC LIMIT 1),
+		               ORDER BY (av.aesthetic_score IS NULL) ASC, av.aesthetic_score DESC,
+		                        aa2.position ASC, aa2.rowid ASC LIMIT 1),
 		           ''),
 		       (SELECT MIN(s.taken_at) FROM album_assets aa
 		          JOIN assets s ON s.id = aa.asset_id WHERE aa.album_id = albums.id),

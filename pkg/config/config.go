@@ -27,6 +27,9 @@ type Config struct {
 	ScenesEnabled    bool
 	OCREnabled       bool
 	SmartViewEnabled bool
+	// AestheticEnabled 控制美学评分:关闭时不内联打分、不跑 BackfillAesthetic;
+	// 已有分数保留并继续参与封面排序,新资产分数为 NULL 走各处兜底排序。
+	AestheticEnabled bool
 
 	// MinMatchSimilarity, when > 0, drops SmartSearch results whose (display-scale,
 	// post-recalibration) match score is below it. Left at 0 (no filtering) by
@@ -99,6 +102,7 @@ func Init(configFile, confSample string) error {
 		ScenesEnabled:    v.GetBool("photos.ScenesEnabled"),
 		OCREnabled:       v.GetBool("photos.OCREnabled"),
 		SmartViewEnabled: v.GetBool("photos.SmartViewEnabled"),
+		AestheticEnabled: v.GetBool("photos.AestheticEnabled"),
 
 		MinMatchSimilarity: v.GetFloat64("photos.MinMatchSimilarity"),
 		SimDisplayFloor:    v.GetFloat64("photos.SimDisplayFloor"),
@@ -142,6 +146,9 @@ func Init(configFile, confSample string) error {
 	}
 	if !v.IsSet("photos.SmartViewEnabled") {
 		Cfg.SmartViewEnabled = true
+	}
+	if !v.IsSet("photos.AestheticEnabled") {
+		Cfg.AestheticEnabled = true
 	}
 	// 扫描间隔（分钟）；配置无此 key 时默认 1440（24h）。0 = 关闭周期重扫。
 	if !v.IsSet("photos.ScanInterval") {
