@@ -186,6 +186,27 @@ Smart View 也复用 `SmartSearch` 接口，按自然语言条件定义动态相
 
 `common.MLModelGen`（当前 `"3"` = SigLIP2 SO400M + antelopev2 + PP-OCRv5_server；gen 2 为 nllb-clip-large 时代）标识当前二进制绑定的模型组合（CLIP/人脸/OCR 三个选型 + 维度）；成功重建后写入 `photos_meta.ml_model_gen`。服务启动时若检测到该键缺失（老库）或与当前 `MLModelGen` 不符，`Rebuilder.MaybeAutoRebuild`（`service/rebuild.go`）会轮询等待 ML 后端就绪（新模型缓存就位）后自动触发一次全量重建：清空 `clip_embeddings`/`asset_clip_idx`、对所有 `status='indexed'` 资产重跑 CLIP/人脸/OCR、重新聚类人脸并清理无脸的空 `persons`，最后写回新代次。空库（无资产）跳过 worker pool，直接完成重聚类并写代次，秒级完成。代次仅在重建成功收尾（`finalize()`）后写入，中途失败或断电会在下次启动时重试。
 
+### 7. 美学评分
+
+`pkg/aesthetic` 是一个纯 Go 线性头：在现成 CLIP（SigLIP2）图向量上跑一个小 MLP（`NAES` 权重格式，`go:embed` 内嵌进二进制，见 `pkg/aesthetic/weights/head_v1.bin`），当前探针头版本串 `v25probe1`，维度链 1152→1024→128→64→16→1。`Score` 输入先做 L2 归一化再逐层 `y=Wx+b`；输入向量维度与头不符时返回 `NaN`（调用侧跳过该资产，不写脏分）。**探针性质**：该头基于 SigLIP v1 训练，与本机实际使用的 SigLIP2 向量空间不同，不保证打分效果——若人工验收（`scripts/aesthetic/report.py` 生成最高/最低分对比页）不合格，阶段二会转为在 AVA 数据集上自训一个对齐 SigLIP2 空间的线性头，复用同一份 NAES 格式与 `Load`/`LoadFrom` 接口，只换 `head_v1.bin` 不用改 Go 代码（详见 `scripts/aesthetic/README.md`，权重转换脚本 `convert_v25.py`）。
+
+打分双路，互为补充：
+1. **内联**：`writeClipEmbedding`（`service/indexer.go`）成功写入 CLIP 向量后，若 `aestheticHead` 非空（由 `AestheticEnabled` 注入），当场算分写回 `assets.aesthetic_score`——纯本地矩阵乘，微秒级，不额外占 ML 调用。
+2. **补跑**：`Embedder.BackfillAesthetic`（`service/embedder.go`，CAS 防重入 + rerun-pending 语义同 `BackfillOCR`）扫描「有 CLIP 向量但 `aesthetic_score IS NULL`」的资产补算，登记任务 `type="aesthetic"`。三处触发：服务启动（`AestheticEnabled` 开启时，纯本地计算不等 ML 就绪，与 OCR 补跑的关键差异）、ML 恢复链尾（掉线→恢复跳变）、每个上传批次完成时（`SetOnBatchDone`）。**不依赖 ML 在线**（只读库内已存的 CLIP 向量，不碰原文件），**不过滤 offline** 资产。
+
+`assets.aesthetic_score`（REAL，NULL=未打分）与 `photos_meta.aesthetic_head_ver` 独立于 `ml_model_gen` 管理版本：`EnsureAestheticHeadVer`（`service/embedder.go`）在头版本变化时，同一事务内把全库分数置 NULL 并盖章新版本——不同于 `ml_model_gen` 的「成功后盖章」，置 NULL 本身就是原子清除、无脏数据窗口，可以提前盖章，重打靠 `BackfillAesthetic` 的 NULL 查询自然收敛。ML 模型代次重建（`service/rebuild.go`，见上节）换向量时逐资产清分（`UPDATE assets SET aesthetic_score=NULL`），`ForceReprocess` 重写向量后由内联打分自动补回，不需要单独任务。
+
+**五处封面选优**（未手动指定时的隐式排序，`aesthetic_score IS NULL` 永远排最后，回退到旧有排序规则）：
+- 相册隐式封面（`service/album.go`：相册列表摘要与单相册详情两处查询，按 `aesthetic_score DESC` 取相册内最高分成员，`position`/`rowid` 兜底稳定排序）
+- 地点城市卡 + 打点（spot）封面候选（`service/places.go`：城市聚合卡与 spot 最佳照片查询）
+- 智能相册（Smart View）预览 seeds（`service/smartview.go`：预览取样按分排序）
+- 人物封面混合分（`service/persons.go` `hybridCoverScore`：整图美学分 × 该脸 bbox 占比，双因子都要求可比——资产未打分/EXIF 缺宽高/bbox 退化则记不可比；`cover_locked=1` 时不受影响，仍跳过自动重算）
+- 人物 hero 兜底（`service/persons.go`：无锁定封面时的列表/详情 hero 查询）
+
+手动指定的封面（`cover_asset_id`/`cover_face_id`/`cover_locked=1`）永远优先于美学分；全库分数为 NULL（如刚换头待重打期间）时上述五处均回退到各自原有的旧排序（时间/position 等）。
+
+配置开关 `AestheticEnabled`（`photos.conf`，默认 `true`），**非热重载**：关闭后仅停止新打分（内联跳过、`BackfillAesthetic` 不触发），已有分数不清除；重新打开需重启服务加载头。
+
 ---
 
 ## 数据存储
@@ -209,7 +230,7 @@ Smart View 也复用 `SmartSearch` 接口，按自然语言条件定义动态相
 
 | 表 | 用途 |
 |---|---|
-| `assets` | 资产主表（路径、MIME、拍摄时间、checksum、状态、软删除） |
+| `assets` | 资产主表（路径、MIME、拍摄时间、checksum、状态、软删除、`aesthetic_score` 美学分 REAL/NULL=未打分） |
 | `asset_exif` | EXIF/视频元数据（分辨率、GPS、相机、ISO、编解码等） |
 | `clip_embeddings` | sqlite-vec **vec0** 虚拟表，1152 维 CLIP 向量 |
 | `asset_clip_idx` | rowid ↔ asset_id 映射（连接 clip_embeddings 与 assets） |
@@ -227,7 +248,7 @@ Smart View 也复用 `SmartSearch` 接口，按自然语言条件定义动态相
 | `merge_rejections` | 被拒绝的人脸合并建议对 |
 | `place_cover_overrides` | 用户自定义地点封面 |
 | `spot_name_overrides` | 用户自定义打点名称 |
-| `photos_meta` | 键值元数据（如 `index_last_rebuilt`、`ml_model_gen`） |
+| `photos_meta` | 键值元数据（如 `index_last_rebuilt`、`ml_model_gen`、`aesthetic_head_ver`） |
 
 ---
 
@@ -274,12 +295,13 @@ FacesEnabled = true
 ScenesEnabled = true
 OCREnabled = true
 SmartViewEnabled = true
+AestheticEnabled = true
 ```
 
 - `WatchDirs`：逗号分隔，fsnotify 监视目录，默认三个；可运行时通过 `PUT /v1/photos/config` 热生效（`Watcher.Restart`）。
 - `Workers`：Indexer 并发 worker 数，默认 3。
 - `MLEndpoint`：immich-machine-learning 地址，默认 `http://127.0.0.1:3003`。
-- 各功能开关（`FacesEnabled/ScenesEnabled/OCREnabled/SmartViewEnabled`）缺省均为 `true`；关闭 `ScenesEnabled` 后新照片不再生成 CLIP 向量，语义搜索将失效。
+- 各功能开关（`FacesEnabled/ScenesEnabled/OCREnabled/SmartViewEnabled/AestheticEnabled`）缺省均为 `true`；关闭 `ScenesEnabled` 后新照片不再生成 CLIP 向量，语义搜索将失效。`AestheticEnabled` 非热重载，关闭仅停止新打分（内联+补跑都跳过），已有 `aesthetic_score` 不清除，见「核心流程 § 7 美学评分」。
 
 ---
 
