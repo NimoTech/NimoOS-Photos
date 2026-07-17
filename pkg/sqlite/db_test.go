@@ -790,3 +790,30 @@ func TestMigrateAssetsAestheticScore(t *testing.T) {
 	require.NoError(t, db2.QueryRow(`SELECT aesthetic_score FROM assets WHERE id='a1'`).Scan(&score))
 	require.False(t, score.Valid, "重复迁移不应改变既有 NULL 值")
 }
+
+// TestMigrateSmartViewMatchesOrigin 验证:旧库升级应给 smart_view_matches 补
+// origin 列(0=自动匹配/1=手动钉住/2=手动排除),默认 0;二次 Open 幂等。
+func TestMigrateSmartViewMatchesOrigin(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "photos.db")
+
+	db, err := sqlite.Open(path)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO assets(id, file_path, checksum, status) VALUES('a1','/x','c1','indexed')`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO smart_views(id, name, conds_raw, conds_parsed) VALUES('sv1','v','[]','[]')`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO smart_view_matches(smart_view_id, asset_id, match_score) VALUES('sv1','a1',0.8)`)
+	require.NoError(t, err)
+	var origin int
+	require.NoError(t, db.QueryRow(`SELECT origin FROM smart_view_matches WHERE asset_id='a1'`).Scan(&origin))
+	require.Equal(t, 0, origin, "默认应为 0(自动匹配)")
+	require.NoError(t, db.Close())
+
+	// 重复打开应幂等,不报错、不清空既有值。
+	db2, err := sqlite.Open(path)
+	require.NoError(t, err)
+	defer db2.Close()
+	require.NoError(t, db2.QueryRow(`SELECT origin FROM smart_view_matches WHERE asset_id='a1'`).Scan(&origin))
+	require.Equal(t, 0, origin, "重复迁移不应改变既有值")
+}
