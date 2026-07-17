@@ -1,6 +1,7 @@
 package service
 
 import (
+	"database/sql"
 	"math"
 	"path/filepath"
 	"testing"
@@ -294,6 +295,84 @@ func TestEvaluateReparsesFromRaw(t *testing.T) {
 	require.Equal(t, 1, n, "Evaluate should re-parse raw conds so the upgraded parser takes effect")
 }
 
+// Evaluate 的调和循环不得触碰手动行（origin!=0）：钉住行（不匹配当前条件）
+// 存活且分数保持 1.0 不被刷新；排除行同样存活（保留"记忆"，供读路径过滤）；
+// 自动行（origin=0）该增该删照旧——不匹配的自动行被删,新匹配的资产以
+// origin=0 被 INSERT。
+func TestEvaluatePreservesManualRows(t *testing.T) {
+	s := svTestService(t)
+	db := s.db
+
+	// aPin/aExcl/aGone 均无 CLIP 向量,天然不满足 "scene: sunset" 语义条件；
+	// aMatch 有对齐的 CLIP 向量,天然满足条件（展示分 1.0）。
+	for _, id := range []string{"aPin", "aExcl", "aGone"} {
+		_, err := db.Exec(`INSERT INTO assets(id,file_path,status,is_live_photo_video) VALUES(?,?,'indexed',0)`,
+			id, "/p/"+id+".jpg")
+		require.NoError(t, err)
+	}
+	seedClipAsset(t, s, "aMatch")
+
+	_, err := db.Exec(`INSERT INTO smart_views(id,name,conds_raw,conds_parsed,threshold,include_videos)
+		VALUES('sv-manual','Manual','["scene: sunset"]','[]',50,0)`)
+	require.NoError(t, err)
+
+	// 预置表内手动/陈旧行。
+	_, err = db.Exec(`INSERT INTO smart_view_matches(smart_view_id,asset_id,match_score,origin) VALUES('sv-manual','aPin',1.0,1)`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO smart_view_matches(smart_view_id,asset_id,match_score,origin) VALUES('sv-manual','aExcl',0.7,2)`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO smart_view_matches(smart_view_id,asset_id,match_score,origin) VALUES('sv-manual','aGone',0.6,0)`)
+	require.NoError(t, err)
+
+	require.NoError(t, s.Evaluate("sv-manual"))
+
+	var org int
+	var score float64
+	require.NoError(t, db.QueryRow(`SELECT origin,match_score FROM smart_view_matches WHERE smart_view_id='sv-manual' AND asset_id='aPin'`).Scan(&org, &score))
+	require.Equal(t, 1, org, "钉住行 origin 不应被改动")
+	require.Equal(t, 1.0, score, "钉住行分数应恒为 1.0,不被重估刷新")
+
+	require.NoError(t, db.QueryRow(`SELECT origin,match_score FROM smart_view_matches WHERE smart_view_id='sv-manual' AND asset_id='aExcl'`).Scan(&org, &score))
+	require.Equal(t, 2, org, "排除行应存活,保留记忆")
+	require.Equal(t, 0.7, score, "排除行分数不应被重估改动")
+
+	err = db.QueryRow(`SELECT origin FROM smart_view_matches WHERE smart_view_id='sv-manual' AND asset_id='aGone'`).Scan(&org)
+	require.ErrorIs(t, err, sql.ErrNoRows, "不匹配条件的自动行应被重估删除")
+
+	require.NoError(t, db.QueryRow(`SELECT origin,match_score FROM smart_view_matches WHERE smart_view_id='sv-manual' AND asset_id='aMatch'`).Scan(&org, &score))
+	require.Equal(t, 0, org, "新匹配的资产应以 origin=0 自动插入")
+	require.Equal(t, 1.0, score)
+}
+
+// 钉住行若同时天然满足条件（evalParsed 会为它算出 <1 的展示分）,重估也不得
+// 刷新其分数,也不得因为它已在表中而触发 INSERT 主键冲突。
+func TestEvaluatePinnedAlsoMatching(t *testing.T) {
+	s := svTestService(t)
+	db := s.db
+
+	// 展示分 50%——明显低于钉住行记忆中的 1.0,用于验证"不刷分"。
+	raw := simDisplayFloor() + (simDisplayCeil()-simDisplayFloor())*0.5
+	seedClipAssetWithSim(t, s, "aPin", raw, "2024-06-01T00:00:00Z")
+
+	_, err := db.Exec(`INSERT INTO smart_views(id,name,conds_raw,conds_parsed,threshold,include_videos)
+		VALUES('sv-pinmatch','PinMatch','["scene: sunset"]','[]',40,0)`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO smart_view_matches(smart_view_id,asset_id,match_score,origin) VALUES('sv-pinmatch','aPin',1.0,1)`)
+	require.NoError(t, err)
+
+	require.NoError(t, s.Evaluate("sv-pinmatch"))
+
+	var cnt int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM smart_view_matches WHERE smart_view_id='sv-pinmatch'`).Scan(&cnt))
+	require.Equal(t, 1, cnt, "不应出现重复行/主键冲突")
+
+	var org int
+	var score float64
+	require.NoError(t, db.QueryRow(`SELECT origin,match_score FROM smart_view_matches WHERE smart_view_id='sv-pinmatch' AND asset_id='aPin'`).Scan(&org, &score))
+	require.Equal(t, 1, org)
+	require.Equal(t, 1.0, score, "钉住行即便天然匹配,分数也不应被重估刷新为 evalParsed 算出的 <1 值")
+}
+
 // 条件为空（或全部不可执行）但填了 description 时，描述本身应作为
 // semantic 条件参与匹配——"What should Nimo match?" 不再是摆设。
 func TestCreateDescriptionFallbackSemantic(t *testing.T) {
@@ -557,6 +636,101 @@ func TestIncrementalEvaluateRespectsPaused(t *testing.T) {
 	require.Equal(t, 0, pausedN)
 }
 
+// TestMatchedAssetsFilterAndPinned 验证读路径过滤:排除行(origin=2)对
+// MatchedAssets 不可见;钉住行(origin=1)可见、Pinned=true 且以 1.0 排最前。
+func TestMatchedAssetsFilterAndPinned(t *testing.T) {
+	s := svTestService(t)
+	db := s.db
+	_, _ = db.Exec(`INSERT INTO smart_views(id,name,conds_raw,conds_parsed,threshold) VALUES('sv-p','P','[]','[]',50)`)
+	for _, id := range []string{"a-auto", "a-pinned", "a-excluded"} {
+		_, err := db.Exec(`INSERT INTO assets(id,file_path,status,is_live_photo_video) VALUES(?,?,'indexed',0)`,
+			id, "/p/"+id+".jpg")
+		require.NoError(t, err)
+	}
+	_, _ = db.Exec(`INSERT INTO smart_view_matches(smart_view_id,asset_id,match_score,origin) VALUES('sv-p','a-auto',0.6,0)`)
+	_, _ = db.Exec(`INSERT INTO smart_view_matches(smart_view_id,asset_id,match_score,origin) VALUES('sv-p','a-pinned',1.0,1)`)
+	_, _ = db.Exec(`INSERT INTO smart_view_matches(smart_view_id,asset_id,match_score,origin) VALUES('sv-p','a-excluded',0.9,2)`)
+
+	assets, err := s.MatchedAssets("sv-p", 60, 0, false, "")
+	require.NoError(t, err)
+	require.Len(t, assets, 2, "排除行不可见")
+
+	byID := map[string]Asset{}
+	for _, a := range assets {
+		byID[a.ID] = a
+	}
+	_, excludedPresent := byID["a-excluded"]
+	require.False(t, excludedPresent, "排除行不应出现在结果中")
+
+	require.Equal(t, "a-pinned", assets[0].ID, "钉住行分数恒 1.0,应排最前")
+	require.True(t, assets[0].Pinned, "钉住行 Pinned 应为 true")
+	require.False(t, byID["a-auto"].Pinned, "自动行 Pinned 应为 false")
+}
+
+// TestFillStatsExcludesExcluded 验证 fillStats 五处统计查询(Count/
+// AddedThisWeek/StorageBytes/Distribution+Median/Seeds)均不含排除行、
+// 且包含钉住行。
+func TestFillStatsExcludesExcluded(t *testing.T) {
+	s := svTestService(t)
+	db := s.db
+	_, _ = db.Exec(`INSERT INTO smart_views(id,name,conds_raw,conds_parsed,threshold) VALUES('sv-fs','FS','[]','[]',50)`)
+
+	// a-auto: 自动匹配,本周内
+	_, _ = db.Exec(`INSERT INTO assets(id,file_path,status,file_size,aesthetic_score) VALUES('a-auto','/p/a-auto','indexed',100,8.0)`)
+	_, _ = db.Exec(`INSERT INTO smart_view_matches(smart_view_id,asset_id,match_score,origin,matched_at)
+		VALUES('sv-fs','a-auto',0.6,0,?)`, time.Now().UTC().Format("2006-01-02T15:04:05Z"))
+
+	// a-pinned: 手动钉住,应计入所有统计
+	_, _ = db.Exec(`INSERT INTO assets(id,file_path,status,file_size,aesthetic_score) VALUES('a-pinned','/p/a-pinned','indexed',200,9.0)`)
+	_, _ = db.Exec(`INSERT INTO smart_view_matches(smart_view_id,asset_id,match_score,origin,matched_at)
+		VALUES('sv-fs','a-pinned',1.0,1,?)`, time.Now().UTC().Format("2006-01-02T15:04:05Z"))
+
+	// a-excluded: 手动排除,不应计入任何统计
+	_, _ = db.Exec(`INSERT INTO assets(id,file_path,status,file_size,aesthetic_score) VALUES('a-excluded','/p/a-excluded','indexed',999999,10.0)`)
+	_, _ = db.Exec(`INSERT INTO smart_view_matches(smart_view_id,asset_id,match_score,origin,matched_at)
+		VALUES('sv-fs','a-excluded',0.99,2,?)`, time.Now().UTC().Format("2006-01-02T15:04:05Z"))
+
+	sv, err := s.Get("sv-fs")
+	require.NoError(t, err)
+	require.Equal(t, 2, sv.Count, "Count 不应包含排除行")
+	require.Equal(t, 2, sv.AddedThisWeek, "AddedThisWeek 不应包含排除行")
+	require.Equal(t, int64(300), sv.StorageBytes, "StorageBytes 不应包含排除行的巨量字节数")
+	require.Equal(t, 2, sumInts(sv.Distribution), "Distribution 不应包含排除行")
+	require.NotContains(t, sv.Seeds, "a-excluded", "Seeds 不应包含排除行")
+	require.Contains(t, sv.Seeds, "a-pinned", "Seeds 应包含钉住行")
+}
+
+// TestExportRespectsOrigin 验证 ExportAsAlbum 经 MatchedAssets 复用同一份读路径
+// 过滤:钉住行导出、排除行不导出。
+func TestExportRespectsOrigin(t *testing.T) {
+	s := svTestService(t)
+	db := s.db
+	_, _ = db.Exec(`INSERT INTO smart_views(id,name,conds_raw,conds_parsed,threshold) VALUES('sv-exp','EXP','[]','[]',50)`)
+	for _, id := range []string{"a-auto", "a-pinned", "a-excluded"} {
+		_, err := db.Exec(`INSERT INTO assets(id,file_path,status,is_live_photo_video) VALUES(?,?,'indexed',0)`,
+			id, "/p/"+id+".jpg")
+		require.NoError(t, err)
+	}
+	_, _ = db.Exec(`INSERT INTO smart_view_matches(smart_view_id,asset_id,match_score,origin) VALUES('sv-exp','a-auto',0.6,0)`)
+	_, _ = db.Exec(`INSERT INTO smart_view_matches(smart_view_id,asset_id,match_score,origin) VALUES('sv-exp','a-pinned',1.0,1)`)
+	_, _ = db.Exec(`INSERT INTO smart_view_matches(smart_view_id,asset_id,match_score,origin) VALUES('sv-exp','a-excluded',0.9,2)`)
+
+	albumID, err := s.ExportAsAlbum("sv-exp")
+	require.NoError(t, err)
+
+	albumSvc := NewAlbumService(db)
+	assets, err := albumSvc.ListAssets(albumID)
+	require.NoError(t, err)
+
+	ids := map[string]bool{}
+	for _, a := range assets {
+		ids[a.ID] = true
+	}
+	require.True(t, ids["a-pinned"], "钉住行应导出")
+	require.True(t, ids["a-auto"], "自动匹配行应导出")
+	require.False(t, ids["a-excluded"], "排除行不应导出")
+}
+
 // TestUpdateResumeLiveTriggersEvaluate: 暂停期间 displayScore 标定端点
 // (simDisplayFloor/Ceil) 可能随模型换代调整，导致 match_score 停留在旧标度。
 // 恢复 live（Live: true）必须触发一次重算，把陈旧分数刷新；仅改 name 之类
@@ -591,4 +765,214 @@ func TestUpdateResumeLiveTriggersEvaluate(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, db.QueryRow(`SELECT match_score FROM smart_view_matches WHERE smart_view_id='sv-resume' AND asset_id='a1'`).Scan(&score))
 	require.InDelta(t, 1.0, score, 1e-9, "恢复 live 应重算并刷新陈旧的 match_score")
+}
+
+// TestPinAssets 覆盖 PinAssets 的四类落库路径 + 两类无效资产静默跳过：
+// 新行 INSERT(origin=1,score=1.0)；自动行(origin=0)升级钉住并改分 1.0；
+// 排除行(origin=2)翻转为钉住；已钉住行重复钉住幂等不计数；
+// 不存在的资产 / 软删资产静默跳过；视图不存在返回 ErrNotFound。
+func TestPinAssets(t *testing.T) {
+	s := svTestService(t)
+	db := s.db
+
+	for _, id := range []string{"aNew", "aAuto", "aExcl", "aPinned", "aDeleted"} {
+		_, err := db.Exec(`INSERT INTO assets(id,file_path,status,is_live_photo_video) VALUES(?,?,'indexed',0)`,
+			id, "/p/"+id+".jpg")
+		require.NoError(t, err)
+	}
+	_, err := db.Exec(`UPDATE assets SET deleted_at=CURRENT_TIMESTAMP WHERE id='aDeleted'`)
+	require.NoError(t, err)
+
+	_, err = db.Exec(`INSERT INTO smart_views(id,name,conds_raw,conds_parsed,threshold,live)
+		VALUES('sv-pin','Pin','[]','[]',70,0)`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO smart_view_matches(smart_view_id,asset_id,match_score,origin) VALUES('sv-pin','aAuto',0.6,0)`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO smart_view_matches(smart_view_id,asset_id,match_score,origin) VALUES('sv-pin','aExcl',0.6,2)`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO smart_view_matches(smart_view_id,asset_id,match_score,origin) VALUES('sv-pin','aPinned',1.0,1)`)
+	require.NoError(t, err)
+
+	added, err := s.PinAssets("sv-pin", []string{"aNew", "aAuto", "aExcl", "aPinned", "aDeleted", "aMissing"})
+	require.NoError(t, err)
+	require.Equal(t, 3, added, "只有 aNew/aAuto/aExcl 三个真正发生了钉住状态变化,aPinned 已是钉住不重复计数,aDeleted/aMissing 静默跳过")
+
+	for _, id := range []string{"aNew", "aAuto", "aExcl", "aPinned"} {
+		var org int
+		var score float64
+		require.NoError(t, db.QueryRow(`SELECT origin,match_score FROM smart_view_matches WHERE smart_view_id='sv-pin' AND asset_id=?`, id).
+			Scan(&org, &score), "asset %s 应有钉住行", id)
+		require.Equal(t, 1, org, "asset %s 应为钉住 origin", id)
+		require.Equal(t, 1.0, score, "asset %s 分数应恒为 1.0", id)
+	}
+	for _, id := range []string{"aDeleted", "aMissing"} {
+		var n int
+		require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM smart_view_matches WHERE smart_view_id='sv-pin' AND asset_id=?`, id).Scan(&n))
+		require.Equal(t, 0, n, "无效资产 %s 不应产生任何行", id)
+	}
+
+	_, err = s.PinAssets("sv-missing", []string{"aNew"})
+	require.ErrorIs(t, err, ErrNotFound)
+}
+
+// TestRemoveAssetsTiered 覆盖 RemoveAssets 的分层移除：钉住行→删行计 unpinned；
+// 自动行→origin=2 计 excluded；排除行/表外 id no-op；live=1 的视图在取消钉住后
+// 触发重估,若被取消钉住的资产天然匹配条件,会以 origin=0 回归；live=0 的视图
+// 不触发重估,删掉的钉住行就此消失,不会自动回归。
+func TestRemoveAssetsTiered(t *testing.T) {
+	s := svTestService(t)
+	db := s.db
+
+	// aPinLive 有对齐的 CLIP 向量,天然满足 "scene: sunset" 语义条件。
+	seedClipAsset(t, s, "aPinLive")
+	_, err := db.Exec(`INSERT INTO assets(id,file_path,status,is_live_photo_video) VALUES('aAuto','/p/aAuto.jpg','indexed',0)`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO assets(id,file_path,status,is_live_photo_video) VALUES('aExcl','/p/aExcl.jpg','indexed',0)`)
+	require.NoError(t, err)
+
+	_, err = db.Exec(`INSERT INTO smart_views(id,name,conds_raw,conds_parsed,threshold,live)
+		VALUES('sv-rm-live','RmLive','["scene: sunset"]','[]',50,1)`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO smart_view_matches(smart_view_id,asset_id,match_score,origin) VALUES('sv-rm-live','aPinLive',1.0,1)`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO smart_view_matches(smart_view_id,asset_id,match_score,origin) VALUES('sv-rm-live','aAuto',0.6,0)`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO smart_view_matches(smart_view_id,asset_id,match_score,origin) VALUES('sv-rm-live','aExcl',0.6,2)`)
+	require.NoError(t, err)
+
+	unpinned, excluded, err := s.RemoveAssets("sv-rm-live", []string{"aPinLive", "aAuto", "aExcl", "aOutside"})
+	require.NoError(t, err)
+	require.Equal(t, 1, unpinned, "aPinLive 是唯一的钉住行")
+	require.Equal(t, 1, excluded, "aAuto 是唯一的自动行")
+
+	var org int
+	require.NoError(t, db.QueryRow(`SELECT origin FROM smart_view_matches WHERE smart_view_id='sv-rm-live' AND asset_id='aExcl'`).Scan(&org))
+	require.Equal(t, 2, org, "已排除行 no-op,origin 不变")
+
+	// live=1:取消钉住后触发重估,aPinLive 天然匹配条件,应以 origin=0 回归。
+	require.NoError(t, db.QueryRow(`SELECT origin FROM smart_view_matches WHERE smart_view_id='sv-rm-live' AND asset_id='aPinLive'`).Scan(&org))
+	require.Equal(t, 0, org, "取消钉住且天然匹配的资产,重估后应以 origin=0 回归")
+
+	// live=0(暂停):取消钉住不触发重估,删掉的行不会自动回归。
+	seedClipAsset(t, s, "aPinPaused")
+	_, err = db.Exec(`INSERT INTO smart_views(id,name,conds_raw,conds_parsed,threshold,live)
+		VALUES('sv-rm-paused','RmPaused','["scene: sunset"]','[]',50,0)`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO smart_view_matches(smart_view_id,asset_id,match_score,origin) VALUES('sv-rm-paused','aPinPaused',1.0,1)`)
+	require.NoError(t, err)
+
+	unpinned, _, err = s.RemoveAssets("sv-rm-paused", []string{"aPinPaused"})
+	require.NoError(t, err)
+	require.Equal(t, 1, unpinned)
+	var n int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM smart_view_matches WHERE smart_view_id='sv-rm-paused' AND asset_id='aPinPaused'`).Scan(&n))
+	require.Equal(t, 0, n, "暂停视图不触发重估,行删除后不会自动回归")
+
+	_, _, err = s.RemoveAssets("sv-missing", []string{"aAuto"})
+	require.ErrorIs(t, err, ErrNotFound)
+}
+
+// TestRestoreAssets 覆盖 RestoreAssets：删除排除行计 restored,live=1 触发重估
+// 使天然匹配的资产以 origin=0 回归；非排除行(自动/钉住)no-op 不计数、不改动。
+func TestRestoreAssets(t *testing.T) {
+	s := svTestService(t)
+	db := s.db
+
+	seedClipAsset(t, s, "aExclLive")
+	_, err := db.Exec(`INSERT INTO assets(id,file_path,status,is_live_photo_video) VALUES('aPin','/p/aPin.jpg','indexed',0)`)
+	require.NoError(t, err)
+
+	_, err = db.Exec(`INSERT INTO smart_views(id,name,conds_raw,conds_parsed,threshold,live)
+		VALUES('sv-restore','Restore','["scene: sunset"]','[]',50,1)`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO smart_view_matches(smart_view_id,asset_id,match_score,origin) VALUES('sv-restore','aExclLive',0.6,2)`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO smart_view_matches(smart_view_id,asset_id,match_score,origin) VALUES('sv-restore','aPin',1.0,1)`)
+	require.NoError(t, err)
+
+	restored, err := s.RestoreAssets("sv-restore", []string{"aExclLive", "aPin", "aOutside"})
+	require.NoError(t, err)
+	require.Equal(t, 1, restored, "只有 aExclLive 是排除行")
+
+	var org int
+	require.NoError(t, db.QueryRow(`SELECT origin FROM smart_view_matches WHERE smart_view_id='sv-restore' AND asset_id='aExclLive'`).Scan(&org))
+	require.Equal(t, 0, org, "恢复后天然匹配的资产重估应以 origin=0 回归")
+
+	require.NoError(t, db.QueryRow(`SELECT origin FROM smart_view_matches WHERE smart_view_id='sv-restore' AND asset_id='aPin'`).Scan(&org))
+	require.Equal(t, 1, org, "钉住行不受 RestoreAssets 影响")
+
+	_, err = s.RestoreAssets("sv-missing", []string{"aExclLive"})
+	require.ErrorIs(t, err, ErrNotFound)
+}
+
+// TestExcludedAssets 只返回 origin=2 且可见(未软删、未离线)的资产;origin=0/1
+// 行以及软删/离线的排除行都不应出现。
+func TestExcludedAssets(t *testing.T) {
+	s := svTestService(t)
+	db := s.db
+
+	for _, id := range []string{"aExclVisible", "aExclDeleted", "aExclOffline", "aAuto", "aPin"} {
+		_, err := db.Exec(`INSERT INTO assets(id,file_path,status,is_live_photo_video) VALUES(?,?,'indexed',0)`,
+			id, "/p/"+id+".jpg")
+		require.NoError(t, err)
+	}
+	_, err := db.Exec(`UPDATE assets SET deleted_at=CURRENT_TIMESTAMP WHERE id='aExclDeleted'`)
+	require.NoError(t, err)
+	_, err = db.Exec(`UPDATE assets SET offline=1 WHERE id='aExclOffline'`)
+	require.NoError(t, err)
+
+	_, err = db.Exec(`INSERT INTO smart_views(id,name,conds_raw,conds_parsed,threshold,live)
+		VALUES('sv-excl','Excl','[]','[]',70,0)`)
+	require.NoError(t, err)
+	for _, row := range []struct {
+		id     string
+		origin int
+	}{
+		{"aExclVisible", 2}, {"aExclDeleted", 2}, {"aExclOffline", 2},
+		{"aAuto", 0}, {"aPin", 1},
+	} {
+		_, err = db.Exec(`INSERT INTO smart_view_matches(smart_view_id,asset_id,match_score,origin) VALUES('sv-excl',?,0.6,?)`,
+			row.id, row.origin)
+		require.NoError(t, err)
+	}
+
+	out, err := s.ExcludedAssets("sv-excl")
+	require.NoError(t, err)
+	require.Len(t, out, 1)
+	require.Equal(t, "aExclVisible", out[0].ID)
+}
+
+// TestDuplicateDoesNotCopyManualRows: spec 明确 Duplicate 只复制查询定义(条件/
+// 阈值等),不复制手动行(钉住/排除)。副本是全新的 smart_view_id,
+// smart_view_matches 按 smart_view_id 分区,原视图的手动行天然不会跟着复制；
+// 本测试锁定这一行为，防止未来改动（例如"完整克隆"需求）无意间引入复制。
+func TestDuplicateDoesNotCopyManualRows(t *testing.T) {
+	s := svTestService(t)
+	db := s.db
+
+	_, err := db.Exec(`INSERT INTO assets(id,file_path,status,is_live_photo_video) VALUES('aPin','/p/aPin.jpg','indexed',0)`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO assets(id,file_path,status,is_live_photo_video) VALUES('aExcl','/p/aExcl.jpg','indexed',0)`)
+	require.NoError(t, err)
+
+	orig, err := s.Create(SmartViewInput{ID: "sv-dup-src", Name: "DupSrc", CondsRaw: []string{}, Threshold: 70, Live: true})
+	require.NoError(t, err)
+	require.NoError(t, err)
+	added, err := s.PinAssets(orig.ID, []string{"aPin"})
+	require.NoError(t, err)
+	require.Equal(t, 1, added)
+	_, excluded, err := s.RemoveAssets(orig.ID, []string{"aPin"})
+	require.NoError(t, err)
+	require.Equal(t, 0, excluded, "aPin 是钉住行,RemoveAssets 会把它变回取消钉住而非排除")
+	_, err = db.Exec(`INSERT INTO smart_view_matches(smart_view_id,asset_id,match_score,origin) VALUES(?,?,0.6,2)`,
+		orig.ID, "aExcl")
+	require.NoError(t, err)
+
+	dup, err := s.Duplicate(orig.ID)
+	require.NoError(t, err)
+	require.NotEqual(t, orig.ID, dup.ID)
+
+	var n int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM smart_view_matches WHERE smart_view_id=?`, dup.ID).Scan(&n))
+	require.Equal(t, 0, n, "副本不应复制原视图的任何 matches 行(手动或自动)")
 }

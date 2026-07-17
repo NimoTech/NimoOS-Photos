@@ -82,6 +82,12 @@ type Asset struct {
 	// clients that ignore it see no behavior change. See
 	// docs/superpowers/specs/2026-07-08-search-cut-tiering-design.md.
 	BelowCut bool `json:"belowCut,omitempty"`
+
+	// Pinned marks a SmartView-matched asset as manually pinned by the user
+	// (smart_view_matches.origin=1): the row survives reconciliation and is
+	// scored 1.0. Populated only by SmartViewService.MatchedAssets; false
+	// (omitted) elsewhere.
+	Pinned bool `json:"pinned,omitempty"`
 }
 
 type AssetExif struct {

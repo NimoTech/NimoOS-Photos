@@ -496,6 +496,9 @@ func migrate(db *sql.DB) error {
 		`ALTER TABLE asset_ocr ADD COLUMN doc_geo REAL`,
 		`ALTER TABLE asset_ocr ADD COLUMN is_doc INTEGER`,
 		`ALTER TABLE asset_ocr ADD COLUMN doc_ver INTEGER NOT NULL DEFAULT 0`,
+		// smart_view_matches.origin: 行来源(0=自动匹配/1=手动钉住/2=手动排除)。
+		// 钉住行重估不删、分数恒 1.0;排除行留存作"记忆",读路径以 origin<>2 过滤。
+		`ALTER TABLE smart_view_matches ADD COLUMN origin INTEGER NOT NULL DEFAULT 0`,
 	}
 	for _, stmt := range alters {
 		if _, err := db.Exec(stmt); err != nil &&
