@@ -26,8 +26,74 @@ func RegisterSmartViewRoutes(g *echo.Group, h *SmartViewsHandler) {
 	g.DELETE("/smart-views/:id", h.Delete)
 	g.POST("/smart-views/:id/duplicate", h.Duplicate)
 	g.GET("/smart-views/:id/assets", h.Assets)
+	g.POST("/smart-views/:id/assets", h.PinAssets)
+	g.POST("/smart-views/:id/assets/remove", h.RemoveAssets)
+	g.POST("/smart-views/:id/assets/restore", h.RestoreAssets)
+	g.GET("/smart-views/:id/excluded", h.Excluded)
 	g.GET("/smart-views/:id/activity", h.Activity)
 	g.POST("/smart-views/:id/export", h.Export)
+}
+
+// svAssetIDsReq 是钉住/移除/恢复三个写接口共用的请求体。
+type svAssetIDsReq struct {
+	AssetIDs []string `json:"assetIds"`
+}
+
+// PinAssets 把指定资产钉进视图,返回本次实际发生状态变化的数量。
+func (h *SmartViewsHandler) PinAssets(c echo.Context) error {
+	var req svAssetIDsReq
+	if err := c.Bind(&req); err != nil || len(req.AssetIDs) == 0 {
+		return echo.NewHTTPError(http.StatusBadRequest, "assetIds is required")
+	}
+	added, err := h.svc.SmartViews().PinAssets(c.Param("id"), req.AssetIDs)
+	if errors.Is(err, service.ErrNotFound) {
+		return echo.NewHTTPError(http.StatusNotFound, "not found")
+	}
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	}
+	return c.JSON(http.StatusOK, map[string]int{"added": added})
+}
+
+// RemoveAssets 分层移除:钉住行取消钉住,自动行置为排除。
+func (h *SmartViewsHandler) RemoveAssets(c echo.Context) error {
+	var req svAssetIDsReq
+	if err := c.Bind(&req); err != nil || len(req.AssetIDs) == 0 {
+		return echo.NewHTTPError(http.StatusBadRequest, "assetIds is required")
+	}
+	unpinned, excluded, err := h.svc.SmartViews().RemoveAssets(c.Param("id"), req.AssetIDs)
+	if errors.Is(err, service.ErrNotFound) {
+		return echo.NewHTTPError(http.StatusNotFound, "not found")
+	}
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	}
+	return c.JSON(http.StatusOK, map[string]int{"unpinned": unpinned, "excluded": excluded})
+}
+
+// RestoreAssets 恢复被排除的资产,使其重新参与视图匹配。
+func (h *SmartViewsHandler) RestoreAssets(c echo.Context) error {
+	var req svAssetIDsReq
+	if err := c.Bind(&req); err != nil || len(req.AssetIDs) == 0 {
+		return echo.NewHTTPError(http.StatusBadRequest, "assetIds is required")
+	}
+	restored, err := h.svc.SmartViews().RestoreAssets(c.Param("id"), req.AssetIDs)
+	if errors.Is(err, service.ErrNotFound) {
+		return echo.NewHTTPError(http.StatusNotFound, "not found")
+	}
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	}
+	return c.JSON(http.StatusOK, map[string]int{"restored": restored})
+}
+
+// Excluded 返回视图的排除清单(供详情页折叠区展示)。
+func (h *SmartViewsHandler) Excluded(c echo.Context) error {
+	assets, err := h.svc.SmartViews().ExcludedAssets(c.Param("id"))
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	}
+	return c.JSON(http.StatusOK, assets)
 }
 
 func (h *SmartViewsHandler) List(c echo.Context) error {
