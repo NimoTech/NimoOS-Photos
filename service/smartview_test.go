@@ -1,6 +1,7 @@
 package service
 
 import (
+	"database/sql"
 	"math"
 	"path/filepath"
 	"testing"
@@ -292,6 +293,84 @@ func TestEvaluateReparsesFromRaw(t *testing.T) {
 	var n int
 	s.db.QueryRow(`SELECT COUNT(*) FROM smart_view_matches WHERE smart_view_id='sv-old' AND asset_id='a24'`).Scan(&n)
 	require.Equal(t, 1, n, "Evaluate should re-parse raw conds so the upgraded parser takes effect")
+}
+
+// Evaluate 的调和循环不得触碰手动行（origin!=0）：钉住行（不匹配当前条件）
+// 存活且分数保持 1.0 不被刷新；排除行同样存活（保留"记忆"，供读路径过滤）；
+// 自动行（origin=0）该增该删照旧——不匹配的自动行被删,新匹配的资产以
+// origin=0 被 INSERT。
+func TestEvaluatePreservesManualRows(t *testing.T) {
+	s := svTestService(t)
+	db := s.db
+
+	// aPin/aExcl/aGone 均无 CLIP 向量,天然不满足 "scene: sunset" 语义条件；
+	// aMatch 有对齐的 CLIP 向量,天然满足条件（展示分 1.0）。
+	for _, id := range []string{"aPin", "aExcl", "aGone"} {
+		_, err := db.Exec(`INSERT INTO assets(id,file_path,status,is_live_photo_video) VALUES(?,?,'indexed',0)`,
+			id, "/p/"+id+".jpg")
+		require.NoError(t, err)
+	}
+	seedClipAsset(t, s, "aMatch")
+
+	_, err := db.Exec(`INSERT INTO smart_views(id,name,conds_raw,conds_parsed,threshold,include_videos)
+		VALUES('sv-manual','Manual','["scene: sunset"]','[]',50,0)`)
+	require.NoError(t, err)
+
+	// 预置表内手动/陈旧行。
+	_, err = db.Exec(`INSERT INTO smart_view_matches(smart_view_id,asset_id,match_score,origin) VALUES('sv-manual','aPin',1.0,1)`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO smart_view_matches(smart_view_id,asset_id,match_score,origin) VALUES('sv-manual','aExcl',0.7,2)`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO smart_view_matches(smart_view_id,asset_id,match_score,origin) VALUES('sv-manual','aGone',0.6,0)`)
+	require.NoError(t, err)
+
+	require.NoError(t, s.Evaluate("sv-manual"))
+
+	var org int
+	var score float64
+	require.NoError(t, db.QueryRow(`SELECT origin,match_score FROM smart_view_matches WHERE smart_view_id='sv-manual' AND asset_id='aPin'`).Scan(&org, &score))
+	require.Equal(t, 1, org, "钉住行 origin 不应被改动")
+	require.Equal(t, 1.0, score, "钉住行分数应恒为 1.0,不被重估刷新")
+
+	require.NoError(t, db.QueryRow(`SELECT origin,match_score FROM smart_view_matches WHERE smart_view_id='sv-manual' AND asset_id='aExcl'`).Scan(&org, &score))
+	require.Equal(t, 2, org, "排除行应存活,保留记忆")
+	require.Equal(t, 0.7, score, "排除行分数不应被重估改动")
+
+	err = db.QueryRow(`SELECT origin FROM smart_view_matches WHERE smart_view_id='sv-manual' AND asset_id='aGone'`).Scan(&org)
+	require.ErrorIs(t, err, sql.ErrNoRows, "不匹配条件的自动行应被重估删除")
+
+	require.NoError(t, db.QueryRow(`SELECT origin,match_score FROM smart_view_matches WHERE smart_view_id='sv-manual' AND asset_id='aMatch'`).Scan(&org, &score))
+	require.Equal(t, 0, org, "新匹配的资产应以 origin=0 自动插入")
+	require.Equal(t, 1.0, score)
+}
+
+// 钉住行若同时天然满足条件（evalParsed 会为它算出 <1 的展示分）,重估也不得
+// 刷新其分数,也不得因为它已在表中而触发 INSERT 主键冲突。
+func TestEvaluatePinnedAlsoMatching(t *testing.T) {
+	s := svTestService(t)
+	db := s.db
+
+	// 展示分 50%——明显低于钉住行记忆中的 1.0,用于验证"不刷分"。
+	raw := simDisplayFloor() + (simDisplayCeil()-simDisplayFloor())*0.5
+	seedClipAssetWithSim(t, s, "aPin", raw, "2024-06-01T00:00:00Z")
+
+	_, err := db.Exec(`INSERT INTO smart_views(id,name,conds_raw,conds_parsed,threshold,include_videos)
+		VALUES('sv-pinmatch','PinMatch','["scene: sunset"]','[]',40,0)`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO smart_view_matches(smart_view_id,asset_id,match_score,origin) VALUES('sv-pinmatch','aPin',1.0,1)`)
+	require.NoError(t, err)
+
+	require.NoError(t, s.Evaluate("sv-pinmatch"))
+
+	var cnt int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM smart_view_matches WHERE smart_view_id='sv-pinmatch'`).Scan(&cnt))
+	require.Equal(t, 1, cnt, "不应出现重复行/主键冲突")
+
+	var org int
+	var score float64
+	require.NoError(t, db.QueryRow(`SELECT origin,match_score FROM smart_view_matches WHERE smart_view_id='sv-pinmatch' AND asset_id='aPin'`).Scan(&org, &score))
+	require.Equal(t, 1, org)
+	require.Equal(t, 1.0, score, "钉住行即便天然匹配,分数也不应被重估刷新为 evalParsed 算出的 <1 值")
 }
 
 // 条件为空（或全部不可执行）但填了 description 时，描述本身应作为

@@ -384,15 +384,16 @@ func (s *SmartViewService) Evaluate(id string) error {
 	for aid, sc := range scoreMap {
 		keep = append(keep, scored{aid, sc})
 	}
-	existing := map[string]struct{}{}
-	rows, err := s.db.Query(`SELECT asset_id FROM smart_view_matches WHERE smart_view_id=?`, id)
+	existing := map[string]int{} // asset_id → origin(0=自动/1=钉住/2=排除)
+	rows, err := s.db.Query(`SELECT asset_id, origin FROM smart_view_matches WHERE smart_view_id=?`, id)
 	if err != nil {
 		return err
 	}
 	for rows.Next() {
 		var aid string
-		rows.Scan(&aid)
-		existing[aid] = struct{}{}
+		var org int
+		rows.Scan(&aid, &org)
+		existing[aid] = org
 	}
 	rows.Close()
 
@@ -405,7 +406,11 @@ func (s *SmartViewService) Evaluate(id string) error {
 	defer tx.Rollback() //nolint:errcheck
 	for _, k := range keep {
 		keepSet[k.id] = struct{}{}
-		if _, ok := existing[k.id]; ok {
+		if org, ok := existing[k.id]; ok {
+			// 手动行（钉住/排除）完全不碰：钉住分数恒 1.0,排除行保持"记忆"。
+			if org != 0 {
+				continue
+			}
 			if _, err := tx.Exec(`UPDATE smart_view_matches SET match_score=? WHERE smart_view_id=? AND asset_id=?`,
 				k.score, id, k.id); err != nil {
 				return err
@@ -418,7 +423,10 @@ func (s *SmartViewService) Evaluate(id string) error {
 			added = append(added, k.id)
 		}
 	}
-	for aid := range existing {
+	for aid, org := range existing {
+		if org != 0 {
+			continue // 钉住/排除行只有用户能动,重估不删
+		}
 		if _, ok := keepSet[aid]; !ok {
 			if _, err := tx.Exec(`DELETE FROM smart_view_matches WHERE smart_view_id=? AND asset_id=?`, id, aid); err != nil {
 				return err
