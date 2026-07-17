@@ -212,15 +212,15 @@ func (s *SmartViewService) fillStats(sv *SmartView) {
 	sv.Seeds = []string{}
 	sv.Distribution = make([]int, 10)
 
-	_ = s.db.QueryRow(`SELECT COUNT(*) FROM smart_view_matches WHERE smart_view_id=?`, sv.ID).Scan(&sv.Count)
+	_ = s.db.QueryRow(`SELECT COUNT(*) FROM smart_view_matches WHERE smart_view_id=? AND origin<>2`, sv.ID).Scan(&sv.Count)
 
 	_ = s.db.QueryRow(`SELECT COUNT(*) FROM smart_view_matches
-		WHERE smart_view_id=? AND matched_at >= datetime('now','-7 days')`, sv.ID).Scan(&sv.AddedThisWeek)
+		WHERE smart_view_id=? AND origin<>2 AND matched_at >= datetime('now','-7 days')`, sv.ID).Scan(&sv.AddedThisWeek)
 
 	_ = s.db.QueryRow(`SELECT COALESCE(SUM(a.file_size),0) FROM smart_view_matches m
-		JOIN assets a ON a.id=m.asset_id WHERE m.smart_view_id=?`, sv.ID).Scan(&sv.StorageBytes)
+		JOIN assets a ON a.id=m.asset_id WHERE m.smart_view_id=? AND m.origin<>2`, sv.ID).Scan(&sv.StorageBytes)
 
-	rows, err := s.db.Query(`SELECT match_score FROM smart_view_matches WHERE smart_view_id=? ORDER BY match_score`, sv.ID)
+	rows, err := s.db.Query(`SELECT match_score FROM smart_view_matches WHERE smart_view_id=? AND origin<>2 ORDER BY match_score`, sv.ID)
 	if err == nil {
 		var scores []float64
 		for rows.Next() {
@@ -249,7 +249,7 @@ func (s *SmartViewService) fillStats(sv *SmartView) {
 	// Seeds 预览优先展示美学分高的资产(NULL 排最后),同美学分档次内再按匹配分排序。
 	srows, err := s.db.Query(`SELECT m.asset_id FROM smart_view_matches m
 		JOIN assets a ON a.id = m.asset_id
-		WHERE m.smart_view_id=?
+		WHERE m.smart_view_id=? AND m.origin<>2
 		ORDER BY (a.aesthetic_score IS NULL) ASC, a.aesthetic_score DESC,
 		         m.match_score DESC LIMIT 6`, sv.ID)
 	if err == nil {
@@ -267,7 +267,8 @@ func (s *SmartViewService) fillStats(sv *SmartView) {
 // IsNew is per-user: true until userID opens the asset after it matched
 // (asset_views row at/after matched_at) — drives the dismissible "New" tag.
 func (s *SmartViewService) MatchedAssets(id string, limit, offset int, recent bool, userID string) ([]Asset, error) {
-	where := `m.smart_view_id=?`
+	// origin<>2 隐藏手动排除行(记忆保留在库里,读路径一律不可见)。
+	where := `m.smart_view_id=? AND m.origin<>2`
 	args := []any{userID, id}
 	if recent {
 		where += ` AND m.matched_at >= datetime('now','-7 days')`
@@ -277,7 +278,7 @@ func (s *SmartViewService) MatchedAssets(id string, limit, offset int, recent bo
 	q := `SELECT a.id, a.file_path, a.file_size, COALESCE(a.mime_type,''),
 	       COALESCE(a.original_name,''), a.taken_at, a.duration_ms,
 	       COALESCE(a.live_photo_video_id,''), a.is_live_photo_video, ` + hasOcrExpr + `,
-	       a.indexed_at, a.status, m.match_score,
+	       a.indexed_at, a.status, m.match_score, m.origin,
 	       (v.last_viewed_at IS NULL OR julianday(v.last_viewed_at) < julianday(m.matched_at))
 	FROM smart_view_matches m JOIN assets a ON a.id=m.asset_id
 	LEFT JOIN asset_views v ON v.user_id=? AND v.asset_id=a.id
@@ -294,6 +295,7 @@ func (s *SmartViewService) MatchedAssets(id string, limit, offset int, recent bo
 	for rows.Next() {
 		var a Asset
 		var score float64
+		var origin int
 		// duration_ms / taken_at / file_size / indexed_at are nullable in the
 		// assets table — scan through sql.Null* like scanAssets does, or a single
 		// NULL (every photo's duration_ms) fails the whole query.
@@ -301,9 +303,10 @@ func (s *SmartViewService) MatchedAssets(id string, limit, offset int, recent bo
 		var fileSize, durationMs sql.NullInt64
 		if err := rows.Scan(&a.ID, &a.FilePath, &fileSize, &a.MimeType, &a.OriginalName,
 			&takenAt, &durationMs, &a.LivePhotoVideoID, &a.IsLivePhotoVideo, &a.HasOCR,
-			&indexedAt, &a.Status, &score, &a.IsNew); err != nil {
+			&indexedAt, &a.Status, &score, &origin, &a.IsNew); err != nil {
 			return nil, err
 		}
+		a.Pinned = origin == 1
 		if fileSize.Valid {
 			a.FileSize = fileSize.Int64
 		}
