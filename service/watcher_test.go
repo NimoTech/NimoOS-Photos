@@ -216,6 +216,69 @@ func TestWatcherDynamicNewDirectory(t *testing.T) {
 		"a directory moved in with a file already inside it must be caught up by the scan")
 }
 
+// TestWatcherSkipsSnapshotsDirectory 是 TestWatcherSkipsHiddenDirectories 的
+// .snapshots 版本:真实场景是 btrbk/snapper 每小时快照,目录形态为
+// <root>/.snapshots/<ts>/Image/xxx.jpg——两层嵌套也不能被实时监控/索引到。
+func TestWatcherSkipsSnapshotsDirectory(t *testing.T) {
+	root := t.TempDir()
+	snapDir := filepath.Join(root, ".snapshots", "20260716T200714Z_auto-hourly", "Image")
+	require.NoError(t, os.MkdirAll(snapDir, 0o755))
+	preFile := filepath.Join(snapDir, "f.jpg")
+	writeFile(t, preFile, "pre-existing")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	w, idx := newWatcherTestHarness(t, ctx, []string{root})
+	go w.Start(ctx)
+
+	warmFile := filepath.Join(root, "warmup.jpg")
+	require.Eventually(t, func() bool {
+		writeFile(t, warmFile, "warm")
+		return assetIndexed(t, idx, warmFile)
+	}, 5*time.Second, 100*time.Millisecond, "warmup file must be indexed")
+
+	postFile := filepath.Join(snapDir, "g.jpg")
+	writeFile(t, postFile, "post")
+
+	require.Never(t, func() bool {
+		return assetIndexed(t, idx, preFile) || assetIndexed(t, idx, postFile)
+	}, 1500*time.Millisecond, 100*time.Millisecond,
+		"files inside a .snapshots tree must never be indexed by the watcher")
+}
+
+// TestWatcherAutoModeSkipsRootNestedInSnapshots 覆盖真实事故的根因:自动模式
+// 下 enumerateRoots 直接返回一个"根本身已经在 .snapshots 里面"的路径——这正是
+// btrbk/snapper 把每个快照子卷单独挂载成一条 /proc/mounts 记录时,
+// EnumerateScanRoots 曾经会产出的根。哪怕这种根被交给 Watcher,也绝不能监控
+// 或索引任何东西。
+func TestWatcherAutoModeSkipsRootNestedInSnapshots(t *testing.T) {
+	base := t.TempDir()
+	snapRoot := filepath.Join(base, ".snapshots", "20260716T200714Z_auto-hourly")
+	require.NoError(t, os.MkdirAll(snapRoot, 0o755))
+	preFile := filepath.Join(snapRoot, "f.jpg")
+	writeFile(t, preFile, "pre-existing")
+
+	db := makeTestDB(t)
+	ix := NewIndexer(db, &mockML{}, t.TempDir(), 1)
+	w := NewWatcher(db, nil, ix, "") // 空 watchDirs = 自动模式
+	w.enumerateRoots = func() []string { return []string{snapRoot} }
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go ix.Start(ctx)
+	go w.Start(ctx)
+
+	postFile := filepath.Join(snapRoot, "g.jpg")
+	writeFile(t, postFile, "post")
+
+	require.Never(t, func() bool {
+		return assetIndexed(t, ix, preFile) || assetIndexed(t, ix, postFile)
+	}, 1500*time.Millisecond, 100*time.Millisecond,
+		"a scan root that is itself nested inside .snapshots must never be watched or indexed")
+}
+
 // TestWatcherSkipsHiddenDirectories verifies a hidden directory nested under
 // a WatchDir is never watched, so files inside it (whether present before
 // Start or added afterward) are never indexed by the watcher.

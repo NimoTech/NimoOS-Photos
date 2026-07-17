@@ -66,6 +66,13 @@ func TestIsExcludedMountAndUserPartition(t *testing.T) {
 		{"/media/root-ro", true, false},
 		{"/mnt/overlay", true, false},
 		{"/home/user", false, false}, // 前缀不符,非用户分区但也非"排除名单"
+		// btrbk/snapper 把每个只读小时级快照子卷各自挂载为一条独立
+		// /proc/mounts 记录:这条记录一旦被当成普通用户分区,就会绕开
+		// walk 时才生效的隐藏目录跳过规则(该规则只在"遍历途中遇到"时
+		// 才拦,永远拦不住"walk 的根本身就在 .snapshots 里面"这种情况)。
+		{"/media/RAID_0/.snapshots/20260716T200714Z_auto-hourly", true, false},
+		// 仅路径子串命中、并非真正的 .snapshots 目录组件,不得被误拦。
+		{"/media/RAID_0/my.snapshots.backup", false, true},
 	}
 	for _, c := range cases {
 		if got := IsExcludedMount(c.mp); got != c.excluded {

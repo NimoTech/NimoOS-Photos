@@ -365,16 +365,25 @@ func (w *Watcher) walkCovered(dir string) bool {
 // addRecursiveWatch walks root and adds an inotify watch on root itself and
 // every eligible subdirectory beneath it, stopping early if ctx is cancelled.
 // It skips (via fs.SkipDir):
+//   - any directory literally named ".snapshots", unconditionally — including
+//     root itself (see isInSnapshotsDir, service/snapshots.go). btrbk/snapper
+//     mount each read-only hourly btrfs snapshot subvolume as its own
+//     /proc/mounts entry under "<volume mountpoint>/.snapshots/<ts>/", so root
+//     here can itself already be nested inside .snapshots without its own
+//     basename being ".snapshots" — the IsExcludedMount(path) check below
+//     already catches that case too (isInSnapshotsDir is folded into it), this
+//     check is the explicit, no-lookup-required first line of defense;
 //   - hidden directories (basename starting with ".") — except root itself,
 //     mirroring walkSupported's convention so an explicitly configured
 //     WatchDir is never silently ignored;
 //   - scanExcludeDirs (service/indexer.go), including root itself — these
 //     hold app/system data, never user media;
 //   - any path IsExcludedMount reports as an excluded mount (known OS system
-//     mount, or a devmon removable-media mount), including root itself — this
-//     closes the gap where an admin manually configuring, say,
-//     /media/devmon/USB1 as a WatchDir would otherwise get it watched even
-//     though the rest of the codebase treats that mount as off-limits.
+//     mount, a devmon removable-media mount, or a ".snapshots"-nested path),
+//     including root itself — this closes the gap where an admin manually
+//     configuring, say, /media/devmon/USB1 as a WatchDir would otherwise get
+//     it watched even though the rest of the codebase treats that mount as
+//     off-limits.
 //
 // addRecursiveWatch never follows symlinks: filepath.WalkDir uses lstat
 // semantics throughout, so a symlink — whether it is root itself or appears
@@ -413,6 +422,9 @@ func addRecursiveWatch(ctx context.Context, fw *fsnotify.Watcher, root string) (
 		}
 		if !d.IsDir() {
 			return nil
+		}
+		if d.Name() == snapshotsDirName {
+			return filepath.SkipDir
 		}
 		if path != root && strings.HasPrefix(d.Name(), ".") {
 			return filepath.SkipDir

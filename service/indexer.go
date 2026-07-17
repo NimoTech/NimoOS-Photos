@@ -564,6 +564,9 @@ func (ix *Indexer) SetIngestIdleTimeout(d time.Duration) {
 // Enqueue adds path to the processing queue with no batch association.
 // Duplicate in-flight paths are silently dropped (only one copy processed at a time).
 func (ix *Indexer) Enqueue(path string) {
+	if isInSnapshotsDir(path) {
+		return
+	}
 	// LoadOrStore: if already in flight, skip.
 	if _, loaded := ix.seen.LoadOrStore(path, struct{}{}); loaded {
 		return
@@ -589,6 +592,9 @@ func (ix *Indexer) EnqueueWithBatch(path, batchID string, batchTotal int64) {
 		ix.Enqueue(path)
 		return
 	}
+	if isInSnapshotsDir(path) {
+		return
+	}
 	if _, loaded := ix.seen.LoadOrStore(path, struct{}{}); loaded {
 		return
 	}
@@ -609,8 +615,15 @@ func (ix *Indexer) EnqueueWithBatch(path, batchID string, batchTotal int64) {
 // in the default idle slot (batches[""]) instead of the named batch.
 //
 // Returns false when path is already occupied in seen (should not normally
-// happen); the caller must not proceed with the rename in that case.
+// happen) or when path sits under a ".snapshots" directory component
+// (isInSnapshotsDir — should never happen either, since callers always
+// target the gallery directory, but this keeps MarkAndReserve consistent with
+// every other ingestion entry point); the caller must not proceed with the
+// rename in that case.
 func (ix *Indexer) MarkAndReserve(path, batchID string, batchTotal int64) bool {
+	if isInSnapshotsDir(path) {
+		return false
+	}
 	if _, loaded := ix.seen.LoadOrStore(path, struct{}{}); loaded {
 		return false
 	}
@@ -703,8 +716,17 @@ func (ix *Indexer) ForceReprocess(path string, opts processOpts) bool {
 	return ix.processFileInternal(path, opts)
 }
 
-// processFileInternal runs the full indexing pipeline for a single file.
+// processFileInternal runs the full indexing pipeline for a single file. This
+// is the final choke point every ingestion path eventually reaches (worker
+// queue, ScanDirectory's synchronous loop, and ForceReprocess), so the
+// ".snapshots" guard here is the last line of defense even if some future
+// ingestion path forgets to call isInSnapshotsDir directly (see the doc
+// comment on isInSnapshotsDir, service/snapshots.go, for the full list of
+// entry points this is layered with).
 func (ix *Indexer) processFileInternal(path string, opts processOpts) (success bool) {
+	if isInSnapshotsDir(path) {
+		return false
+	}
 	// Consume pending album entry immediately so that a failed file does not
 	// leave a stale entry in the map.
 	pendingAlbumID := ix.takePendingAlbum(path)
@@ -1231,7 +1253,19 @@ func sha256File(data []byte) string {
 // that soft-deleted files are never re-indexed. ctx is checked before each
 // filesystem entry is visited; if it is cancelled, the walk stops immediately
 // and returns ctx.Err() (context.Canceled / context.DeadlineExceeded).
+//
+// dir itself is rejected up front if it sits under a ".snapshots" directory
+// component (isInSnapshotsDir) — this covers callers that hand walkSupported
+// a root nested inside .snapshots directly (e.g. a stale/manually supplied
+// path), even though the normal source of such roots (mount enumeration) is
+// already filtered at IsExcludedMount. Once inside the walk, any directory
+// literally named ".snapshots" is skipped unconditionally (not just when
+// path != dir, unlike the generic hidden-dir rule below) so a walk rooted
+// one level above .snapshots never descends into it.
 func walkSupported(ctx context.Context, dir string, fn func(path string)) error {
+	if isInSnapshotsDir(dir) {
+		return nil
+	}
 	return filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
 		select {
 		case <-ctx.Done():
@@ -1251,6 +1285,9 @@ func walkSupported(ctx context.Context, dir string, fn func(path string)) error 
 			return nil
 		}
 		if d.IsDir() {
+			if d.Name() == snapshotsDirName {
+				return filepath.SkipDir
+			}
 			if path != dir && strings.HasPrefix(d.Name(), ".") {
 				return filepath.SkipDir
 			}

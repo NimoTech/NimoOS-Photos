@@ -115,12 +115,19 @@ var systemMounts = map[string]bool{
 var excludedMountPrefixes = []string{"/media/devmon/"}
 
 // IsExcludedMount reports whether mp is a mount point Photos must never treat
-// as user data to scan/track: either an exact-match OS system mount
-// (systemMounts) or a mount under one of excludedMountPrefixes (currently just
-// devmon's removable-media namespace). isUserPartition, MountGuard's mount-set
-// snapshotting, and the startup devmon-asset purge all call this single
-// function so the three stay in lockstep by construction — a new exclusion
-// only needs to be added here once.
+// as user data to scan/track: an exact-match OS system mount (systemMounts), a
+// mount under one of excludedMountPrefixes (currently just devmon's
+// removable-media namespace), or a mount point sitting under a ".snapshots"
+// directory component (see isInSnapshotsDir) — btrbk/snapper mount each
+// read-only hourly btrfs snapshot subvolume as its own /proc/mounts entry
+// under "<volume mountpoint>/.snapshots/<ts>/", so without this check
+// EnumerateScanRoots would hand them back as ordinary scan/watch roots (this
+// was the actual root cause of snapshot subvolumes getting indexed as if they
+// were the live library — the walk-time hidden-dir skip only ever fires for a
+// directory encountered *during* a walk, never for the walk's own root).
+// isUserPartition, MountGuard's mount-set snapshotting, and the startup
+// devmon-asset purge all call this single function so they stay in lockstep
+// by construction — a new exclusion only needs to be added here once.
 func IsExcludedMount(mp string) bool {
 	if systemMounts[mp] {
 		return true
@@ -129,6 +136,9 @@ func IsExcludedMount(mp string) bool {
 		if strings.HasPrefix(mp, p) {
 			return true
 		}
+	}
+	if isInSnapshotsDir(mp) {
+		return true
 	}
 	return false
 }
