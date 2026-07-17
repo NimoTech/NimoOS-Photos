@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"go.uber.org/zap"
 )
 
 type SmartView struct {
@@ -321,6 +322,169 @@ func (s *SmartViewService) MatchedAssets(id string, limit, offset int, recent bo
 		out = append(out, a)
 	}
 	return out, nil
+}
+
+// PinAssets 把指定资产钉进视图:重估洗不掉,只有用户能移除。
+// 分数恒 1.0(与纯结构条件的既有语义一致),matched_at=now 使 IsNew 生效。
+// 无效 asset(不存在/软删)静默跳过;重复钉住幂等不计数。
+func (s *SmartViewService) PinAssets(id string, assetIDs []string) (int, error) {
+	var dummy string
+	err := s.db.QueryRow(`SELECT id FROM smart_views WHERE id=?`, id).Scan(&dummy)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, ErrNotFound
+	}
+	if err != nil {
+		return 0, err
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback() //nolint:errcheck
+	added := 0
+	for _, aid := range assetIDs {
+		var ok string
+		if err := tx.QueryRow(`SELECT id FROM assets WHERE id=? AND deleted_at IS NULL`, aid).Scan(&ok); err != nil {
+			continue // 无效资产静默跳过
+		}
+		var org int
+		err := tx.QueryRow(`SELECT origin FROM smart_view_matches WHERE smart_view_id=? AND asset_id=?`, id, aid).Scan(&org)
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			if _, err := tx.Exec(`INSERT INTO smart_view_matches(smart_view_id,asset_id,match_score,origin) VALUES(?,?,1.0,1)`,
+				id, aid); err != nil {
+				return 0, err
+			}
+			added++
+		case err != nil:
+			return 0, err
+		case org != 1: // 自动行升级钉住 / 排除行翻转恢复为钉住
+			if _, err := tx.Exec(`UPDATE smart_view_matches SET origin=1, match_score=1.0 WHERE smart_view_id=? AND asset_id=?`,
+				id, aid); err != nil {
+				return 0, err
+			}
+			added++
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return added, nil
+}
+
+// RemoveAssets 分层移除:钉住行=取消钉住(删行,重估后若自然匹配会以普通匹配回归);
+// 自动行=置为排除(origin=2);排除行与表外 id no-op。
+// 有取消钉住或排除发生且视图 live 时,同步触发一次重估让网格立即反映真实状态。
+func (s *SmartViewService) RemoveAssets(id string, assetIDs []string) (int, int, error) {
+	var live int
+	err := s.db.QueryRow(`SELECT live FROM smart_views WHERE id=?`, id).Scan(&live)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, 0, ErrNotFound
+	}
+	if err != nil {
+		return 0, 0, err
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, 0, err
+	}
+	defer tx.Rollback() //nolint:errcheck
+	unpinned, excluded := 0, 0
+	for _, aid := range assetIDs {
+		var org int
+		err := tx.QueryRow(`SELECT origin FROM smart_view_matches WHERE smart_view_id=? AND asset_id=?`, id, aid).Scan(&org)
+		if errors.Is(err, sql.ErrNoRows) {
+			continue
+		}
+		if err != nil {
+			return 0, 0, err
+		}
+		switch org {
+		case 1:
+			if _, err := tx.Exec(`DELETE FROM smart_view_matches WHERE smart_view_id=? AND asset_id=?`, id, aid); err != nil {
+				return 0, 0, err
+			}
+			unpinned++
+		case 0:
+			if _, err := tx.Exec(`UPDATE smart_view_matches SET origin=2 WHERE smart_view_id=? AND asset_id=?`, id, aid); err != nil {
+				return 0, 0, err
+			}
+			excluded++
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, 0, err
+	}
+	// 取消钉住的照片若自然匹配,重估会把它以 origin=0 找回;暂停视图跳过(暂停=不重估)。
+	if unpinned > 0 && live == 1 {
+		if err := s.Evaluate(id); err != nil {
+			zap.L().Warn("smartview: 移除后重估失败", zap.String("id", id), zap.Error(err))
+		}
+	}
+	return unpinned, excluded, nil
+}
+
+// RestoreAssets 恢复被排除的资产:删除排除行,live 视图触发重估自然回归。
+func (s *SmartViewService) RestoreAssets(id string, assetIDs []string) (int, error) {
+	var live int
+	err := s.db.QueryRow(`SELECT live FROM smart_views WHERE id=?`, id).Scan(&live)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, ErrNotFound
+	}
+	if err != nil {
+		return 0, err
+	}
+	restored := 0
+	for _, aid := range assetIDs {
+		res, err := s.db.Exec(`DELETE FROM smart_view_matches WHERE smart_view_id=? AND asset_id=? AND origin=2`, id, aid)
+		if err != nil {
+			return 0, err
+		}
+		if n, _ := res.RowsAffected(); n > 0 {
+			restored++
+		}
+	}
+	if restored > 0 && live == 1 {
+		if err := s.Evaluate(id); err != nil {
+			zap.L().Warn("smartview: 恢复后重估失败", zap.String("id", id), zap.Error(err))
+		}
+	}
+	return restored, nil
+}
+
+// ExcludedAssets 返回视图的排除清单(供详情页折叠区),量小不分页。
+func (s *SmartViewService) ExcludedAssets(id string) ([]Asset, error) {
+	rows, err := s.db.Query(`SELECT a.id, a.file_path, a.file_size, COALESCE(a.mime_type,''),
+	       COALESCE(a.original_name,''), a.taken_at, a.duration_ms
+	FROM smart_view_matches m JOIN assets a ON a.id=m.asset_id
+	WHERE m.smart_view_id=? AND m.origin=2 AND a.deleted_at IS NULL AND a.offline=0
+	ORDER BY COALESCE(a.taken_at,a.indexed_at) DESC`, id)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Asset
+	for rows.Next() {
+		var a Asset
+		var takenAt sql.NullTime
+		var fileSize, durationMs sql.NullInt64
+		if err := rows.Scan(&a.ID, &a.FilePath, &fileSize, &a.MimeType, &a.OriginalName,
+			&takenAt, &durationMs); err != nil {
+			return nil, err
+		}
+		if fileSize.Valid {
+			a.FileSize = fileSize.Int64
+		}
+		if takenAt.Valid {
+			t := takenAt.Time
+			a.TakenAt = &t
+		}
+		if durationMs.Valid {
+			a.DurationMs = durationMs.Int64
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
 }
 
 func (s *SmartViewService) logActivity(svID, evType, detail string, assetIDs []string) {
