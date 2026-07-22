@@ -249,6 +249,12 @@ type Indexer struct {
 	// spriteBackfillRunning 是 BackfillSprites 的 CAS 重入门闩：一次只允许
 	// 一轮存量补跑在跑，避免服务重启风暴或误触发导致多轮并发扫同一批候选。
 	spriteBackfillRunning atomic.Bool
+
+	// onIndexed 在资产写为 status='indexed'（唯一写入点，见 processFileInternal
+	// 末尾）成功后异步调用一次，供 CaptionFeeder.FeedOne 内联投喂钩子使用。
+	// 函数字段注入（同 albumAssigner/onBatchDone 模式），避免 Indexer 直接依赖
+	// CaptionFeeder 类型；为 nil 时（未接线 / 测试）安全跳过。
+	onIndexed func(assetID string)
 }
 
 // touch marks index activity (enqueue or a processed result) at the current time.
@@ -707,6 +713,14 @@ func (ix *Indexer) SetOnBatchDone(fn func()) {
 	}
 }
 
+// SetOnIndexed registers a callback invoked (asynchronously, via `go fn(id)`)
+// each time an asset is successfully written as status='indexed'. Intended for
+// CaptionFeeder's inline feed hook. Call this after construction, before any
+// scans begin. Same injection pattern as SetOnBatchDone/SetAlbumAssigner.
+func (ix *Indexer) SetOnIndexed(fn func(assetID string)) {
+	ix.onIndexed = fn
+}
+
 // Start launches workers goroutines that consume the queue until ctx is cancelled.
 func (ix *Indexer) Start(ctx context.Context) {
 	var wg sync.WaitGroup
@@ -1146,6 +1160,9 @@ func (ix *Indexer) processFileInternal(path string, opts processOpts) (success b
 	); err != nil {
 		fmt.Fprintf(os.Stderr, "[indexer] failed to mark asset indexed %s: %v\n", assetID, err)
 		return false
+	}
+	if ix.onIndexed != nil {
+		go ix.onIndexed(assetID) // 异步旁路：投喂失败不影响索引结果
 	}
 	return true
 }
