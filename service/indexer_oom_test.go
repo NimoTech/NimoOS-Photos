@@ -1,6 +1,7 @@
 package service
 
 import (
+	"database/sql"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -195,6 +196,41 @@ func TestProcessFileInternal_StatFastPath_ReprocessesWhenContentChanges(t *testi
 	var checksum string
 	require.NoError(t, db.QueryRow(`SELECT checksum FROM assets WHERE file_path=?`, path).Scan(&checksum))
 	require.NotEmpty(t, checksum)
+}
+
+// TestProcessFileInternal_LegacyNullMtime_BackfilledViaChecksumShortcut 覆盖
+// 升级前入库的存量行(mtime 为 NULL)的回填闭环:stat 快速路径必然 miss →
+// 流式哈希 → 命中 checksum 短路。修复前 checksum 短路在 INSERT 之前 return、
+// 永远回填不到 mtime,存量行每次续扫都要被整文件重读;修复后 checksum 短路里
+// 就地把 size+mtime 写回本 file_path,于是:①该行 mtime 立即变为非空;②再处理
+// 一次时被第 2 步 stat 快速路径零读取命中(不再重复跑 ML)。
+func TestProcessFileInternal_LegacyNullMtime_BackfilledViaChecksumShortcut(t *testing.T) {
+	db := makeTestDB(t)
+	thumbDir := t.TempDir()
+	imgDir := t.TempDir()
+	path := makeTestJPEG(t, imgDir)
+
+	ml := &recordingML{}
+	ix := NewIndexer(db, ml, thumbDir, 1)
+	require.True(t, ix.processFileInternal(path, processOpts{}))
+	require.Equal(t, 1, ml.clipCalls)
+
+	// 模拟"升级前入库"的存量行:把 mtime 抹成 NULL。
+	_, err := db.Exec(`UPDATE assets SET mtime=NULL WHERE file_path=?`, path)
+	require.NoError(t, err)
+
+	// 再处理一次:stat 快速路径 miss(mtime 为 NULL)→ 走到 checksum 短路,
+	// 内容没变命中 indexed → 应就地回填 mtime,且不重复跑 ML。
+	require.True(t, ix.processFileInternal(path, processOpts{}))
+	require.Equal(t, 1, ml.clipCalls, "内容没变时 checksum 短路不应重复跑 ML")
+
+	var mtime sql.NullInt64
+	require.NoError(t, db.QueryRow(`SELECT mtime FROM assets WHERE file_path=?`, path).Scan(&mtime))
+	require.True(t, mtime.Valid && mtime.Int64 != 0, "checksum 短路应把存量行的 mtime 回填为非空")
+
+	// 回填之后,第三次处理应被 stat 快速路径零读取命中(仍不跑 ML)。
+	require.True(t, ix.processFileInternal(path, processOpts{}))
+	require.Equal(t, 1, ml.clipCalls, "回填后应由 stat 快速路径命中,不再触达 checksum 路径")
 }
 
 // TestProcessFileInternal_StatFastPath_IgnoredWhenForced 断言 opts.force=true

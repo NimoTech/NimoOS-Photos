@@ -797,8 +797,9 @@ func (ix *Indexer) processFileInternal(path string, opts processOpts) (success b
 	// 2. stat 快速跳过（P2）：已经 status='indexed' 且 file_size+mtime 都没变
 	// 的文件，不读一个字节就能确认"这份内容早就处理过"——这是打破"重启→整读
 	// 全部 pending 行→再次 OOM→再被杀重启"死循环的关键一步。旧数据（升级前
-	// 入库、mtime 列还是 NULL）在这里必然 miss，会往下走一遍流式哈希+checksum
-	// 判重，处理一次后 mtime 就地回填，下次重启即可直接命中这里。
+	// 入库、mtime 列还是 NULL）在这里必然 miss，会往下走一遍流式哈希 + checksum
+	// 判重，并在第 4 步命中 checksum 短路时就地把 mtime 回填到本 file_path，
+	// 下次重启/续扫即可直接命中这里、彻底免读。
 	if !opts.force {
 		var existingID string
 		if err := ix.db.QueryRow(
@@ -830,6 +831,19 @@ func (ix *Indexer) processFileInternal(path string, opts processOpts) (success b
 		var existingID string
 		err = ix.db.QueryRow(`SELECT id FROM assets WHERE checksum=? AND status='indexed'`, checksum).Scan(&existingID)
 		if err == nil {
+			// 关键回填：升级前入库的存量行 mtime 为 NULL，第 2 步的 stat 快速
+			// 路径永远 miss、每次续扫都要在这里重新流式读一遍整文件。既然已经
+			// 确认这条路径的内容没变（checksum 命中 indexed），就把 size+mtime
+			// 写回本 file_path，下次续扫第 2 步即可零读取命中，彻底摆脱"存量行
+			// 每次重启都被整库重读一遍"。仅当本路径确有 indexed 行时才更新
+			// （纯内容去重——同内容的另一个新路径此处无对应行——是 0 行 no-op，
+			// 那种情况本就没有自己的行可回填，与本次修复无关）。
+			if _, uerr := ix.db.Exec(
+				`UPDATE assets SET mtime=?, file_size=? WHERE file_path=? AND status='indexed' AND (mtime IS NULL OR mtime<>?)`,
+				mtime, fileSize, path, mtime,
+			); uerr != nil {
+				fmt.Fprintf(os.Stderr, "[indexer] mtime 回填失败 %s: %v\n", path, uerr)
+			}
 			// already fully indexed — assign to album if requested, then short-circuit
 			if pendingAlbumID != "" && ix.albumAssigner != nil {
 				ix.albumAssigner(existingID, pendingAlbumID)
