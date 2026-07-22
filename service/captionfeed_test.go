@@ -45,6 +45,28 @@ func (r *recordingSink) DeleteAsset(_ context.Context, id string) error {
 	return nil
 }
 
+// sequenceSink 按调用顺序消费一串预设错误（nil 表示成功），用于测试需要
+// 区分"第几次调用 sink"的场景（比如首次 feedInfo 失败、真正命中
+// ErrParserUnavailable 的其实是第二次 sink 调用)。
+type sequenceSink struct {
+	mu      sync.Mutex
+	results []error
+	calls   []string
+}
+
+func (s *sequenceSink) IngestAsset(_ context.Context, id, _, _, _, _ string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	idx := len(s.calls)
+	s.calls = append(s.calls, id)
+	if idx < len(s.results) {
+		return s.results[idx]
+	}
+	return nil
+}
+
+func (s *sequenceSink) DeleteAsset(context.Context, string) error { return nil }
+
 // insertCaptionCandidate 插入一条 Backfill 会选中的资产：已索引、未软删、
 // 不在离线盘上、caption_synced=0。
 func insertCaptionCandidate(t *testing.T, db *sql.DB, id string) {
@@ -214,6 +236,66 @@ func TestBackfillSelectionAndCAS(t *testing.T) {
 		var synced int
 		require.NoError(t, db.QueryRow(`SELECT caption_synced FROM assets WHERE id='e1'`).Scan(&synced))
 		require.Equal(t, 1, synced)
+	})
+
+	// 回归用例：短路判断此前死绑下标 0，若列表首条的 feedInfo 先失败（资产
+	// 被并发删除等良性竞态），真正命中 ErrParserUnavailable 的是下标 1，短
+	// 路会失效，整轮空遍历后仍打一条汇总 Info，违背"未部署机器零日志"诉
+	// 求。用 feedBatch 直接注入一个不存在的 id 在前，模拟这种竞态。
+	t.Run("首条feedInfo失败不掩盖首次sink短路", func(t *testing.T) {
+		db := makeTestDB(t)
+		thumbDir := t.TempDir()
+		insertCaptionCandidate(t, db, "e2")
+
+		obsCore, logs := observer.New(zap.DebugLevel)
+		restore := zap.ReplaceGlobals(zap.New(obsCore))
+		defer restore()
+
+		sink := &sequenceSink{results: []error{parserclient.ErrParserUnavailable}}
+		f := NewCaptionFeeder(db, sink, thumbDir)
+		require.NoError(t, f.feedBatch(context.Background(), []string{"ghost", "e2"}))
+
+		sink.mu.Lock()
+		gotCalls := append([]string(nil), sink.calls...)
+		sink.mu.Unlock()
+		require.Equal(t, []string{"e2"}, gotCalls, "sink 应只被真正调用一次（ghost 的 feedInfo 失败不算 sink 尝试）")
+
+		var synced int
+		require.NoError(t, db.QueryRow(`SELECT caption_synced FROM assets WHERE id='e2'`).Scan(&synced))
+		require.Equal(t, 0, synced)
+		require.Empty(t, logs.All(), "Parser 未部署时整轮应静默，不留汇总日志")
+	})
+
+	// 非首次命中 Unavailable：Parser 曾经可用（e1 投喂成功），本轮途中才掉
+	// 线，属正常运维场景，应中断循环但保留汇总日志。
+	t.Run("非首次命中Unavailable保留汇总日志", func(t *testing.T) {
+		db := makeTestDB(t)
+		thumbDir := t.TempDir()
+		insertCaptionCandidate(t, db, "e1")
+		insertCaptionCandidate(t, db, "e2")
+
+		obsCore, logs := observer.New(zap.InfoLevel)
+		restore := zap.ReplaceGlobals(zap.New(obsCore))
+		defer restore()
+
+		sink := &sequenceSink{results: []error{nil, parserclient.ErrParserUnavailable}}
+		f := NewCaptionFeeder(db, sink, thumbDir)
+		require.NoError(t, f.feedBatch(context.Background(), []string{"e1", "e2"}))
+
+		sink.mu.Lock()
+		gotCalls := append([]string(nil), sink.calls...)
+		sink.mu.Unlock()
+		require.Equal(t, []string{"e1", "e2"}, gotCalls)
+
+		var synced int
+		require.NoError(t, db.QueryRow(`SELECT caption_synced FROM assets WHERE id='e1'`).Scan(&synced))
+		require.Equal(t, 1, synced, "e1 投喂成功应置 synced=1")
+		require.NoError(t, db.QueryRow(`SELECT caption_synced FROM assets WHERE id='e2'`).Scan(&synced))
+		require.Equal(t, 0, synced, "e2 命中 Unavailable 不应置位")
+
+		entries := logs.All()
+		require.Len(t, entries, 1, "中途掉线属正常运维场景，应保留一条汇总日志")
+		require.Equal(t, "caption 补扫完成", entries[0].Message)
 	})
 }
 

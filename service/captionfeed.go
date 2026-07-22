@@ -81,6 +81,8 @@ func joinPlace(city, country string) string {
 func (f *CaptionFeeder) FeedOne(ctx context.Context, assetID string) {
 	mime, takenAt, place, err := f.feedInfo(ctx, assetID)
 	if err != nil {
+		// 资产在触发投喂后到查询前被删除/软删属良性竞态（比如用户几乎同时
+		// 删了这张照片），不值得 Warn，Debug 留痕即可。
 		zap.L().Debug("caption feed: 查询资产信息失败", zap.String("asset_id", assetID), zap.Error(err))
 		return
 	}
@@ -130,9 +132,10 @@ func (f *CaptionFeeder) queryPending(ctx context.Context) ([]string, error) {
 // Embedder.BackfillOCR：并发调用安全，第二次调用立即返回 nil，但置位
 // rerun，由进行中的那轮结束后自动再跑一轮（重新查询目标）。
 //
-// 先探一次可用性：本轮第一张资产若命中 ErrParserUnavailable，说明 Parser
-// 未部署，直接整轮静默返回（不留任何日志、不继续查后续资产）——这是常态
-// （多数机器不装 Parser），不能每次补扫都刷屏。
+// 先探一次可用性：本轮首次真正调用 sink 若命中 ErrParserUnavailable，说明
+// Parser 未部署，直接整轮静默返回（不留任何日志、不继续查后续资产）——这
+// 是常态（多数机器不装 Parser），不能每次补扫都刷屏。短路锚点是"首次调用
+// sink"而非列表下标 0：详见 feedBatch 内的说明。
 func (f *CaptionFeeder) Backfill(ctx context.Context) error {
 	if !f.running.CompareAndSwap(false, true) {
 		f.rerun.Store(true)
@@ -159,27 +162,52 @@ func (f *CaptionFeeder) backfillOnce(ctx context.Context) error {
 	if len(ids) == 0 {
 		return nil
 	}
+	return f.feedBatch(ctx, ids)
+}
 
+// feedBatch 对给定 id 列表逐个投喂。从 backfillOnce 中拆出，便于测试直接
+// 注入 ids（含不存在的 id，模拟 feedInfo 因资产竞态被删的场景）而不必依赖
+// 真实并发时序。
+//
+// 短路判断锚定在"本轮首次真正调用 sink"，而不是列表下标 0：若开头几个 id
+// 的 feedInfo 先失败（资产被并发删除/软删等良性竞态，见下方 continue 分
+// 支），真正命中 ErrParserUnavailable 的可能是后续下标——这种情况下仍要
+// 判定为"Parser 未部署"整轮静默短路，不能因为下标非 0 就漏判，否则会在
+// 未部署 Parser 的机器上打出一条汇总日志，违背"零日志"诉求。
+//
+// 若非首次调用 sink 才命中 Unavailable，说明 Parser 在本轮开始时是可用
+// 的、中途才掉线（比如补扫过程中重启了 Parser 容器）——这属于正常运维场
+// 景，中断循环避免对已知不可用的 Parser 继续逐个重试，但保留汇总日志（已
+// 有真实投喂发生，值得留痕，不算"零部署"静默场景）。
+func (f *CaptionFeeder) feedBatch(ctx context.Context, ids []string) error {
 	var fed, failed int64
-	for i, id := range ids {
+	firstSinkCall := true
+	for _, id := range ids {
 		if ctx.Err() != nil {
 			break
 		}
 		mime, takenAt, place, ierr := f.feedInfo(ctx, id)
 		if ierr != nil {
+			// 资产在被 queryPending 选中后到这里被删除/软删属良性竞态，不算
+			// 作一次 sink 尝试，也不足以判断 Parser 是否部署，计入 failed
+			// 后继续下一条。
 			failed++
 			continue
 		}
 		imagePath := filepath.Join(f.thumbDir, id, "large.jpg")
 		serr := f.sink.IngestAsset(ctx, id, imagePath, mime, takenAt, place)
+		isFirstSinkCall := firstSinkCall
+		firstSinkCall = false
 		if serr != nil {
 			if errors.Is(serr, parserclient.ErrParserUnavailable) {
-				if i == 0 {
-					// 首张即不可用：Parser 没部署，整轮静默短路，不留汇总日志。
+				if isFirstSinkCall {
+					// 本轮首次真正调用 sink 就不可用：Parser 没部署，整轮
+					// 静默短路，不留汇总日志。
 					return nil
 				}
-				failed++
-				continue
+				// 非首次命中 Unavailable：Parser 中途掉线，中断循环但保留
+				// 汇总日志（正常运维场景，值得留痕）。
+				break
 			}
 			failed++
 			continue
