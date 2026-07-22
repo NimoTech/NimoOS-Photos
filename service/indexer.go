@@ -946,11 +946,14 @@ func (ix *Indexer) processFileInternal(path string, opts processOpts) (success b
 		  duration_ms   = excluded.duration_ms,
 		  status        = 'pending',
 		  mtime         = excluded.mtime,
-		  face_scanned  = CASE WHEN excluded.checksum <> checksum THEN 0 ELSE face_scanned END`,
+		  face_scanned  = CASE WHEN excluded.checksum <> checksum THEN 0 ELSE face_scanned END,
+		  caption_synced = CASE WHEN excluded.checksum <> checksum THEN 0 ELSE caption_synced END`,
 		// face_scanned 只在内容真的变了(checksum 变化)才置回 0，交给 RunPipeline
 		// 重新检测；纯粹的 force 重跑(如 Embedder/Rebuilder 对未变内容的 CLIP
 		// 补跑,同一 checksum)不应清掉已完成的人脸检测标记——否则每轮 CLIP 补跑
 		// 都会把同一批资产重新扔回人脸检测队列,产生重复的 face_detections 行。
+		// caption_synced 同款语义：只在内容真的变了才置回 0，交给照片知识库
+		// 投喂管线重新交接给 Parser；未变内容的补跑不清掉已交接标记，避免重复投喂。
 		assetID, path, fileSize, mime, originalName,
 		nullTime(takenAt), sqlNullInt64(durationMs),
 		checksum, mtime,
