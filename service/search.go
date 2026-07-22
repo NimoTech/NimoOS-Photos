@@ -72,12 +72,23 @@ type SearchFilters struct {
 type SearchService struct {
 	db *sql.DB
 	ml textEmbedder
+
+	// onCaptionDelete 在 DeleteAsset（紧邻 dropClipVector 的硬删调用点）成功后
+	// 调用，供 CaptionFeeder.DeleteRemote 联动使用（Task 4）。函数字段注入，
+	// 避免 SearchService 直接依赖 CaptionFeeder 类型；为 nil 时安全跳过。
+	onCaptionDelete func(assetID string)
 }
 
 // NewSearchService constructs a SearchService.
 // ml may be nil when only non-CLIP methods (Timeline, ListAssets, …) are used.
 func NewSearchService(db *sql.DB, ml textEmbedder) *SearchService {
 	return &SearchService{db: db, ml: ml}
+}
+
+// SetCaptionDelete 注入硬删除资产成功后的 caption 删除回调（通常是
+// CaptionFeeder.DeleteRemote）。
+func (s *SearchService) SetCaptionDelete(fn func(assetID string)) {
+	s.onCaptionDelete = fn
 }
 
 // ─── Smart (CLIP) search ─────────────────────────────────────────────────────
@@ -814,6 +825,9 @@ func (s *SearchService) UpdateDurationMs(id string, ms int64) error {
 // DeleteAsset removes an asset by ID; returns ErrNotFound when absent.
 func (s *SearchService) DeleteAsset(id string) error {
 	dropClipVector(s.db, id) // before the cascade drops asset_clip_idx
+	if s.onCaptionDelete != nil {
+		s.onCaptionDelete(id) // caption 联动：防 agent 检索到幽灵结果
+	}
 	res, err := s.db.Exec(`DELETE FROM assets WHERE id=?`, id)
 	if err != nil {
 		return fmt.Errorf("DeleteAsset: %w", err)

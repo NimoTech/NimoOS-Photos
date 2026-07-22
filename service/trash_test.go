@@ -3,6 +3,7 @@ package service
 import (
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/NimoTech/NimoOS-Photos/pkg/sqlite"
@@ -149,5 +150,110 @@ func TestPurgeExpiredKeepsRecent(t *testing.T) {
 	items, _ := ts.ListTrash("u1")
 	if len(items) != 1 {
 		t.Fatalf("recent item should be kept, got %d", len(items))
+	}
+}
+
+// TestTrashAsset_TriggersCaptionDelete：软删移动成功后应调用 SetCaptionDelete
+// 注入的回调（Task 4 caption 联动），携带正确的 assetID。
+func TestTrashAsset_TriggersCaptionDelete(t *testing.T) {
+	ts, _, _ := newTrashFixture(t)
+
+	var mu sync.Mutex
+	var got []string
+	ts.SetCaptionDelete(func(id string) {
+		mu.Lock()
+		got = append(got, id)
+		mu.Unlock()
+	})
+
+	if err := ts.TrashAsset("a1"); err != nil {
+		t.Fatalf("TrashAsset: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(got) != 1 || got[0] != "a1" {
+		t.Fatalf("caption delete callback got %+v, want [a1]", got)
+	}
+}
+
+// TestRestoreAsset_TriggersCaptionRestore：恢复成功后应调用 SetCaptionRestore
+// 注入的回调，携带正确的 assetID（供 caption_synced 复位重投）。
+func TestRestoreAsset_TriggersCaptionRestore(t *testing.T) {
+	ts, _, _ := newTrashFixture(t)
+	if err := ts.TrashAsset("a1"); err != nil {
+		t.Fatal(err)
+	}
+
+	var mu sync.Mutex
+	var got []string
+	ts.SetCaptionRestore(func(id string) {
+		mu.Lock()
+		got = append(got, id)
+		mu.Unlock()
+	})
+
+	if err := ts.RestoreAsset("a1"); err != nil {
+		t.Fatalf("RestoreAsset: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(got) != 1 || got[0] != "a1" {
+		t.Fatalf("caption restore callback got %+v, want [a1]", got)
+	}
+}
+
+// TestPurgeAsset_TriggersCaptionDelete：物理删除（永久删除单项）成功后应调用
+// caption 删除回调，紧邻 dropClipVector 的两处调用点之一（本项测主资产项）。
+func TestPurgeAsset_TriggersCaptionDelete(t *testing.T) {
+	ts, _, _ := newTrashFixture(t)
+	if err := ts.TrashAsset("a1"); err != nil {
+		t.Fatal(err)
+	}
+
+	var mu sync.Mutex
+	var got []string
+	ts.SetCaptionDelete(func(id string) {
+		mu.Lock()
+		got = append(got, id)
+		mu.Unlock()
+	})
+
+	if err := ts.PurgeAsset("a1"); err != nil {
+		t.Fatalf("PurgeAsset: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(got) != 1 || got[0] != "a1" {
+		t.Fatalf("caption delete callback got %+v, want [a1]", got)
+	}
+}
+
+// TestEmptyTrash_TriggersCaptionDelete：清空回收站（EmptyTrash → PurgeAsset）
+// 每一项都应触发 caption 删除回调。
+func TestEmptyTrash_TriggersCaptionDelete(t *testing.T) {
+	ts, _, _ := newTrashFixture(t)
+	if err := ts.TrashAsset("a1"); err != nil {
+		t.Fatal(err)
+	}
+
+	var mu sync.Mutex
+	var got []string
+	ts.SetCaptionDelete(func(id string) {
+		mu.Lock()
+		got = append(got, id)
+		mu.Unlock()
+	})
+
+	if err := ts.EmptyTrash(); err != nil {
+		t.Fatalf("EmptyTrash: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(got) != 1 || got[0] != "a1" {
+		t.Fatalf("caption delete callback got %+v, want [a1]", got)
 	}
 }

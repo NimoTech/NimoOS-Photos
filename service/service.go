@@ -191,6 +191,13 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 	// parserclient 返回 ErrParserUnavailable，全链路静默跳过。
 	feeder := NewCaptionFeeder(db, parserclient.New(cfg.RuntimePath), thumbDir)
 	idx.SetOnIndexed(func(id string) { feeder.FeedOne(parentCtx, id) })
+	// 删除/回收站全路径联动（Task 4）：软删/物理删（含清空回收站、Indexer 硬删、
+	// SearchService 硬删）异步通知 Parser 删 caption；恢复后置 caption_synced=0
+	// 待下轮补扫重投。函数字段注入，各 service 无需 import CaptionFeeder 类型。
+	idx.SetCaptionDelete(feeder.DeleteRemote)
+	search.SetCaptionDelete(feeder.DeleteRemote)
+	trash.SetCaptionDelete(feeder.DeleteRemote)
+	trash.SetCaptionRestore(feeder.OnRestore)
 	// 启动即补扫一次，捡起服务重启前遗留的欠投喂资产。
 	go func() {
 		if err := feeder.Backfill(parentCtx); err != nil {

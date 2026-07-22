@@ -255,6 +255,11 @@ type Indexer struct {
 	// 函数字段注入（同 albumAssigner/onBatchDone 模式），避免 Indexer 直接依赖
 	// CaptionFeeder 类型；为 nil 时（未接线 / 测试）安全跳过。
 	onIndexed func(assetID string)
+
+	// onCaptionDelete 在硬删除资产（RemoveByPath/pruneMissingUnder，紧邻
+	// dropClipVector 调用点）成功后调用，供 CaptionFeeder.DeleteRemote 联动使
+	// 用（Task 4）。函数字段注入，同 onIndexed；为 nil 时安全跳过。
+	onCaptionDelete func(assetID string)
 }
 
 // touch marks index activity (enqueue or a processed result) at the current time.
@@ -719,6 +724,12 @@ func (ix *Indexer) SetOnBatchDone(fn func()) {
 // scans begin. Same injection pattern as SetOnBatchDone/SetAlbumAssigner.
 func (ix *Indexer) SetOnIndexed(fn func(assetID string)) {
 	ix.onIndexed = fn
+}
+
+// SetCaptionDelete 注入硬删除资产成功后的 caption 删除回调（通常是
+// CaptionFeeder.DeleteRemote），供 RemoveByPath/pruneMissingUnder 调用（Task 4）。
+func (ix *Indexer) SetCaptionDelete(fn func(assetID string)) {
+	ix.onCaptionDelete = fn
 }
 
 // Start launches workers goroutines that consume the queue until ctx is cancelled.
@@ -1606,6 +1617,9 @@ func (ix *Indexer) RemoveByPath(path string) {
 		return
 	}
 	dropClipVector(ix.db, id) // before the cascade drops asset_clip_idx
+	if ix.onCaptionDelete != nil {
+		ix.onCaptionDelete(id) // caption 联动：防 agent 检索到幽灵结果
+	}
 	if _, err := ix.db.Exec(`DELETE FROM assets WHERE id = ?`, id); err != nil {
 		return
 	}
@@ -1667,6 +1681,9 @@ func (ix *Indexer) pruneMissingUnder(dir string) error {
 	}
 	for _, r := range gone {
 		dropClipVector(ix.db, r.id) // before the cascade drops asset_clip_idx
+		if ix.onCaptionDelete != nil {
+			ix.onCaptionDelete(r.id) // caption 联动：防 agent 检索到幽灵结果
+		}
 		if _, err := ix.db.Exec(`DELETE FROM assets WHERE id = ?`, r.id); err != nil {
 			continue
 		}

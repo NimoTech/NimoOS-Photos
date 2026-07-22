@@ -6,10 +6,22 @@ import (
 	"errors"
 	"path/filepath"
 	"sync/atomic"
+	"time"
 
 	"github.com/NimoTech/NimoOS-Photos/pkg/parserclient"
 	"go.uber.org/zap"
 )
+
+// captionDeleteSem 是包级并发信号量（容量 4），限制同一时刻在跑的 DeleteRemote
+// goroutine 数量：批量删除/清空回收站会瞬间触发成百上千次调用，不限流会打出
+// 等量并发 HTTP 请求把 Parser 打垮。包级而非按 CaptionFeeder 实例，因为生产环境
+// 只有一个 feeder 实例，用包级变量与其它 best-effort 辅助方法（FeedOne 等）保持
+// 同一处理惯例一致，同时省去在 struct 里再开一个字段。
+var captionDeleteSem = make(chan struct{}, 4)
+
+// deleteTimeout 是单次 DeleteAsset 调用的上限：删除必须是"发完就走"的旁路操作，
+// 不能让个别慢请求把信号量槽位占住拖慢后续删除。
+const deleteTimeout = 3 * time.Second
 
 // captionSink 是 CaptionFeeder 依赖的鸭子类型接口，只取 parserclient.Client
 // 用到的两个方法，便于测试注入 recordingSink 之类的假实现。
@@ -97,6 +109,27 @@ func (f *CaptionFeeder) FeedOne(ctx context.Context, assetID string) {
 	if _, err := f.db.ExecContext(ctx, `UPDATE assets SET caption_synced=1 WHERE id=?`, assetID); err != nil {
 		zap.L().Warn("caption_synced 置位失败", zap.String("asset_id", assetID), zap.Error(err))
 	}
+}
+
+// DeleteRemote 异步通知 Parser 删除该资产的 caption 块，供删除/回收站全路径
+// 联动调用（Task 4）：防止 agent 后续检索命中已经不存在的照片，产生幽灵结果。
+// fire-and-forget——调用方（TrashAsset/PurgeAsset/RemoveByPath/…）不等待也不
+// 关心结果，best-effort：包级信号量限并发 4，goroutine 内 3s 超时；
+// ErrParserUnavailable（Parser 未部署，常态）完全静默，其它失败仅 Warn 一条留痕。
+func (f *CaptionFeeder) DeleteRemote(assetID string) {
+	go func() {
+		captionDeleteSem <- struct{}{}
+		defer func() { <-captionDeleteSem }()
+
+		ctx, cancel := context.WithTimeout(context.Background(), deleteTimeout)
+		defer cancel()
+		if err := f.sink.DeleteAsset(ctx, assetID); err != nil {
+			if errors.Is(err, parserclient.ErrParserUnavailable) {
+				return
+			}
+			zap.L().Warn("caption 删除失败", zap.String("asset_id", assetID), zap.Error(err))
+		}
+	}()
 }
 
 // OnRestore 把资产的 caption_synced 置回 0，供回收站恢复流程调用（Task 4 用）：

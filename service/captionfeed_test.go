@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -19,10 +20,11 @@ import (
 // recordingSink 是供测试注入的 captionSink 假实现：记录每次调用的完整载荷，
 // 并可注入 failWith 模拟投喂失败（含 ErrParserUnavailable 静默场景)。
 type recordingSink struct {
-	mu       sync.Mutex
-	ingests  []string
-	deletes  []string
-	failWith error // 注入 ErrParserUnavailable / 一般错误
+	mu          sync.Mutex
+	ingests     []string
+	deletes     []string
+	deleteCalls int   // 无论成败都计数,供测试判定 DeleteAsset 是否已被调用过(fire-and-forget 场景下 deletes 在失败注入时不会追加)
+	failWith    error // 注入 ErrParserUnavailable / 一般错误
 }
 
 func (r *recordingSink) IngestAsset(_ context.Context, id, path, mime, takenAt, place string) error {
@@ -38,6 +40,7 @@ func (r *recordingSink) IngestAsset(_ context.Context, id, path, mime, takenAt, 
 func (r *recordingSink) DeleteAsset(_ context.Context, id string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.deleteCalls++
 	if r.failWith != nil {
 		return r.failWith
 	}
@@ -332,4 +335,117 @@ func TestOnIndexedHookFires(t *testing.T) {
 	mu.Lock()
 	defer mu.Unlock()
 	require.Equal(t, []string{id}, got)
+}
+
+// concurrencySink 是供 DeleteRemote 并发上限测试用的假 sink：DeleteAsset 阻塞
+// 在 release 上直到测试放行，同时记录进行中的最大并发数，用来断言包级信号量
+// （容量 4）确实生效。
+type concurrencySink struct {
+	mu         sync.Mutex
+	current    int
+	maxCurrent int
+	release    chan struct{}
+}
+
+func (s *concurrencySink) IngestAsset(context.Context, string, string, string, string, string) error {
+	return nil
+}
+
+func (s *concurrencySink) DeleteAsset(_ context.Context, _ string) error {
+	s.mu.Lock()
+	s.current++
+	if s.current > s.maxCurrent {
+		s.maxCurrent = s.current
+	}
+	s.mu.Unlock()
+
+	<-s.release
+
+	s.mu.Lock()
+	s.current--
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *concurrencySink) snapshot() (current, max int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.current, s.maxCurrent
+}
+
+// DeleteRemote：并发上限锁死在 4——同时甩出 10 个 DeleteRemote，进行中的
+// DeleteAsset 调用数应顶到 4 就不再往上涨（包级信号量生效），全部放行后应
+// 归零（无 goroutine 泄漏/死锁)。
+func TestDeleteRemoteConcurrencyLimit(t *testing.T) {
+	db := makeTestDB(t)
+	thumbDir := t.TempDir()
+	sink := &concurrencySink{release: make(chan struct{})}
+	f := NewCaptionFeeder(db, sink, thumbDir)
+
+	const n = 10
+	for i := 0; i < n; i++ {
+		f.DeleteRemote(fmt.Sprintf("a%d", i))
+	}
+
+	require.Eventually(t, func() bool {
+		cur, _ := sink.snapshot()
+		return cur == 4
+	}, 2*time.Second, 10*time.Millisecond, "并发数应顶到信号量上限 4")
+
+	// 顶住上限一小段时间，确认第 5 个及之后确实被卡住而非意外多放行了几个。
+	time.Sleep(100 * time.Millisecond)
+	cur, max := sink.snapshot()
+	require.Equal(t, 4, cur, "在全部放行前，进行中的调用数不应超过信号量容量")
+	require.Equal(t, 4, max, "10 个并发请求应把信号量用满到 4")
+
+	close(sink.release)
+	require.Eventually(t, func() bool {
+		cur, _ := sink.snapshot()
+		return cur == 0
+	}, 2*time.Second, 10*time.Millisecond, "全部放行后进行中的调用数应归零")
+}
+
+// DeleteRemote：ErrParserUnavailable 完全静默（Parser 未部署是常态），一般
+// 错误仅产生一条 Warn 留痕——均为 fire-and-forget，不影响调用方。
+func TestDeleteRemoteFailureSemantics(t *testing.T) {
+	t.Run("ErrParserUnavailable静默", func(t *testing.T) {
+		db := makeTestDB(t)
+		thumbDir := t.TempDir()
+
+		obsCore, logs := observer.New(zap.DebugLevel)
+		restore := zap.ReplaceGlobals(zap.New(obsCore))
+		defer restore()
+
+		sink := &recordingSink{failWith: parserclient.ErrParserUnavailable}
+		f := NewCaptionFeeder(db, sink, thumbDir)
+		f.DeleteRemote("a1")
+
+		require.Eventually(t, func() bool {
+			sink.mu.Lock()
+			defer sink.mu.Unlock()
+			return sink.deleteCalls == 1
+		}, 2*time.Second, 10*time.Millisecond, "DeleteRemote 应异步调用一次 sink")
+		// sink 调用后 goroutine 只剩一次 errors.Is 判断即返回，留出极短余量
+		// 让其跑完，再确认全程零日志。
+		time.Sleep(50 * time.Millisecond)
+		require.Empty(t, logs.All(), "ErrParserUnavailable 不应产生任何日志")
+	})
+
+	t.Run("一般错误仅Warn一条", func(t *testing.T) {
+		db := makeTestDB(t)
+		thumbDir := t.TempDir()
+
+		obsCore, logs := observer.New(zap.DebugLevel)
+		restore := zap.ReplaceGlobals(zap.New(obsCore))
+		defer restore()
+
+		sink := &recordingSink{failWith: errors.New("boom")}
+		f := NewCaptionFeeder(db, sink, thumbDir)
+		f.DeleteRemote("a1")
+
+		require.Eventually(t, func() bool {
+			return len(logs.All()) >= 1
+		}, 2*time.Second, 10*time.Millisecond, "一般错误应产生 Warn 日志")
+		require.Len(t, logs.All(), 1, "一般错误应仅产生一条 Warn 日志")
+	})
 }
