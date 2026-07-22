@@ -13,6 +13,7 @@ import (
 	_ "image/gif"
 	_ "image/jpeg"
 	_ "image/png"
+	"io"
 	"io/fs"
 	"math"
 	"net/http"
@@ -126,6 +127,58 @@ func resolveMimeType(data []byte, ext string) string {
 		return m
 	}
 	return http.DetectContentType(data)
+}
+
+// mimeSniffBytes 是未知扩展名回退到内容嗅探时最多读取的文件头部字节数。
+// http.DetectContentType 本身只看前 512B，这里留一点冗余；已知扩展名
+// （canonicalMime 命中）完全不受这个常量影响，压根不会读文件。
+const mimeSniffBytes = 4096
+
+// readHeader 最多读取 path 的前 n 个字节，用于只需要文件头部信息的场景（如
+// MIME 内容嗅探），避免像 os.ReadFile 那样把整个文件读入内存。文件本身小于
+// n 字节是正常情况（返回已读到的部分，不算错误）。
+func readHeader(path string, n int) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	buf := make([]byte, n)
+	nr, err := io.ReadFull(f, buf)
+	if err != nil && !errors.Is(err, io.ErrUnexpectedEOF) && !errors.Is(err, io.EOF) {
+		return nil, err
+	}
+	return buf[:nr], nil
+}
+
+// detectMimeType 是 processFileInternal 里实际调用的 MIME 探测入口：已知扩展
+// 名直接查 canonicalMime 表、完全不碰磁盘；只有未识别的扩展名才读文件头部
+// （mimeSniffBytes）做内容嗅探——取代原来"先把整个文件读进内存，再嗅探"的
+// 做法（视频文件哪怕几个 GB，MIME 探测阶段现在最多只读 4KB）。
+func detectMimeType(path, ext string) string {
+	if m, ok := canonicalMime[strings.ToLower(ext)]; ok {
+		return m
+	}
+	header, err := readHeader(path, mimeSniffBytes)
+	if err != nil {
+		header = nil
+	}
+	return resolveMimeType(header, ext)
+}
+
+// maxImageReadBytes 是索引阶段把图片原图整个读入内存（供 ML faceData 与
+// image.DecodeConfig 尺寸兜底使用）的字节上限，防止异常超大/伪装的图片文件
+// 把 Go 进程常驻内存打爆。注意这和 oversizedForML（mlinput.go，178.9MP 像素
+// 上限，管的是喂给 immich-ml /predict 的输入尺寸）是两码事，不要混用：那个
+// 判定图片"能不能喂给 ML"，这个判定图片"要不要整图读进内存"。
+// 声明成 var 而不是 const 是为了让测试能注入一个更小的阈值，不必真的在测试
+// 里落地一个 100MB+ 的文件。
+var maxImageReadBytes int64 = 100 * 1024 * 1024 // 100MB
+
+// imageExceedsReadLimit 是纯函数判定：文件大小是否超过 maxImageReadBytes。
+// 抽出来单独测试边界值，不需要构造真实的大文件。
+func imageExceedsReadLimit(size int64) bool {
+	return size > maxImageReadBytes
 }
 
 // ingestQueueItem carries a file path and its optional batch association
@@ -731,16 +784,46 @@ func (ix *Indexer) processFileInternal(path string, opts processOpts) (success b
 	// leave a stale entry in the map.
 	pendingAlbumID := ix.takePendingAlbum(path)
 
-	// 1. Read file content.
-	data, err := os.ReadFile(path)
+	// 1. 先 stat，不读一个字节。size+mtime 既是下面 P2 快速跳过判断的依据，也
+	// 直接复用为 INSERT 阶段需要的 file_size/mtime，避免处理期间文件被替换导
+	// 致前后两次 stat 结果不一致。
+	fi, err := os.Stat(path)
+	if err != nil {
+		return false
+	}
+	fileSize := fi.Size()
+	mtime := fi.ModTime().UnixNano()
+
+	// 2. stat 快速跳过（P2）：已经 status='indexed' 且 file_size+mtime 都没变
+	// 的文件，不读一个字节就能确认"这份内容早就处理过"——这是打破"重启→整读
+	// 全部 pending 行→再次 OOM→再被杀重启"死循环的关键一步。旧数据（升级前
+	// 入库、mtime 列还是 NULL）在这里必然 miss，会往下走一遍流式哈希 + checksum
+	// 判重，并在第 4 步命中 checksum 短路时就地把 mtime 回填到本 file_path，
+	// 下次重启/续扫即可直接命中这里、彻底免读。
+	if !opts.force {
+		var existingID string
+		if err := ix.db.QueryRow(
+			`SELECT id FROM assets WHERE file_path=? AND file_size=? AND mtime=? AND status='indexed'`,
+			path, fileSize, mtime,
+		).Scan(&existingID); err == nil {
+			if pendingAlbumID != "" && ix.albumAssigner != nil {
+				ix.albumAssigner(existingID, pendingAlbumID)
+			}
+			return true
+		}
+	}
+
+	// 3. 流式计算 SHA-256（os.Open + io.Copy）：边读边算，不把整个文件驻留到
+	// 内存里——几十 KB 的图片和几个 GB 的视频走的是同一份常量级内存开销。
+	checksum, err := sha256FileStream(path)
 	if err != nil {
 		return false
 	}
 
-	// 2. Compute SHA-256 checksum.
-	checksum := sha256File(data)
-
-	// 3. Skip if checksum already exists in DB with status='indexed'.
+	// 4. checksum 命中已索引记录时短路。这条判重逻辑和改动前语义完全一致，
+	// 只是不再要求"整个文件已经读进内存"——它是上面 stat 快速路径的兜底：
+	// mtime 还没回填的存量数据、或者文件被"touch"过但内容没变的场景，都靠它
+	// 兜底识别成"其实早就处理过"。
 	// Records with status='pending' (e.g. left by a crash) are intentionally
 	// re-processed so they can reach 'indexed' status.
 	// When opts.force is set, bypass this short-circuit entirely.
@@ -748,6 +831,19 @@ func (ix *Indexer) processFileInternal(path string, opts processOpts) (success b
 		var existingID string
 		err = ix.db.QueryRow(`SELECT id FROM assets WHERE checksum=? AND status='indexed'`, checksum).Scan(&existingID)
 		if err == nil {
+			// 关键回填：升级前入库的存量行 mtime 为 NULL，第 2 步的 stat 快速
+			// 路径永远 miss、每次续扫都要在这里重新流式读一遍整文件。既然已经
+			// 确认这条路径的内容没变（checksum 命中 indexed），就把 size+mtime
+			// 写回本 file_path，下次续扫第 2 步即可零读取命中，彻底摆脱"存量行
+			// 每次重启都被整库重读一遍"。仅当本路径确有 indexed 行时才更新
+			// （纯内容去重——同内容的另一个新路径此处无对应行——是 0 行 no-op，
+			// 那种情况本就没有自己的行可回填，与本次修复无关）。
+			if _, uerr := ix.db.Exec(
+				`UPDATE assets SET mtime=?, file_size=? WHERE file_path=? AND status='indexed' AND (mtime IS NULL OR mtime<>?)`,
+				mtime, fileSize, path, mtime,
+			); uerr != nil {
+				fmt.Fprintf(os.Stderr, "[indexer] mtime 回填失败 %s: %v\n", path, uerr)
+			}
 			// already fully indexed — assign to album if requested, then short-circuit
 			if pendingAlbumID != "" && ix.albumAssigner != nil {
 				ix.albumAssigner(existingID, pendingAlbumID)
@@ -756,18 +852,22 @@ func (ix *Indexer) processFileInternal(path string, opts processOpts) (success b
 		}
 	}
 
-	// 4. Detect MIME type and decide image vs. video.
+	// 5. Detect MIME type and decide image vs. video. 已知扩展名直查表，不碰
+	// 磁盘；只有未知扩展名才读文件头部做内容嗅探（detectMimeType）。
 	ext := strings.ToLower(filepath.Ext(path))
-	mime := resolveMimeType(data, ext)
+	mime := detectMimeType(path, ext)
 	isVideo := strings.HasPrefix(mime, "video/") || videoExts[ext]
 
-	// 5. Gather metadata.
+	// 6. Gather metadata.
 	var takenAt time.Time
 	var durationMs int64
 	var exifResult *exif.Result
 	var mediaInfo *ffmpeg.MediaInfo
 	var keyframePath string
 	var keyframeTmpDir string
+	// data 只在图片路径、且文件不超过 maxImageReadBytes 时才会被填充；视频
+	// 路径全程保持 nil——关键帧/probe 都按路径走 ffmpeg，一个字节都不碰 data。
+	var data []byte
 
 	if isVideo {
 		keyframeTmpDir, err = os.MkdirTemp("", "nimoos-kf-*")
@@ -798,9 +898,23 @@ func (ix *Indexer) processFileInternal(path string, opts processOpts) (success b
 				takenAt = exifResult.TakenAt
 			}
 		}
+
+		// 超过 maxImageReadBytes 的图片跳过整图读入内存：ML faceData 置空
+		// （下面第 9 步 CLIP 会退化成只用缩略图、没有缩略图就跳过；OCR 直接
+		// 跳过），但 EXIF（已流式解析）、缩略图（thumb.Generate 按路径读）、
+		// 入库都照常完成——异常超大图不应该拖累基础索引。
+		if imageExceedsReadLimit(fileSize) {
+			zap.L().Warn("图片超过索引读取上限，跳过依赖原图字节的 ML（人脸检测/OCR），CLIP 仍走缩略图，基础索引照常",
+				zap.String("path", path),
+				zap.Int64("file_size", fileSize),
+				zap.Int64("limit_bytes", maxImageReadBytes))
+		} else if b, rerr := os.ReadFile(path); rerr == nil {
+			data = b
+		}
+
 		// Most JPEGs put dimensions in the SOF marker rather than EXIF.
 		// Fall back to image.DecodeConfig (header-only decode) when EXIF lacks them.
-		if exifResult != nil && (exifResult.Width == 0 || exifResult.Height == 0) {
+		if exifResult != nil && (exifResult.Width == 0 || exifResult.Height == 0) && len(data) > 0 {
 			if cfg, _, derr := image.DecodeConfig(bytes.NewReader(data)); derr == nil {
 				exifResult.Width = cfg.Width
 				exifResult.Height = cfg.Height
@@ -808,25 +922,21 @@ func (ix *Indexer) processFileInternal(path string, opts processOpts) (success b
 		}
 	}
 
-	// 6. INSERT into assets with status='pending'.
+	// 7. INSERT into assets with status='pending'.
+	// fileSize/mtime 复用第 1 步的 stat 结果，不再重复 os.Stat。
 	assetID := uuid.NewString()
-	fi, _ := os.Stat(path)
-	var fileSize int64
-	if fi != nil {
-		fileSize = fi.Size()
-	}
 	// Fall back to file mtime when no embedded capture time was found.
 	// Without this, files lacking EXIF DateTime or video creation_time would
 	// all collapse to indexed_at and bunch together on the timeline.
-	if takenAt.IsZero() && fi != nil {
+	if takenAt.IsZero() {
 		takenAt = fi.ModTime()
 	}
 	originalName := filepath.Base(path)
 
 	_, err = ix.db.Exec(`
 		INSERT INTO assets(id, file_path, file_size, mime_type, original_name,
-		                   taken_at, duration_ms, is_live_photo_video, status, checksum)
-		VALUES(?,?,?,?,?,?,?,0,'pending',?)
+		                   taken_at, duration_ms, is_live_photo_video, status, checksum, mtime)
+		VALUES(?,?,?,?,?,?,?,0,'pending',?,?)
 		ON CONFLICT(file_path) DO UPDATE SET
 		  checksum      = excluded.checksum,
 		  file_size     = excluded.file_size,
@@ -835,6 +945,7 @@ func (ix *Indexer) processFileInternal(path string, opts processOpts) (success b
 		  taken_at      = excluded.taken_at,
 		  duration_ms   = excluded.duration_ms,
 		  status        = 'pending',
+		  mtime         = excluded.mtime,
 		  face_scanned  = CASE WHEN excluded.checksum <> checksum THEN 0 ELSE face_scanned END`,
 		// face_scanned 只在内容真的变了(checksum 变化)才置回 0，交给 RunPipeline
 		// 重新检测；纯粹的 force 重跑(如 Embedder/Rebuilder 对未变内容的 CLIP
@@ -842,7 +953,7 @@ func (ix *Indexer) processFileInternal(path string, opts processOpts) (success b
 		// 都会把同一批资产重新扔回人脸检测队列,产生重复的 face_detections 行。
 		assetID, path, fileSize, mime, originalName,
 		nullTime(takenAt), sqlNullInt64(durationMs),
-		checksum,
+		checksum, mtime,
 	)
 	if err != nil {
 		return false
@@ -860,7 +971,7 @@ func (ix *Indexer) processFileInternal(path string, opts processOpts) (success b
 		ix.albumAssigner(assetID, pendingAlbumID)
 	}
 
-	// 7. INSERT/UPDATE asset_exif — images and videos both write their metadata.
+	// 8. INSERT/UPDATE asset_exif — images and videos both write their metadata.
 	// Skipped when opts.skipExif is set (e.g. Embedder retry path).
 	if !opts.skipExif {
 		if isVideo && mediaInfo != nil {
@@ -926,7 +1037,7 @@ func (ix *Indexer) processFileInternal(path string, opts processOpts) (success b
 		}
 	}
 
-	// 8. Generate thumbnails.
+	// 9. Generate thumbnails.
 	// Skipped when opts.skipThumb is set (e.g. Embedder retry path).
 	imagePath := path
 	if isVideo && keyframePath != "" {
@@ -961,7 +1072,7 @@ func (ix *Indexer) processFileInternal(path string, opts processOpts) (success b
 		}(path, previewPath, spritePath, durationMs, assetID)
 	}
 
-	// 9. ML inference (only when ML service is ready).
+	// 10. ML inference (only when ML service is ready).
 	if ix.ml.IsReady() {
 		// Face detection needs full-resolution detail, so it uses the original
 		// image (photos) or the full keyframe (videos).
@@ -1025,7 +1136,7 @@ func (ix *Indexer) processFileInternal(path string, opts processOpts) (success b
 		}
 	}
 
-	// 10. Mark as indexed.
+	// 11. Mark as indexed.
 	if _, err := ix.db.Exec(`
 		UPDATE assets SET status='indexed', indexed_at=? WHERE id=?`,
 		time.Now(), assetID,
@@ -1242,10 +1353,28 @@ func (ix *Indexer) scoreAesthetic(assetID string, vec []float32) {
 	}
 }
 
-// sha256File returns the hex-encoded SHA-256 hash of data.
+// sha256File returns the hex-encoded SHA-256 hash of data. processFileInternal
+// 的判重主路径已经改用下面的 sha256FileStream（不要求整文件读进内存）；这个
+// 版本仍保留给已经拿到内存字节的场景（如测试里与流式哈希结果做交叉验证）。
 func sha256File(data []byte) string {
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:])
+}
+
+// sha256FileStream 边读边算文件的 SHA-256（os.Open + io.Copy），不需要把整个
+// 文件驻留到内存——8GB 的视频和几十 KB 的缩略图走的是同一份常量级（io.Copy
+// 内部缓冲区大小）常驻内存，这是 processFileInternal 消除 OOM 的核心手段。
+func sha256FileStream(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // walkSupported recursively walks dir, calling fn for each supported media file.

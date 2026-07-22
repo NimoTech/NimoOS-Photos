@@ -8,6 +8,17 @@ ExecStartPre=/usr/bin/nimoos-photos -v
 ExecStart=/usr/bin/nimoos-photos -c /etc/nimoos/photos.conf
 Restart=always
 Type=notify
+# P3 兜底：索引流程已经改造成流式读取(P1)+ stat 快速跳过(P2)，理论上不该
+# 再整文件读入内存 OOM；这里再加一层内核/Go 双重兜底，防止未知问题把 31G
+# 内存的整机拖垮——MemoryHigh 触顶时 cgroup 先回收页缓存等软限制手段，
+# MemoryMax 是硬上限(超过直接被 cgroup OOM kill，只杀 Photos 自己这一个
+# service，不牵连其它 15+ 个 systemd 服务)；GOMEMLIMIT 让 Go runtime 的 GC
+# 在真正撞到 cgroup 限制之前主动触发，减少被内核硬杀的概率；RestartSec=30
+# 避免 Restart=always 在崩溃后立刻重启形成"秒杀-重启-再秒杀"的无用功空转。
+MemoryHigh=3G
+MemoryMax=4G
+RestartSec=30
+Environment=GOMEMLIMIT=2500MiB
 
 [Install]
 WantedBy=multi-user.target

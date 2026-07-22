@@ -381,6 +381,13 @@ func migrate(db *sql.DB) error {
 		// aesthetic_score: 美学评分(NULL=未打分,由内联打分/BackfillAesthetic 填充;
 		// 换头版本或 ML 代次重建时置回 NULL 重打)。
 		{"aesthetic_score", "REAL"},
+		// mtime: 源文件 ModTime().UnixNano()，索引时随 file_size 一起写入。
+		// 用于 processFileInternal 的"stat 快速跳过"——重启续扫时，
+		// file_path+file_size+mtime 都命中且 status='indexed' 的资产不用读一个
+		// 字节就能判定"已经处理过"，避免整批已完成的大文件被重新流式哈希一遍。
+		// 升级前入库的存量行该列是 NULL，天然 miss 这条快速路径，回落到下面的
+		// checksum 判重，处理一次后就地回填 mtime，后续重启即可命中。
+		{"mtime", "INTEGER"},
 	}
 	assetsExisting := map[string]bool{}
 	aRows, err := db.Query(`PRAGMA table_info(assets)`)
