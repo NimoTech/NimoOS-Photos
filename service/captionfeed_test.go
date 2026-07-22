@@ -147,6 +147,48 @@ func TestFeedOneFailureLeavesUnsynced(t *testing.T) {
 	})
 }
 
+// FeedOne：caption_synced=1 短路——已交接资产不应再次调用 sink（防
+// ForceReprocess/rebuild/CLIP 补跑等强制重跑路径重复烧 35s VLM）；
+// synced=0 时照常投喂。
+func TestFeedOneSyncedShortCircuit(t *testing.T) {
+	t.Run("已同步不再投喂", func(t *testing.T) {
+		db := makeTestDB(t)
+		thumbDir := t.TempDir()
+		assetID := "a1"
+		_, err := db.Exec(`INSERT INTO assets(id, file_path, mime_type, status, caption_synced)
+			VALUES(?,?,?,'indexed',1)`, assetID, "/g/a1.jpg", "image/jpeg")
+		require.NoError(t, err)
+
+		sink := &recordingSink{}
+		f := NewCaptionFeeder(db, sink, thumbDir)
+		f.FeedOne(context.Background(), assetID)
+
+		sink.mu.Lock()
+		got := append([]string(nil), sink.ingests...)
+		sink.mu.Unlock()
+		require.Empty(t, got, "已同步资产不应再次调用 sink")
+	})
+
+	t.Run("未同步照常投喂", func(t *testing.T) {
+		db := makeTestDB(t)
+		thumbDir := t.TempDir()
+		insertIndexedAsset(t, db, "a1")
+
+		sink := &recordingSink{}
+		f := NewCaptionFeeder(db, sink, thumbDir)
+		f.FeedOne(context.Background(), "a1")
+
+		sink.mu.Lock()
+		got := append([]string(nil), sink.ingests...)
+		sink.mu.Unlock()
+		require.Len(t, got, 1, "未同步资产应照常投喂")
+
+		var synced int
+		require.NoError(t, db.QueryRow(`SELECT caption_synced FROM assets WHERE id='a1'`).Scan(&synced))
+		require.Equal(t, 1, synced)
+	})
+}
+
 // Backfill：只投 synced=0 且可见的资产；成功逐个置 1；CAS 防重入；
 // 首张遇 ErrParserUnavailable 时整轮静默短路。
 func TestBackfillSelectionAndCAS(t *testing.T) {

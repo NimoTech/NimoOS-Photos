@@ -62,7 +62,9 @@ func (s *TrashService) TrashAsset(id string) error {
 		if e := s.db.QueryRow(
 			`SELECT file_path FROM assets WHERE id=? AND deleted_at IS NULL`, liveID,
 		).Scan(&livePath); e == nil {
-			_ = s.moveToTrash(liveID, livePath)
+			if me := s.moveToTrash(liveID, livePath); me == nil && s.onCaptionDelete != nil {
+				s.onCaptionDelete(liveID) // caption 联动：Live Photo 伴随资产同步删除，防幽灵结果
+			}
 		}
 	}
 	if s.onCaptionDelete != nil {
@@ -105,7 +107,9 @@ func (s *TrashService) RestoreAsset(id string) error {
 	}
 	if liveID != "" {
 		if lp, lo, _, e := s.trashRow(liveID); e == nil {
-			_ = s.restoreFile(liveID, lp, lo)
+			if re := s.restoreFile(liveID, lp, lo); re == nil && s.onCaptionRestore != nil {
+				s.onCaptionRestore(liveID) // caption 联动：Live Photo 伴随资产同步复位重投
+			}
 		}
 	}
 	if s.onCaptionRestore != nil {

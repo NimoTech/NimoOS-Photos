@@ -86,11 +86,32 @@ func joinPlace(city, country string) string {
 	}
 }
 
+// captionSynced 查询资产当前的 caption_synced 标记，供 FeedOne 短路判断用。
+func (f *CaptionFeeder) captionSynced(ctx context.Context, assetID string) (bool, error) {
+	var synced int
+	err := f.db.QueryRowContext(ctx, `SELECT caption_synced FROM assets WHERE id=?`, assetID).Scan(&synced)
+	if err != nil {
+		return false, err
+	}
+	return synced == 1, nil
+}
+
 // FeedOne 把单个资产投喂给 Parser：查载荷 → 投喂 → 成功置 caption_synced=1。
 // 供索引内联钩子（SetOnIndexed）调用。任何失败都不影响调用方——本方法从不
 // 返回 error，只在需要留痕时打日志；ErrParserUnavailable 完全静默（Parser
 // 未部署是正常状态，不能刷日志)。
+//
+// 投喂前先查 caption_synced：已是 1 直接静默返回（零日志），防
+// ForceReprocess/rebuild/CLIP 补跑等强制重跑路径把已交接资产重复烧
+// 35s VLM。资产内容真变更（checksum 变化）时 UPSERT 已把标记归 0，
+// 不受此短路影响。查询失败沿用既有 Debug 语义（良性竞态，不值得 Warn）。
 func (f *CaptionFeeder) FeedOne(ctx context.Context, assetID string) {
+	if synced, err := f.captionSynced(ctx, assetID); err != nil {
+		zap.L().Debug("caption feed: 查询资产信息失败", zap.String("asset_id", assetID), zap.Error(err))
+		return
+	} else if synced {
+		return
+	}
 	mime, takenAt, place, err := f.feedInfo(ctx, assetID)
 	if err != nil {
 		// 资产在触发投喂后到查询前被删除/软删属良性竞态（比如用户几乎同时
