@@ -388,6 +388,10 @@ func migrate(db *sql.DB) error {
 		// 升级前入库的存量行该列是 NULL，天然 miss 这条快速路径，回落到下面的
 		// checksum 判重，处理一次后就地回填 mtime，后续重启即可命中。
 		{"mtime", "INTEGER"},
+		// caption_synced: 照片知识库投喂标记——1=已交接 Parser(生成过 caption/
+		// embedding 供 RAG 检索),0=未交接/待投喂。checksum 变化(内容真的变了)
+		// 或回收站恢复时置回 0,交给投喂管线重新交接。
+		{"caption_synced", "INTEGER NOT NULL DEFAULT 0"},
 	}
 	assetsExisting := map[string]bool{}
 	aRows, err := db.Query(`PRAGMA table_info(assets)`)

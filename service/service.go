@@ -13,6 +13,7 @@ import (
 	"github.com/NimoTech/NimoOS-Photos/pkg/config"
 	"github.com/NimoTech/NimoOS-Photos/pkg/geo"
 	"github.com/NimoTech/NimoOS-Photos/pkg/mlclient"
+	"github.com/NimoTech/NimoOS-Photos/pkg/parserclient"
 	"github.com/NimoTech/NimoOS-Photos/pkg/sqlite"
 	"go.uber.org/zap"
 )
@@ -185,6 +186,25 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 	mountGuard.SetBackfillOCR(embedder.BackfillOCR)
 	// Run() 由 main.go 与其它后台 worker 一起以 goroutine 启动。
 
+	// CaptionFeeder：把已索引资产旁路投喂给 NimoOS-Parser 生成 caption
+	// （照片知识库子项目二)。Parser 未部署（discoveryFile 不存在）时
+	// parserclient 返回 ErrParserUnavailable，全链路静默跳过。
+	feeder := NewCaptionFeeder(db, parserclient.New(cfg.RuntimePath), thumbDir)
+	idx.SetOnIndexed(func(id string) { feeder.FeedOne(parentCtx, id) })
+	// 删除/回收站全路径联动（Task 4）：软删/物理删（含清空回收站、Indexer 硬删、
+	// SearchService 硬删）异步通知 Parser 删 caption；恢复后置 caption_synced=0
+	// 待下轮补扫重投。函数字段注入，各 service 无需 import CaptionFeeder 类型。
+	idx.SetCaptionDelete(feeder.DeleteRemote)
+	search.SetCaptionDelete(feeder.DeleteRemote)
+	trash.SetCaptionDelete(feeder.DeleteRemote)
+	trash.SetCaptionRestore(feeder.OnRestore)
+	// 启动即补扫一次，捡起服务重启前遗留的欠投喂资产。
+	go func() {
+		if err := feeder.Backfill(parentCtx); err != nil {
+			zap.L().Warn("caption: 启动补扫失败", zap.Error(err))
+		}
+	}()
+
 	// batch 上传完成后触发人脸检测+聚类一体任务，让前端能看到从 0% 涨到 100% 的
 	// "识别人物" task（真实进度，而非旧的聚类专属假进度）。
 	// faces.RunPipeline 内部用 CAS 防重入，多个 batch 同时 done 也只会跑一次。
@@ -211,6 +231,10 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 			}
 			if err := embedder.BackfillAesthetic(parentCtx); err != nil {
 				zap.L().Warn("post-batch aesthetic backfill failed", zap.Error(err))
+			}
+			// caption 补扫链尾:批次末尾捡起漏投喂的资产(Parser 未部署时静默空跑)。
+			if err := feeder.Backfill(parentCtx); err != nil {
+				zap.L().Warn("post-batch caption backfill failed", zap.Error(err))
 			}
 		}()
 		go func() {

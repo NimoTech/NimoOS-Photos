@@ -13,11 +13,29 @@ type TrashService struct {
 	db         *sql.DB
 	galleryDir string // 回收站根目录所在的 gallery 根（.trash 放它下面）
 	thumbDir   string // 缩略图根目录，用于永久删除时清理
+
+	// onCaptionDelete/onCaptionRestore 是 caption 联动钩子（Task 4），函数字段
+	// 注入避免 TrashService 直接 import CaptionFeeder（同 MountGuard/Embedder
+	// 的注入惯例）。为 nil 时（未接线 / 测试）安全跳过。
+	onCaptionDelete  func(assetID string)
+	onCaptionRestore func(assetID string)
 }
 
 // NewTrashService 构造 TrashService。
 func NewTrashService(db *sql.DB, galleryDir, thumbDir string) *TrashService {
 	return &TrashService{db: db, galleryDir: galleryDir, thumbDir: thumbDir}
+}
+
+// SetCaptionDelete 注入软删/永久删成功后的 caption 删除回调（通常是
+// CaptionFeeder.DeleteRemote）。
+func (s *TrashService) SetCaptionDelete(fn func(assetID string)) {
+	s.onCaptionDelete = fn
+}
+
+// SetCaptionRestore 注入恢复成功后的 caption 复位回调（通常是
+// CaptionFeeder.OnRestore）。
+func (s *TrashService) SetCaptionRestore(fn func(assetID string)) {
+	s.onCaptionRestore = fn
 }
 
 func (s *TrashService) trashDir(id string) string {
@@ -44,8 +62,13 @@ func (s *TrashService) TrashAsset(id string) error {
 		if e := s.db.QueryRow(
 			`SELECT file_path FROM assets WHERE id=? AND deleted_at IS NULL`, liveID,
 		).Scan(&livePath); e == nil {
-			_ = s.moveToTrash(liveID, livePath)
+			if me := s.moveToTrash(liveID, livePath); me == nil && s.onCaptionDelete != nil {
+				s.onCaptionDelete(liveID) // caption 联动：Live Photo 伴随资产同步删除，防幽灵结果
+			}
 		}
+	}
+	if s.onCaptionDelete != nil {
+		s.onCaptionDelete(id) // caption 联动：防 agent 检索到幽灵结果
 	}
 	return nil
 }
@@ -84,8 +107,13 @@ func (s *TrashService) RestoreAsset(id string) error {
 	}
 	if liveID != "" {
 		if lp, lo, _, e := s.trashRow(liveID); e == nil {
-			_ = s.restoreFile(liveID, lp, lo)
+			if re := s.restoreFile(liveID, lp, lo); re == nil && s.onCaptionRestore != nil {
+				s.onCaptionRestore(liveID) // caption 联动：Live Photo 伴随资产同步复位重投
+			}
 		}
+	}
+	if s.onCaptionRestore != nil {
+		s.onCaptionRestore(id) // caption 联动：恢复后重投,防止 caption 缺失
 	}
 	return nil
 }
@@ -159,10 +187,16 @@ func (s *TrashService) PurgeAsset(id string) error {
 		if e := s.db.QueryRow(`SELECT file_path FROM assets WHERE id=?`, liveID).Scan(&lp); e == nil {
 			s.purgeFiles(liveID, lp)
 			dropClipVector(s.db, liveID) // before the cascade drops asset_clip_idx
+			if s.onCaptionDelete != nil {
+				s.onCaptionDelete(liveID) // caption 联动：防 agent 检索到幽灵结果
+			}
 			s.db.Exec(`DELETE FROM assets WHERE id=?`, liveID) //nolint:errcheck
 		}
 	}
 	dropClipVector(s.db, id) // before the cascade drops asset_clip_idx
+	if s.onCaptionDelete != nil {
+		s.onCaptionDelete(id) // caption 联动：防 agent 检索到幽灵结果
+	}
 	if _, err := s.db.Exec(`DELETE FROM assets WHERE id=?`, id); err != nil {
 		return fmt.Errorf("PurgeAsset delete: %w", err)
 	}

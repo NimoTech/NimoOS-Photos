@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/NimoTech/NimoOS-Photos/common"
@@ -850,4 +851,31 @@ func TestOCRLinesMatchAndAll(t *testing.T) {
 	require.NoError(t, err)
 	_, err = s.OCRLines("a1", "发票")
 	require.ErrorIs(t, err, service.ErrNotFound)
+}
+
+// TestDeleteAsset_TriggersCaptionDelete：物理删除（DeleteAsset，紧邻
+// dropClipVector 的调用点）成功后应调用 SetCaptionDelete 注入的回调，携带正确
+// 的 assetID（Task 4 caption 联动：防 agent 检索到已删除照片的幽灵结果）。
+func TestDeleteAsset_TriggersCaptionDelete(t *testing.T) {
+	db, err := sqlite.Open(filepath.Join(t.TempDir(), "delcap.db"))
+	require.NoError(t, err)
+	defer db.Close()
+
+	db.Exec(`INSERT INTO assets(id, file_path, status, is_live_photo_video) VALUES('a1','/p/beach.jpg','indexed',0)`)
+
+	svc := service.NewSearchService(db, &mockTextML{})
+
+	var mu sync.Mutex
+	var got []string
+	svc.SetCaptionDelete(func(id string) {
+		mu.Lock()
+		got = append(got, id)
+		mu.Unlock()
+	})
+
+	require.NoError(t, svc.DeleteAsset("a1"))
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.Equal(t, []string{"a1"}, got)
 }

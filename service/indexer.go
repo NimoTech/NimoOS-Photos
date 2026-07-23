@@ -249,6 +249,17 @@ type Indexer struct {
 	// spriteBackfillRunning 是 BackfillSprites 的 CAS 重入门闩：一次只允许
 	// 一轮存量补跑在跑，避免服务重启风暴或误触发导致多轮并发扫同一批候选。
 	spriteBackfillRunning atomic.Bool
+
+	// onIndexed 在资产写为 status='indexed'（唯一写入点，见 processFileInternal
+	// 末尾）成功后异步调用一次，供 CaptionFeeder.FeedOne 内联投喂钩子使用。
+	// 函数字段注入（同 albumAssigner/onBatchDone 模式），避免 Indexer 直接依赖
+	// CaptionFeeder 类型；为 nil 时（未接线 / 测试）安全跳过。
+	onIndexed func(assetID string)
+
+	// onCaptionDelete 在硬删除资产（RemoveByPath/pruneMissingUnder，紧邻
+	// dropClipVector 调用点）成功后调用，供 CaptionFeeder.DeleteRemote 联动使
+	// 用（Task 4）。函数字段注入，同 onIndexed；为 nil 时安全跳过。
+	onCaptionDelete func(assetID string)
 }
 
 // touch marks index activity (enqueue or a processed result) at the current time.
@@ -707,6 +718,20 @@ func (ix *Indexer) SetOnBatchDone(fn func()) {
 	}
 }
 
+// SetOnIndexed registers a callback invoked (asynchronously, via `go fn(id)`)
+// each time an asset is successfully written as status='indexed'. Intended for
+// CaptionFeeder's inline feed hook. Call this after construction, before any
+// scans begin. Same injection pattern as SetOnBatchDone/SetAlbumAssigner.
+func (ix *Indexer) SetOnIndexed(fn func(assetID string)) {
+	ix.onIndexed = fn
+}
+
+// SetCaptionDelete 注入硬删除资产成功后的 caption 删除回调（通常是
+// CaptionFeeder.DeleteRemote），供 RemoveByPath/pruneMissingUnder 调用（Task 4）。
+func (ix *Indexer) SetCaptionDelete(fn func(assetID string)) {
+	ix.onCaptionDelete = fn
+}
+
 // Start launches workers goroutines that consume the queue until ctx is cancelled.
 func (ix *Indexer) Start(ctx context.Context) {
 	var wg sync.WaitGroup
@@ -946,11 +971,14 @@ func (ix *Indexer) processFileInternal(path string, opts processOpts) (success b
 		  duration_ms   = excluded.duration_ms,
 		  status        = 'pending',
 		  mtime         = excluded.mtime,
-		  face_scanned  = CASE WHEN excluded.checksum <> checksum THEN 0 ELSE face_scanned END`,
+		  face_scanned  = CASE WHEN excluded.checksum <> checksum THEN 0 ELSE face_scanned END,
+		  caption_synced = CASE WHEN excluded.checksum <> checksum THEN 0 ELSE caption_synced END`,
 		// face_scanned 只在内容真的变了(checksum 变化)才置回 0，交给 RunPipeline
 		// 重新检测；纯粹的 force 重跑(如 Embedder/Rebuilder 对未变内容的 CLIP
 		// 补跑,同一 checksum)不应清掉已完成的人脸检测标记——否则每轮 CLIP 补跑
 		// 都会把同一批资产重新扔回人脸检测队列,产生重复的 face_detections 行。
+		// caption_synced 同款语义：只在内容真的变了才置回 0，交给照片知识库
+		// 投喂管线重新交接给 Parser；未变内容的补跑不清掉已交接标记，避免重复投喂。
 		assetID, path, fileSize, mime, originalName,
 		nullTime(takenAt), sqlNullInt64(durationMs),
 		checksum, mtime,
@@ -1143,6 +1171,9 @@ func (ix *Indexer) processFileInternal(path string, opts processOpts) (success b
 	); err != nil {
 		fmt.Fprintf(os.Stderr, "[indexer] failed to mark asset indexed %s: %v\n", assetID, err)
 		return false
+	}
+	if ix.onIndexed != nil {
+		go ix.onIndexed(assetID) // 异步旁路：投喂失败不影响索引结果
 	}
 	return true
 }
@@ -1586,6 +1617,9 @@ func (ix *Indexer) RemoveByPath(path string) {
 		return
 	}
 	dropClipVector(ix.db, id) // before the cascade drops asset_clip_idx
+	if ix.onCaptionDelete != nil {
+		ix.onCaptionDelete(id) // caption 联动：防 agent 检索到幽灵结果
+	}
 	if _, err := ix.db.Exec(`DELETE FROM assets WHERE id = ?`, id); err != nil {
 		return
 	}
@@ -1647,6 +1681,9 @@ func (ix *Indexer) pruneMissingUnder(dir string) error {
 	}
 	for _, r := range gone {
 		dropClipVector(ix.db, r.id) // before the cascade drops asset_clip_idx
+		if ix.onCaptionDelete != nil {
+			ix.onCaptionDelete(r.id) // caption 联动：防 agent 检索到幽灵结果
+		}
 		if _, err := ix.db.Exec(`DELETE FROM assets WHERE id = ?`, r.id); err != nil {
 			continue
 		}

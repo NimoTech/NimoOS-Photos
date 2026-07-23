@@ -167,6 +167,56 @@ func TestForceReprocess_UnchangedContent_PreservesFaceScanned(t *testing.T) {
 	require.Equal(t, 1, fs, "内容未变时 force 重跑不应清掉 face_scanned")
 }
 
+// TestReprocess_ContentChange_ResetsCaptionSynced 断言:同一 file_path 内容真的
+// 变了(checksum 变化)时,重新处理会把 caption_synced 置回 0，交给照片知识库
+// 投喂管线重新交接给 Parser——覆盖"编辑/替换了原图但路径不变"的场景。
+func TestReprocess_ContentChange_ResetsCaptionSynced(t *testing.T) {
+	db := makeTestDB(t)
+	ix := NewIndexer(db, &mockML{}, t.TempDir(), 1)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "a.jpg")
+	writeJPEGAt(t, path, 1)
+
+	require.True(t, ix.processFileInternal(path, processOpts{}))
+	var assetID string
+	require.NoError(t, db.QueryRow(`SELECT id FROM assets WHERE file_path=?`, path).Scan(&assetID))
+	_, err := db.Exec(`UPDATE assets SET caption_synced=1 WHERE id=?`, assetID)
+	require.NoError(t, err)
+
+	// 内容真的变了：换一张不同的图片写到同一路径（checksum 必然不同）。
+	writeJPEGAt(t, path, 2)
+	require.True(t, ix.processFileInternal(path, processOpts{}))
+
+	var cs int
+	require.NoError(t, db.QueryRow(`SELECT caption_synced FROM assets WHERE id=?`, assetID).Scan(&cs))
+	require.Equal(t, 0, cs, "内容变化(checksum 不同)应把 caption_synced 置回 0")
+}
+
+// TestForceReprocess_UnchangedContent_PreservesCaptionSynced 断言:force
+// 重跑但文件内容(checksum)没变时（如 Embedder/Rebuilder 的纯 CLIP 补跑），
+// caption_synced 不应被清掉——否则每轮补跑都会把同一批已交接 Parser 的资产
+// 重新扔回投喂队列，产生重复投喂。
+func TestForceReprocess_UnchangedContent_PreservesCaptionSynced(t *testing.T) {
+	db := makeTestDB(t)
+	ix := NewIndexer(db, &mockML{}, t.TempDir(), 1)
+	path := makeTestJPEG(t, t.TempDir())
+
+	require.True(t, ix.processFileInternal(path, processOpts{}))
+	var assetID string
+	require.NoError(t, db.QueryRow(`SELECT id FROM assets WHERE file_path=?`, path).Scan(&assetID))
+	_, err := db.Exec(`UPDATE assets SET caption_synced=1 WHERE id=?`, assetID)
+	require.NoError(t, err)
+
+	// 同一份文件内容，force=true 只是绕过"已 indexed 跳过"短路（照 Embedder
+	// 的 ForceReprocess(processOpts{force:true, skipExif:true, skipThumb:true})用法）。
+	ok := ix.ForceReprocess(path, processOpts{force: true, skipExif: true, skipThumb: true})
+	require.True(t, ok)
+
+	var cs int
+	require.NoError(t, db.QueryRow(`SELECT caption_synced FROM assets WHERE id=?`, assetID).Scan(&cs))
+	require.Equal(t, 1, cs, "内容未变时 force 重跑不应清掉 caption_synced")
+}
+
 // boxedML 返回带文字框的 OCR 结果，用于覆盖率计算测试。
 type boxedML struct{ mockML }
 

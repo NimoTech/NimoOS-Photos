@@ -2,6 +2,7 @@ package service_test
 
 import (
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/NimoTech/NimoOS-Photos/common"
@@ -61,4 +62,31 @@ func TestPurgeAssetDropsClipVector(t *testing.T) {
 	var clipN int
 	require.NoError(t, db.QueryRow(`SELECT count(*) FROM clip_embeddings`).Scan(&clipN))
 	require.Equal(t, 0, clipN, "purged asset's CLIP vector removed")
+}
+
+// TestRemoveByPath_TriggersCaptionDelete：RemoveByPath 紧邻 dropClipVector 的
+// caption 联动调用点（Task 4），fsnotify 探测到文件被硬删时触发，应携带正确的
+// assetID 调用 SetCaptionDelete 注入的回调。
+func TestRemoveByPath_TriggersCaptionDelete(t *testing.T) {
+	db, err := sqlite.Open(filepath.Join(t.TempDir(), "rmcap.db"))
+	require.NoError(t, err)
+	defer db.Close()
+
+	db.Exec(`INSERT INTO assets(id,file_path,status,is_live_photo_video) VALUES('a1','/p/x.jpg','indexed',0)`)
+
+	idx := service.NewIndexer(db, nil, t.TempDir(), 1)
+
+	var mu sync.Mutex
+	var got []string
+	idx.SetCaptionDelete(func(id string) {
+		mu.Lock()
+		got = append(got, id)
+		mu.Unlock()
+	})
+
+	idx.RemoveByPath("/p/x.jpg")
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.Equal(t, []string{"a1"}, got)
 }
