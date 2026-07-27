@@ -3,8 +3,10 @@ package service
 import (
 	"context"
 	"database/sql"
+	"errors"
 
 	"github.com/NimoTech/NimoOS-Photos/pkg/parserclient"
+	sqlite3 "github.com/mattn/go-sqlite3"
 	"go.uber.org/zap"
 )
 
@@ -60,9 +62,11 @@ func (p *Puller) localMtime(ctx context.Context, assetID string) (mtime int64, o
 
 // PullOnce 拉取 Parser 侧全量 caption 并 diff-upsert 进本地表:分页游标
 // 循环拉到底,每条与本地 mtime_ms 比对,本地缺失或 Parser 侧 mtime 更大
-// 才写入(ON CONFLICT 覆盖);外键失败(孤儿资产)跳过继续,不中断整轮。
+// 才写入(ON CONFLICT 覆盖);写入失败时精确区分:仅 SQLITE_CONSTRAINT_
+// FOREIGNKEY(真孤儿资产)跳过继续,其它错误(SQLITE_BUSY 超时、磁盘 I/O
+// 等真实故障)整轮直接返回 err,避免把故障误记为孤儿而静默吞掉。
 //
-// lister 出错(Parser 未部署 / 网络失败 / 非 2xx)时整轮直接返回 err、
+// lister 出错(Parser 未部署 / 网络失败 / 非 2xx)同样整轮直接返回 err、
 // 已写入的 upserted 计数原样返回——调用方(挂点)按 best-effort 语义仅
 // 记日志,不向上传播致命错误。
 func (p *Puller) PullOnce(ctx context.Context) (upserted int, err error) {
@@ -89,11 +93,18 @@ func (p *Puller) PullOnce(ctx context.Context) (upserted int, err error) {
 					fetched_at = excluded.fetched_at`,
 				it.AssetID, it.Text, it.MtimeMs)
 			if werr != nil {
-				// 外键失败(本地 assets 无此 id 的孤儿,两侧删除通知有时间差属
-				// 正常竞态)→ 跳过继续,不中断整轮拉取。
-				zap.L().Debug("caption pull: 写入跳过(可能是孤儿资产)",
-					zap.String("asset_id", it.AssetID), zap.Error(werr))
-				continue
+				var sqliteErr sqlite3.Error
+				if errors.As(werr, &sqliteErr) && sqliteErr.ExtendedCode == sqlite3.ErrConstraintForeignKey {
+					// 真孤儿:本地 assets 无此 id(两侧删除通知有时间差属正常
+					// 竞态)→ 跳过继续,不中断整轮拉取。
+					zap.L().Debug("caption pull: 写入跳过(孤儿资产,外键约束失败)",
+						zap.String("asset_id", it.AssetID), zap.Error(werr))
+					continue
+				}
+				// 非外键错误(SQLITE_BUSY 超时、磁盘 I/O 等真实故障)不能当孤儿
+				// 静默吞掉,否则会抹平故障信号——整轮直接返回 err,交给挂点的
+				// 既有 Warn 日志路径处理。
+				return upserted, werr
 			}
 			upserted++
 		}

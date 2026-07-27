@@ -125,6 +125,41 @@ func TestPullOnce_ListerErrorSilent(t *testing.T) {
 	require.Equal(t, 0, count, "lister 出错时本地表不应有任何变化")
 }
 
+// PullOnce:写入时遇到"非外键"错误(用触发器模拟磁盘 I/O/约束等真实故障,
+// 区别于孤儿资产的外键约束失败)应整轮直接返回 err,不能被误当孤儿静默
+// continue——否则 SQLITE_BUSY 超时等真实故障会被抹平成"孤儿跳过"。
+//
+// 用 BEFORE INSERT 触发器对特定 asset_id 主动 RAISE(ABORT,...) 来制造一个
+// "sqlite3.Error 但 ExtendedCode 不是 ErrConstraintForeignKey"的写入失败,
+// 精确验证 PullOnce 是按 ExtendedCode 判断而非"任何 Exec 错误都当孤儿"。
+func TestPullOnce_NonForeignKeyErrorPropagates(t *testing.T) {
+	db := makeTestDB(t)
+	insertCaptionAsset(t, db, "boom") // 资产真实存在,不是孤儿
+
+	_, err := db.Exec(`
+		CREATE TRIGGER trg_force_fail BEFORE INSERT ON asset_caption
+		WHEN NEW.asset_id = 'boom'
+		BEGIN
+			SELECT RAISE(ABORT, 'forced non-fk failure for test');
+		END;`)
+	require.NoError(t, err)
+
+	lister := &fakeLister{pages: map[string]struct {
+		items []parserclient.CaptionItem
+		next  string
+	}{
+		"": {items: []parserclient.CaptionItem{{AssetID: "boom", Text: "x", MtimeMs: 1}}, next: ""},
+	}}
+	p := NewPuller(db, lister)
+	n, err := p.PullOnce(context.Background())
+	require.Error(t, err, "非外键的写入失败应向上返回 err,不应被静默吞掉")
+	require.Equal(t, 0, n)
+
+	var count int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM asset_caption WHERE asset_id='boom'`).Scan(&count))
+	require.Equal(t, 0, count, "写入失败不应留下半成品记录")
+}
+
 // PullOnce:遇到本地 assets 不存在的孤儿 asset_id 应跳过继续,不影响其余条目入库。
 func TestPullOnce_OrphanSkipped(t *testing.T) {
 	db := makeTestDB(t)
