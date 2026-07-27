@@ -62,6 +62,10 @@ func NewMomentsService(db *sql.DB, store *MomentStore, searcher clipTextSearcher
 // SetTaskRegistry injects a TaskRegistry so RecomputeAll can report progress.
 func (s *MomentsService) SetTaskRegistry(reg *TaskRegistry) { s.reg = reg }
 
+// Store 暴露底层 MomentStore,供 route 层直接读写 moments/recipes(列表、
+// 成员、recipe 热更新)——这些是纯 repo 层操作,不需要经过调度层。
+func (s *MomentsService) Store() *MomentStore { return s.store }
+
 // RecomputeAll 是全量重算入口:对每个 enabled recipe 按 kind 分派引擎产出
 // 草稿、过共用选优填精选/封面、幂等落库,随后对本轮仍是模板打底
 // (named_by_llm=0)的时刻逐个尝试 LLM 命名。CAS 防重入:已有一轮在跑时

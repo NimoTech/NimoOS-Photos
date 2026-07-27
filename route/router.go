@@ -238,6 +238,15 @@ func InitRouter(ctx context.Context, svc service.Services, runtimePath string, t
 	smartViews := v1.NewSmartViewsHandler(svc)
 	v1.RegisterSmartViewRoutes(g, smartViews)
 
+	// Smart Moments
+	moments := v1.NewMomentsHandler(svc, ctx)
+	g.GET("/moments", moments.List)
+	g.GET("/moments/:id/assets", moments.Assets)
+	g.POST("/moments/:id/album", moments.CreateAlbum)
+	g.POST("/moments/recompute", moments.Recompute)
+	g.GET("/moments/recipes", moments.ListRecipes)
+	g.PUT("/moments/recipes", moments.UpdateRecipes)
+
 	// 构造 upload Store(连接 photos.db),供 TUS handler 与 uploads API 共用。
 	uploadStore := uploadstore.NewStore(svc.DB())
 
