@@ -95,15 +95,20 @@ func BuildTripMoments(ctx context.Context, db *sql.DB, recipe MomentRecipe) ([]M
 
 // loadTripCandidates 查询候选池:status='indexed'、非回收站(deleted_at IS
 // NULL AND offline=0,与本库既有查询——见 embedder.go/faces.go 等——同一
-// 判据)、排除文档(hasOcrExpr 取反,见 docscore.go:202)、且必须有
-// asset_geo(JOIN 天然过滤掉无 GPS 的资产),按拍摄时间升序返回。taken_at
-// 相同时按 id 兜底排序,保证多轮调用切段结果确定、可复现。
+// 判据)、排除文档(hasOcrExpr 取反,见 docscore.go:202)、排除
+// is_live_photo_video(live photo 的 MOV 侧与其静态照片同一瞬间各自落一条
+// asset_geo,不排除会在同一段内被双计,拉高计数/扭曲主城占比;与本库其它
+// 15+ 处 geo JOIN 查询——places.go/persons.go/search.go/smartview.go
+// 等——统一判据一致,而非参照 embedder/faces 这类非 geo 流水线),且必须
+// 有 asset_geo(JOIN 天然过滤掉无 GPS 的资产),按拍摄时间升序返回。
+// taken_at 相同时按 id 兜底排序,保证多轮调用切段结果确定、可复现。
 func loadTripCandidates(ctx context.Context, db *sql.DB) ([]tripCandidate, error) {
 	rows, err := db.QueryContext(ctx, `
 		SELECT a.id, a.taken_at, COALESCE(g.city,''), COALESCE(g.country,'')
 		FROM assets a
 		JOIN asset_geo g ON g.asset_id = a.id
 		WHERE a.status='indexed' AND a.deleted_at IS NULL AND a.offline=0
+		  AND a.is_live_photo_video=0
 		  AND a.taken_at IS NOT NULL
 		  AND NOT (`+hasOcrExpr+`)
 		ORDER BY a.taken_at ASC, a.id ASC`)

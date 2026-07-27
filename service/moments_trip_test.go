@@ -140,3 +140,40 @@ func TestBuildTripMoments_ExcludesTrashOfflineAndDocs(t *testing.T) {
 	require.Len(t, drafts, 1)
 	require.Len(t, drafts[0].Assets, 6, "回收站/离线/文档资产均不应计入候选池")
 }
+
+// TestBuildTripMoments_ExcludesLivePhotoVideoSide 覆盖审查发现的遗漏:live
+// photo 的 MOV 视频侧与其静态照片同一瞬间各自都会落一条 asset_geo(见
+// geo.go BackfillPending 不排除视频侧),候选池若不排除
+// is_live_photo_video=1 就会把同一瞬间双计进段,拉高计数、扭曲主城占比、
+// 段内成员出现重复。与本库其它 geo JOIN 查询(places.go/persons.go/
+// search.go/smartview.go 等)统一判据。
+func TestBuildTripMoments_ExcludesLivePhotoVideoSide(t *testing.T) {
+	db := makeTestDB(t)
+	recipe := MomentRecipe{Key: "trip", Kind: "trip", ParamsJSON: `{"min_assets":6}`}
+
+	base := []time.Time{day(8, 1), day(8, 2), day(8, 3), day(8, 4), day(8, 5), day(8, 6)}
+	for i, ts := range base {
+		insertTripAsset(t, db, "p"+string(rune('0'+i)), ts, "Tokyo", "Japan")
+	}
+
+	// p2(base[2]=8/3)的 live photo 视频侧:同一瞬间、同城市,也有 asset_geo。
+	insertTripAsset(t, db, "p2_video", day(8, 3), "Tokyo", "Japan")
+	_, err := db.Exec(`UPDATE assets SET is_live_photo_video=1 WHERE id='p2_video'`)
+	require.NoError(t, err)
+
+	drafts, err := BuildTripMoments(context.Background(), db, recipe)
+	require.NoError(t, err)
+	require.Len(t, drafts, 1)
+	require.Len(t, drafts[0].Assets, 6, "live photo 视频侧不应计入候选池,只计静态照片侧")
+	for _, a := range drafts[0].Assets {
+		require.NotEqual(t, "p2_video", a.AssetID)
+	}
+}
+
+// TestTripSubtitle_CrossYear 锁定跨年场景:两侧各带年份,如
+// "Dec 2011 – Jan 2012"。
+func TestTripSubtitle_CrossYear(t *testing.T) {
+	from := time.Date(2011, time.December, 20, 0, 0, 0, 0, time.UTC)
+	to := time.Date(2012, time.January, 3, 0, 0, 0, 0, time.UTC)
+	require.Equal(t, "Dec 2011 – Jan 2012", tripSubtitle(from, to))
+}
