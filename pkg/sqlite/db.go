@@ -271,6 +271,18 @@ func migrate(db *sql.DB) error {
 			PRIMARY KEY (asset_id, line_no)
 		)`,
 
+		// ── Caption 回流表(照片知识库子项目二回流侧)──────────────────────────
+		// 一份 Parser 侧生成 caption 的本地只读缓存,由 captionpull 周期拉取
+		// diff-upsert 写入。mtime_ms 是 Parser 侧的版本戳,用于判断是否需要
+		// 覆盖旧文本;fetched_at 记录本地写入时间,供排障用。资产删除时靠
+		// ON DELETE CASCADE 级联清理,无需额外清理逻辑。
+		`CREATE TABLE IF NOT EXISTS asset_caption (
+			asset_id   TEXT PRIMARY KEY REFERENCES assets(id) ON DELETE CASCADE,
+			text       TEXT NOT NULL DEFAULT '',
+			mtime_ms   INTEGER NOT NULL DEFAULT 0,
+			fetched_at DATETIME
+		)`,
+
 		`CREATE TABLE IF NOT EXISTS smart_view_activity (
 			id            TEXT PRIMARY KEY,
 			smart_view_id TEXT NOT NULL REFERENCES smart_views(id) ON DELETE CASCADE,
