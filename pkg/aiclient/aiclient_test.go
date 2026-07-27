@@ -75,6 +75,32 @@ func TestCompletePicksLocalModelAndPostsChat(t *testing.T) {
 	require.Equal(t, "qwen2.5:7b", gotBody["model"])
 }
 
+// TestCompleteChatBodyCapsMaxTokensAndTemperature:请求体必须带
+// max_tokens/temperature 约束(对照 wiki_summary_worker/llm.py 同款防御)——
+// NimoOS-AI 云端适配层 max_tokens 缺省高达 16000,起名这种短输出调用不加
+// 约束会放大云端调用的成本/延迟。
+func TestCompleteChatBodyCapsMaxTokensAndTemperature(t *testing.T) {
+	stubEmptyUsersDB(t)
+	var gotBody map[string]any
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/ai/_internal/models":
+			w.Write([]byte(`{"local":[{"name":"m1"}],"cloud":[]}`))
+		case "/v1/ai/_internal/chat/completions":
+			require.NoError(t, json.NewDecoder(r.Body).Decode(&gotBody))
+			w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}]}`))
+		}
+	}))
+	defer srv.Close()
+
+	c := New(writeAIURL(t, srv.URL))
+	_, err := c.Complete(context.Background(), "x")
+	require.NoError(t, err)
+	require.Equal(t, float64(60), gotBody["max_tokens"])
+	require.Equal(t, 0.2, gotBody["temperature"])
+}
+
 // TestCompleteFallsBackToCloudModel:local 为空、cloud 非空时选云端默认模型,
 // 且带上 X-NimoOS-Force-Cloud: true。
 func TestCompleteFallsBackToCloudModel(t *testing.T) {

@@ -7,6 +7,7 @@ package service
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -174,4 +175,49 @@ func TestRecomputeAll_ReentrancyReturnsNilImmediately(t *testing.T) {
 	moments, err := store.ListMoments()
 	require.NoError(t, err)
 	require.Empty(t, moments, "CAS 重入应直接返回,不做任何重算工作")
+}
+
+// TestCleanLLMTitle_TruncatesOverlongOutput:模型不守"至多 4 个单词"约束、
+// 附赠一段长解释时,cleanLLMTitle 必须按 rune 安全截断到
+// maxLLMTitleRunes,防止长文原样落库展示给用户。
+func TestCleanLLMTitle_TruncatesOverlongOutput(t *testing.T) {
+	long := strings.Repeat("汉字标题超长测试", 20) // 160 个 rune,远超 80 上限
+	got := cleanLLMTitle(long)
+	require.Len(t, []rune(got), maxLLMTitleRunes)
+	require.Equal(t, string([]rune(long)[:maxLLMTitleRunes]), got)
+
+	// 短标题不受影响。
+	require.Equal(t, "Sunset Beach", cleanLLMTitle(`  "Sunset Beach"  `+"\nsome trailing explanation"))
+}
+
+// TestRecomputeAll_OverlongLLMTitleIsTruncatedBeforeStore:端到端确认
+// RecomputeAll 落库前会截断超长 LLM 输出,而不是原样存进 moments.title。
+func TestRecomputeAll_OverlongLLMTitleIsTruncatedBeforeStore(t *testing.T) {
+	db := makeTestDB(t)
+	store := NewMomentStore(db)
+	require.NoError(t, store.UpsertRecipes([]MomentRecipe{
+		{Key: "trip", Kind: "trip", Title: "Trip", Enabled: true, ParamsJSON: `{"min_assets":2}`},
+	}))
+
+	base := time.Date(2014, time.April, 1, 9, 0, 0, 0, time.UTC)
+	for i := 0; i < 2; i++ {
+		id := "c" + string(rune('0'+i))
+		takenAt := base.AddDate(0, 0, i)
+		_, err := db.Exec(`INSERT INTO assets(id, file_path, status, taken_at) VALUES(?,?,'indexed',?)`,
+			id, "/g/"+id+".jpg", takenAt.UTC().Format("2006-01-02 15:04:05"))
+		require.NoError(t, err)
+		_, err = db.Exec(`INSERT INTO asset_geo(asset_id, city, country) VALUES(?,?,?)`, id, "Sapporo", "JP")
+		require.NoError(t, err)
+	}
+
+	overlong := strings.Repeat("a very long unwanted explanation ", 10)
+	namer := &fakeNamer{title: overlong}
+	svc := NewMomentsService(db, store, fakeThemeSearcher{}, noVecLoader, namer)
+
+	require.NoError(t, svc.RecomputeAll(context.Background()))
+
+	moments, err := store.ListMoments()
+	require.NoError(t, err)
+	require.Len(t, moments, 1)
+	require.LessOrEqual(t, len([]rune(moments[0].Title)), maxLLMTitleRunes)
 }

@@ -34,6 +34,15 @@ var usersDBPath = "/var/lib/nimoos/db/user.db"
 // 合计)的整体超时。
 const completeTimeout = 5 * time.Second
 
+// chatMaxTokens/chatTemperature 是 chat completions 请求体里的防御性约束
+// (对照 wiki_summary_worker/llm.py 同款做法):Complete 只用来生成"至多 4
+// 个单词"的短标题,NimoOS-AI 云端适配层的 max_tokens 缺省高达 16000,不加
+// 约束会白白放大云端调用的成本/延迟;温度调低让输出风格更稳定。
+const (
+	chatMaxTokens   = 60
+	chatTemperature = 0.2
+)
+
 // ErrAIUnavailable 表示发现文件缺失/不可读(AI 服务未部署或未启动),调用方
 // 应据此静默跳过(best-effort)。
 var ErrAIUnavailable = errors.New("ai service not available")
@@ -147,9 +156,15 @@ func (c *Client) Complete(ctx context.Context, prompt string) (string, error) {
 		return "", err
 	}
 
+	// max_tokens/temperature 是对照 wiki_summary_worker/llm.py 的同款防御:
+	// NimoOS-AI 云端适配层 max_tokens 缺省高达 16000,起名这种短输出调用不
+	// 加约束会放大云端调用的成本/延迟;temperature 走低值让标题风格更稳定、
+	// 少一些天马行空的联想。
 	body, err := json.Marshal(map[string]any{
-		"model":    model,
-		"messages": []chatMessage{{Role: "user", Content: prompt}},
+		"model":       model,
+		"messages":    []chatMessage{{Role: "user", Content: prompt}},
+		"max_tokens":  chatMaxTokens,
+		"temperature": chatTemperature,
 	})
 	if err != nil {
 		return "", err

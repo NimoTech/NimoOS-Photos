@@ -274,15 +274,26 @@ func buildNamingPrompt(m Moment, captions []string) string {
 	return b.String()
 }
 
+// maxLLMTitleRunes 是 LLM 命名结果落库前的硬截断上限:prompt 要求"至多 4
+// 个单词",但模型不保证守约束(尤其云端模型偶尔会无视指令附赠解释性长文)。
+// 没有这道防线,失控的长文本会原样进 moments.title 展示给用户,截断不加
+// 省略号——标题场景直接截断即可,不必刻意提示"这里被截过"。
+const maxLLMTitleRunes = 80
+
 // cleanLLMTitle 清洗 LLM 输出:掐头去尾空白、去掉一层包裹引号、只取第一行
-// (防止模型无视指令附赠解释性文字)。
+// (防止模型无视指令附赠解释性文字),最后按 rune 安全截断到
+// maxLLMTitleRunes,防止模型不守"至多 4 个单词"的约束时把长文原样落库。
 func cleanLLMTitle(s string) string {
 	s = strings.TrimSpace(s)
 	if idx := strings.IndexByte(s, '\n'); idx >= 0 {
 		s = strings.TrimSpace(s[:idx])
 	}
 	s = strings.Trim(s, `"'`)
-	return strings.TrimSpace(s)
+	s = strings.TrimSpace(s)
+	if runes := []rune(s); len(runes) > maxLLMTitleRunes {
+		s = string(runes[:maxLLMTitleRunes])
+	}
+	return s
 }
 
 // StartScheduler runs a background goroutine that triggers RecomputeAll:
