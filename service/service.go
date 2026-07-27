@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"os"
 	"path/filepath"
 	"sync"
@@ -189,7 +190,9 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 	// CaptionFeeder：把已索引资产旁路投喂给 NimoOS-Parser 生成 caption
 	// （照片知识库子项目二)。Parser 未部署（discoveryFile 不存在）时
 	// parserclient 返回 ErrParserUnavailable，全链路静默跳过。
-	feeder := NewCaptionFeeder(db, parserclient.New(cfg.RuntimePath), thumbDir)
+	// parserClient 与下方 Puller 共用同一份 discoveryFile/http.Client。
+	parserClient := parserclient.New(cfg.RuntimePath)
+	feeder := NewCaptionFeeder(db, parserClient, thumbDir)
 	idx.SetOnIndexed(func(id string) { feeder.FeedOne(parentCtx, id) })
 	// 删除/回收站全路径联动（Task 4）：软删/物理删（含清空回收站、Indexer 硬删、
 	// SearchService 硬删）异步通知 Parser 删 caption；恢复后置 caption_synced=0
@@ -202,6 +205,18 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 	go func() {
 		if err := feeder.Backfill(parentCtx); err != nil {
 			zap.L().Warn("caption: 启动补扫失败", zap.Error(err))
+		}
+	}()
+
+	// Puller：周期性从 Parser 拉取已生成的 caption 回流进本地 asset_caption
+	// 表（照片知识库子项目二回流侧，消费/检索是后续子项目）。挂点节奏照抄
+	// CaptionFeeder 同款：启动即拉一次 + 挂在 SetOnBatchDone 链尾跟随批次
+	// 节奏。lister 出错（含 Parser 未部署）不向上传播，ErrParserUnavailable
+	// 完全静默、其它错误仅 Warn 留痕，均不影响索引主流程。
+	puller := NewPuller(db, parserClient)
+	go func() {
+		if _, err := puller.PullOnce(parentCtx); err != nil && !errors.Is(err, parserclient.ErrParserUnavailable) {
+			zap.L().Warn("caption pull: 启动拉取失败", zap.Error(err))
 		}
 	}()
 
@@ -235,6 +250,11 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 			// caption 补扫链尾:批次末尾捡起漏投喂的资产(Parser 未部署时静默空跑)。
 			if err := feeder.Backfill(parentCtx); err != nil {
 				zap.L().Warn("post-batch caption backfill failed", zap.Error(err))
+			}
+			// caption 拉取链尾:批次末尾从 Parser 拉取新增/更新的 caption 回填
+			// 本地表(Parser 未部署时静默跳过,一般失败仅 Warn 留痕)。
+			if _, err := puller.PullOnce(parentCtx); err != nil && !errors.Is(err, parserclient.ErrParserUnavailable) {
+				zap.L().Warn("post-batch caption pull failed", zap.Error(err))
 			}
 		}()
 		go func() {
