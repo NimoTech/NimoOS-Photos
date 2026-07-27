@@ -283,3 +283,26 @@ func TestMomentsHandler_UpdateRecipesEmptyBodyRejected(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, http.StatusBadRequest, he.Code)
 }
+
+// TestMomentsHandler_UpdateRecipesUnknownKindRejected:kind 不在
+// {"trip","theme"} 白名单内(如运维/脚本手误的 "thmee")应 400,而不是静默
+// 落库——引擎(recomputeRecipe)对未知 kind 只 Warn 跳过、永不产出/永不报错,
+// 若在这一层不拦,typo 会悄悄进库且没有任何用户可见的提示。
+func TestMomentsHandler_UpdateRecipesUnknownKindRejected(t *testing.T) {
+	h, _, store := newMomentsHarness(t)
+
+	reqBody, _ := json.Marshal(map[string]any{
+		"recipes": []map[string]any{
+			{"key": "theme:typo", "kind": "thmee", "title": "Typo Kind", "enabled": true},
+		},
+	})
+	c, _ := newEchoCtx(http.MethodPut, "/v1/photos/moments/recipes", reqBody)
+	err := h.UpdateRecipes(c)
+	he, ok := err.(*echo.HTTPError)
+	require.True(t, ok)
+	require.Equal(t, http.StatusBadRequest, he.Code)
+
+	recipes, lerr := store.ListRecipes(false)
+	require.NoError(t, lerr)
+	require.Empty(t, recipes, "被拒绝的 recipe 不应落库")
+}

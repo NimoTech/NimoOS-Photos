@@ -69,9 +69,17 @@ func (s *MomentsService) Store() *MomentStore { return s.store }
 // RecomputeAll 是全量重算入口:对每个 enabled recipe 按 kind 分派引擎产出
 // 草稿、过共用选优填精选/封面、幂等落库,随后对本轮仍是模板打底
 // (named_by_llm=0)的时刻逐个尝试 LLM 命名。CAS 防重入:已有一轮在跑时
-// 直接返回 nil。除 LLM 命名外的失败(引擎查询/落库等基础设施故障)会中断
-// 本轮并向上返回 error;LLM 命名本身是 best-effort,单个时刻命名失败只
-// 静默跳过,绝不影响本方法的返回值。
+// 直接返回 nil。
+//
+// 单个 recipe 失败(引擎查询/落库等)只 Warn + 跳过、继续处理下一个
+// recipe——与未知 kind 的 skip 哲学一致,不调用 SyncRecipeMoments 意味着
+// 该 recipe 上一轮产出的旧时刻原样保留在库里,不会被清空。这个隔离很关键:
+// theme 引擎依赖 CLIP 语义检索(immich ML 容器),ML 掉线是本库常态瞬时
+// 状态;recipe 按 key 字典序处理,"theme:*" 排在 "trip" 之前,若一个 recipe
+// 出错就中断整轮,ML 一挂会导致完全不依赖 ML 的 trip 时刻也永远算不出,
+// 且每次触发都重演。只有 ListRecipes/ListMoments 这类真正致命的基础设施
+// 故障(读不到 recipe 列表本身)才会让 RecomputeAll 整体返回 error。
+// LLM 命名同样是 best-effort,单个时刻命名失败只静默跳过。
 func (s *MomentsService) RecomputeAll(ctx context.Context) error {
 	if !s.running.CompareAndSwap(false, true) {
 		return nil
@@ -80,7 +88,11 @@ func (s *MomentsService) RecomputeAll(ctx context.Context) error {
 
 	taskID := fmt.Sprintf("moments_%d", time.Now().UnixNano())
 	started := time.Now()
-	pub := func(progress float64, status string, errKey string, errParams map[string]string) {
+	// pub 的 Added 字段在这个 Type("moments")下复用为"本轮跳过的 recipe
+	// 数"(与 FaceService 用 Added 表示"新增人脸数"是同一个字段、按 Type
+	// 各自定义语义的既有惯例),只在终态("done")携带,供前端"部分 recipe
+	// 因 ML 掉线等原因跳过"时提示用户,而不是让整轮 recompute 直接报错。
+	pub := func(progress float64, status string, errKey string, errParams map[string]string, skipped int64) {
 		if s.reg == nil {
 			return
 		}
@@ -92,25 +104,36 @@ func (s *MomentsService) RecomputeAll(ctx context.Context) error {
 			Status:    status,
 			StartedAt: started,
 		}
+		if status == "done" {
+			t.Added = skipped
+		}
 		if errKey != "" {
 			t.SetError(errKey, errParams)
 		}
 		s.reg.Upsert(t)
 	}
-	pub(0, "running", "", nil)
+	pub(0, "running", "", nil, 0)
 
 	recipes, err := s.store.ListRecipes(true)
 	if err != nil {
-		pub(0, "error", TaskErrMomentsRecomputeFailed, map[string]string{"detail": err.Error()})
+		pub(0, "error", TaskErrMomentsRecomputeFailed, map[string]string{"detail": err.Error()}, 0)
 		return fmt.Errorf("moments: list recipes: %w", err)
 	}
 
+	var skipped int64
 	for i, recipe := range recipes {
 		if err := s.recomputeRecipe(ctx, recipe); err != nil {
-			pub(float64(i)/float64(len(recipes)), "error", TaskErrMomentsRecomputeFailed, map[string]string{"detail": err.Error()})
-			return fmt.Errorf("moments: recompute recipe %q: %w", recipe.Key, err)
+			// 单 recipe 失败只 Warn + 跳过,继续下一个:不调用
+			// SyncRecipeMoments 意味着该 recipe 上一轮产出的旧时刻原样
+			// 保留,不会被清空(见本方法顶部注释——ML 闪断不能连累其它
+			// recipe,尤其不依赖 ML 的 trip)。
+			zap.L().Warn("moments: recipe 重算失败,跳过本轮、保留旧时刻",
+				zap.String("key", recipe.Key), zap.Error(err))
+			skipped++
+			pub(0.7*float64(i+1)/float64(len(recipes)), "running", "", nil, 0)
+			continue
 		}
-		pub(0.7*float64(i+1)/float64(len(recipes)), "running", "", nil)
+		pub(0.7*float64(i+1)/float64(len(recipes)), "running", "", nil, 0)
 	}
 
 	// LLM best-effort 命名:只挑本轮仍是模板打底(named_by_llm=0)的时刻,
@@ -118,7 +141,7 @@ func (s *MomentsService) RecomputeAll(ctx context.Context) error {
 	// title,这里只是不去重复调用 LLM。
 	moments, err := s.store.ListMoments()
 	if err != nil {
-		pub(0.7, "error", TaskErrMomentsRecomputeFailed, map[string]string{"detail": err.Error()})
+		pub(0.7, "error", TaskErrMomentsRecomputeFailed, map[string]string{"detail": err.Error()}, 0)
 		return fmt.Errorf("moments: list moments: %w", err)
 	}
 	var toName []Moment
@@ -129,10 +152,10 @@ func (s *MomentsService) RecomputeAll(ctx context.Context) error {
 	}
 	for i, m := range toName {
 		s.tryNameMoment(ctx, m)
-		pub(0.7+0.3*float64(i+1)/float64(len(toName)), "running", "", nil)
+		pub(0.7+0.3*float64(i+1)/float64(len(toName)), "running", "", nil, 0)
 	}
 
-	pub(1, "done", "", nil)
+	pub(1, "done", "", nil, skipped)
 	go func() {
 		time.Sleep(taskCleanupDelay)
 		if s.reg != nil {

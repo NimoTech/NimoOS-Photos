@@ -177,6 +177,75 @@ func TestRecomputeAll_ReentrancyReturnsNilImmediately(t *testing.T) {
 	require.Empty(t, moments, "CAS 重入应直接返回,不做任何重算工作")
 }
 
+// TestRecomputeAll_PerRecipeFailureIsolation:theme 引擎依赖的 CLIP 检索(ML)
+// 掉线时,单个 recipe 失败必须 Warn + 跳过、继续处理下一个 recipe——不阻塞
+// 不依赖 ML 的 trip、也不清空该 theme recipe 上一轮产出的旧时刻(不调用
+// SyncRecipeMoments 意味着旧时刻原样保留)。RecomputeAll 整体仍返回 nil。
+func TestRecomputeAll_PerRecipeFailureIsolation(t *testing.T) {
+	db := makeTestDB(t)
+	store := NewMomentStore(db)
+	require.NoError(t, store.UpsertRecipes([]MomentRecipe{
+		{Key: "trip", Kind: "trip", Title: "Trip", Enabled: true, ParamsJSON: `{"min_assets":2}`},
+		{Key: "theme:pets", Kind: "theme", Title: "Pet Moments", Enabled: true,
+			ParamsJSON: `{"min_assets":2,"clip_prompts":["a photo of a dog"],"caption_keywords":["dog"]}`},
+	}))
+
+	base := time.Date(2015, time.May, 1, 9, 0, 0, 0, time.UTC)
+	for i := 0; i < 2; i++ {
+		id := "trip-" + string(rune('a'+i))
+		takenAt := base.AddDate(0, 0, i)
+		_, err := db.Exec(`INSERT INTO assets(id, file_path, status, taken_at) VALUES(?,?,'indexed',?)`,
+			id, "/g/"+id+".jpg", takenAt.UTC().Format("2006-01-02 15:04:05"))
+		require.NoError(t, err)
+		_, err = db.Exec(`INSERT INTO asset_geo(asset_id, city, country) VALUES(?,?,?)`, id, "Nagoya", "JP")
+		require.NoError(t, err)
+	}
+	for i, id := range []string{"theme-a", "theme-b"} {
+		takenAt := base.AddDate(0, 0, 20+i)
+		_, err := db.Exec(`INSERT INTO assets(id, file_path, status, taken_at) VALUES(?,?,'indexed',?)`,
+			id, "/g/"+id+".jpg", takenAt.UTC().Format("2006-01-02 15:04:05"))
+		require.NoError(t, err)
+	}
+
+	// 第一轮:ML 正常,trip + theme 都应产出。
+	workingSearcher := fakeThemeSearcher{hits: map[string][]AssetScore{
+		"a photo of a dog": {{AssetID: "theme-a", Score: 0.9}, {AssetID: "theme-b", Score: 0.8}},
+	}}
+	firstRun := NewMomentsService(db, store, workingSearcher, noVecLoader, &fakeNamer{title: "irrelevant"})
+	require.NoError(t, firstRun.RecomputeAll(context.Background()))
+
+	before, err := store.ListMoments()
+	require.NoError(t, err)
+	require.Len(t, before, 2, "ML 正常时 trip+theme 都应产出")
+	var themeBefore Moment
+	for _, m := range before {
+		if m.RecipeKey == "theme:pets" {
+			themeBefore = m
+		}
+	}
+	require.NotEmpty(t, themeBefore.ID, "第一轮应已产出 theme:pets 时刻")
+
+	// 第二轮:ML 掉线(searcher 报错),theme:pets 应被跳过,trip 仍正常重算。
+	failingSearcher := fakeThemeSearcher{err: errors.New("clip search: connection refused (ML 掉线)")}
+	secondRun := NewMomentsService(db, store, failingSearcher, noVecLoader, &fakeNamer{title: "irrelevant"})
+	err = secondRun.RecomputeAll(context.Background())
+	require.NoError(t, err, "单个 recipe(theme)失败必须 best-effort 跳过,不阻塞整轮、不向上传播 error")
+
+	after, err := store.ListMoments()
+	require.NoError(t, err)
+	require.Len(t, after, 2, "theme 失败应保留旧时刻不被清空;trip 仍应正常重算产出")
+
+	var themeAfter Moment
+	for _, m := range after {
+		if m.RecipeKey == "theme:pets" {
+			themeAfter = m
+		}
+	}
+	require.Equal(t, themeBefore.ID, themeAfter.ID)
+	require.Equal(t, themeBefore.UpdatedAt, themeAfter.UpdatedAt,
+		"ML 闪断跳过的 recipe 不应调用 SyncRecipeMoments,updated_at 不变")
+}
+
 // TestCleanLLMTitle_TruncatesOverlongOutput:模型不守"至多 4 个单词"约束、
 // 附赠一段长解释时,cleanLLMTitle 必须按 rune 安全截断到
 // maxLLMTitleRunes,防止长文原样落库展示给用户。

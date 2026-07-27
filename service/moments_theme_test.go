@@ -13,12 +13,18 @@ import (
 )
 
 // fakeThemeSearcher 是 clipTextSearcher 的测试替身:按 prompt 返回预设命中,
-// 不接触真实 ML/向量表。
+// 不接触真实 ML/向量表。err 非 nil 时模拟 ML(immich CLIP 容器)掉线——
+// SearchAssetsByText 对任意 prompt 都返回这个 error,供
+// MomentsService.RecomputeAll 的 per-recipe 失败隔离测试使用。
 type fakeThemeSearcher struct {
 	hits map[string][]AssetScore
+	err  error
 }
 
 func (f fakeThemeSearcher) SearchAssetsByText(_ context.Context, prompt string, _ int) ([]AssetScore, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
 	return f.hits[prompt], nil
 }
 

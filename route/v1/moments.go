@@ -236,6 +236,14 @@ func (h *MomentsHandler) UpdateRecipes(c echo.Context) error {
 		if dto.Key == "" || dto.Kind == "" {
 			return echo.NewHTTPError(http.StatusBadRequest, "recipe key/kind is required")
 		}
+		if dto.Kind != "trip" && dto.Kind != "theme" {
+			// kind 白名单:引擎(service/moments.go recomputeRecipe)只认
+			// "trip"/"theme" 两种,其它 kind 会被静默 Warn 跳过(不报错)—
+			// 这在推送入口这层拦掉更好:防止运维/脚本 typo(如
+			// "thmee"/"Trip")悄悄把无效 recipe 写进库,重算永远不会产出、
+			// 也没有任何报错提示。
+			return echo.NewHTTPError(http.StatusBadRequest, "kind must be one of: trip, theme")
+		}
 		paramsJSON, err := json.Marshal(dto.Params)
 		if err != nil {
 			return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
