@@ -33,6 +33,9 @@ const (
 	// (对齐 BackfillOCR 惯例);出现部分失败但仍有成功项时任务终态为 done,失败
 	// 数只记入日志,不占用这个 error key,避免个别损坏视频反复刷 Failed。
 	TaskErrPreviewPartialFailed = "Failed to generate previews for {failed} videos"
+	// TaskErrMomentsRecomputeFailed 参数: detail。仅覆盖引擎/落库这类基础设施
+	// 故障;LLM 命名失败是 best-effort,静默跳过,不占用这个 error key。
+	TaskErrMomentsRecomputeFailed = "Smart moments recompute failed: {detail}"
 )
 
 // 任务停滞阈值:running 任务超过这么久没有任何更新,视为僵尸(漏发 done、

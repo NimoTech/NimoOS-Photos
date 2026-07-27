@@ -11,14 +11,14 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/NimoTech/NimoOS-Photos/common"
-	"github.com/NimoTech/NimoOS-Photos/pkg/config"
-	"github.com/NimoTech/NimoOS-Photos/route"
-	"github.com/NimoTech/NimoOS-Photos/service"
 	"github.com/NimoTech/NimoOS-Common/external"
 	"github.com/NimoTech/NimoOS-Common/model"
 	"github.com/NimoTech/NimoOS-Common/utils/file"
 	"github.com/NimoTech/NimoOS-Common/utils/logger"
+	"github.com/NimoTech/NimoOS-Photos/common"
+	"github.com/NimoTech/NimoOS-Photos/pkg/config"
+	"github.com/NimoTech/NimoOS-Photos/route"
+	"github.com/NimoTech/NimoOS-Photos/service"
 	"github.com/coreos/go-systemd/daemon"
 	"go.uber.org/zap"
 )
@@ -74,6 +74,7 @@ func main() {
 	go svc.Watcher().Start(ctx)
 	go svc.Indexer().Start(ctx)
 	go svc.Faces().StartScheduler(ctx)
+	go svc.Moments().StartScheduler(ctx)
 	go svc.Embedder().Run(ctx)
 	go svc.Rebuilder().MaybeAutoRebuild(svc.Indexer().MLReady)
 	go svc.MountGuard().Run(ctx)
