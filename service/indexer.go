@@ -250,6 +250,11 @@ type Indexer struct {
 	// 一轮存量补跑在跑，避免服务重启风暴或误触发导致多轮并发扫同一批候选。
 	spriteBackfillRunning atomic.Bool
 
+	// previewPregen 对应 photos.PreviewPregen 配置（经 SetPreviewPregen 注入）：
+	// false（缺省）时索引期内联生成与 BackfillSprites 启动补跑都跳过
+	// preview.mp4，只保留 /preview 路由端的懒生成；sprite.jpg 不受影响。
+	previewPregen bool
+
 	// onIndexed 在资产写为 status='indexed'（唯一写入点，见 processFileInternal
 	// 末尾）成功后异步调用一次，供 CaptionFeeder.FeedOne 内联投喂钩子使用。
 	// 函数字段注入（同 albumAssigner/onBatchDone 模式），避免 Indexer 直接依赖
@@ -605,6 +610,10 @@ func (ix *Indexer) takePendingAlbum(path string) string {
 func (ix *Indexer) SetAlbumAssigner(fn func(assetID, albumID string)) {
 	ix.albumAssigner = fn
 }
+
+// SetPreviewPregen 注入 photos.PreviewPregen 配置:false(缺省)时索引期与
+// 启动补跑都不预生成 preview.mp4,只保留路由端懒生成。
+func (ix *Indexer) SetPreviewPregen(on bool) { ix.previewPregen = on }
 
 // SetTaskRegistry injects a TaskRegistry so ScanDirectory can report progress.
 // Call this after construction (e.g. from NewService) before any scans begin.
@@ -1079,8 +1088,11 @@ func (ix *Indexer) processFileInternal(path string, opts processOpts) (success b
 		thumb.Generate(imagePath, assetID, ix.thumbDir) //nolint:errcheck
 	}
 
-	// 视频入库即异步预生成悬浮预览产物(雪碧图 + 低码率预览视频):消除首次
-	// hover 的现场生成空窗。best-effort,goroutine 阻塞在生成器信号量(并发
+	// 视频入库即异步预生成雪碧图(sprite.jpg,数百 KB):消除首次 hover 的现场
+	// 生成空窗。preview.mp4(低码率预览视频,单个可达数十 MB)默认改为纯懒
+	// 生成——仅当 photos.PreviewPregen=true 时才在此一并预生成,缺省交给
+	// /preview 路由端现场生成(见 route/v1/assets.go Preview),不为从不
+	// 预览的视频付出磁盘。best-effort,goroutine 阻塞在生成器信号量(并发
 	// ≤2,两类产物共享)上排队,失败只记日志;ensure 核心幂等(已存在秒退)
 	// 且 in-flight 去重,与 /sprite、/preview 路由及启动补跑并发安全。
 	// sprite 仍以 dur>0 为前提(fps 表达式需要时长);preview 无此依赖,启动
@@ -1088,14 +1100,17 @@ func (ix *Indexer) processFileInternal(path string, opts processOpts) (success b
 	if isVideo {
 		previewPath := filepath.Join(ix.thumbDir, assetID, "preview.mp4")
 		spritePath := filepath.Join(ix.thumbDir, assetID, "sprite.jpg")
+		pregen := ix.previewPregen
 		go func(src, previewOut, spriteOut string, dur int64, id string) {
 			if dur > 0 {
 				if _, err := ix.sprites.Ensure(src, spriteOut, dur); err != nil {
 					zap.L().Warn("sprite 预生成失败", zap.String("asset_id", id), zap.Error(err))
 				}
 			}
-			if err := ix.sprites.EnsurePreview(src, previewOut); err != nil {
-				zap.L().Warn("preview 预生成失败", zap.String("asset_id", id), zap.Error(err))
+			if pregen {
+				if err := ix.sprites.EnsurePreview(src, previewOut); err != nil {
+					zap.L().Warn("preview 预生成失败", zap.String("asset_id", id), zap.Error(err))
+				}
 			}
 		}(path, previewPath, spritePath, durationMs, assetID)
 	}
@@ -1791,12 +1806,32 @@ func spriteBackfillCandidates(db *sql.DB) ([]spriteCandidate, error) {
 	return out, rows.Err()
 }
 
-// BackfillSprites 为存量视频补雪碧图与预览视频(启动时调用一次,批次完成钩子
-// 也会追加触发)。CAS 防重入;顺序逐个生成(生成器信号量另有并发≤2 的全局上限,
-// 两类产物共享);ffmpeg 不存在(exec.ErrNotFound)时立即放弃整轮,避免逐条刷
-// 错误日志。候选查询仍以 duration_ms>0 过滤(时长未知的破损视频极罕见,交由
-// 路由端惰性兜底),两类产物在循环体内各自 os.Stat 判存在跳过(省函数调用,
-// 与 sprite 既有写法对齐;preview 侧 ensure 核心本身也天然幂等)。
+// pendingBackfill 返回缺失悬浮预览产物的候选。includePreview=false(即
+// PreviewPregen 关闭)时只按 sprite.jpg 缺失判定,preview.mp4 交给懒生成。
+func pendingBackfill(candidates []spriteCandidate, thumbDir string, includePreview bool) []spriteCandidate {
+	var pending []spriteCandidate
+	for _, c := range candidates {
+		_, spriteErr := os.Stat(filepath.Join(thumbDir, c.id, "sprite.jpg"))
+		previewMissing := false
+		if includePreview {
+			_, perr := os.Stat(filepath.Join(thumbDir, c.id, "preview.mp4"))
+			previewMissing = perr != nil
+		}
+		if spriteErr != nil || previewMissing {
+			pending = append(pending, c)
+		}
+	}
+	return pending
+}
+
+// BackfillSprites 为存量视频补雪碧图,以及(仅当 photos.PreviewPregen=true 时)
+// 补预览视频(启动时调用一次,批次完成钩子也会追加触发)。CAS 防重入;顺序逐个
+// 生成(生成器信号量另有并发≤2 的全局上限,两类产物共享);ffmpeg 不存在
+// (exec.ErrNotFound)时立即放弃整轮,避免逐条刷错误日志。候选查询仍以
+// duration_ms>0 过滤(时长未知的破损视频极罕见,交由路由端惰性兜底),两类产物
+// 在循环体内各自 os.Stat 判存在跳过(省函数调用,与 sprite 既有写法对齐;
+// preview 侧 ensure 核心本身也天然幂等)。PreviewPregen=false(缺省)时 preview
+// 完全交给 /preview 路由端懒生成,本函数只补 sprite。
 //
 // 任务栏接入(沿用 faces.go RunPipeline 的生命周期模式):先对候选逐条预扫描
 // sprite.jpg/preview.mp4 是否缺失,只有真正有欠账(total>0)才发「生成视频
@@ -1822,19 +1857,11 @@ func (ix *Indexer) BackfillSprites(ctx context.Context) {
 		return
 	}
 
-	// 预扫描:逐条候选判 sprite.jpg / preview.mp4 是否缺失,只有任一缺失的才
-	// 算一个待处理项,得到 total。两者都已齐备的候选不计入 total、也不进入
-	// 下面的处理循环(本轮它无事可做)。total==0 直接返回,不发任务。
-	var pending []spriteCandidate
-	for _, c := range candidates {
-		spritePath := filepath.Join(ix.thumbDir, c.id, "sprite.jpg")
-		previewPath := filepath.Join(ix.thumbDir, c.id, "preview.mp4")
-		_, spriteErr := os.Stat(spritePath)
-		_, previewErr := os.Stat(previewPath)
-		if spriteErr != nil || previewErr != nil {
-			pending = append(pending, c)
-		}
-	}
+	// 预扫描:逐条候选判 sprite.jpg(以及 PreviewPregen 开启时的 preview.mp4)
+	// 是否缺失,只有任一缺失的才算一个待处理项,得到 total。两者都已齐备(或
+	// PreviewPregen 关闭下 sprite 已齐备)的候选不计入 total、也不进入下面的
+	// 处理循环(本轮它无事可做)。total==0 直接返回,不发任务。
+	pending := pendingBackfill(candidates, ix.thumbDir, ix.previewPregen)
 	total := int64(len(pending))
 	if total == 0 {
 		return
@@ -1908,19 +1935,21 @@ func (ix *Indexer) BackfillSprites(ctx context.Context) {
 			}
 		}
 
-		previewPath := filepath.Join(ix.thumbDir, c.id, "preview.mp4")
-		if _, statErr := os.Stat(previewPath); statErr != nil {
-			if err := ix.sprites.EnsurePreview(c.filePath, previewPath); err != nil {
-				if errors.Is(err, exec.ErrNotFound) {
-					zap.L().Warn("ffmpeg 不可用,放弃本轮 sprite/preview 补跑", zap.Error(err))
-					pub(current, "error", TaskErrPreviewFfmpegMissing, nil)
-					scheduleRemove()
-					return
+		if ix.previewPregen {
+			previewPath := filepath.Join(ix.thumbDir, c.id, "preview.mp4")
+			if _, statErr := os.Stat(previewPath); statErr != nil {
+				if err := ix.sprites.EnsurePreview(c.filePath, previewPath); err != nil {
+					if errors.Is(err, exec.ErrNotFound) {
+						zap.L().Warn("ffmpeg 不可用,放弃本轮 sprite/preview 补跑", zap.Error(err))
+						pub(current, "error", TaskErrPreviewFfmpegMissing, nil)
+						scheduleRemove()
+						return
+					}
+					zap.L().Warn("preview 补跑失败", zap.String("asset_id", c.id), zap.Error(err))
+					itemFailed = true
+				} else {
+					previewsGenerated++
 				}
-				zap.L().Warn("preview 补跑失败", zap.String("asset_id", c.id), zap.Error(err))
-				itemFailed = true
-			} else {
-				previewsGenerated++
 			}
 		}
 

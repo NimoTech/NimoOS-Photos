@@ -100,7 +100,7 @@ ML 后端为独立 Docker Compose 栈（`deploy/ml/docker-compose.yml`），绑�
 | GET | `/tasks` | 当前任务列表（index/embedding/ocr） |
 | GET/PUT | `/config` | 相册配置（WatchDirs、功能开关等） |
 | GET | `/storage` | 存储统计 |
-| POST | `/cache/prune` | 清理孤儿缩略图 |
+| POST | `/cache/prune` | 清理孤儿缩略图 + face-thumbs 孤儿 + 过期上传暂存(与每日定时清理同一实现) |
 | POST | `/index/rebuild` | 重建向量索引 |
 | GET | `/about` | 版本/ML 状态信息 |
 | GET/POST/PUT/DELETE | `/smart-views[/:id]` | 语义自动相册 CRUD |
@@ -111,7 +111,7 @@ ML 后端为独立 Docker Compose 栈（`deploy/ml/docker-compose.yml`），绑�
 | POST | `/smart-views/:id/duplicate` | 复制 Smart View |
 
 **TUS 路由**（注册在 `/v1/upload-tus`，独立于上述 group）：
-- `ANY /v1/upload-tus` 和 `ANY /v1/upload-tus/*`：TUS v2 断点续传（POST/PATCH/HEAD/OPTIONS），单文件最大 20 GB，暂存目录 `/DATA/.system_data/photos-tus-staging`，7 天自动清理。
+- `ANY /v1/upload-tus` 和 `ANY /v1/upload-tus/*`：TUS v2 断点续传（POST/PATCH/HEAD/OPTIONS），单文件最大 20 GB，暂存目录 `<DataPath>/tus-staging`（跟随 `photos.conf` 的 `DataPath`，随派生数据同盘迁移；以 `0700` 权限创建，`main.go` 在 `config.Init` 之后、任何使用方之前完成重设），7 天自动清理。旧固定路径 `/DATA/.system_data/photos-tus-staging`（`common.LegacyStagingDir`）已弃用，仅在服务**启动时**兜底扫一轮清理历史遗留文件，此后不再使用；此后的周期清理只扫新目录（见下方「每日缓存清理」）。
 
 ---
 
@@ -213,18 +213,24 @@ Smart View 也复用 `SmartSearch` 接口，按自然语言条件定义动态相
 
 ```
 /etc/nimoos/photos.conf          配置（INI，Viper 读取）
-/DATA/.system_data/photos/       DataPath（默认）
+/DATA/.system_data/photos/       DataPath（默认，可迁移；下方各派生数据目录均跟随它）
   ├── photos.db                  SQLite 数据库（WAL 模式）
   ├── thumbs/<asset_id>/
   │     ├── small.jpg            250px 缩略图（CLIP 嵌入来源）
-  │     └── large.jpg            1280px 缩略图
+  │     ├── large.jpg            1280px 缩略图
+  │     ├── sprite.jpg           视频悬浮预览雪碧图（数百 KB），入库即异步预生成，恒定预生成不受开关影响
+  │     └── preview.mp4          视频低码率悬浮预览（单个可达数十 MB），默认纯懒生成（首次 GET /preview 时现场生成）；`photos.PreviewPregen=true` 时改为入库/补跑一并预生成
+  ├── face-thumbs/<face_id>.jpg  人脸缩略图；孤儿（`face_detections` 差集之外的文件）由 Prune 回收，无独立回收路径
   ├── live/                      Live Photo 视频片段缓存
-  └── ml-cache/                  immich-ml 模型缓存（bind-mount 进容器）
-/DATA/.system_data/photos-tus-staging/   TUS 上传暂存（7 天清理）
+  ├── ml-cache/                  immich-ml 模型缓存（bind-mount 进容器；容器侧挂载路径由 `deploy/ml/install.sh` 固化进 `.env` 的 `NIMOOS_PHOTOS_ML_CACHE`，随 DataPath 迁移自动跟随）
+  └── tus-staging/               TUS 上传暂存（0700 权限；7 天自动清理，见「暂存目录」）
+/DATA/.system_data/photos-tus-staging/   旧版固定暂存目录（已弃用），仅服务启动时兜底扫一轮清理
 /DATA/Gallery/                   默认照片主目录（可配置）
 /var/run/nimoos/photos.url       服务发现地址
 /var/log/nimoos/                 日志（zap）
 ```
+
+**每日缓存清理**：`main.go` 启动一个 24 小时 ticker，调用 `StorageService.Prune`（与设置页手动按钮 `POST /cache/prune` 同一实现），一次性清理三类孤儿/过期数据：`thumbs/` 下资产已不存在的缩略图目录、`face-thumbs/` 下 `face_detections` 已不存在的头像文件、`tus-staging/` 下超过 7 天（`common.StagingMaxAge`）的暂存文件。此前只能靠手动触发，现改为每日自动执行；启动时另有一次性清扫（新旧暂存目录都扫）。
 
 ### SQLite 主要表
 
@@ -296,12 +302,14 @@ ScenesEnabled = true
 OCREnabled = true
 SmartViewEnabled = true
 AestheticEnabled = true
+PreviewPregen = false
 ```
 
 - `WatchDirs`：逗号分隔，fsnotify 监视目录，默认三个；可运行时通过 `PUT /v1/photos/config` 热生效（`Watcher.Restart`）。
 - `Workers`：Indexer 并发 worker 数，默认 3。
 - `MLEndpoint`：immich-machine-learning 地址，默认 `http://127.0.0.1:3003`。
 - 各功能开关（`FacesEnabled/ScenesEnabled/OCREnabled/SmartViewEnabled/AestheticEnabled`）缺省均为 `true`；关闭 `ScenesEnabled` 后新照片不再生成 CLIP 向量，语义搜索将失效。`AestheticEnabled` 非热重载，关闭仅停止新打分（内联+补跑都跳过），已有 `aesthetic_score` 不清除，见「核心流程 § 7 美学评分」。
+- `PreviewPregen`：默认 `false`，视频 `preview.mp4` 纯懒生成（首次 `GET /preview` 现场生成），只有入库/启动补跑阶段跳过预生成；置 `true` 后与 `sprite.jpg` 一样在入库时异步预生成、`BackfillSprites` 补跑时一并覆盖存量视频。`sprite.jpg` 不受此开关影响，恒定预生成。
 
 ---
 
@@ -328,6 +336,8 @@ AestheticEnabled = true
 3. **视频缩略图用于 CLIP 嵌入**：视频用 ffmpeg 提取的关键帧生成 CLIP 嵌入（而非关键帧原图），与图片路径统一为 `small.jpg`；这是有意设计——避免高细节关键帧在语义搜索中不当排名高于图片。标记文件 `.clip_reembed_thumb_v1.done` 防止重建索引后的重复嵌入。
 
 4. **TUS 上传与 fsnotify 竞态**：TUS 上传完成后先 `MarkAndReserve` 占位，再 rename，最后 `SubmitReserved`，防止 Watcher 的 Create 事件抢先走匿名 batch 槽（`batches[""]`），导致前端进度报告错乱。
+
+5. **caption 回流的孤儿对账**：`Puller`（`service/captionpull.go`）周期性从 NimoOS-Parser 拉取 caption 全量 diff-upsert 进本地 `asset_caption` 表（供 Smart Moments 主题匹配），若拉到的资产 ID 在本地 `assets` 已不存在（真孤儿，通常是删除通知丢失导致 Parser 侧未跟着清），除本地跳过写入外，还会 best-effort 回删 Parser 侧对应向量，补上「删除即清理」链路可能丢事件时的兜底对账；`asset_caption` 自身则靠 `asset_id` 外键 `ON DELETE CASCADE` 随 `assets` 删除自动清理，不需要单独的 Prune 逻辑。
 
 ---
 

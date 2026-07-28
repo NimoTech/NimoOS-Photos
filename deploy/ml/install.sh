@@ -7,7 +7,11 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 APP_ID="nimoos-photos-ml"
 APP_DIR="/var/lib/nimoos/apps/${APP_ID}"
-PHOTOS_DATA="/DATA/.system_data/photos"
+# DataPath 跟随 /etc/nimoos/photos.conf(photos 派生数据可迁移到别的盘),
+# 读不到时退回历史默认值。
+# 注意:photos.conf 被 Settings.Save()(viper)回写后 key 会变全小写 datapath,必须大小写不敏感匹配
+CONF_DATA_PATH="$(awk -F' *= *' '{k=$1; gsub(/^[ \t]+|[ \t]+$/,"",k); if (tolower(k)=="datapath") print $2}' /etc/nimoos/photos.conf 2>/dev/null | tail -n1 || true)"
+PHOTOS_DATA="${CONF_DATA_PATH:-/DATA/.system_data/photos}"
 ML_CACHE="${PHOTOS_DATA}/ml-cache"
 IMAGE_TAR="${HERE}/immich-ml.tar"
 MODELS_TAR="${HERE}/ml-models.tar.gz"
@@ -52,6 +56,10 @@ docker load -i "${IMAGE_TAR}"
 echo "==> [2/5] 部署 compose 到 ${APP_DIR} ..."
 mkdir -p "${APP_DIR}" "${ML_CACHE}"
 cp "${HERE}/docker-compose.yml" "${APP_DIR}/docker-compose.yml"
+
+# 把实际 ml-cache 路径固化进 .env,compose(project dir = APP_DIR)自动读取;
+# AppManagement/手工 restart 都会带上同一路径。
+printf 'NIMOOS_PHOTOS_ML_CACHE=%s\n' "${ML_CACHE}" > "${APP_DIR}/.env"
 
 COMPOSE_FILES=(-f "${APP_DIR}/docker-compose.yml")
 if [[ "${FLAVOR}" != cpu ]]; then

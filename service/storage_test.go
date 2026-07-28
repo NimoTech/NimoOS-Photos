@@ -94,3 +94,29 @@ func TestStoragePruneRemovesOnlyOrphans(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, int64(0), st.PrunableBytes) // 缓存已失效并重算
 }
+
+func TestPruneRemovesOrphanFaceThumbs(t *testing.T) {
+	db := makeTestDB(t)
+	_, err := db.Exec(`INSERT INTO assets(id, file_path, file_size, mime_type, status)
+		VALUES('a1','/x/a.jpg',1000,'image/jpeg','indexed')`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO face_detections(id, asset_id, bbox, embedding)
+		VALUES('keep','a1','{}',x'00')`)
+	require.NoError(t, err)
+
+	faceDir := t.TempDir()
+	keep := writeFileOfSize(t, faceDir, "keep.jpg", 50)
+	orphan := writeFileOfSize(t, faceDir, "orphan.jpg", 80)
+
+	s := NewStorageService(db, filepath.Join(t.TempDir(), "photos.db"), t.TempDir(), faceDir, t.TempDir())
+	res, err := s.Prune("", 0)
+	require.NoError(t, err)
+
+	_, statErr := os.Stat(keep)
+	require.NoError(t, statErr) // 有对应 face_detections 行，保留
+	_, statErr = os.Stat(orphan)
+	require.True(t, os.IsNotExist(statErr)) // 孤儿脸缩略图删除
+
+	require.Equal(t, int64(80), res.FreedBytes)
+	require.Equal(t, 1, res.RemovedCount)
+}

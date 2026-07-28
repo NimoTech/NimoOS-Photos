@@ -62,6 +62,7 @@ func TestBackfillSpritesGeneratesAndIdempotent(t *testing.T) {
 	db := makeTestDB(t)
 	thumbDir := t.TempDir()
 	ix := NewIndexer(db, &mockML{}, thumbDir, 1)
+	ix.SetPreviewPregen(true) // 本测试专测 preview.mp4 补跑,需显式开启(默认纯懒生成)
 
 	srcDir := t.TempDir()
 	src := filepath.Join(srcDir, "v1.mp4")
@@ -111,6 +112,7 @@ func TestBackfillSprites_AllReadyEmitsNoTask(t *testing.T) {
 	db := makeTestDB(t)
 	thumbDir := t.TempDir()
 	ix := NewIndexer(db, &mockML{}, thumbDir, 1)
+	ix.SetPreviewPregen(true) // 本测试要求 preview.mp4 也纳入"无欠账"判定,需显式开启
 
 	srcDir := t.TempDir()
 	src := makeTestVideo(t, srcDir, "v1.mp4")
@@ -226,6 +228,7 @@ func TestBackfillSprites_NilRegistryDoesNotPanic(t *testing.T) {
 	db := makeTestDB(t)
 	thumbDir := t.TempDir()
 	ix := NewIndexer(db, &mockML{}, thumbDir, 1) // 未调用 SetTaskRegistry，taskReg 保持 nil
+	ix.SetPreviewPregen(true)                    // 本测试要求覆盖 preview.mp4 补跑路径,需显式开启
 
 	srcDir := t.TempDir()
 	src := makeTestVideo(t, srcDir, "v1.mp4")
@@ -358,6 +361,7 @@ func TestBackfillSpritesCASReentrant(t *testing.T) {
 	db := makeTestDB(t)
 	thumbDir := t.TempDir()
 	ix := NewIndexer(db, &mockML{}, thumbDir, 1)
+	ix.SetPreviewPregen(true) // 本测试要求覆盖 preview.mp4 补跑路径,需显式开启
 
 	srcDir := t.TempDir()
 	src := filepath.Join(srcDir, "v1.mp4")

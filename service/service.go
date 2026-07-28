@@ -117,6 +117,7 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 	go taskReg.StartStaleSweeper(parentCtx, taskStaleTimeout, taskSweepInterval)
 	idx := NewIndexer(db, ml, thumbDir, cfg.Workers)
 	idx.SetTaskRegistry(taskReg)
+	idx.SetPreviewPregen(cfg.PreviewPregen)
 	watcher := NewWatcher(db, cfg.WatchDirs, idx, liveDir)
 	albums := NewAlbumService(db)
 	// Wire post-index album assignment: uploads carrying an albumId join the
@@ -237,8 +238,10 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 	// 表（照片知识库子项目二回流侧，消费/检索是后续子项目）。挂点节奏照抄
 	// CaptionFeeder 同款：启动即拉一次 + 挂在 SetOnBatchDone 链尾跟随批次
 	// 节奏。lister 出错（含 Parser 未部署）不向上传播，ErrParserUnavailable
-	// 完全静默、其它错误仅 Warn 留痕，均不影响索引主流程。
-	puller := NewPuller(db, parserClient)
+	// 完全静默、其它错误仅 Warn 留痕，均不影响索引主流程。deleter 复用同一
+	// parserClient：遇真孤儿（本地 assets 无此 id）时 best-effort 回删 Parser
+	// 侧向量，补齐删除通知 fire-and-forget 丢失场景的对账兜底。
+	puller := NewPuller(db, parserClient, parserClient)
 	go func() {
 		if _, err := puller.PullOnce(parentCtx); err != nil && !errors.Is(err, parserclient.ErrParserUnavailable) {
 			zap.L().Warn("caption pull: 启动拉取失败", zap.Error(err))

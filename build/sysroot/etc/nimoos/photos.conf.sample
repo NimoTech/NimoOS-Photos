@@ -9,3 +9,4 @@ Workers = 3
 # WatchDirs 留空 = 自动模式:监控系统盘 + 全部已挂载用户分区(RAID/独立存储),动态跟随挂载
 # 需要手工限定时才取消注释:WatchDirs = /DATA/Gallery,/DATA/Documents,/DATA/Downloads
 FacesEnabled = true
+# PreviewPregen = false ; 视频悬浮预览(preview.mp4)是否预生成;默认 false=悬浮时才生成

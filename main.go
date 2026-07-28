@@ -52,6 +52,10 @@ func main() {
 		os.Exit(1)
 	}
 
+	// 暂存跟随 DataPath(见 common.StagingDir 注释);必须在任何使用方(路由
+	// 初始化、PruneStaging)之前完成重设。
+	common.StagingDir = filepath.Join(config.Cfg.DataPath, "tus-staging")
+
 	// Create required data directories
 	for _, dir := range []string{
 		config.Cfg.DataPath,
@@ -63,6 +67,14 @@ func main() {
 			fmt.Fprintf(os.Stderr, "failed to create directory %s: %v\n", dir, err)
 			os.Exit(1)
 		}
+	}
+
+	// 暂存目录含未完成上传的原始文件,权限收紧为 0700(与 route/v1/tus.go 的
+	// 防御性建目录一致;MkdirAll 不会修改已存在目录的权限,故必须在这里就以
+	// 0700 创建,不能进上面的 0755 共享列表)。
+	if err := os.MkdirAll(common.StagingDir, 0700); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to create staging directory %s: %v\n", common.StagingDir, err)
+		os.Exit(1)
 	}
 
 	logger.LogInit(config.Cfg.LogPath, "nimoos-photos", "log")
@@ -83,19 +95,29 @@ func main() {
 	// 未走新版内联预生成的历史视频。
 	go svc.Indexer().BackfillSprites(ctx)
 
-	// Prune orphaned TUS staging files at startup (one-shot) and then daily.
+	// 启动时一次性清理孤儿 TUS 暂存文件(新旧两个目录都扫,旧目录只在启动时
+	// 兜底扫一轮);此后每日清理由下方 ticker 负责(仅扫新目录)。
 	go func() {
-		if n, err := service.PruneStaging(common.StagingDir, time.Duration(common.StagingMaxAge)*time.Hour); err != nil {
-			zap.L().Warn("PruneStaging failed", zap.Error(err))
-		} else if n > 0 {
-			zap.L().Info("PruneStaging removed orphans", zap.Int("count", n))
+		for _, dir := range []string{common.StagingDir, common.LegacyStagingDir} {
+			if n, err := service.PruneStaging(dir, time.Duration(common.StagingMaxAge)*time.Hour); err != nil {
+				zap.L().Warn("PruneStaging failed", zap.String("dir", dir), zap.Error(err))
+			} else if n > 0 {
+				zap.L().Info("PruneStaging removed orphans", zap.String("dir", dir), zap.Int("count", n))
+			}
 		}
 	}()
+
+	// 每日全量缓存清理:孤儿缩略图目录 + face-thumbs 孤儿 + 过期暂存,
+	// 与设置页手动按钮(POST /cache/prune)同一实现。
 	go func() {
 		ticker := time.NewTicker(24 * time.Hour)
 		defer ticker.Stop()
 		for range ticker.C {
-			service.PruneStaging(common.StagingDir, time.Duration(common.StagingMaxAge)*time.Hour) //nolint:errcheck
+			if res, err := svc.Storage().Prune(common.StagingDir, time.Duration(common.StagingMaxAge)*time.Hour); err != nil {
+				zap.L().Warn("daily cache prune failed", zap.Error(err))
+			} else if res.RemovedCount > 0 {
+				zap.L().Info("daily cache prune", zap.Int("removed", res.RemovedCount), zap.Int64("freed_bytes", res.FreedBytes))
+			}
 		}
 	}()
 

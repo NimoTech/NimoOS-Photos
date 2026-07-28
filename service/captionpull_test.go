@@ -29,6 +29,14 @@ func (f *fakeLister) ListCaptions(_ context.Context, offset string) ([]parsercli
 	return p.items, p.next, nil
 }
 
+// fakeDeleter 是供测试注入的 captionDeleter 假实现,记录被回删的 asset_id。
+type fakeDeleter struct{ deleted []string }
+
+func (f *fakeDeleter) DeleteAsset(_ context.Context, id string) error {
+	f.deleted = append(f.deleted, id)
+	return nil
+}
+
 // insertCaptionAsset 插入一条 asset_caption 会外键引用到的资产行(id 存在即可,
 // 其它字段对本测试无关紧要)。
 func insertCaptionAsset(t *testing.T, db *sql.DB, id string) {
@@ -51,7 +59,7 @@ func TestPullOnce_PagesAndUpserts(t *testing.T) {
 		"c2": {items: []parserclient.CaptionItem{{AssetID: "a2", Text: "一片海", MtimeMs: 200}}, next: ""},
 	}}
 
-	p := NewPuller(db, lister)
+	p := NewPuller(db, lister, nil)
 	n, err := p.PullOnce(context.Background())
 	require.NoError(t, err)
 	require.Equal(t, 2, n)
@@ -81,7 +89,7 @@ func TestPullOnce_SkipsUnchangedUpdatesChanged(t *testing.T) {
 	}{
 		"": {items: []parserclient.CaptionItem{{AssetID: "a1", Text: "新文本-未变", MtimeMs: 5}}, next: ""},
 	}}
-	p := NewPuller(db, lister)
+	p := NewPuller(db, lister, nil)
 	n, err := p.PullOnce(context.Background())
 	require.NoError(t, err)
 	require.Equal(t, 0, n, "mtime 未变不应计入 upsert")
@@ -99,7 +107,7 @@ func TestPullOnce_SkipsUnchangedUpdatesChanged(t *testing.T) {
 	}{
 		"": {items: []parserclient.CaptionItem{{AssetID: "a1", Text: "新文本-已变", MtimeMs: 9}}, next: ""},
 	}}
-	p2 := NewPuller(db, lister2)
+	p2 := NewPuller(db, lister2, nil)
 	n2, err := p2.PullOnce(context.Background())
 	require.NoError(t, err)
 	require.Equal(t, 1, n2, "mtime 变大应计入 upsert")
@@ -115,7 +123,7 @@ func TestPullOnce_ListerErrorSilent(t *testing.T) {
 	insertCaptionAsset(t, db, "a1")
 
 	lister := &fakeLister{err: errors.New("parser 503")}
-	p := NewPuller(db, lister)
+	p := NewPuller(db, lister, nil)
 	n, err := p.PullOnce(context.Background())
 	require.Error(t, err)
 	require.Equal(t, 0, n)
@@ -150,7 +158,7 @@ func TestPullOnce_NonForeignKeyErrorPropagates(t *testing.T) {
 	}{
 		"": {items: []parserclient.CaptionItem{{AssetID: "boom", Text: "x", MtimeMs: 1}}, next: ""},
 	}}
-	p := NewPuller(db, lister)
+	p := NewPuller(db, lister, nil)
 	n, err := p.PullOnce(context.Background())
 	require.Error(t, err, "非外键的写入失败应向上返回 err,不应被静默吞掉")
 	require.Equal(t, 0, n)
@@ -174,7 +182,7 @@ func TestPullOnce_OrphanSkipped(t *testing.T) {
 			{AssetID: "a2", Text: "正常", MtimeMs: 2},
 		}, next: ""},
 	}}
-	p := NewPuller(db, lister)
+	p := NewPuller(db, lister, nil)
 	n, err := p.PullOnce(context.Background())
 	require.NoError(t, err)
 	require.Equal(t, 1, n, "孤儿应跳过,只有 a2 计入 upsert")
@@ -186,4 +194,24 @@ func TestPullOnce_OrphanSkipped(t *testing.T) {
 	var text string
 	require.NoError(t, db.QueryRow(`SELECT text FROM asset_caption WHERE asset_id='a2'`).Scan(&text))
 	require.Equal(t, "正常", text)
+}
+
+// PullOnce 遇到孤儿(本地 assets 无此 id)时,应 best-effort 回删 Parser 侧
+// 向量——删除通知是 fire-and-forget,Parser 当时不可达会永久漏删,这是唯一
+// 的对账兜底。回删失败不应影响本轮拉取(不计入 err、不阻断其它条目)。
+func TestPullOnceDeletesOrphanRemote(t *testing.T) {
+	db := makeTestDB(t) // 未插入 "ghost" 对应的 assets 行,是真孤儿
+
+	lister := &fakeLister{pages: map[string]struct {
+		items []parserclient.CaptionItem
+		next  string
+	}{
+		"": {items: []parserclient.CaptionItem{{AssetID: "ghost", Text: "孤儿", MtimeMs: 1}}, next: ""},
+	}}
+	deleter := &fakeDeleter{}
+	p := NewPuller(db, lister, deleter)
+	n, err := p.PullOnce(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, 0, n)
+	require.Equal(t, []string{"ghost"}, deleter.deleted)
 }

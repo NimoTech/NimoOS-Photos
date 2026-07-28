@@ -971,3 +971,22 @@ func TestPruneRcloneMountAssetsPurges(t *testing.T) {
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM assets WHERE id=?`, keep).Scan(&n))
 	require.Equal(t, 1, n)
 }
+
+// TestPendingBackfillExcludesPreviewWhenDisabled:PreviewPregen 关闭
+// (includePreview=false)时预扫描只按 sprite.jpg 缺失判定欠账，preview.mp4
+// 缺失不再计入——它交给路由端懒生成；打开时两者都判。
+func TestPendingBackfillExcludesPreviewWhenDisabled(t *testing.T) {
+	thumbDir := t.TempDir()
+	// 候选 a：sprite 已存在、preview 缺失 → includePreview=false 时不算欠账
+	require.NoError(t, os.MkdirAll(filepath.Join(thumbDir, "a"), 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(thumbDir, "a", "sprite.jpg"), []byte("x"), 0644))
+	// 候选 b：sprite 缺失 → 两种模式都算欠账
+	cands := []spriteCandidate{{id: "a"}, {id: "b"}}
+
+	got := pendingBackfill(cands, thumbDir, false)
+	require.Len(t, got, 1)
+	require.Equal(t, "b", got[0].id, "includePreview=false 应只剩 b")
+
+	got = pendingBackfill(cands, thumbDir, true)
+	require.Len(t, got, 2, "includePreview=true 应两条都欠")
+}

@@ -17,6 +17,11 @@ type captionLister interface {
 	ListCaptions(ctx context.Context, offset string) ([]parserclient.CaptionItem, string, error)
 }
 
+// captionDeleter 是孤儿回删的最小接口(parserclient.Client 满足)。
+type captionDeleter interface {
+	DeleteAsset(ctx context.Context, assetID string) error
+}
+
 // Puller 周期性从 NimoOS-Parser 拉取 caption 全量并 diff-upsert 进本地
 // asset_caption 表(照片知识库子项目二的回流侧;caption 消费/检索是后续
 // 子项目,这里只负责把数据落到本地)。
@@ -33,18 +38,21 @@ type captionLister interface {
 //   - 资产被恢复(回收站恢复等)→ 只要资产行还在(级联未触发),旧 caption
 //     行原样保留;Parser 侧后续若有更新,mtime 覆盖会自然生效。
 //   - 孤儿(Parser 已生成 caption,但本地 assets 表暂无该 id,比如两侧删除
-//     通知有时间差)→ 外键约束下 INSERT 失败,跳过继续处理下一条,不中断
-//     整轮拉取。
+//     通知有时间差,或删除通知是 fire-and-forget、Parser 当时不可达导致
+//     永久漏删)→ 外键约束下 INSERT 失败,跳过继续处理下一条,不中断整轮
+//     拉取;同时 best-effort 回删 Parser 侧向量,补上这条对账兜底。
 type Puller struct {
-	db     *sql.DB
-	lister captionLister
+	db      *sql.DB
+	lister  captionLister
+	deleter captionDeleter
 }
 
 // NewPuller 构造 Puller。lister 通常是 parserclient.New(cfg.RuntimePath)
 // (与 CaptionFeeder 共用同一个 parserclient.Client 实例即可,ListCaptions
-// 与 IngestAsset/DeleteAsset 走同一份 discoveryFile/http.Client)。
-func NewPuller(db *sql.DB, lister captionLister) *Puller {
-	return &Puller{db: db, lister: lister}
+// 与 IngestAsset/DeleteAsset 走同一份 discoveryFile/http.Client)。deleter
+// 用于孤儿回删,可为 nil(退化为只跳过,不回删)。
+func NewPuller(db *sql.DB, lister captionLister, deleter captionDeleter) *Puller {
+	return &Puller{db: db, lister: lister, deleter: deleter}
 }
 
 // localMtime 查询本地 asset_caption 表中某资产当前记录的 mtime_ms;
@@ -95,10 +103,17 @@ func (p *Puller) PullOnce(ctx context.Context) (upserted int, err error) {
 			if werr != nil {
 				var sqliteErr sqlite3.Error
 				if errors.As(werr, &sqliteErr) && sqliteErr.ExtendedCode == sqlite3.ErrConstraintForeignKey {
-					// 真孤儿:本地 assets 无此 id(两侧删除通知有时间差属正常
-					// 竞态)→ 跳过继续,不中断整轮拉取。
+					// 真孤儿:本地 assets 无此 id。除跳过外,回删 Parser 侧向量——
+					// 删除通知是 fire-and-forget(captionfeed.go DeleteRemote),
+					// Parser 当时不可达会永久漏删,这里是唯一的对账兜底。
+					// best-effort:失败仅 Warn,不中断整轮。
 					zap.L().Debug("caption pull: 写入跳过(孤儿资产,外键约束失败)",
 						zap.String("asset_id", it.AssetID), zap.Error(werr))
+					if p.deleter != nil {
+						if derr := p.deleter.DeleteAsset(ctx, it.AssetID); derr != nil && !errors.Is(derr, parserclient.ErrParserUnavailable) {
+							zap.L().Warn("caption pull: 孤儿向量回删失败", zap.String("asset_id", it.AssetID), zap.Error(derr))
+						}
+					}
 					continue
 				}
 				// 非外键错误(SQLITE_BUSY 超时、磁盘 I/O 等真实故障)不能当孤儿

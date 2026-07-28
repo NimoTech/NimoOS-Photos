@@ -131,7 +131,8 @@ func (s *StorageService) compute() (*StorageStats, error) {
 		}
 	}
 	// Face thumbnails count as cache but are keyed by person, not asset —
-	// no orphan detection here.
+	// orphan detection for this bucket lives in Prune()'s face_detections
+	// diff instead (删人/删照片留下的孤儿 jpg 由 Prune 统一回收).
 	st.CacheBytes += dirSize(s.faceDir)
 
 	// 4. AI bucket = SQLite database files.
@@ -181,6 +182,44 @@ func (s *StorageService) Prune(stagingDir string, stagingMaxAge time.Duration) (
 		p := filepath.Join(s.thumbDir, e.Name())
 		size := dirSize(p)
 		if err := os.RemoveAll(p); err == nil {
+			res.FreedBytes += size
+			res.RemovedCount++
+		}
+	}
+
+	// face-thumbs 孤儿：按 face_detections 差集清理（删人/删照片不会清这里，
+	// 见 Stats 中的注释；此处是唯一的回收路径）。
+	faceIDs := map[string]bool{}
+	frows, err := s.db.Query(`SELECT id FROM face_detections`)
+	if err != nil {
+		return nil, err
+	}
+	for frows.Next() {
+		var id string
+		if err := frows.Scan(&id); err != nil {
+			frows.Close()
+			return nil, err
+		}
+		faceIDs[id] = true
+	}
+	frows.Close()
+	if err := frows.Err(); err != nil {
+		return nil, err
+	}
+	fentries, _ := os.ReadDir(s.faceDir)
+	for _, e := range fentries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, ".jpg") {
+			continue
+		}
+		if faceIDs[strings.TrimSuffix(name, ".jpg")] {
+			continue
+		}
+		var size int64
+		if fi, ierr := e.Info(); ierr == nil {
+			size = fi.Size()
+		}
+		if err := os.Remove(filepath.Join(s.faceDir, name)); err == nil {
 			res.FreedBytes += size
 			res.RemovedCount++
 		}

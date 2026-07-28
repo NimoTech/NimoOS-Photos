@@ -33,11 +33,20 @@ const (
 
 // TUS upload staging
 const (
-	StagingDir    = "/DATA/.system_data/photos-tus-staging"
-	MaxUploadSize = int64(20 * 1024 * 1024 * 1024) // 20 GB
-	StagingMaxAge = 7 * 24                         // hours
+	// LegacyStagingDir 是 2026-07 之前写死的暂存目录;现行目录跟随
+	// photos.DataPath(见 main.go 对 StagingDir 的重设),这里仅供启动时
+	// 清扫历史残留。
+	LegacyStagingDir = "/DATA/.system_data/photos-tus-staging"
+	MaxUploadSize    = int64(20 * 1024 * 1024 * 1024) // 20 GB
+	StagingMaxAge    = 7 * 24                         // hours
 
 	// V1TUSPath is the Gateway prefix that must be registered so the resumable
 	// upload endpoint at /v1/upload-tus reaches this service.
 	V1TUSPath = "/v1/upload-tus"
 )
+
+// StagingDir 是 tus 上传暂存目录。var 而非 const:main.go 在 config.Init 之后
+// 把它重设为 <DataPath>/tus-staging,使暂存与派生数据同盘(DataPath 迁走时暂存
+// 一起走,不再固定挤占系统盘);完成侧 rename 失败已有跨盘 copy 兜底
+// (route/v1/tus.go)。默认值保持旧路径,测试可重定向。
+var StagingDir = LegacyStagingDir
