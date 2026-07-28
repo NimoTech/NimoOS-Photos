@@ -288,6 +288,51 @@ func TestMomentsHandler_UpdateRecipesEmptyBodyRejected(t *testing.T) {
 // {"trip","theme"} 白名单内(如运维/脚本手误的 "thmee")应 400,而不是静默
 // 落库——引擎(recomputeRecipe)对未知 kind 只 Warn 跳过、永不产出/永不报错,
 // 若在这一层不拦,typo 会悄悄进库且没有任何用户可见的提示。
+// ── PUT /v1/photos/moments/order ────────────────────────────────────────
+
+func TestMomentsHandler_ReorderEmptyIdsRejected(t *testing.T) {
+	h, _, _ := newMomentsHarness(t)
+
+	c, _ := newEchoCtx(http.MethodPut, "/v1/photos/moments/order", []byte(`{"ids":[]}`))
+	err := h.ReorderMoments(c)
+	he, ok := err.(*echo.HTTPError)
+	require.True(t, ok)
+	require.Equal(t, http.StatusBadRequest, he.Code)
+}
+
+func TestMomentsHandler_ReorderSuccess(t *testing.T) {
+	h, db, store := newMomentsHarness(t)
+	// 两个 moment 落在不同 recipe_key 下,才能共存——seedOneMoment 内部走
+	// SyncRecipeMoments("trip", ...),同 recipe 二次调用会把前一个当"消失的
+	// 旧时刻"删掉(见 momentstore.go 语义),故这里不能用同一 recipeKey 连续
+	// seed 两次。
+	seedOneMoment(t, db, store, "m1", []string{"a1"})
+	for _, id := range []string{"a2"} {
+		_, err := db.Exec(`INSERT INTO assets(id,file_path,status) VALUES(?,?,'indexed')`, id, "/p/"+id+".jpg")
+		require.NoError(t, err)
+	}
+	draft2 := service.MomentDraft{
+		Moment: service.Moment{ID: "m2", RecipeKey: "theme:pets", Title: "Pet Moments", AssetCount: 1},
+		Assets: []service.MomentAsset{{AssetID: "a2"}},
+	}
+	require.NoError(t, store.SyncRecipeMoments("theme:pets", []service.MomentDraft{draft2}))
+
+	reqBody, _ := json.Marshal(map[string]any{"ids": []string{"m2", "m1"}})
+	c, rec := newEchoCtx(http.MethodPut, "/v1/photos/moments/order", reqBody)
+	require.NoError(t, h.ReorderMoments(c))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	var body map[string]any
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &body))
+	require.Equal(t, true, body["ok"])
+
+	moments, err := store.ListMoments()
+	require.NoError(t, err)
+	require.Len(t, moments, 2)
+	require.Equal(t, "m2", moments[0].ID, "手排后 m2(ids[0])应排在 m1 前面")
+	require.Equal(t, "m1", moments[1].ID)
+}
+
 func TestMomentsHandler_UpdateRecipesUnknownKindRejected(t *testing.T) {
 	h, _, store := newMomentsHarness(t)
 

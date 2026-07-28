@@ -572,6 +572,11 @@ func migrate(db *sql.DB) error {
 		// smart_view_matches.origin: 行来源(0=自动匹配/1=手动钉住/2=手动排除)。
 		// 钉住行重估不删、分数恒 1.0;排除行留存作"记忆",读路径以 origin<>2 过滤。
 		`ALTER TABLE smart_view_matches ADD COLUMN origin INTEGER NOT NULL DEFAULT 0`,
+		// moments.sort_order: Moments 拖拽手排序(NULL=未手排,ListMoments 排序
+		// 语义见 momentstore.go)。PUT /v1/photos/moments/order 写入
+		// (i+1)*10(留间隙便于未来插入);SyncRecipeMoments 的 upsert 列清单
+		// 不含该列,重算天然保留用户手排顺序。
+		`ALTER TABLE moments ADD COLUMN sort_order INTEGER`,
 	}
 	for _, stmt := range alters {
 		if _, err := db.Exec(stmt); err != nil &&

@@ -377,3 +377,116 @@ func TestMomentStore_ListMomentsOrderAndFeaturedFilter(t *testing.T) {
 	require.Len(t, featured, 1)
 	require.Equal(t, "a2", featured[0].AssetID)
 }
+
+// ── ListMoments:手排序语义(sort_order 列)────────────────────────────────
+//
+// 三段语义(见设计 spec 第一节):
+//  1. 手排序(sort_order 非 NULL)的排在最前面,按 sort_order 升序;
+//  2. 未手排(sort_order 为 NULL)的排在手排序之后,按 updated_at 降序;
+//  3. 全库都未手排时 = 现状不变(纯 updated_at 降序,向后兼容既有断言)。
+func TestMomentStore_ListMomentsSortOrderSemantics(t *testing.T) {
+	db := makeTestDB(t)
+	store := NewMomentStore(db)
+	insertMomentAsset(t, db, "a1")
+	insertMomentAsset(t, db, "a2")
+	insertMomentAsset(t, db, "a3")
+
+	// 依次产出 m1(最旧)→m2→m3(最新),updated_at 递增。
+	d1 := MomentDraft{Moment: Moment{ID: "m1", RecipeKey: "trip", Title: "First", AssetCount: 1}, Assets: []MomentAsset{{AssetID: "a1"}}}
+	require.NoError(t, store.SyncRecipeMoments("trip", []MomentDraft{d1}))
+	time.Sleep(2 * time.Millisecond)
+	d2 := MomentDraft{Moment: Moment{ID: "m2", RecipeKey: "theme:pets", Title: "Second", AssetCount: 1}, Assets: []MomentAsset{{AssetID: "a2"}}}
+	require.NoError(t, store.SyncRecipeMoments("theme:pets", []MomentDraft{d2}))
+	time.Sleep(2 * time.Millisecond)
+	d3 := MomentDraft{Moment: Moment{ID: "m3", RecipeKey: "theme:food", Title: "Third", AssetCount: 1}, Assets: []MomentAsset{{AssetID: "a3"}}}
+	require.NoError(t, store.SyncRecipeMoments("theme:food", []MomentDraft{d3}))
+
+	// 段 3:全库未手排 = 现状不变,按 updated_at DESC(最新的 m3 在最前)。
+	all, err := store.ListMoments()
+	require.NoError(t, err)
+	require.Len(t, all, 3)
+	require.Equal(t, []string{"m3", "m2", "m1"}, []string{all[0].ID, all[1].ID, all[2].ID})
+	require.Nil(t, all[0].SortOrder, "未手排时 SortOrder 应为 nil(NULL 语义保真)")
+
+	// 段 1+2:手排 m1、m2(m1 排在 m2 前面,即便 m1 updated_at 更旧),
+	// m3 仍未手排。手排的应整体排在未手排(m3)前面,内部按用户给定顺序。
+	require.NoError(t, store.ReorderMoments([]string{"m1", "m2"}))
+
+	mixed, err := store.ListMoments()
+	require.NoError(t, err)
+	require.Len(t, mixed, 3)
+	require.Equal(t, []string{"m1", "m2", "m3"}, []string{mixed[0].ID, mixed[1].ID, mixed[2].ID},
+		"手排的 m1/m2 应排在未手排的 m3 前面,且内部按手排顺序")
+	require.NotNil(t, mixed[0].SortOrder)
+	require.Equal(t, 10, *mixed[0].SortOrder)
+	require.NotNil(t, mixed[1].SortOrder)
+	require.Equal(t, 20, *mixed[1].SortOrder)
+	require.Nil(t, mixed[2].SortOrder, "m3 未手排,SortOrder 应仍为 nil")
+}
+
+// ── ReorderMoments:赋值与间隙 + 未知 id 忽略 ─────────────────────────────
+
+func TestMomentStore_ReorderAssignsGapsAndIgnoresUnknown(t *testing.T) {
+	db := makeTestDB(t)
+	store := NewMomentStore(db)
+	insertMomentAsset(t, db, "a1")
+	insertMomentAsset(t, db, "a2")
+	insertMomentAsset(t, db, "a3")
+
+	d1 := MomentDraft{Moment: Moment{ID: "m1", RecipeKey: "trip", Title: "One", AssetCount: 1}, Assets: []MomentAsset{{AssetID: "a1"}}}
+	d2 := MomentDraft{Moment: Moment{ID: "m2", RecipeKey: "theme:pets", Title: "Two", AssetCount: 1}, Assets: []MomentAsset{{AssetID: "a2"}}}
+	d3 := MomentDraft{Moment: Moment{ID: "m3", RecipeKey: "theme:food", Title: "Three", AssetCount: 1}, Assets: []MomentAsset{{AssetID: "a3"}}}
+	require.NoError(t, store.SyncRecipeMoments("trip", []MomentDraft{d1}))
+	require.NoError(t, store.SyncRecipeMoments("theme:pets", []MomentDraft{d2}))
+	require.NoError(t, store.SyncRecipeMoments("theme:food", []MomentDraft{d3}))
+
+	// 中间混入一个未知 id("ghost"不存在于 moments 表),应影响 0 行、不报错。
+	require.NoError(t, store.ReorderMoments([]string{"m1", "ghost", "m2", "m3"}))
+
+	moments, err := store.ListMoments()
+	require.NoError(t, err)
+	byID := map[string]Moment{}
+	for _, m := range moments {
+		byID[m.ID] = m
+	}
+	require.NotNil(t, byID["m1"].SortOrder)
+	require.Equal(t, 10, *byID["m1"].SortOrder, "m1 是 ids[0],赋值 (0+1)*10=10")
+	require.NotNil(t, byID["m2"].SortOrder)
+	require.Equal(t, 30, *byID["m2"].SortOrder, "m2 是 ids[2](ghost 占了 index 1),赋值 (2+1)*10=30")
+	require.NotNil(t, byID["m3"].SortOrder)
+	require.Equal(t, 40, *byID["m3"].SortOrder, "m3 是 ids[3],赋值 (3+1)*10=40")
+}
+
+// ── SyncRecipeMoments:重算不触碰已手排的 sort_order(幸存)─────────────────
+
+func TestMomentStore_SyncPreservesSortOrder(t *testing.T) {
+	db := makeTestDB(t)
+	store := NewMomentStore(db)
+	insertMomentAsset(t, db, "a1")
+
+	draft := MomentDraft{
+		Moment: Moment{ID: "m1", RecipeKey: "trip", Title: "Yosemite Trip", AssetCount: 1},
+		Assets: []MomentAsset{{AssetID: "a1"}},
+	}
+	require.NoError(t, store.SyncRecipeMoments("trip", []MomentDraft{draft}))
+	require.NoError(t, store.ReorderMoments([]string{"m1"}))
+
+	moments, err := store.ListMoments()
+	require.NoError(t, err)
+	require.Len(t, moments, 1)
+	require.NotNil(t, moments[0].SortOrder)
+	require.Equal(t, 10, *moments[0].SortOrder)
+
+	// 下一轮重算(同 id upsert),sort_order 不应被触碰。
+	draft2 := draft
+	draft2.Title = "Yosemite Trip (Recomputed)"
+	draft2.AssetCount = 5
+	require.NoError(t, store.SyncRecipeMoments("trip", []MomentDraft{draft2}))
+
+	moments2, err := store.ListMoments()
+	require.NoError(t, err)
+	require.Len(t, moments2, 1)
+	require.NotNil(t, moments2[0].SortOrder, "Sync upsert 不应清空已手排的 sort_order")
+	require.Equal(t, 10, *moments2[0].SortOrder)
+	require.Equal(t, "Yosemite Trip (Recomputed)", moments2[0].Title)
+}

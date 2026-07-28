@@ -246,6 +246,7 @@ func InitRouter(ctx context.Context, svc service.Services, runtimePath string, t
 	g.POST("/moments/recompute", moments.Recompute)
 	g.GET("/moments/recipes", moments.ListRecipes)
 	g.PUT("/moments/recipes", moments.UpdateRecipes)
+	g.PUT("/moments/order", moments.ReorderMoments)
 
 	// 构造 upload Store(连接 photos.db),供 TUS handler 与 uploads API 共用。
 	uploadStore := uploadstore.NewStore(svc.DB())
