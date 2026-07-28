@@ -339,6 +339,113 @@ func TestBuildNamingPrompt_NoPhotoAppEchoAndHasHardenedConstraints(t *testing.T)
 	require.Contains(t, prompt, "Alpine Ski Days", "应带第二条 few-shot 示例")
 }
 
+// TestRecomputeAll_PetEntitiesReplaceConceptThemePets:替换规则正向——
+// profile:pets 挖掘出 ≥1 个达标宠物实体时,概念版 theme:pets 时刻必须被
+// 清空(即使 theme 引擎本身的判据也能命中同一批照片,产出的是"用户自己的
+// 那只狗"而不是"全库搜索含狗元素")。recipe key 字典序 profile:pets <
+// theme:pets(p<t),ListRecipes 按 key 升序,故本轮循环处理到 theme:pets 时
+// petEntitiesProduced 标志已经就位。
+func TestRecomputeAll_PetEntitiesReplaceConceptThemePets(t *testing.T) {
+	db := makeTestDB(t)
+	store := NewMomentStore(db)
+	require.NoError(t, store.UpsertRecipes([]MomentRecipe{
+		{Key: "profile:pets", Kind: "pet_entities", Title: "Pet Entities", Enabled: true,
+			ParamsJSON: `{"lexicon":["beagle"],"min_photos":2,"min_months":1}`},
+		{Key: "theme:pets", Kind: "theme", Title: "Pet Moments", Enabled: true,
+			ParamsJSON: `{"min_assets":2,"clip_prompts":["a photo of a dog"],"caption_keywords":["dog"]}`},
+	}))
+
+	base := time.Date(2020, time.March, 1, 12, 0, 0, 0, time.UTC)
+	for i := 0; i < 3; i++ {
+		id := "pet-" + string(rune('a'+i))
+		takenAt := base.AddDate(0, 0, i)
+		_, err := db.Exec(`INSERT INTO assets(id, file_path, status, taken_at) VALUES(?,?,'indexed',?)`,
+			id, "/g/"+id+".jpg", takenAt.UTC().Format("2006-01-02 15:04:05"))
+		require.NoError(t, err)
+		_, err = db.Exec(`INSERT INTO asset_caption(asset_id, text) VALUES(?,?)`, id, "our beagle dog running")
+		require.NoError(t, err)
+	}
+
+	// 若替换规则不生效,theme 引擎凭 caption_keywords "dog" 命中这 3 张也足以
+	// 达标(min_assets=2)产出概念版——本用例要证明它被清空,而不是"本来就没
+	// 有候选"。
+	searcher := fakeThemeSearcher{hits: map[string][]AssetScore{
+		"a photo of a dog": {
+			{AssetID: "pet-a", Score: 0.9}, {AssetID: "pet-b", Score: 0.9}, {AssetID: "pet-c", Score: 0.9},
+		},
+	}}
+	svc := NewMomentsService(db, store, searcher, noVecLoader, &fakeNamer{title: "irrelevant"})
+
+	require.NoError(t, svc.RecomputeAll(context.Background()))
+
+	moments, err := store.ListMoments()
+	require.NoError(t, err)
+
+	var recipeKeys []string
+	for _, m := range moments {
+		recipeKeys = append(recipeKeys, m.RecipeKey)
+	}
+	require.NotContains(t, recipeKeys, "theme:pets", "已产出个人化宠物实体时刻应替换掉概念版")
+	require.Contains(t, recipeKeys, "profile:pets", "应产出 Your Beagle 实体时刻")
+
+	var petMoment Moment
+	for _, m := range moments {
+		if m.RecipeKey == "profile:pets" {
+			petMoment = m
+		}
+	}
+	require.Equal(t, "Your Beagle", petMoment.Title)
+}
+
+// TestRecomputeAll_NoPetEntitiesFallsBackToConceptThemePets:替换规则反向——
+// 全库无达标宠物实体时,概念版 theme:pets 照常产出(回退语义)。
+func TestRecomputeAll_NoPetEntitiesFallsBackToConceptThemePets(t *testing.T) {
+	db := makeTestDB(t)
+	store := NewMomentStore(db)
+	require.NoError(t, store.UpsertRecipes([]MomentRecipe{
+		// min_photos 故意设得远高于本轮实际张数,确保 profile:pets 本轮无
+		// 达标实体产出。
+		{Key: "profile:pets", Kind: "pet_entities", Title: "Pet Entities", Enabled: true,
+			ParamsJSON: `{"lexicon":["labrador"],"min_photos":50,"min_months":5}`},
+		{Key: "theme:pets", Kind: "theme", Title: "Pet Moments", Enabled: true,
+			ParamsJSON: `{"min_assets":2,"clip_prompts":["a photo of a dog"],"caption_keywords":["dog"]}`},
+	}))
+
+	base := time.Date(2021, time.May, 1, 12, 0, 0, 0, time.UTC)
+	for i := 0; i < 2; i++ {
+		id := "pet2-" + string(rune('a'+i))
+		takenAt := base.AddDate(0, 0, i)
+		_, err := db.Exec(`INSERT INTO assets(id, file_path, status, taken_at) VALUES(?,?,'indexed',?)`,
+			id, "/g/"+id+".jpg", takenAt.UTC().Format("2006-01-02 15:04:05"))
+		require.NoError(t, err)
+		_, err = db.Exec(`INSERT INTO asset_caption(asset_id, text) VALUES(?,?)`, id, "a labrador dog running")
+		require.NoError(t, err)
+	}
+
+	searcher := fakeThemeSearcher{hits: map[string][]AssetScore{
+		"a photo of a dog": {
+			{AssetID: "pet2-a", Score: 0.9}, {AssetID: "pet2-b", Score: 0.9},
+		},
+	}}
+	svc := NewMomentsService(db, store, searcher, noVecLoader, &fakeNamer{title: "irrelevant"})
+
+	require.NoError(t, svc.RecomputeAll(context.Background()))
+
+	moments, err := store.ListMoments()
+	require.NoError(t, err)
+
+	var themeMoment Moment
+	var found bool
+	for _, m := range moments {
+		if m.RecipeKey == "theme:pets" {
+			themeMoment = m
+			found = true
+		}
+	}
+	require.True(t, found, "无达标宠物实体时,概念版 theme:pets 应照常产出(回退)")
+	require.Equal(t, "Pet Moments", themeMoment.Title)
+}
+
 // TestRecomputeAll_OverlongLLMTitleIsTruncatedBeforeStore:端到端确认
 // RecomputeAll 落库前会截断超长 LLM 输出,而不是原样存进 moments.title。
 func TestRecomputeAll_OverlongLLMTitleIsTruncatedBeforeStore(t *testing.T) {

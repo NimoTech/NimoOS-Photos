@@ -33,12 +33,13 @@ const maxNamingCaptions = 10
 
 // MomentsService 是 Smart Moments 的调度装配层。
 type MomentsService struct {
-	db       *sql.DB
-	store    *MomentStore
-	searcher clipTextSearcher
-	loadVec  clipVecLoader
-	namer    namer
-	reg      *TaskRegistry
+	db           *sql.DB
+	store        *MomentStore
+	searcher     clipTextSearcher
+	loadVec      clipVecLoader
+	namer        namer
+	profileStore *ProfileStore // Moments M2 画像层:pet_entities/family 引擎落 user_profile_entities。
+	reg          *TaskRegistry
 
 	running atomic.Bool
 
@@ -53,11 +54,12 @@ type MomentsService struct {
 // clipTextSearcher)、loadVec=RealClipVecLoader(db)、namer=aiclient.Client。
 func NewMomentsService(db *sql.DB, store *MomentStore, searcher clipTextSearcher, loadVec clipVecLoader, namer namer) *MomentsService {
 	return &MomentsService{
-		db:       db,
-		store:    store,
-		searcher: searcher,
-		loadVec:  loadVec,
-		namer:    namer,
+		db:           db,
+		store:        store,
+		searcher:     searcher,
+		loadVec:      loadVec,
+		namer:        namer,
+		profileStore: NewProfileStore(db),
 	}
 }
 
@@ -122,9 +124,33 @@ func (s *MomentsService) RecomputeAll(ctx context.Context) error {
 		return fmt.Errorf("moments: list recipes: %w", err)
 	}
 
+	// petEntitiesProduced 记录本轮 profile:pets(kind=pet_entities)是否产出了
+	// ≥1 个个人化宠物实体时刻——若是,轮到 theme:pets 时用空 drafts 调
+	// SyncRecipeMoments 清空概念版(替换规则,见设计 spec 第二节)。这个替
+	// 换依赖 recipe 按 key 字典序处理("profile:pets" < "theme:pets",p<t,
+	// ListRecipes 已按 key ASC 排序)——处理到 theme:pets 时 profile:pets 一
+	// 定已经跑过,标志已经就位。
+	var petEntitiesProduced bool
 	var skipped int64
 	for i, recipe := range recipes {
-		if err := s.recomputeRecipe(ctx, recipe); err != nil {
+		if recipe.Key == "theme:pets" && petEntitiesProduced {
+			// 个人化宠物实体已产出:替换概念版——以空 drafts 调
+			// SyncRecipeMoments 清空 theme:pets 上一轮产出的旧时刻,不再跑
+			// 概念引擎(不依赖 BuildThemeMoments/CLIP,替换本身不该受 ML
+			// 状态影响)。
+			if err := s.store.SyncRecipeMoments(recipe.Key, nil); err != nil {
+				zap.L().Warn("moments: 清空概念版 theme:pets 失败,跳过本轮、保留旧时刻",
+					zap.String("key", recipe.Key), zap.Error(err))
+				skipped++
+			} else {
+				zap.L().Info("moments: 个人化宠物实体已产出,替换概念版 theme:pets(清空)")
+			}
+			pub(0.7*float64(i+1)/float64(len(recipes)), "running", "", nil, 0)
+			continue
+		}
+
+		draftCount, err := s.recomputeRecipe(ctx, recipe)
+		if err != nil {
 			// 单 recipe 失败只 Warn + 跳过,继续下一个:不调用
 			// SyncRecipeMoments 意味着该 recipe 上一轮产出的旧时刻原样
 			// 保留,不会被清空(见本方法顶部注释——ML 闪断不能连累其它
@@ -134,6 +160,9 @@ func (s *MomentsService) RecomputeAll(ctx context.Context) error {
 			skipped++
 			pub(0.7*float64(i+1)/float64(len(recipes)), "running", "", nil, 0)
 			continue
+		}
+		if recipe.Kind == "pet_entities" && draftCount > 0 {
+			petEntitiesProduced = true
 		}
 		pub(0.7*float64(i+1)/float64(len(recipes)), "running", "", nil, 0)
 	}
@@ -182,8 +211,9 @@ func (s *MomentsService) RecomputeAll(ctx context.Context) error {
 }
 
 // recomputeRecipe 处理单个 recipe:引擎产出草稿 → 共用选优填精选/封面 →
-// 幂等落库。
-func (s *MomentsService) recomputeRecipe(ctx context.Context, recipe MomentRecipe) error {
+// 幂等落库。返回本轮产出的草稿数(RecomputeAll 用它判断 pet_entities 是否
+// 产出了 ≥1 个实体时刻,以决定 theme:pets 替换规则)。
+func (s *MomentsService) recomputeRecipe(ctx context.Context, recipe MomentRecipe) (int, error) {
 	var drafts []MomentDraft
 	var err error
 	switch recipe.Kind {
@@ -191,25 +221,27 @@ func (s *MomentsService) recomputeRecipe(ctx context.Context, recipe MomentRecip
 		drafts, err = BuildTripMoments(ctx, s.db, recipe)
 	case "theme":
 		drafts, err = BuildThemeMoments(ctx, s.db, s.searcher, recipe)
+	case "pet_entities":
+		drafts, err = BuildPetEntityMoments(ctx, s.db, s.searcher, s.profileStore, recipe)
 	default:
 		// 未知 kind:热更新的 recipe 数据可能引入未来才实现的算法,跳过而非
 		// 报错,不阻塞其它 recipe 的重算。
 		zap.L().Warn("moments: 未知 recipe kind,跳过", zap.String("key", recipe.Key), zap.String("kind", recipe.Kind))
-		return nil
+		return 0, nil
 	}
 	if err != nil {
-		return err
+		return 0, err
 	}
 
 	params, err := ParseParams(recipe)
 	if err != nil {
-		return err
+		return 0, err
 	}
 
 	for i := range drafts {
 		featured, cover, err := PickFeaturedAndCover(ctx, s.db, drafts[i].Assets, params.MaxFeatured, s.loadVec)
 		if err != nil {
-			return err
+			return 0, err
 		}
 		featuredSet := make(map[string]bool, len(featured))
 		for _, id := range featured {
@@ -221,7 +253,10 @@ func (s *MomentsService) recomputeRecipe(ctx context.Context, recipe MomentRecip
 		drafts[i].CoverAssetID = cover
 	}
 
-	return s.store.SyncRecipeMoments(recipe.Key, drafts)
+	if err := s.store.SyncRecipeMoments(recipe.Key, drafts); err != nil {
+		return 0, err
+	}
+	return len(drafts), nil
 }
 
 // tryNameMoment 是 LLM 命名的 best-effort 单点尝试:读精选 caption 失败、
