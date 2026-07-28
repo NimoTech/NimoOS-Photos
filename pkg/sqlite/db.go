@@ -354,7 +354,7 @@ func migrate(db *sql.DB) error {
 		`CREATE TABLE IF NOT EXISTS moment_edits (
 			moment_id  TEXT NOT NULL REFERENCES moments(id) ON DELETE CASCADE,
 			asset_id   TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
-			op         TEXT NOT NULL,             -- 'pin' | 'exclude'
+			op         TEXT NOT NULL CHECK(op IN ('pin','exclude')), -- 'pin' | 'exclude'
 			created_at INTEGER NOT NULL,           -- Unix ms
 			PRIMARY KEY (moment_id, asset_id)
 		)`,

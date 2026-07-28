@@ -588,6 +588,47 @@ func TestMomentStore_PinSurvivesRecompute(t *testing.T) {
 	require.True(t, ids["a2"].Manual, "回放插入的成员应标记 manual=1")
 }
 
+// ── 可编辑时刻:pin 不降级引擎已纳入成员(INSERT OR IGNORE 语义)──────────
+
+func TestMomentStore_PinDoesNotDowngradeExistingEngineMember(t *testing.T) {
+	db := makeTestDB(t)
+	store := NewMomentStore(db)
+	insertMomentAsset(t, db, "a1")
+
+	// a1 已被引擎本轮纳入为精选成员(featured=1, score>0)。
+	draft := MomentDraft{
+		Moment: Moment{ID: "m1", RecipeKey: "trip", Title: "Trip", AssetCount: 1},
+		Assets: []MomentAsset{{AssetID: "a1", Featured: true, Score: 0.9}},
+	}
+	require.NoError(t, store.SyncRecipeMoments("trip", []MomentDraft{draft}))
+
+	// 对同一 asset 调用 PinMomentAssets:INSERT OR IGNORE 不应把已有行降级
+	// 覆盖为 manual 插入的 featured=0/score=0。
+	count, err := store.PinMomentAssets("m1", []string{"a1"})
+	require.NoError(t, err)
+	require.Equal(t, 1, count)
+
+	members, err := store.GetMomentAssets("m1", false)
+	require.NoError(t, err)
+	require.Len(t, members, 1)
+	require.True(t, members[0].Featured, "pin 已是引擎成员的 asset 不应把 featured 降级为 0")
+	require.Equal(t, 0.9, members[0].Score, "pin 已是引擎成员的 asset 不应把 score 清零")
+
+	// moment_edits 应留下 pin 记录。
+	pins, excludes, err := store.MomentEditsFor("m1")
+	require.NoError(t, err)
+	require.Equal(t, []string{"a1"}, pins)
+	require.Empty(t, excludes)
+
+	// 下一轮重算(引擎依旧纳入 a1)回放后依然不应降级。
+	require.NoError(t, store.SyncRecipeMoments("trip", []MomentDraft{draft}))
+	members2, err := store.GetMomentAssets("m1", false)
+	require.NoError(t, err)
+	require.Len(t, members2, 1)
+	require.True(t, members2[0].Featured, "重算回放后仍不应降级 featured")
+	require.Equal(t, 0.9, members2[0].Score, "重算回放后仍不应降级 score")
+}
+
 // ── 可编辑时刻:exclude 幸存重算 ─────────────────────────────────────────
 
 func TestMomentStore_ExcludeSurvivesRecompute(t *testing.T) {
@@ -650,6 +691,52 @@ func TestMomentStore_PinOverridesExclude(t *testing.T) {
 		ids[m.AssetID] = true
 	}
 	require.True(t, ids["a2"])
+}
+
+// ── 可编辑时刻:主题类时刻时间窗免疫(TimeFrom/TimeTo 恒为 NULL)────────────
+
+func TestMomentStore_ThemeMomentTimeWindowImmuneToEditRecompute(t *testing.T) {
+	db := makeTestDB(t)
+	store := NewMomentStore(db)
+	insertMomentAssetAt(t, db, "a1", time.Date(2011, 5, 10, 0, 0, 0, 0, time.UTC))
+	insertMomentAssetAt(t, db, "a2", time.Date(2011, 6, 1, 0, 0, 0, 0, time.UTC))
+
+	// theme 类草稿:TimeFrom/TimeTo 保持零值(不设置),落库应为 NULL。
+	draft := MomentDraft{
+		Moment: Moment{ID: "m1", RecipeKey: "theme:pets", Title: "Pets", AssetCount: 1},
+		Assets: []MomentAsset{{AssetID: "a1", Featured: true, Score: 0.9}},
+	}
+	require.NoError(t, store.SyncRecipeMoments("theme:pets", []MomentDraft{draft}))
+
+	moments, err := store.ListMoments()
+	require.NoError(t, err)
+	require.Len(t, moments, 1)
+	require.True(t, moments[0].TimeFrom.IsZero(), "theme 时刻初始时间窗应为零值(NULL)")
+	require.True(t, moments[0].TimeTo.IsZero())
+
+	// Pin 一个带 taken_at 的资产——若时间窗被误刷,会被撑成非零值。
+	_, err = store.PinMomentAssets("m1", []string{"a2"})
+	require.NoError(t, err)
+	moments, err = store.ListMoments()
+	require.NoError(t, err)
+	require.True(t, moments[0].TimeFrom.IsZero(), "pin 后 theme 时刻时间窗仍应保持 NULL")
+	require.True(t, moments[0].TimeTo.IsZero())
+
+	// Exclude 现有成员,同样应免疫。
+	_, err = store.ExcludeMomentAssets("m1", []string{"a1"})
+	require.NoError(t, err)
+	moments, err = store.ListMoments()
+	require.NoError(t, err)
+	require.True(t, moments[0].TimeFrom.IsZero(), "exclude 后 theme 时刻时间窗仍应保持 NULL")
+	require.True(t, moments[0].TimeTo.IsZero())
+
+	// 再触发一轮带 edits 回放的 SyncRecipeMoments(hasEdits=true 会进入
+	// refreshMomentDerived,须确认 hadTimeWindow 判定继续为 false)。
+	require.NoError(t, store.SyncRecipeMoments("theme:pets", []MomentDraft{draft}))
+	moments, err = store.ListMoments()
+	require.NoError(t, err)
+	require.True(t, moments[0].TimeFrom.IsZero(), "带 edits 回放的重算后 theme 时刻时间窗仍应保持 NULL")
+	require.True(t, moments[0].TimeTo.IsZero())
 }
 
 // ── 可编辑时刻:派生刷新(count + 时间窗 + 封面重挑)──────────────────────
