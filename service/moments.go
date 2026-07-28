@@ -31,12 +31,19 @@ const momentsFailBackoff = 30 * time.Minute
 // maxNamingCaptions 是喂给 LLM 命名 prompt 的精选照片 caption 上限。
 const maxNamingCaptions = 10
 
+// maxLLMTitleWords 是 LLM 命名结果落库前的词数守卫上限:prompt 要求"至多 4
+// 个单词",但本地弱模型不保证守约束;这里放宽到 6 词做一点弹性余量,超过则
+// 整条标题拒收(保留模板名),不做截断——半截的长句一样难看,不如干脆当
+// 模型没给出满意答案。
+const maxLLMTitleWords = 6
+
 // MomentsService 是 Smart Moments 的调度装配层。
 type MomentsService struct {
 	db           *sql.DB
 	store        *MomentStore
 	searcher     clipTextSearcher
 	loadVec      clipVecLoader
+	loadCover    coverImageLoader // 封面亮度闸缩略图 loader;nil 时 pickCover 直接回退 featured[0](见 SetLoadCover)。
 	namer        namer
 	profileStore *ProfileStore // Moments M2 画像层:pet_entities/family 引擎落 user_profile_entities。
 	reg          *TaskRegistry
@@ -65,6 +72,13 @@ func NewMomentsService(db *sql.DB, store *MomentStore, searcher clipTextSearcher
 
 // SetTaskRegistry injects a TaskRegistry so RecomputeAll can report progress.
 func (s *MomentsService) SetTaskRegistry(reg *TaskRegistry) { s.reg = reg }
+
+// SetLoadCover 注入封面亮度闸用的缩略图 loader(生产实现见
+// RealCoverImageLoader;调用点在 service.go NewService)。照 SetThumbDir/
+// SetTaskRegistry 同款可选注入范式:不调用则 loadCover 保持 nil,
+// PickFeaturedAndCover 会直接回退到 featured[0](等价于本改动前的行为),
+// 不影响未装配这道闸的既有测试。
+func (s *MomentsService) SetLoadCover(loadCover coverImageLoader) { s.loadCover = loadCover }
 
 // Store 暴露底层 MomentStore,供 route 层直接读写 moments/recipes(列表、
 // 成员、recipe 热更新)——这些是纯 repo 层操作,不需要经过调度层。
@@ -241,7 +255,7 @@ func (s *MomentsService) recomputeRecipe(ctx context.Context, recipe MomentRecip
 	}
 
 	for i := range drafts {
-		featured, cover, err := PickFeaturedAndCover(ctx, s.db, drafts[i].Assets, params.MaxFeatured, s.loadVec)
+		featured, cover, err := PickFeaturedAndCover(ctx, s.db, drafts[i].Assets, params.MaxFeatured, s.loadVec, s.loadCover)
 		if err != nil {
 			return 0, err
 		}
@@ -279,6 +293,15 @@ func (s *MomentsService) tryNameMoment(ctx context.Context, m Moment) {
 	}
 	title = cleanLLMTitle(title)
 	if title == "" {
+		return
+	}
+	// 词数守卫:prompt 要求"至多 4 个单词",但本地弱模型不保证守约束(真机
+	// 观测到 5 个 trip 被长句钉死,如 "May 28, 2011 - ...Overcast Sky")。
+	// 语义从"信模型守约"改成"合格才收,不合格当没说"——超过 6 词(留出一点
+	// 弹性余量而不是死磕 4)的标题直接拒收、保留原模板名,只留痕不落库。
+	if wc := len(strings.Fields(title)); wc > maxLLMTitleWords {
+		zap.L().Debug("moments: LLM 标题词数超限,拒收保留模板名",
+			zap.String("moment_id", m.ID), zap.String("rejected_title", title), zap.Int("word_count", wc))
 		return
 	}
 	if err := s.store.SetMomentTitle(m.ID, title); err != nil {

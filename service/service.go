@@ -148,6 +148,7 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 	aiClient := aiclient.New(filepath.Join(cfg.RuntimePath, "ai.url"))
 	momentsSvc := NewMomentsService(db, momentStore, search, RealClipVecLoader(db), aiClient)
 	momentsSvc.SetTaskRegistry(taskReg)
+	momentsSvc.SetLoadCover(RealCoverImageLoader(thumbDir))
 	// 启动即补跑一次,捡起服务重启前遗留的欠重算(新装 recipe、上次重启前的
 	// 半程重算等);之后跟随批次节奏(见下方 SetOnBatchDone 链尾)与每日
 	// 调度(main.go 里的 StartScheduler)。
