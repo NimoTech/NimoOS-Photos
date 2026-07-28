@@ -223,6 +223,8 @@ func (s *MomentsService) recomputeRecipe(ctx context.Context, recipe MomentRecip
 		drafts, err = BuildThemeMoments(ctx, s.db, s.searcher, recipe)
 	case "pet_entities":
 		drafts, err = BuildPetEntityMoments(ctx, s.db, s.searcher, s.profileStore, recipe)
+	case "family":
+		drafts, err = BuildFamilyMoments(ctx, s.db, s.profileStore, recipe)
 	default:
 		// 未知 kind:热更新的 recipe 数据可能引入未来才实现的算法,跳过而非
 		// 报错,不阻塞其它 recipe 的重算。
