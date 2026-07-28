@@ -52,12 +52,17 @@ func main() {
 		os.Exit(1)
 	}
 
+	// 暂存跟随 DataPath(见 common.StagingDir 注释);必须在任何使用方(路由
+	// 初始化、PruneStaging)之前完成重设。
+	common.StagingDir = filepath.Join(config.Cfg.DataPath, "tus-staging")
+
 	// Create required data directories
 	for _, dir := range []string{
 		config.Cfg.DataPath,
 		filepath.Join(config.Cfg.DataPath, "thumbs"),
 		filepath.Join(config.Cfg.DataPath, "live"),
 		filepath.Join(config.Cfg.DataPath, "ml-cache"),
+		common.StagingDir,
 	} {
 		if err := os.MkdirAll(dir, 0755); err != nil {
 			fmt.Fprintf(os.Stderr, "failed to create directory %s: %v\n", dir, err)
@@ -83,12 +88,15 @@ func main() {
 	// 未走新版内联预生成的历史视频。
 	go svc.Indexer().BackfillSprites(ctx)
 
-	// Prune orphaned TUS staging files at startup (one-shot) and then daily.
+	// Prune orphaned TUS staging files at startup (one-shot, 新旧两个目录都扫)
+	// and then daily (仅新目录,旧目录只在启动时兜底扫一轮).
 	go func() {
-		if n, err := service.PruneStaging(common.StagingDir, time.Duration(common.StagingMaxAge)*time.Hour); err != nil {
-			zap.L().Warn("PruneStaging failed", zap.Error(err))
-		} else if n > 0 {
-			zap.L().Info("PruneStaging removed orphans", zap.Int("count", n))
+		for _, dir := range []string{common.StagingDir, common.LegacyStagingDir} {
+			if n, err := service.PruneStaging(dir, time.Duration(common.StagingMaxAge)*time.Hour); err != nil {
+				zap.L().Warn("PruneStaging failed", zap.String("dir", dir), zap.Error(err))
+			} else if n > 0 {
+				zap.L().Info("PruneStaging removed orphans", zap.String("dir", dir), zap.Int("count", n))
+			}
 		}
 	}()
 	go func() {
