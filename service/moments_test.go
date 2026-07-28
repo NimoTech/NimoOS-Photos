@@ -259,6 +259,86 @@ func TestCleanLLMTitle_TruncatesOverlongOutput(t *testing.T) {
 	require.Equal(t, "Sunset Beach", cleanLLMTitle(`  "Sunset Beach"  `+"\nsome trailing explanation"))
 }
 
+// TestRecomputeAll_ThemeMomentsNeverGoThroughLLMNaming:真机验收发现 LLM
+// 会把 theme 策划好的标题(recipe.Title,如"Pet Moments")改差(如误改成
+// "Sunset on Highway"),故 theme 时刻必须永不进 LLM 命名循环;trip 时刻仍
+// 应正常尝试 LLM 命名。用同一个 fakeNamer 记录调用次数,断言最终只有 trip
+// 那一次调用,且 theme 标题原样是 recipe.Title、未被 fakeNamer 的固定值覆盖。
+func TestRecomputeAll_ThemeMomentsNeverGoThroughLLMNaming(t *testing.T) {
+	db := makeTestDB(t)
+	store := NewMomentStore(db)
+	require.NoError(t, store.UpsertRecipes([]MomentRecipe{
+		{Key: "trip", Kind: "trip", Title: "Trip", Enabled: true, ParamsJSON: `{"min_assets":2}`},
+		{Key: "theme:pets", Kind: "theme", Title: "Pet Moments", Enabled: true,
+			ParamsJSON: `{"min_assets":2,"clip_prompts":["a photo of a dog"],"caption_keywords":["dog"]}`},
+	}))
+
+	base := time.Date(2016, time.February, 1, 9, 0, 0, 0, time.UTC)
+	for i := 0; i < 2; i++ {
+		id := "d" + string(rune('0'+i))
+		takenAt := base.AddDate(0, 0, i)
+		_, err := db.Exec(`INSERT INTO assets(id, file_path, status, taken_at) VALUES(?,?,'indexed',?)`,
+			id, "/g/"+id+".jpg", takenAt.UTC().Format("2006-01-02 15:04:05"))
+		require.NoError(t, err)
+		_, err = db.Exec(`INSERT INTO asset_geo(asset_id, city, country) VALUES(?,?,?)`, id, "Tokyo", "JP")
+		require.NoError(t, err)
+	}
+
+	searcher := fakeThemeSearcher{hits: map[string][]AssetScore{
+		"a photo of a dog": {{AssetID: "theme-a", Score: 0.9}, {AssetID: "theme-b", Score: 0.8}},
+	}}
+	for i, id := range []string{"theme-a", "theme-b"} {
+		takenAt := base.AddDate(0, 0, 20+i)
+		_, err := db.Exec(`INSERT INTO assets(id, file_path, status, taken_at) VALUES(?,?,'indexed',?)`,
+			id, "/g/"+id+".jpg", takenAt.UTC().Format("2006-01-02 15:04:05"))
+		require.NoError(t, err)
+	}
+
+	namer := &fakeNamer{title: "Sunset On Highway"} // 模拟 LLM 会瞎改名的场景
+	svc := NewMomentsService(db, store, searcher, noVecLoader, namer)
+
+	require.NoError(t, svc.RecomputeAll(context.Background()))
+
+	require.Equal(t, 1, namer.calls, "只有 trip 时刻应触发 LLM 命名,theme 一次都不该调用")
+
+	moments, err := store.ListMoments()
+	require.NoError(t, err)
+	require.Len(t, moments, 2)
+
+	var trip, theme Moment
+	for _, m := range moments {
+		switch m.RecipeKey {
+		case "trip":
+			trip = m
+		case "theme:pets":
+			theme = m
+		}
+	}
+	require.True(t, trip.NamedByLLM, "trip 时刻应正常走 LLM 命名")
+	require.Equal(t, "Sunset On Highway", trip.Title)
+	require.False(t, theme.NamedByLLM, "theme 时刻永不应被标记为 LLM 命名")
+	require.Equal(t, "Pet Moments", theme.Title, "theme 标题必须保持 recipe.Title 策划好的名字,不被 LLM 篡改")
+}
+
+// TestBuildNamingPrompt_NoPhotoAppEchoAndHasHardenedConstraints:真机验收
+// 发现弱本地模型会把旧 prompt 里的 "photo app" 措辞回声进标题(如"Nighttime
+// Las Vegas Photo App."),故新 prompt 必须不含这个措辞,且显式列出
+// Title Case/English only/≤4 words/无标点引号/不要复述指令等加固约束,并
+// 带上 few-shot 示例。
+func TestBuildNamingPrompt_NoPhotoAppEchoAndHasHardenedConstraints(t *testing.T) {
+	m := Moment{Place: "Kyoto, JP", TimeFrom: time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)}
+	prompt := buildNamingPrompt(m, []string{"a photo of a temple"})
+
+	require.NotContains(t, prompt, "photo app", "prompt 不应再出现会被模型回声进标题的 'photo app' 措辞")
+	require.Contains(t, prompt, "Title Case")
+	require.Contains(t, prompt, "English only")
+	require.Contains(t, prompt, "at most 4 words")
+	require.Contains(t, prompt, "no punctuation or quotes")
+	require.Contains(t, prompt, "do not repeat or explain these instructions")
+	require.Contains(t, prompt, "Golden Gate Evenings", "应带 few-shot 示例")
+	require.Contains(t, prompt, "Alpine Ski Days", "应带第二条 few-shot 示例")
+}
+
 // TestRecomputeAll_OverlongLLMTitleIsTruncatedBeforeStore:端到端确认
 // RecomputeAll 落库前会截断超长 LLM 输出,而不是原样存进 moments.title。
 func TestRecomputeAll_OverlongLLMTitleIsTruncatedBeforeStore(t *testing.T) {

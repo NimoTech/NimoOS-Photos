@@ -176,9 +176,9 @@ func TestCompleteAIURLFileMissingIsError(t *testing.T) {
 	require.ErrorIs(t, err, ErrAIUnavailable)
 }
 
-// TestCompleteTimesOutWithin5Seconds:models 端点挂起不回应时,Complete 应在
-// completeTimeout(5s)左右超时返回,而不是无限等待。
-func TestCompleteTimesOutWithin5Seconds(t *testing.T) {
+// TestCompleteTimesOutWithin10Seconds:models 端点挂起不回应时,Complete 应在
+// completeTimeout(10s)左右超时返回,而不是无限等待。
+func TestCompleteTimesOutWithin10Seconds(t *testing.T) {
 	stubEmptyUsersDB(t)
 	block := make(chan struct{})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -194,8 +194,8 @@ func TestCompleteTimesOutWithin5Seconds(t *testing.T) {
 	_, err := c.Complete(context.Background(), "x")
 	elapsed := time.Since(start)
 	require.Error(t, err)
-	require.Less(t, elapsed, 7*time.Second, "5s 超时应生效,不应显著超出")
-	require.GreaterOrEqual(t, elapsed, 4*time.Second, "不应远早于 5s 超时就返回")
+	require.Less(t, elapsed, 12*time.Second, "10s 超时应生效,不应显著超出")
+	require.GreaterOrEqual(t, elapsed, 9*time.Second, "不应远早于 10s 超时就返回")
 }
 
 // TestResolveUserIDPrefersAdminThenAnyThenSystem:user.db 存在且有 admin 用户
