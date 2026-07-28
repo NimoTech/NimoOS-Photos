@@ -44,8 +44,13 @@ type personFreq struct {
 
 // MinePersonEntities 是 family 画像挖掘的纯函数入口:统计 persons 出现频次
 // (distinct asset,join 写法照 persons.go ListPersons——face_person join
-// face_detections 且 excluded=0、join persons 且 hidden=0、join assets 且
-// 非回收站/非离线/非 live photo 视频侧、要求 taken_at 非空),
+// face_detections 且 excluded=0、join persons 且 hidden=0),assets 侧判据
+// 逐字对齐 loadThemeCandidatePool(moments_theme.go)的候选池口径——
+// status='indexed'、非回收站(deleted_at IS NULL AND offline=0)、排除文档
+// (hasOcrExpr 取反)、排除 is_live_photo_video、要求 taken_at 非空——否则
+// 频次达标计数会虚高于成员侧实际可用的候选池(成员侧 buildTogetherDraft/
+// buildNamedPersonDraft 都要与候选池取交集,若挖掘口径更宽松,可能出现
+// "达标了但成员数怎么都凑不够 MinAssets"的口径落差)。
 // photo_count >= MinPersonPhotos 才达标;达标者按频次降序(并列按
 // person_id 字典序稳定,保证多轮挖掘结果确定、可复现)取前 TopPersons。
 // 未命名人物(persons.name 为空)同样参与挖掘、可以入选实体——"具名"的
@@ -63,8 +68,8 @@ func MinePersonEntities(ctx context.Context, db *sql.DB, recipe MomentRecipe) ([
 		FROM face_person fp
 		JOIN face_detections fd ON fd.id=fp.face_id AND fd.excluded=0
 		JOIN persons p ON p.id=fp.person_id AND p.hidden=0
-		JOIN assets a ON a.id=fd.asset_id AND a.deleted_at IS NULL AND a.offline=0 AND a.is_live_photo_video=0
-		WHERE a.taken_at IS NOT NULL
+		JOIN assets a ON a.id=fd.asset_id AND a.status='indexed' AND a.deleted_at IS NULL AND a.offline=0 AND a.is_live_photo_video=0
+		WHERE a.taken_at IS NOT NULL AND NOT (`+hasOcrExpr+`)
 		GROUP BY fp.person_id
 		HAVING cnt >= ?
 		ORDER BY cnt DESC, fp.person_id ASC`, params.MinPersonPhotos)
@@ -186,6 +191,12 @@ func buildTogetherDraft(ctx context.Context, db *sql.DB, entities []ProfileEntit
 	personIDs := make([]string, len(entities))
 	for i, e := range entities {
 		personIDs[i] = e.Key
+	}
+	if len(personIDs) == 0 {
+		// 防御:调用方 BuildFamilyMoments 在 entities 为空时已提前返回,这里
+		// 理论不可达;但 strings.Repeat(..., -1) 会 panic,加一行防御比依赖
+		// "调用方总是先检查"更稳妥。
+		return nil, nil
 	}
 	placeholders := strings.Repeat("?,", len(personIDs)-1) + "?"
 	args := make([]interface{}, 0, len(personIDs)+1)
