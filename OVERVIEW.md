@@ -100,7 +100,7 @@ ML 后端为独立 Docker Compose 栈（`deploy/ml/docker-compose.yml`），绑�
 | GET | `/tasks` | 当前任务列表（index/embedding/ocr） |
 | GET/PUT | `/config` | 相册配置（WatchDirs、功能开关等） |
 | GET | `/storage` | 存储统计 |
-| POST | `/cache/prune` | 清理孤儿缩略图 |
+| POST | `/cache/prune` | 清理孤儿缩略图 + face-thumbs 孤儿 + 过期上传暂存(与每日定时清理同一实现) |
 | POST | `/index/rebuild` | 重建向量索引 |
 | GET | `/about` | 版本/ML 状态信息 |
 | GET/POST/PUT/DELETE | `/smart-views[/:id]` | 语义自动相册 CRUD |
