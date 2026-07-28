@@ -7,6 +7,12 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"image"
+	"image/color"
+	"image/jpeg"
+	"math"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -25,6 +31,122 @@ func RealClipVecLoader(db *sql.DB) clipVecLoader {
 		v := readClipVector(db, assetID)
 		return v, v != nil
 	}
+}
+
+// coverImageLoader 按 asset_id 返回封面亮度闸要检查的缩略图;ok=false 表示读
+// 不到(缩略图缺失/解码失败)——pickCover 对这种候选跳过亮度闸、直接采用
+// (宁可放行一张没法验证的图,也不要因为读不到缩略图就让整个 recipe 没有
+// 封面)。
+type coverImageLoader func(assetID string) (image.Image, bool)
+
+// RealCoverImageLoader 是 coverImageLoader 的生产实现,读
+// <thumbDir>/<assetID>/small.jpg(与 pkg/thumb.Generate 落盘路径同款惯例)并
+// 解码为 image.Image。文件不存在/解码失败按 ok=false 处理。
+func RealCoverImageLoader(thumbDir string) coverImageLoader {
+	return func(assetID string) (image.Image, bool) {
+		f, err := os.Open(filepath.Join(thumbDir, assetID, "small.jpg"))
+		if err != nil {
+			return nil, false
+		}
+		defer f.Close()
+		img, err := jpeg.Decode(f)
+		if err != nil {
+			return nil, false
+		}
+		return img, true
+	}
+}
+
+// 封面亮度/对比硬闸阈值——探针美学头选出的封面偶发过暗/过曝/灰雾低对比
+// (真机截图实证),这是等 AVA 对齐头上线前的过渡补丁,阈值不进 recipe。
+// 换 AVA 头后,pickCover 及以下几个亮度闸相关函数可整段退役。
+const (
+	coverMinMeanLuma = 0.12 // 灰度均值低于此值判过暗
+	coverMaxMeanLuma = 0.92 // 灰度均值高于此值判过曝
+	coverMinStdDev   = 0.05 // 灰度标准差低于此值判灰雾/低对比
+)
+
+// passesCoverBrightnessGate 计算 img 的灰度均值/标准差(取值域 [0,1]),判断是
+// 否适合当封面:过暗、过曝、或灰雾低对比都不通过。
+func passesCoverBrightnessGate(img image.Image) bool {
+	mean, stddev := grayscaleMeanStdDev(img)
+	if mean < coverMinMeanLuma || mean > coverMaxMeanLuma {
+		return false
+	}
+	if stddev < coverMinStdDev {
+		return false
+	}
+	return true
+}
+
+// grayscaleMeanStdDev 遍历 img 全部像素转灰度,返回均值与标准差(都归一化到
+// [0,1])。缩略图是 small.jpg(250px 宽),像素量小,不需要额外降采样。
+func grayscaleMeanStdDev(img image.Image) (mean, stddev float64) {
+	bounds := img.Bounds()
+	var sum, sumSq, n float64
+	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+		for x := bounds.Min.X; x < bounds.Max.X; x++ {
+			g := color.GrayModel.Convert(img.At(x, y)).(color.Gray).Y
+			v := float64(g) / 255.0
+			sum += v
+			sumSq += v * v
+			n++
+		}
+	}
+	if n == 0 {
+		return 0, 0
+	}
+	mean = sum / n
+	variance := sumSq/n - mean*mean
+	if variance < 0 {
+		variance = 0 // 浮点误差兜底
+	}
+	return mean, math.Sqrt(variance)
+}
+
+// pickCover 从 featured(已按 aesthetic_score 排好、且已按 maxFeatured 截断的
+// 精选成员)中挑封面:按 MomentAsset.Score 降序、同分再按 aesthetic_score 降
+// 序重排候选顺序(score 对 theme/pet 时刻是 CLIP 主题相似分,让 Your Beagle
+// 的封面挑到"最像狗"的那张;trip 时刻 score 恒为 0,自然退化为纯美学序,即
+// 现状行为)。逐候选过亮度/对比闸,第一个通过者当封面;loadCover 读不到
+// (ok=false)的候选直接采用,不受闸约束;全部被拒(或没有可用 loader)则回退
+// 到 featured[0](aesthetic 序下的最高分),不因闸失败导致"没有封面"。
+func pickCover(featured []string, assets []MomentAsset, info map[string]pickAssetInfo, loadCover coverImageLoader) string {
+	if len(featured) == 0 {
+		return ""
+	}
+	if loadCover == nil {
+		return featured[0]
+	}
+
+	scoreByID := make(map[string]float64, len(assets))
+	for _, a := range assets {
+		scoreByID[a.AssetID] = a.Score
+	}
+
+	ordered := append([]string(nil), featured...)
+	sort.SliceStable(ordered, func(i, j int) bool {
+		si, sj := scoreByID[ordered[i]], scoreByID[ordered[j]]
+		if si != sj {
+			return si > sj
+		}
+		ai, aj := aestheticOf(info, ordered[i]), aestheticOf(info, ordered[j])
+		if ai != aj {
+			return ai > aj
+		}
+		return ordered[i] < ordered[j]
+	})
+
+	for _, id := range ordered {
+		img, ok := loadCover(id)
+		if !ok {
+			return id
+		}
+		if passesCoverBrightnessGate(img) {
+			return id
+		}
+	}
+	return featured[0]
 }
 
 // burstWindowSeconds 是连拍分簇的时间窗:相邻两张照片拍摄时间间隔 <=
@@ -47,12 +169,14 @@ type pickAssetInfo struct {
 // assets 分簇 → 簇内按 CLIP 向量两两余弦相似度 > 0.95 判连拍(同一连拍组只
 // 保留 aesthetic_score 最高者进精选候选池,其余仍是该时刻成员,只是不参与
 // 精选/不作为封面候选)→ 候选池按 aesthetic_score 降序取前 maxFeatured 张为
-// 精选,首张(分数最高)为封面。向量缺失的资产跳过去重步骤,直接进候选池。
+// 精选。封面则从精选候选中另按 MomentAsset.Score(CLIP 主题相似分,trip 时刻
+// 恒为 0)降序 + aesthetic_score 降序重排后,过 pickCover 的亮度/对比闸挑选
+// (过渡补丁,见 pickCover 注释)。向量缺失的资产跳过去重步骤,直接进候选池。
 //
 // 注意:aesthetic_score 是探针头模型的输出,只在同一批候选内做相对排序
 // (谁比谁"更值得展示"),不是绝对质量分——禁止拿它做跨批次/跨时刻的绝对
 // 阈值判断(比如"低于 0.4 就不能当封面"这种规则是错的)。
-func PickFeaturedAndCover(ctx context.Context, db *sql.DB, assets []MomentAsset, maxFeatured int, loadVec clipVecLoader) ([]string, string, error) {
+func PickFeaturedAndCover(ctx context.Context, db *sql.DB, assets []MomentAsset, maxFeatured int, loadVec clipVecLoader, loadCover coverImageLoader) ([]string, string, error) {
 	if len(assets) == 0 {
 		return nil, "", nil
 	}
@@ -99,11 +223,11 @@ func PickFeaturedAndCover(ctx context.Context, db *sql.DB, assets []MomentAsset,
 		return poolIDs[i] < poolIDs[j]
 	})
 
-	cover := poolIDs[0]
 	featured := poolIDs
 	if maxFeatured >= 0 && maxFeatured < len(featured) {
 		featured = featured[:maxFeatured]
 	}
+	cover := pickCover(featured, assets, info, loadCover)
 	return featured, cover, nil
 }
 

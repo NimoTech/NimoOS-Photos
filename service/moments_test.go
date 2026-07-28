@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 // noVecLoader 是 clipVecLoader 的测试替身:永远返回"无向量",PickFeaturedAndCover
@@ -446,9 +448,11 @@ func TestRecomputeAll_NoPetEntitiesFallsBackToConceptThemePets(t *testing.T) {
 	require.Equal(t, "Pet Moments", themeMoment.Title)
 }
 
-// TestRecomputeAll_OverlongLLMTitleIsTruncatedBeforeStore:端到端确认
-// RecomputeAll 落库前会截断超长 LLM 输出,而不是原样存进 moments.title。
-func TestRecomputeAll_OverlongLLMTitleIsTruncatedBeforeStore(t *testing.T) {
+// TestRecomputeAll_OverlongLLMTitleRejectedKeepsTemplate:端到端确认
+// RecomputeAll 面对远超词数守卫的长句 LLM 输出时,不会原样(或截断后)存进
+// moments.title——cleanLLMTitle 的 rune 截断仍在(见 maxLLMTitleRunes),但
+// 截断后词数依旧 > maxLLMTitleWords,词数守卫会整条拒收、保留模板打底标题。
+func TestRecomputeAll_OverlongLLMTitleRejectedKeepsTemplate(t *testing.T) {
 	db := makeTestDB(t)
 	store := NewMomentStore(db)
 	require.NoError(t, store.UpsertRecipes([]MomentRecipe{
@@ -476,4 +480,87 @@ func TestRecomputeAll_OverlongLLMTitleIsTruncatedBeforeStore(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, moments, 1)
 	require.LessOrEqual(t, len([]rune(moments[0].Title)), maxLLMTitleRunes)
+	require.False(t, moments[0].NamedByLLM, "超词数应被词数守卫拒收,不算 LLM 命名成功")
+	require.Equal(t, "Sapporo Trip", moments[0].Title, "拒收应保留模板打底标题")
+}
+
+// TestRecomputeAll_LLMTitleWordGuardRejectsOverSixWords:真机实证的核心场景——
+// 本地弱模型不守"至多 4 词"指令、吐出 7 词整句(如 "May 28 2011 Overcast Sky
+// Somewhere" 这类日期+天气拼接),词数守卫应整条拒收、保留模板打底标题、且
+// 不置 named_by_llm,同时留一条 Debug 日志供观测(被拒标题)。
+func TestRecomputeAll_LLMTitleWordGuardRejectsOverSixWords(t *testing.T) {
+	db := makeTestDB(t)
+	store := NewMomentStore(db)
+	require.NoError(t, store.UpsertRecipes([]MomentRecipe{
+		{Key: "trip", Kind: "trip", Title: "Trip", Enabled: true, ParamsJSON: `{"min_assets":2}`},
+	}))
+
+	base := time.Date(2015, time.May, 1, 9, 0, 0, 0, time.UTC)
+	for i := 0; i < 2; i++ {
+		id := "d" + string(rune('0'+i))
+		takenAt := base.AddDate(0, 0, i)
+		_, err := db.Exec(`INSERT INTO assets(id, file_path, status, taken_at) VALUES(?,?,'indexed',?)`,
+			id, "/g/"+id+".jpg", takenAt.UTC().Format("2006-01-02 15:04:05"))
+		require.NoError(t, err)
+		_, err = db.Exec(`INSERT INTO asset_geo(asset_id, city, country) VALUES(?,?,?)`, id, "Naha", "JP")
+		require.NoError(t, err)
+	}
+
+	rejected := "May 28 2011 Overcast Sky Somewhere Nearby" // 7 词,超过 6 词上限
+	namer := &fakeNamer{title: rejected}
+	svc := NewMomentsService(db, store, fakeThemeSearcher{}, noVecLoader, namer)
+
+	obsCore, logs := observer.New(zap.DebugLevel)
+	restore := zap.ReplaceGlobals(zap.New(obsCore))
+	defer restore()
+
+	require.NoError(t, svc.RecomputeAll(context.Background()))
+
+	moments, err := store.ListMoments()
+	require.NoError(t, err)
+	require.Len(t, moments, 1)
+	require.False(t, moments[0].NamedByLLM, "超 6 词应被拒收,不算 LLM 命名成功")
+	require.Equal(t, "Naha Trip", moments[0].Title, "拒收应保留模板打底标题不变")
+
+	found := false
+	for _, entry := range logs.All() {
+		if strings.Contains(entry.Message, "词数超限") {
+			found = true
+			break
+		}
+	}
+	require.True(t, found, "被拒标题应走 Debug 日志留痕")
+}
+
+// TestRecomputeAll_LLMTitleWordGuardAcceptsUpToSixWords:恰好 6 词的标题应正常
+// 收下、覆盖模板名、置 named_by_llm=1——守卫只拒收超过 6 词的,不误伤边界值。
+func TestRecomputeAll_LLMTitleWordGuardAcceptsUpToSixWords(t *testing.T) {
+	db := makeTestDB(t)
+	store := NewMomentStore(db)
+	require.NoError(t, store.UpsertRecipes([]MomentRecipe{
+		{Key: "trip", Kind: "trip", Title: "Trip", Enabled: true, ParamsJSON: `{"min_assets":2}`},
+	}))
+
+	base := time.Date(2015, time.June, 1, 9, 0, 0, 0, time.UTC)
+	for i := 0; i < 2; i++ {
+		id := "e" + string(rune('0'+i))
+		takenAt := base.AddDate(0, 0, i)
+		_, err := db.Exec(`INSERT INTO assets(id, file_path, status, taken_at) VALUES(?,?,'indexed',?)`,
+			id, "/g/"+id+".jpg", takenAt.UTC().Format("2006-01-02 15:04:05"))
+		require.NoError(t, err)
+		_, err = db.Exec(`INSERT INTO asset_geo(asset_id, city, country) VALUES(?,?,?)`, id, "Naha", "JP")
+		require.NoError(t, err)
+	}
+
+	accepted := "One Two Three Four Five Six" // 恰好 6 词
+	namer := &fakeNamer{title: accepted}
+	svc := NewMomentsService(db, store, fakeThemeSearcher{}, noVecLoader, namer)
+
+	require.NoError(t, svc.RecomputeAll(context.Background()))
+
+	moments, err := store.ListMoments()
+	require.NoError(t, err)
+	require.Len(t, moments, 1)
+	require.True(t, moments[0].NamedByLLM, "6 词应正常收下,置 named_by_llm=1")
+	require.Equal(t, accepted, moments[0].Title)
 }
