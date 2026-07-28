@@ -41,6 +41,19 @@ type RecipeParams struct {
 	GapDays         int      `json:"gap_days"`
 	TopK            int      `json:"top_k"`
 	MinScore        float64  `json:"min_score"`
+
+	// ── Moments M2 画像层新增字段(profile:pets / profile:family 专用)──────
+	// Lexicon 无默认回落(未指定就是空词表,凭空回落一份猜的词表比空更危险);
+	// 其余字段(含 MinAssets,family 的"合影集门槛"复用该既有字段)照旧
+	// "零值即未指定"回落默认值,见 ParseParams 注释。
+	Lexicon            []string `json:"lexicon"`              // profile:pets:物种/品种英文词表
+	MinPhotos          int      `json:"min_photos"`           // profile:pets:达标最少张数
+	MinMonths          int      `json:"min_months"`           // profile:pets:达标最少跨月数
+	ClipMinScore       float64  `json:"clip_min_score"`       // profile:pets:CLIP 检索最低分
+	ClipTopK           int      `json:"clip_top_k"`           // profile:pets:CLIP 检索 top-K
+	TopPersons         int      `json:"top_persons"`          // profile:family:具名人物时刻取前 K 高频人物
+	MinPersonPhotos    int      `json:"min_person_photos"`    // profile:family:人物达标最少张数
+	MinTogetherPersons int      `json:"min_together_persons"` // profile:family:合影集同框最少人数
 }
 
 // 默认值:recipe 未显式指定(或字段缺省为零值)时的兜底,详见简报。
@@ -50,6 +63,17 @@ const (
 	defaultGapDays     = 14
 	defaultTopK        = 200
 	defaultMinScore    = 0.2
+
+	// profile:pets 默认值(见设计 spec 第一节)。
+	defaultMinPhotos    = 8
+	defaultMinMonths    = 2
+	defaultClipMinScore = 0.45
+	defaultClipTopK     = 100
+
+	// profile:family 默认值(见设计 spec 第一节)。
+	defaultTopPersons         = 5
+	defaultMinPersonPhotos    = 30
+	defaultMinTogetherPersons = 2
 )
 
 // ParseParams 解析 recipe.ParamsJSON 为 RecipeParams,对缺省(零值)字段填充
@@ -78,6 +102,28 @@ func ParseParams(r MomentRecipe) (RecipeParams, error) {
 	if p.MinScore == 0 {
 		p.MinScore = defaultMinScore
 	}
+	if p.MinPhotos == 0 {
+		p.MinPhotos = defaultMinPhotos
+	}
+	if p.MinMonths == 0 {
+		p.MinMonths = defaultMinMonths
+	}
+	if p.ClipMinScore == 0 {
+		p.ClipMinScore = defaultClipMinScore
+	}
+	if p.ClipTopK == 0 {
+		p.ClipTopK = defaultClipTopK
+	}
+	if p.TopPersons == 0 {
+		p.TopPersons = defaultTopPersons
+	}
+	if p.MinPersonPhotos == 0 {
+		p.MinPersonPhotos = defaultMinPersonPhotos
+	}
+	if p.MinTogetherPersons == 0 {
+		p.MinTogetherPersons = defaultMinTogetherPersons
+	}
+	// Lexicon 故意不回落默认值:未指定就是空词表(见字段注释)。
 	return p, nil
 }
 
@@ -186,6 +232,75 @@ func defaultSeedRecipes() []seedRecipe {
 				CaptionKeywords: []string{"sunset", "dusk", "golden hour", "horizon"},
 			},
 		},
+		{
+			// profile:pets 是画像层挖掘配置(kind=pet_entities,与上面
+			// theme:pets 的"全库搜含宠物元素"概念版不同):对 lexicon 每词做
+			// caption 词边界匹配,统计张数+跨月数,达标(≥min_photos 且
+			// ≥min_months)才归纳成"用户自己的那只狗/猫"实体,详见设计
+			// spec 第一节。lexicon 覆盖常见狗/猫品种 + 鸟类 + 小宠,英文,
+			// 供词边界匹配;多词短语(如 "maine coon")按整短语边界匹配。
+			key: "profile:pets", kind: "pet_entities", title: "Pet Entities",
+			params: RecipeParams{
+				Lexicon:   petEntityLexicon(),
+				MinPhotos: defaultMinPhotos, MinMonths: defaultMinMonths,
+				ClipMinScore: defaultClipMinScore, ClipTopK: defaultClipTopK,
+			},
+		},
+		{
+			// profile:family 是画像层家人挖掘配置(kind=family):具名人物
+			// 出现频次达标 top-K 归纳为具名人物时刻,高频人物同框归纳为合影集,
+			// 详见设计 spec 第一节。
+			key: "profile:family", kind: "family", title: "Family Entities",
+			params: RecipeParams{
+				TopPersons: defaultTopPersons, MinPersonPhotos: defaultMinPersonPhotos,
+				MinTogetherPersons: defaultMinTogetherPersons, MinAssets: defaultMinAssets,
+			},
+		},
+	}
+}
+
+// petEntityLexicon 是 profile:pets 挖掘用的物种/品种英文词表:覆盖常见狗/猫
+// 品种 + 鸟类 + 小型宠物,约 60-100 词,供 caption 词边界匹配。刻意不含过于
+// 宽泛的词(如单独的 "dog"/"cat"——那是 theme:pets 概念版的职责,画像层要的
+// 是能收敛到"用户特定那只"的具体品种/物种词,复现性信号才有区分力)。
+//
+// 审查后修复(高频误匹配词,美国市场场景):
+//   - 删除 newfoundland(纽芬兰,地名同形)、finch(常见姓氏,如 Atticus Finch)、
+//     canary(加纳利群岛,Canary Islands 同形)、goldfish(Goldfish 品牌饼干同名,
+//     且真金鱼 caption 通常连写 "goldfish in a bowl" 一类短语,裸词误召回风险
+//     大于收益)。
+//   - 单词有歧义的品种消歧为短语:akita→"akita dog"、boxer→"boxer dog"、
+//     greyhound→"greyhound dog"(避免与拳击手 boxer / 田径 greyhound 巴士等
+//     混淆);裸 "shepherd" 换成具体品种 "german shepherd"/"australian shepherd"
+//     (裸词本身就不够具体,不如直接两个高频具体品种)。
+//   - 猫的花纹词(tabby/calico/tuxedo/ginger 等)本身极常见于口语但单独一词
+//     歧义大(如 "tuxedo" 可指礼服),但 VLM 生成的 caption 描述猫时几乎只说
+//     花纹+"cat"(如 "a tabby cat"),极少报具体品种——若删掉这类词,大部分
+//     用户的猫根本挖不出来实体。因此这里的取舍是:花纹词全部保留,但一律
+//     锚成 "<花纹> cat" 双词短语(而非裸花纹词),把"猫品种词有限"的专属性
+//     风险交给挖掘门槛(min_photos/min_months 的复现性判据)兜底,而不是在
+//     词表层面因噎废食。
+func petEntityLexicon() []string {
+	return []string{
+		// ── Dogs(品种,不含泛化的 "dog"/"puppy";歧义词见上方注释消歧)──
+		"beagle", "labrador", "corgi", "husky", "poodle", "terrier", "retriever",
+		"bulldog", "dachshund", "chihuahua", "pug", "german shepherd",
+		"australian shepherd", "collie", "spaniel", "dalmatian", "boxer dog",
+		"rottweiler", "doberman", "schnauzer", "mastiff", "greyhound dog",
+		"whippet", "pomeranian", "shih tzu", "maltese", "chow chow", "akita dog",
+		"samoyed", "malamute", "bernese mountain dog", "labradoodle",
+		"goldendoodle", "basset hound", "bloodhound",
+		// ── Cats(品种 + 花纹词,花纹词均锚成 "<花纹> cat" 短语,见上方注释)──
+		"tabby cat", "siamese", "persian cat", "maine coon", "ragdoll", "sphynx",
+		"bengal cat", "calico cat", "tuxedo cat", "ginger cat", "orange cat",
+		"tortoiseshell cat", "british shorthair", "scottish fold", "abyssinian",
+		"burmese cat", "russian blue", "himalayan cat",
+		// ── Birds(canary/finch 因地名/姓氏同形误召回已删,见上方注释)──────
+		"parrot", "parakeet", "cockatiel", "budgie", "macaw", "cockatoo",
+		"lovebird",
+		// ── Small pets(goldfish 因品牌同名已删,见上方注释)───────────────
+		"hamster", "rabbit", "bunny", "guinea pig", "turtle", "tortoise",
+		"gecko", "ferret", "chinchilla", "hedgehog", "iguana",
 	}
 }
 

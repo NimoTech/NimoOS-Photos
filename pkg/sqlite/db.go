@@ -360,6 +360,23 @@ func migrate(db *sql.DB) error {
 		`CREATE INDEX IF NOT EXISTS idx_upload_owner   ON o_upload_tasks(owner_user_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_upload_status  ON o_upload_tasks(status)`,
 		`CREATE INDEX IF NOT EXISTS idx_upload_expires ON o_upload_tasks(expires_at)`,
+
+		// ── Moments M2:用户画像实体(自己的宠物/家人,与全库概念版时刻区分)──
+		// 挖掘产出按 kind 全量替换(delete kind 全部 + insert,幂等),见
+		// ProfileStore.ReplaceEntities。evidence 是挖掘依据的 JSON 快照
+		// (photo_count/months/first/last 等),供排障与后续升级(如画像确认
+		// 交互)读取,不参与查询过滤。
+		`CREATE TABLE IF NOT EXISTS user_profile_entities (
+			id          TEXT PRIMARY KEY,            -- hash(kind|key) 前 16 hex,稳定
+			kind        TEXT NOT NULL,               -- 'pet' | 'person'(预留 place/activity)
+			key         TEXT NOT NULL,               -- pet: 物种词 'beagle';person: person_id
+			label       TEXT NOT NULL DEFAULT '',    -- 展示名:'Beagle' / person.name
+			evidence    TEXT NOT NULL DEFAULT '{}',  -- JSON:photo_count/months/first/last 等
+			photo_count INTEGER NOT NULL DEFAULT 0,
+			first_seen  DATETIME, last_seen DATETIME,
+			updated_at  INTEGER NOT NULL DEFAULT 0   -- Unix ms
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_profile_entities_kind ON user_profile_entities(kind)`,
 	}
 
 	for _, stmt := range statements {
