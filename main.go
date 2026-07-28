@@ -62,12 +62,19 @@ func main() {
 		filepath.Join(config.Cfg.DataPath, "thumbs"),
 		filepath.Join(config.Cfg.DataPath, "live"),
 		filepath.Join(config.Cfg.DataPath, "ml-cache"),
-		common.StagingDir,
 	} {
 		if err := os.MkdirAll(dir, 0755); err != nil {
 			fmt.Fprintf(os.Stderr, "failed to create directory %s: %v\n", dir, err)
 			os.Exit(1)
 		}
+	}
+
+	// 暂存目录含未完成上传的原始文件,权限收紧为 0700(与 route/v1/tus.go 的
+	// 防御性建目录一致;MkdirAll 不会修改已存在目录的权限,故必须在这里就以
+	// 0700 创建,不能进上面的 0755 共享列表)。
+	if err := os.MkdirAll(common.StagingDir, 0700); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to create staging directory %s: %v\n", common.StagingDir, err)
+		os.Exit(1)
 	}
 
 	logger.LogInit(config.Cfg.LogPath, "nimoos-photos", "log")
@@ -88,8 +95,8 @@ func main() {
 	// 未走新版内联预生成的历史视频。
 	go svc.Indexer().BackfillSprites(ctx)
 
-	// Prune orphaned TUS staging files at startup (one-shot, 新旧两个目录都扫)
-	// and then daily (仅新目录,旧目录只在启动时兜底扫一轮).
+	// 启动时一次性清理孤儿 TUS 暂存文件(新旧两个目录都扫,旧目录只在启动时
+	// 兜底扫一轮);此后每日清理由下方 ticker 负责(仅扫新目录)。
 	go func() {
 		for _, dir := range []string{common.StagingDir, common.LegacyStagingDir} {
 			if n, err := service.PruneStaging(dir, time.Duration(common.StagingMaxAge)*time.Hour); err != nil {
