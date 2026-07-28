@@ -142,6 +142,9 @@ type Moment struct {
 	NamedByLLM   bool
 	CreatedAt    int64 // Unix ms
 	UpdatedAt    int64 // Unix ms
+	// SortOrder 对应 sort_order 列:nil=未手排(NULL 语义保真,与"手排到 0"
+	// 区分);非 nil 时是 ReorderMoments 写入的 (i+1)*10 序号。
+	SortOrder *int
 }
 
 // MomentAsset 对应 moment_assets 表一行。
@@ -496,12 +499,16 @@ func nullableStr(s string) interface{} {
 	return s
 }
 
-// ListMoments 列出全部时刻,按 updated_at 倒序(最近重算/命名过的排前面)。
+// ListMoments 列出全部时刻。排序语义(见设计 spec 第一节):手排序
+// (sort_order 非 NULL)的排在最前面,按 sort_order 升序(用户拖拽给定的
+// 顺序);未手排(sort_order NULL)的排在手排序之后,按 updated_at 倒序
+// (最近重算/命名过的排前面)。全库都未手排时 = 现状不变。
 func (s *MomentStore) ListMoments() ([]Moment, error) {
 	rows, err := s.db.Query(`
 		SELECT id, recipe_key, title, subtitle, cover_asset_id, time_from, time_to,
-		       place, asset_count, named_by_llm, created_at, updated_at
-		FROM moments ORDER BY updated_at DESC`)
+		       place, asset_count, named_by_llm, created_at, updated_at, sort_order
+		FROM moments
+		ORDER BY (sort_order IS NULL) ASC, sort_order ASC, updated_at DESC`)
 	if err != nil {
 		return nil, fmt.Errorf("moments: list: %w", err)
 	}
@@ -524,14 +531,15 @@ type momentScanner interface {
 }
 
 // scanMoment 按 ListMoments 的列顺序扫描一行 moments,处理 cover_asset_id/
-// time_from/time_to 可能为 NULL 的情况。
+// time_from/time_to/sort_order 可能为 NULL 的情况。
 func scanMoment(row momentScanner) (Moment, error) {
 	var m Moment
 	var cover sql.NullString
 	var from, to sql.NullString
 	var namedByLLM int
+	var sortOrder sql.NullInt64
 	if err := row.Scan(&m.ID, &m.RecipeKey, &m.Title, &m.Subtitle, &cover, &from, &to,
-		&m.Place, &m.AssetCount, &namedByLLM, &m.CreatedAt, &m.UpdatedAt); err != nil {
+		&m.Place, &m.AssetCount, &namedByLLM, &m.CreatedAt, &m.UpdatedAt, &sortOrder); err != nil {
 		return Moment{}, fmt.Errorf("moments: scan moment: %w", err)
 	}
 	if cover.Valid {
@@ -544,6 +552,10 @@ func scanMoment(row momentScanner) (Moment, error) {
 		m.TimeTo = *t
 	}
 	m.NamedByLLM = namedByLLM != 0
+	if sortOrder.Valid {
+		v := int(sortOrder.Int64)
+		m.SortOrder = &v
+	}
 	return m, nil
 }
 
@@ -582,6 +594,29 @@ func (s *MomentStore) SetMomentTitle(id, title string) error {
 		title, nowMs(), id)
 	if err != nil {
 		return fmt.Errorf("moments: set title %q: %w", id, err)
+	}
+	return nil
+}
+
+// ReorderMoments 是拖拽排序的落库入口:事务内按 ids 的顺序依次把
+// sort_order 赋为 (i+1)*10(留间隙,便于未来"插入到两者之间"而不必整体重排)。
+// ids 里不存在的 moment id(如前端列表略旧、时刻已被重算删除)UPDATE 影响
+// 0 行,忽略不报错——不因单个失效 id 让整批操作失败。空 ids 由调用方
+// (handler)提前拦截为 400,这里不做该校验。
+func (s *MomentStore) ReorderMoments(ids []string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("moments: reorder begin: %w", err)
+	}
+	for i, id := range ids {
+		sortOrder := (i + 1) * 10
+		if _, err := tx.Exec(`UPDATE moments SET sort_order=? WHERE id=?`, sortOrder, id); err != nil {
+			tx.Rollback()
+			return fmt.Errorf("moments: reorder update %q: %w", id, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("moments: reorder commit: %w", err)
 	}
 	return nil
 }

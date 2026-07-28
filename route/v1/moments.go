@@ -41,6 +41,8 @@ type momentResponse struct {
 	Place        string  `json:"place,omitempty"`
 	RecipeKey    string  `json:"recipe_key"`
 	NamedByLLM   bool    `json:"named_by_llm"`
+	// SortOrder 是拖拽手排序的序号(nil=未手排),供前端调试用,不强依赖。
+	SortOrder *int `json:"sort_order,omitempty"`
 }
 
 // toMomentResponse 转换 service.Moment → momentResponse。TimeFrom/TimeTo 为零值
@@ -56,6 +58,7 @@ func toMomentResponse(m service.Moment) momentResponse {
 		Place:        m.Place,
 		RecipeKey:    m.RecipeKey,
 		NamedByLLM:   m.NamedByLLM,
+		SortOrder:    m.SortOrder,
 	}
 	if !m.TimeFrom.IsZero() {
 		s := m.TimeFrom.UTC().Format("2006-01-02T15:04:05Z07:00")
@@ -261,6 +264,27 @@ func (h *MomentsHandler) UpdateRecipes(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
 	}
 	return c.JSON(http.StatusOK, map[string]any{"updated": len(recipes)})
+}
+
+// ReorderMoments 是拖拽排序的落库入口:body 里的 ids 顺序即用户拖拽后的
+// 展示顺序,事务内按序赋 sort_order(见 MomentStore.ReorderMoments)。空
+// ids 视为无效请求(拖拽必然携带至少一个 id)→ 400;body 里未知的 id
+// (前端列表可能略旧)在 store 层被忽略,不影响本次请求成功。
+//
+// PUT /v1/photos/moments/order
+//
+//	{ "ids": ["id1", "id2", ...] }
+func (h *MomentsHandler) ReorderMoments(c echo.Context) error {
+	var req struct {
+		IDs []string `json:"ids"`
+	}
+	if err := c.Bind(&req); err != nil || len(req.IDs) == 0 {
+		return echo.NewHTTPError(http.StatusBadRequest, "ids is required")
+	}
+	if err := h.svc.Moments().Store().ReorderMoments(req.IDs); err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	}
+	return c.JSON(http.StatusOK, map[string]any{"ok": true})
 }
 
 // mapMomentErr maps moment-lookup errors to HTTP responses.
