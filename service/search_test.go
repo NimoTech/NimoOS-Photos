@@ -1,6 +1,7 @@
 package service_test
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"math"
@@ -46,6 +47,43 @@ func TestSmartSearch(t *testing.T) {
 	db.Exec(`INSERT INTO clip_embeddings(rowid, embedding) VALUES(?,?)`, rowid, sqlite.SerializeFloat32(vec))
 
 	svc := service.NewSearchService(db, &mockTextML{})
+	results, err := svc.SmartSearch("beach", 10, 0, service.SearchFilters{})
+	require.NoError(t, err)
+	require.NotEmpty(t, results)
+	require.Equal(t, "a1", results[0].ID)
+}
+
+// TestSearchAssetsByText 验证 Smart Moments theme 引擎复用的抽取方法
+// (search.go 的 SearchAssetsByText,从 SmartSearch 的文本编码 + vec KNN 通路
+// 拆出):返回按距离排序的 AssetScore,排除 live photo 视频侧/回收站/离线
+// 资产,且不受 IncludeOCR/MinMatchSimilarity 等 SmartSearch 专属策略影响。
+func TestSearchAssetsByText(t *testing.T) {
+	db, err := sqlite.Open(filepath.Join(t.TempDir(), "s2.db"))
+	require.NoError(t, err)
+	defer db.Close()
+
+	db.Exec(`INSERT INTO assets(id, file_path, status, is_live_photo_video) VALUES('a1','/p/a1.jpg','indexed',0)`)
+	db.Exec(`INSERT INTO asset_clip_idx(asset_id) VALUES('a1')`)
+	var rowid int64
+	db.QueryRow(`SELECT rowid FROM asset_clip_idx WHERE asset_id='a1'`).Scan(&rowid)
+	vec := make([]float32, common.CLIPDim)
+	vec[0] = 1.0
+	db.Exec(`INSERT INTO clip_embeddings(rowid, embedding) VALUES(?,?)`, rowid, sqlite.SerializeFloat32(vec))
+
+	// live photo 视频侧不应出现在结果里。
+	db.Exec(`INSERT INTO assets(id, file_path, status, is_live_photo_video) VALUES('a2','/p/a2.jpg','indexed',1)`)
+	db.Exec(`INSERT INTO asset_clip_idx(asset_id) VALUES('a2')`)
+	db.QueryRow(`SELECT rowid FROM asset_clip_idx WHERE asset_id='a2'`).Scan(&rowid)
+	db.Exec(`INSERT INTO clip_embeddings(rowid, embedding) VALUES(?,?)`, rowid, sqlite.SerializeFloat32(vec))
+
+	svc := service.NewSearchService(db, &mockTextML{})
+	hits, err := svc.SearchAssetsByText(context.Background(), "beach", 10)
+	require.NoError(t, err)
+	require.Len(t, hits, 1)
+	require.Equal(t, "a1", hits[0].AssetID)
+	require.Greater(t, hits[0].Score, 0.0)
+
+	// 现有 SmartSearch 行为不受影响。
 	results, err := svc.SmartSearch("beach", 10, 0, service.SearchFilters{})
 	require.NoError(t, err)
 	require.NotEmpty(t, results)

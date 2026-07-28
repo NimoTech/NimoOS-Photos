@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -267,6 +268,36 @@ func (s *SearchService) SmartSearch(query string, limit int, offset int, filters
 	}
 	enrichPlaceNames(s.db, page)
 	return page, nil
+}
+
+// SearchAssetsByText 是给 Smart Moments theme 引擎(service/moments_theme.go)
+// 复用的最小通路:纯"文本编码 + CLIP 向量 KNN",抽取自 SmartSearch 上半段
+// (本文件 174-184 行的 CLIPTextEmbed + 序列化,以及下面的 knnSemanticFetch)。
+// 刻意不套 SmartSearch 其余的 OCR 合并/自适应截断/全局 MinMatchSimilarity 门
+// 槛——那些是给交互式搜索结果展示用的策略,theme 引擎按 recipe 自己的
+// MinScore 门槛过滤,语义不同,不应该混在一起。只做结构性过滤(is_live_
+// photo_video/deleted_at/offline,knnSemanticFetch 内置的 raw 序列)+ 按距离
+// 序返回 topK 条,不受 SmartSearch 自身任何测试影响(未改动 SmartSearch/
+// knnSemanticFetch 一行代码)。
+func (s *SearchService) SearchAssetsByText(ctx context.Context, prompt string, topK int) ([]AssetScore, error) {
+	queryVec, err := s.ml.CLIPTextEmbed(prompt)
+	if err != nil {
+		return nil, fmt.Errorf("SearchAssetsByText embed: %w", err)
+	}
+	blob := sqlite.SerializeFloat32(queryVec)
+
+	raw, _, err := s.knnSemanticFetch(blob, topK, SearchFilters{})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]AssetScore, 0, len(raw))
+	for _, a := range raw {
+		if a.MatchScore == nil {
+			continue
+		}
+		out = append(out, AssetScore{AssetID: a.ID, Score: *a.MatchScore})
+	}
+	return out, nil
 }
 
 // knnSemanticFetch runs the base KNN query for k neighbours plus the shared

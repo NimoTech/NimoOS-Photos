@@ -11,6 +11,7 @@ import (
 
 	"github.com/NimoTech/NimoOS-Photos/common"
 	"github.com/NimoTech/NimoOS-Photos/pkg/aesthetic"
+	"github.com/NimoTech/NimoOS-Photos/pkg/aiclient"
 	"github.com/NimoTech/NimoOS-Photos/pkg/config"
 	"github.com/NimoTech/NimoOS-Photos/pkg/geo"
 	"github.com/NimoTech/NimoOS-Photos/pkg/mlclient"
@@ -28,6 +29,7 @@ type Services interface {
 	Albums() *AlbumService
 	Search() *SearchService
 	Faces() *FaceService
+	Moments() *MomentsService
 	Tasks() *TaskRegistry
 	Embedder() *Embedder
 	Favorites() *FavoritesService
@@ -52,6 +54,7 @@ type services struct {
 	albums           *AlbumService
 	search           *SearchService
 	faces            *FaceService
+	moments          *MomentsService
 	tasks            *TaskRegistry
 	embedder         *Embedder
 	favorites        *FavoritesService
@@ -75,6 +78,7 @@ func (s *services) Watcher() *Watcher             { return s.watcher }
 func (s *services) Albums() *AlbumService         { return s.albums }
 func (s *services) Search() *SearchService        { return s.search }
 func (s *services) Faces() *FaceService           { return s.faces }
+func (s *services) Moments() *MomentsService      { return s.moments }
 func (s *services) Tasks() *TaskRegistry          { return s.tasks }
 func (s *services) Embedder() *Embedder           { return s.embedder }
 func (s *services) Favorites() *FavoritesService  { return s.favorites }
@@ -130,6 +134,27 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 	search := NewSearchService(db, ml)
 	smartViews := NewSmartViewService(db, search)
 	persons := NewPersonService(db)
+
+	// Smart Moments:trip/theme 引擎调度装配 + LLM 命名(Task 4)。recipe 热更新
+	// 走 PUT /v1/photos/moments/recipes(Task 5,尚未接路由),这里先播种内置
+	// recipe、装配调度层。aiClient 走 NimoOS-AI 的 `_internal` 直连(localhost-
+	// only、免 JWT),AI 服务未部署时 aiURLFile 读不到,LLM 命名全链路静默跳过
+	// (best-effort,不影响模板打底的标题)。
+	momentStore := NewMomentStore(db)
+	if err := momentStore.SeedDefaultRecipes(); err != nil {
+		zap.L().Warn("moments: 内置 recipe 播种失败", zap.Error(err))
+	}
+	aiClient := aiclient.New(filepath.Join(cfg.RuntimePath, "ai.url"))
+	momentsSvc := NewMomentsService(db, momentStore, search, RealClipVecLoader(db), aiClient)
+	momentsSvc.SetTaskRegistry(taskReg)
+	// 启动即补跑一次,捡起服务重启前遗留的欠重算(新装 recipe、上次重启前的
+	// 半程重算等);之后跟随批次节奏(见下方 SetOnBatchDone 链尾)与每日
+	// 调度(main.go 里的 StartScheduler)。
+	go func() {
+		if err := momentsSvc.RecomputeAll(parentCtx); err != nil {
+			zap.L().Warn("moments: 启动重算失败", zap.Error(err))
+		}
+	}()
 	gaz, gerr := geo.Load()
 	if gerr != nil {
 		panic("nimoos-photos: failed to load gazetteer: " + gerr.Error())
@@ -276,6 +301,14 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 		go func() {
 			idx.BackfillSprites(parentCtx)
 		}()
+		// Smart Moments 链尾:批次末尾重算时刻(trip 时间窗切段 + theme CLIP/
+		// caption 命中会随新资产变化),CAS 防与启动补跑/每日调度并发重入;
+		// LLM 命名是 best-effort,失败只 Warn,不影响其它链尾步骤。
+		go func() {
+			if err := momentsSvc.RecomputeAll(parentCtx); err != nil {
+				zap.L().Warn("post-batch moments recompute failed", zap.Error(err))
+			}
+		}()
 	})
 
 	// 5. Kick off the initial directory scan in the background so startup is
@@ -367,6 +400,7 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 		albums:     albums,
 		search:     search,
 		faces:      faces,
+		moments:    momentsSvc,
 		tasks:      taskReg,
 		embedder:   embedder,
 		favorites:  favorites,

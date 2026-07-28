@@ -310,6 +310,39 @@ func migrate(db *sql.DB) error {
 			PRIMARY KEY (key, gen)
 		)`,
 
+		// ── Smart Moments:时刻类型定义(数据驱动,热更新推送的载体)──────────
+		`CREATE TABLE IF NOT EXISTS moment_recipes (
+			key         TEXT PRIMARY KEY,          -- 'trip' / 'theme:pets' / 'theme:food' ...
+			kind        TEXT NOT NULL,             -- 'trip' | 'theme'(引擎按 kind 分派算法)
+			title       TEXT NOT NULL,             -- 英文显示名模板,如 'Pet Moments'
+			params      TEXT NOT NULL DEFAULT '{}',-- JSON:clip_prompts[]/caption_keywords[]/min_assets/max_featured/gap_days...
+			enabled     INTEGER NOT NULL DEFAULT 1,
+			updated_at  INTEGER NOT NULL DEFAULT 0 -- Unix ms
+		)`,
+
+		// ── Smart Moments:时刻集(活实体,稳定 id,幂等重算合并)─────────────
+		`CREATE TABLE IF NOT EXISTS moments (
+			id           TEXT PRIMARY KEY,         -- 稳定派生 id(见 TripMomentID/ThemeMomentID)
+			recipe_key   TEXT NOT NULL,
+			title        TEXT NOT NULL,            -- 最终展示名(模板打底,LLM 润色后覆盖)
+			subtitle     TEXT NOT NULL DEFAULT '', -- 如 'May 2011 · Yosemite'
+			cover_asset_id TEXT,
+			time_from    DATETIME, time_to DATETIME,
+			place        TEXT NOT NULL DEFAULT '', -- 旅行类:主城市/国家
+			asset_count  INTEGER NOT NULL DEFAULT 0,
+			named_by_llm INTEGER NOT NULL DEFAULT 0,
+			created_at   INTEGER NOT NULL, updated_at INTEGER NOT NULL  -- Unix ms
+		)`,
+
+		// ── Smart Moments:时刻成员(全量替换式重算,随 moments 级联删除)────
+		`CREATE TABLE IF NOT EXISTS moment_assets (
+			moment_id  TEXT NOT NULL REFERENCES moments(id) ON DELETE CASCADE,
+			asset_id   TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+			featured   INTEGER NOT NULL DEFAULT 0, -- top N 精选标记
+			score      REAL NOT NULL DEFAULT 0,    -- 批内排序分(美学+匹配度混合,仅相对意义)
+			PRIMARY KEY (moment_id, asset_id)
+		)`,
+
 		// ── 可恢复上传任务表（与 Common upload.UploadTask gorm column 对应）────
 		`CREATE TABLE IF NOT EXISTS o_upload_tasks (
 			id TEXT PRIMARY KEY,
