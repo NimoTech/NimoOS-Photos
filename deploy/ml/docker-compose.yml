@@ -14,7 +14,7 @@ services:
       - "127.0.0.1:3003:3003"
     volumes:
       - type: bind
-        source: /DATA/.system_data/photos/ml-cache
+        source: ${NIMOOS_PHOTOS_ML_CACHE:-/DATA/.system_data/photos/ml-cache}
         target: /cache
         bind:
           create_host_path: true
