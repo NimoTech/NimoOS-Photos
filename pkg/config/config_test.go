@@ -91,6 +91,18 @@ func TestSearchCutAlphaOverride(t *testing.T) {
 	require.Equal(t, 0.55, Cfg.SearchCutAlpha)
 }
 
+// PreviewPregen 缺省应为 false（纯懒生成：只在用户悬浮时由路由端现场生成）。
+func TestPreviewPregenDefaultOff(t *testing.T) {
+	cfg := loadConfigFromINI(t, "[photos]\nDataPath=/tmp/x\n")
+	require.False(t, cfg.PreviewPregen, "PreviewPregen 缺省应为 false（纯懒生成）")
+}
+
+// 配置文件显式打开时应生效。
+func TestPreviewPregenExplicitOn(t *testing.T) {
+	cfg := loadConfigFromINI(t, "[photos]\nDataPath=/tmp/x\nPreviewPregen = true\n")
+	require.True(t, cfg.PreviewPregen, "PreviewPregen=true 应生效")
+}
+
 func TestScanIntervalDefaultAndSave(t *testing.T) {
 	dir := t.TempDir()
 	cf := filepath.Join(dir, "photos.conf")

@@ -31,6 +31,12 @@ type Config struct {
 	// 已有分数保留并继续参与封面排序,新资产分数为 NULL 走各处兜底排序。
 	AestheticEnabled bool
 
+	// PreviewPregen 控制视频低码率悬浮预览(preview.mp4,单个可达数十 MB)是否
+	// 在索引期/启动补跑时预生成。缺省 false = 纯懒生成:仅当用户真正悬浮预览时
+	// 由路由端现场生成(route/v1/assets.go Preview),不为从不预览的视频付出磁盘。
+	// sprite.jpg(雪碧图,数百 KB)不受此开关影响,始终预生成。
+	PreviewPregen bool
+
 	// MinMatchSimilarity, when > 0, drops SmartSearch results whose (display-scale,
 	// post-recalibration) match score is below it. Left at 0 (no filtering) by
 	// default — see service/search.go for the full rationale and calibration
@@ -90,19 +96,20 @@ func Init(configFile, confSample string) error {
 	// watchDirs 为空 ⇒ watcher 自动模式（范围 = EnumerateScanRoots，即系统盘
 	// + 全部已挂载用户分区，动态跟随挂载）；非空 ⇒ 手工监控清单（向后兼容）。
 	Cfg = &Config{
-		RuntimePath:   v.GetString("common.RuntimePath"),
-		LogPath:       v.GetString("common.LogPath"),
-		DataPath:      v.GetString("photos.DataPath"),
-		MLEndpoint:    v.GetString("photos.MLEndpoint"),
-		Workers:       v.GetInt("photos.Workers"),
-		WatchDirs:     watchDirs,
-		RetentionDays: v.GetInt("photos.RetentionDays"),
-		ScanInterval:  v.GetInt("photos.ScanInterval"),
+		RuntimePath:      v.GetString("common.RuntimePath"),
+		LogPath:          v.GetString("common.LogPath"),
+		DataPath:         v.GetString("photos.DataPath"),
+		MLEndpoint:       v.GetString("photos.MLEndpoint"),
+		Workers:          v.GetInt("photos.Workers"),
+		WatchDirs:        watchDirs,
+		RetentionDays:    v.GetInt("photos.RetentionDays"),
+		ScanInterval:     v.GetInt("photos.ScanInterval"),
 		FacesEnabled:     v.GetBool("photos.FacesEnabled"),
 		ScenesEnabled:    v.GetBool("photos.ScenesEnabled"),
 		OCREnabled:       v.GetBool("photos.OCREnabled"),
 		SmartViewEnabled: v.GetBool("photos.SmartViewEnabled"),
 		AestheticEnabled: v.GetBool("photos.AestheticEnabled"),
+		PreviewPregen:    v.GetBool("photos.PreviewPregen"),
 
 		MinMatchSimilarity: v.GetFloat64("photos.MinMatchSimilarity"),
 		SimDisplayFloor:    v.GetFloat64("photos.SimDisplayFloor"),

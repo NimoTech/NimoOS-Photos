@@ -117,6 +117,7 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 	go taskReg.StartStaleSweeper(parentCtx, taskStaleTimeout, taskSweepInterval)
 	idx := NewIndexer(db, ml, thumbDir, cfg.Workers)
 	idx.SetTaskRegistry(taskReg)
+	idx.SetPreviewPregen(cfg.PreviewPregen)
 	watcher := NewWatcher(db, cfg.WatchDirs, idx, liveDir)
 	albums := NewAlbumService(db)
 	// Wire post-index album assignment: uploads carrying an albumId join the
