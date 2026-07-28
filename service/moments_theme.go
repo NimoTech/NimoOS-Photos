@@ -8,6 +8,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -28,8 +29,8 @@ type clipTextSearcher interface {
 }
 
 // BuildThemeMoments 是 theme 引擎的入口:每条 ClipPrompts 走 searcher 取
-// TopK、按 MinScore 过滤;CaptionKeywords 对 asset_caption 做
-// instr(lower(text), kw) 匹配(命中记 MinScore 保底分);两路取并集(同一
+// TopK、按 MinScore 过滤;CaptionKeywords 对 asset_caption 做词边界匹配(见
+// matchCaptionKeywords,命中记 MinScore 保底分);两路取并集(同一
 // 资产被两路都命中时分数取 max)。并集再与候选池取交集(候选池判据与 trip
 // 引擎一致,见 loadThemeCandidatePool),成员数达 MinAssets 才产出单个
 // MomentDraft;不足则返回空切片(该 recipe 本轮没有可展示的主题时刻,不是
@@ -125,34 +126,54 @@ func BuildThemeMoments(ctx context.Context, db *sql.DB, searcher clipTextSearche
 	return []MomentDraft{draft}, nil
 }
 
-// matchCaptionKeywords 返回 asset_caption 中文本(小写后)包含任一关键词
-// (同样小写)的资产 id 去重列表。与 docscore/ocrSearch 既有的
-// instr(lower(text), lower(?)) > 0 判据同款,一条 SQL 里 OR 起来所有关键词,
-// 不区分具体命中了哪个词——theme 引擎只关心"命中与否"。
+// matchCaptionKeywords 返回 asset_caption 中文本"词边界命中"任一关键词的资产
+// id 去重列表。
+//
+// 真机验收踩坑:早期实现直接照搬 docscore/ocrSearch 的
+// instr(lower(text), lower(?)) > 0 子串判据,SQLite 无 REGEXP、只能子串匹配,
+// 结果是"cat"⊂vacation/location、"pet"⊂carpet、"ice"⊂nice/service 全部
+// 误命中,导致 theme:pets/theme:snow 命中过宽(全库 6882 张里分别命中
+// 1306/1610 张)。修复:SQL 先用 instr 粗筛缩小候选集(避免全表扫描,子串
+// 命中是词边界命中的必要条件、不会漏筛),再在 Go 侧用 `\bkw\b` 正则精滤
+// ——caption 是英文文本,\b 的单词字符语义可靠。
 func matchCaptionKeywords(ctx context.Context, db *sql.DB, keywords []string) ([]string, error) {
 	if len(keywords) == 0 {
 		return nil, nil
 	}
+
 	clauses := make([]string, len(keywords))
 	args := make([]interface{}, len(keywords))
+	boundaryRe := make([]*regexp.Regexp, len(keywords))
 	for i, kw := range keywords {
+		lower := strings.ToLower(kw)
 		clauses[i] = "instr(lower(text), ?) > 0"
-		args[i] = strings.ToLower(kw)
+		args[i] = lower
+		boundaryRe[i] = regexp.MustCompile(`\b` + regexp.QuoteMeta(lower) + `\b`)
 	}
-	q := `SELECT DISTINCT asset_id FROM asset_caption WHERE ` + strings.Join(clauses, " OR ")
+	q := `SELECT asset_id, lower(text) FROM asset_caption WHERE ` + strings.Join(clauses, " OR ")
 	rows, err := db.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, fmt.Errorf("moments: caption keyword query: %w", err)
 	}
 	defer rows.Close()
 
+	seen := map[string]bool{}
 	var out []string
 	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
+		var id, text string
+		if err := rows.Scan(&id, &text); err != nil {
 			return nil, fmt.Errorf("moments: scan caption keyword hit: %w", err)
 		}
-		out = append(out, id)
+		if seen[id] {
+			continue // 同一资产可能有多条 caption 行,去重不重复加入结果。
+		}
+		for _, re := range boundaryRe {
+			if re.MatchString(text) {
+				seen[id] = true
+				out = append(out, id)
+				break
+			}
+		}
 	}
 	return out, rows.Err()
 }

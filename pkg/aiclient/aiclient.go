@@ -31,8 +31,9 @@ const defaultAIURLFile = "/var/run/nimoos/ai.url"
 var usersDBPath = "/var/lib/nimoos/db/user.db"
 
 // completeTimeout 是 Complete 一次调用(选模型 + chat completions 两次请求
-// 合计)的整体超时。
-const completeTimeout = 5 * time.Second
+// 合计)的整体超时。真机验收发现本地弱模型偶发比 5s 慢(命名请求超时后
+// best-effort 跳过、时刻留模板标题),放宽到 10s 换取更高的 LLM 命名成功率。
+const completeTimeout = 10 * time.Second
 
 // chatMaxTokens/chatTemperature 是 chat completions 请求体里的防御性约束
 // (对照 wiki_summary_worker/llm.py 同款做法):Complete 只用来生成"至多 4

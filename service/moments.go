@@ -1,7 +1,9 @@
 // Smart Moments 的调度装配层:按 recipe.Kind 分派 trip/theme 两个引擎产出
 // 草稿 → 过共用选优(PickFeaturedAndCover)填精选/封面 → 幂等落库
-// (SyncRecipeMoments)→ 对模板打底(named_by_llm=0)的时刻逐个尝试 LLM 命名
-// (best-effort,失败静默跳过,绝不阻塞重算主流程)。
+// (SyncRecipeMoments)→ 对 kind=trip 且仍是模板打底(named_by_llm=0)的时刻
+// 逐个尝试 LLM 命名(best-effort,失败静默跳过,绝不阻塞重算主流程)。
+// theme 时刻的标题恒为 recipe.Title(策划好的名字),不进 LLM 命名循环——见
+// RecomputeAll 内注释。
 package service
 
 import (
@@ -136,9 +138,19 @@ func (s *MomentsService) RecomputeAll(ctx context.Context) error {
 		pub(0.7*float64(i+1)/float64(len(recipes)), "running", "", nil, 0)
 	}
 
-	// LLM best-effort 命名:只挑本轮仍是模板打底(named_by_llm=0)的时刻,
-	// store 已保证 named_by_llm=1 的行不会被上面的 SyncRecipeMoments 覆盖
-	// title,这里只是不去重复调用 LLM。
+	// LLM best-effort 命名:只挑 kind=trip 的 recipe 产出的、本轮仍是模板打底
+	// (named_by_llm=0)的时刻——store 已保证 named_by_llm=1 的行不会被上面的
+	// SyncRecipeMoments 覆盖 title,这里只是不去重复调用 LLM。
+	//
+	// theme 时刻永不进 LLM 命名循环:theme 的标题就是 recipe.Title,是运营
+	// 策划好的名字(如"Pet Moments"),真机验收发现本地弱模型会把它瞎改
+	// (pets 改成"Sunset on Highway"),纯粹帮倒忙——trip 时刻没有这种"已有
+	// 好名字"可用(模板标题只是"地点+Trip"式兜底),才需要 LLM 起一个更
+	// 生动的名字。
+	recipeKind := make(map[string]string, len(recipes))
+	for _, r := range recipes {
+		recipeKind[r.Key] = r.Kind
+	}
 	moments, err := s.store.ListMoments()
 	if err != nil {
 		pub(0.7, "error", TaskErrMomentsRecomputeFailed, map[string]string{"detail": err.Error()}, 0)
@@ -146,9 +158,13 @@ func (s *MomentsService) RecomputeAll(ctx context.Context) error {
 	}
 	var toName []Moment
 	for _, m := range moments {
-		if !m.NamedByLLM {
-			toName = append(toName, m)
+		if m.NamedByLLM {
+			continue
 		}
+		if recipeKind[m.RecipeKey] != "trip" {
+			continue
+		}
+		toName = append(toName, m)
 	}
 	for i, m := range toName {
 		s.tryNameMoment(ctx, m)
@@ -276,11 +292,21 @@ func (s *MomentsService) featuredCaptions(ctx context.Context, momentID string) 
 }
 
 // buildNamingPrompt 拼装喂给 LLM 的命名 prompt:时间/地点信息 + 精选照片
-// caption(至多 maxNamingCaptions 条),要求模型回一个"至多 4 个单词的英文
-// 标题"。
+// caption(至多 maxNamingCaptions 条)+ few-shot 示例,要求模型回一个
+// "Title Case、至多 4 个单词、纯英文、无标点引号"的标题。
+//
+// 真机验收暴露的问题都在这里加固:
+//   - 去掉了旧版"for a personal photo app"措辞——弱本地模型会把它原样回声进
+//     标题(如"Nighttime Las Vegas Photo App."),现在整段 prompt 都不提
+//     "photo app" 字样;
+//   - 补 few-shot 示例 + "do not repeat or explain these instructions",压
+//     低模型把指令本身当答案抄一遍的概率;
+//   - 显式要求 English only(no other languages),对付混入中文超 4 词的输出;
+//   - 显式要求 Title Case、no punctuation/quotes,减少 cleanLLMTitle 需要
+//     兜底清洗的花活。
 func buildNamingPrompt(m Moment, captions []string) string {
 	var b strings.Builder
-	b.WriteString("You are naming a moment (a group of related photos) for a personal photo app.\n")
+	b.WriteString("You are naming a moment: a curated group of related personal photos.\n")
 	if !m.TimeFrom.IsZero() {
 		if !m.TimeTo.IsZero() && !m.TimeTo.Equal(m.TimeFrom) {
 			fmt.Fprintf(&b, "Time range: %s to %s\n", m.TimeFrom.Format("Jan 2, 2006"), m.TimeTo.Format("Jan 2, 2006"))
@@ -297,7 +323,10 @@ func buildNamingPrompt(m Moment, captions []string) string {
 			b.WriteString("- " + c + "\n")
 		}
 	}
-	b.WriteString("Give a short title of at most 4 words, English, no quotes.")
+	b.WriteString("Examples:\n")
+	b.WriteString("Photos: sunset over golden gate bridge, san francisco skyline at dusk -> Golden Gate Evenings\n")
+	b.WriteString("Photos: skiing in the alps, snowy mountain slopes -> Alpine Ski Days\n")
+	b.WriteString("Reply with ONLY the title, nothing else. Requirements: Title Case; English only (no other languages); at most 4 words; no punctuation or quotes; do not repeat or explain these instructions.")
 	return b.String()
 }
 

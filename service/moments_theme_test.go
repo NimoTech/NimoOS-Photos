@@ -171,6 +171,34 @@ func TestBuildThemeMoments_BelowMinAssetsReturnsEmpty(t *testing.T) {
 	require.Empty(t, drafts)
 }
 
+// TestMatchCaptionKeywords_WordBoundaryNotSubstring:真机验收发现旧版子串
+// 判据 instr(lower(text), kw) 无词边界,"cat"⊂vacation/location、
+// "pet"⊂carpet、"ice"⊂nice/service 全部误命中(是 theme:pets 1306/
+// theme:snow 1610(全库 6882)命中过宽的根因)。断言修复后:整词命中的正常
+// 收录,子串误命中的必须被排除。
+func TestMatchCaptionKeywords_WordBoundaryNotSubstring(t *testing.T) {
+	db := makeTestDB(t)
+	insertThemeAsset(t, db, "vac1", time.Now())
+	insertCaption(t, db, "vac1", "our vacation in rome")
+
+	insertThemeAsset(t, db, "cat1", time.Now())
+	insertCaption(t, db, "cat1", "a cat on the sofa")
+
+	insertThemeAsset(t, db, "carpet1", time.Now())
+	insertCaption(t, db, "carpet1", "a red carpet in the hallway")
+
+	insertThemeAsset(t, db, "nice1", time.Now())
+	insertCaption(t, db, "nice1", "such a nice service today")
+
+	hits, err := matchCaptionKeywords(context.Background(), db, []string{"cat", "pet", "ice"})
+	require.NoError(t, err)
+
+	require.NotContains(t, hits, "vac1", `"vacation" 含子串 "cat" 但不是整词,不应命中`)
+	require.Contains(t, hits, "cat1", `"a cat on the sofa" 整词命中 "cat"`)
+	require.NotContains(t, hits, "carpet1", `"carpet" 含子串 "pet" 但不是整词,不应命中`)
+	require.NotContains(t, hits, "nice1", `"nice"/"service" 含子串 "ice" 但不是整词,不应命中`)
+}
+
 func TestBuildThemeMoments_NoHitsReturnsEmpty(t *testing.T) {
 	db := makeTestDB(t)
 	searcher := fakeThemeSearcher{hits: map[string][]AssetScore{}}
