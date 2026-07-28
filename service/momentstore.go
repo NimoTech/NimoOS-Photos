@@ -145,6 +145,10 @@ type Moment struct {
 	// SortOrder 对应 sort_order 列:nil=未手排(NULL 语义保真,与"手排到 0"
 	// 区分);非 nil 时是 ReorderMoments 写入的 (i+1)*10 序号。
 	SortOrder *int
+	// Hidden 对应 hidden 列:用户"隐藏此时刻"的 tombstone。ListMoments 按
+	// hidden=0 过滤,SyncRecipeMoments 重算不会清除(不在 upsert 列清单里,
+	// 与 named_by_llm/sort_order 同法)。
+	Hidden bool
 }
 
 // MomentAsset 对应 moment_assets 表一行。
@@ -152,6 +156,9 @@ type MomentAsset struct {
 	AssetID  string
 	Featured bool
 	Score    float64
+	// Manual 对应 manual 列:1=该成员是用户 pin 编辑回放插入(非引擎本轮产出),
+	// 仅供展示/排障区分来源。
+	Manual bool
 }
 
 // MomentDraft 是引擎每轮重算产出的候选时刻(尚未落库的草稿):嵌入 Moment 的
@@ -463,6 +470,25 @@ func (s *MomentStore) SyncRecipeMoments(recipeKey string, drafts []MomentDraft) 
 				return fmt.Errorf("moments: insert member %q/%q: %w", d.ID, a.AssetID, err)
 			}
 		}
+
+		// edits 回放:引擎重算不知道用户此前的 pin/exclude 编辑,成员全量替换
+		// 之后立刻把编辑叠加回去,防止被本轮重算悄悄冲掉。仅当该 moment 存在
+		// edits 时才触发派生刷新(count/时间窗/封面重挑)——没有编辑记录的
+		// moment 维持引擎本轮算出的派生值,不必多余重算。
+		hasEdits, err := applyMomentEdits(tx, d.ID)
+		if err != nil {
+			tx.Rollback()
+			return err
+		}
+		if hasEdits {
+			// hadTimeWindow:只有 trip 类时刻(draft 带具体 TimeFrom)才按成员
+			// taken_at 重算时间窗;主题类时刻(TimeFrom 为零值)时间窗恒为
+			// NULL,不应被这里的重算意外赋值。
+			if err := refreshMomentDerived(tx, d.ID, !d.TimeFrom.IsZero()); err != nil {
+				tx.Rollback()
+				return fmt.Errorf("moments: sync refresh derived %q: %w", d.ID, err)
+			}
+		}
 		keepIDs = append(keepIDs, d.ID)
 	}
 
@@ -506,8 +532,9 @@ func nullableStr(s string) interface{} {
 func (s *MomentStore) ListMoments() ([]Moment, error) {
 	rows, err := s.db.Query(`
 		SELECT id, recipe_key, title, subtitle, cover_asset_id, time_from, time_to,
-		       place, asset_count, named_by_llm, created_at, updated_at, sort_order
+		       place, asset_count, named_by_llm, created_at, updated_at, sort_order, hidden
 		FROM moments
+		WHERE hidden=0
 		ORDER BY (sort_order IS NULL) ASC, sort_order ASC, updated_at DESC`)
 	if err != nil {
 		return nil, fmt.Errorf("moments: list: %w", err)
@@ -538,8 +565,9 @@ func scanMoment(row momentScanner) (Moment, error) {
 	var from, to sql.NullString
 	var namedByLLM int
 	var sortOrder sql.NullInt64
+	var hidden int
 	if err := row.Scan(&m.ID, &m.RecipeKey, &m.Title, &m.Subtitle, &cover, &from, &to,
-		&m.Place, &m.AssetCount, &namedByLLM, &m.CreatedAt, &m.UpdatedAt, &sortOrder); err != nil {
+		&m.Place, &m.AssetCount, &namedByLLM, &m.CreatedAt, &m.UpdatedAt, &sortOrder, &hidden); err != nil {
 		return Moment{}, fmt.Errorf("moments: scan moment: %w", err)
 	}
 	if cover.Valid {
@@ -556,13 +584,14 @@ func scanMoment(row momentScanner) (Moment, error) {
 		v := int(sortOrder.Int64)
 		m.SortOrder = &v
 	}
+	m.Hidden = hidden != 0
 	return m, nil
 }
 
 // GetMomentAssets 返回某时刻的成员,按 score 倒序;featuredOnly=true 时只
 // 返回精选(featured=1)成员。
 func (s *MomentStore) GetMomentAssets(id string, featuredOnly bool) ([]MomentAsset, error) {
-	q := `SELECT asset_id, featured, score FROM moment_assets WHERE moment_id=?`
+	q := `SELECT asset_id, featured, score, manual FROM moment_assets WHERE moment_id=?`
 	if featuredOnly {
 		q += ` AND featured=1`
 	}
@@ -576,14 +605,297 @@ func (s *MomentStore) GetMomentAssets(id string, featuredOnly bool) ([]MomentAss
 	var out []MomentAsset
 	for rows.Next() {
 		var a MomentAsset
-		var featured int
-		if err := rows.Scan(&a.AssetID, &featured, &a.Score); err != nil {
+		var featured, manual int
+		if err := rows.Scan(&a.AssetID, &featured, &a.Score, &manual); err != nil {
 			return nil, fmt.Errorf("moments: scan member: %w", err)
 		}
 		a.Featured = featured != 0
+		a.Manual = manual != 0
 		out = append(out, a)
 	}
 	return out, rows.Err()
+}
+
+// ── 可编辑时刻:pin/exclude/hidden ────────────────────────────────────────
+
+// PinMomentAssets 把若干 asset 强制并入某时刻:落一条 op='pin' 的
+// moment_edits 记录(覆盖此前该 asset 上的任何编辑),并立即改成员——已是
+// 引擎本轮纳入的成员(featured/score 已有值)用 INSERT OR IGNORE 保留原样
+// 不降级,缺席的成员补一条 manual=1/featured=0/score=0 的行。assets 表里
+// 不存在的 id 静默忽略(既不写 edits,也不改成员)。随后触发派生刷新
+// (count/时间窗/封面重挑),返回刷新后的 asset_count。
+func (s *MomentStore) PinMomentAssets(momentID string, assetIDs []string) (int, error) {
+	return s.applyMomentEditOp(momentID, assetIDs, "pin")
+}
+
+// ExcludeMomentAssets 把若干 asset 强制剔除出某时刻:落一条 op='exclude' 的
+// moment_edits 记录(覆盖此前该 asset 上的任何编辑),并立即从成员表删除。
+// assets 表里不存在的 id 静默忽略。随后触发派生刷新,返回刷新后的
+// asset_count(允许降为 0)。
+func (s *MomentStore) ExcludeMomentAssets(momentID string, assetIDs []string) (int, error) {
+	return s.applyMomentEditOp(momentID, assetIDs, "exclude")
+}
+
+// applyMomentEditOp 是 Pin/ExcludeMomentAssets 共用的实现:事务内逐个 asset
+// 校验存在性(不存在则跳过)→ upsert moment_edits(后写覆盖先写)→ 立即改
+// 成员 → 派生刷新 → 读回 asset_count。
+func (s *MomentStore) applyMomentEditOp(momentID string, assetIDs []string, op string) (int, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, fmt.Errorf("moments: %s begin: %w", op, err)
+	}
+	now := nowMs()
+	for _, assetID := range assetIDs {
+		// 未知 id(assets 表不存在)静默忽略:不写 edits、不改成员——moment_edits
+		// 对 assets 有外键约束(本库 DSN 开着 _foreign_keys=on),盲写会报错,
+		// 这里显式判存在性,语义上也更清楚地对应"未知 id 忽略"。
+		var exists int
+		if err := tx.QueryRow(`SELECT COUNT(*) FROM assets WHERE id=?`, assetID).Scan(&exists); err != nil {
+			tx.Rollback()
+			return 0, fmt.Errorf("moments: %s check asset %q: %w", op, assetID, err)
+		}
+		if exists == 0 {
+			continue
+		}
+		if _, err := tx.Exec(`
+			INSERT INTO moment_edits(moment_id, asset_id, op, created_at)
+			VALUES (?, ?, ?, ?)
+			ON CONFLICT(moment_id, asset_id) DO UPDATE SET
+				op         = excluded.op,
+				created_at = excluded.created_at`,
+			momentID, assetID, op, now,
+		); err != nil {
+			tx.Rollback()
+			return 0, fmt.Errorf("moments: %s upsert edit %q/%q: %w", op, momentID, assetID, err)
+		}
+		if op == "pin" {
+			if _, err := tx.Exec(`
+				INSERT OR IGNORE INTO moment_assets(moment_id, asset_id, featured, score, manual)
+				VALUES (?, ?, 0, 0, 1)`,
+				momentID, assetID,
+			); err != nil {
+				tx.Rollback()
+				return 0, fmt.Errorf("moments: pin insert member %q/%q: %w", momentID, assetID, err)
+			}
+		} else {
+			if _, err := tx.Exec(`DELETE FROM moment_assets WHERE moment_id=? AND asset_id=?`,
+				momentID, assetID,
+			); err != nil {
+				tx.Rollback()
+				return 0, fmt.Errorf("moments: exclude delete member %q/%q: %w", momentID, assetID, err)
+			}
+		}
+	}
+
+	hadTimeWindow, err := momentHasTimeWindow(tx, momentID)
+	if err != nil {
+		tx.Rollback()
+		return 0, err
+	}
+	if err := refreshMomentDerived(tx, momentID, hadTimeWindow); err != nil {
+		tx.Rollback()
+		return 0, fmt.Errorf("moments: %s refresh derived %q: %w", op, momentID, err)
+	}
+
+	var count int
+	if err := tx.QueryRow(`SELECT asset_count FROM moments WHERE id=?`, momentID).Scan(&count); err != nil {
+		tx.Rollback()
+		return 0, fmt.Errorf("moments: %s read count %q: %w", op, momentID, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("moments: %s commit %q: %w", op, momentID, err)
+	}
+	return count, nil
+}
+
+// HideMoment 把某时刻标记为隐藏(tombstone):ListMoments 之后不再返回它,
+// 但行本身保留(SyncRecipeMoments 重算不会清除该标记,upsert 列清单里
+// 没有 hidden 列)。
+func (s *MomentStore) HideMoment(momentID string) error {
+	_, err := s.db.Exec(`UPDATE moments SET hidden=1, updated_at=? WHERE id=?`, nowMs(), momentID)
+	if err != nil {
+		return fmt.Errorf("moments: hide %q: %w", momentID, err)
+	}
+	return nil
+}
+
+// MomentEditsFor 返回某时刻当前生效的编辑记录,按 op 分两个切片(供 Task 3
+// 挖掘引擎读取,判断某 asset 是否已被用户手动排除/钉入,避免重算把编辑
+// 意图悄悄吞掉)。没有编辑记录时返回两个空切片,不报错。
+func (s *MomentStore) MomentEditsFor(momentID string) (pins []string, excludes []string, err error) {
+	rows, err := s.db.Query(`SELECT asset_id, op FROM moment_edits WHERE moment_id=? ORDER BY asset_id`, momentID)
+	if err != nil {
+		return nil, nil, fmt.Errorf("moments: edits for %q: %w", momentID, err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var assetID, op string
+		if err := rows.Scan(&assetID, &op); err != nil {
+			return nil, nil, fmt.Errorf("moments: scan edit: %w", err)
+		}
+		switch op {
+		case "pin":
+			pins = append(pins, assetID)
+		case "exclude":
+			excludes = append(excludes, assetID)
+		}
+	}
+	return pins, excludes, rows.Err()
+}
+
+// TopFeaturedByMoment 一次查询取出全库 featured 成员(按 score 降序),JOIN
+// moments 排除各自的封面(封面已经单独展示,不需要在"精选"列表里重复出现),
+// 在 Go 侧按 moment 分组各截取前 perMoment 个。因为 SQL 已按 score 降序
+// 返回,同一 moment 的行在结果流中天然保持相对顺序,分组截取即为"该
+// moment 内 score 最高的前 N 个"。perMoment<=0 视为不截断。
+func (s *MomentStore) TopFeaturedByMoment(perMoment int) (map[string][]string, error) {
+	rows, err := s.db.Query(`
+		SELECT ma.moment_id, ma.asset_id, ma.score
+		FROM moment_assets ma
+		JOIN moments m ON m.id = ma.moment_id
+		WHERE ma.featured=1 AND (m.cover_asset_id IS NULL OR ma.asset_id <> m.cover_asset_id)
+		ORDER BY ma.score DESC, ma.asset_id ASC`)
+	if err != nil {
+		return nil, fmt.Errorf("moments: top featured: %w", err)
+	}
+	defer rows.Close()
+
+	out := map[string][]string{}
+	for rows.Next() {
+		var momentID, assetID string
+		var score float64
+		if err := rows.Scan(&momentID, &assetID, &score); err != nil {
+			return nil, fmt.Errorf("moments: scan top featured: %w", err)
+		}
+		if perMoment > 0 && len(out[momentID]) >= perMoment {
+			continue
+		}
+		out[momentID] = append(out[momentID], assetID)
+	}
+	return out, rows.Err()
+}
+
+// momentHasTimeWindow 判断某时刻当前是否有具体时间窗(time_from 非 NULL,
+// 即 trip 类时刻);主题类时刻(time_from 恒 NULL)不应被派生刷新意外赋予
+// 一个时间窗。
+func momentHasTimeWindow(tx *sql.Tx, momentID string) (bool, error) {
+	var from sql.NullString
+	if err := tx.QueryRow(`SELECT time_from FROM moments WHERE id=?`, momentID).Scan(&from); err != nil {
+		return false, fmt.Errorf("moments: check time window %q: %w", momentID, err)
+	}
+	return from.Valid, nil
+}
+
+// applyMomentEdits 是 SyncRecipeMoments 的回放钩子:成员全量替换后,把用户
+// 此前对该 moment 做过的 pin/exclude 编辑重新叠加回去。exclude 先剔除,pin
+// 后并入(INSERT OR IGNORE 不会降级引擎本轮已纳入的成员——已是
+// featured/score 有值的行原样保留,只在缺席时补一条 manual=1/featured=0/
+// score=0 的行)。返回值 hasEdits 表示该 moment 是否存在任何编辑记录,供
+// 调用方决定是否需要派生刷新(没有编辑的 moment 维持引擎本轮算出的派生
+// 值,不必多余重算)。
+func applyMomentEdits(tx *sql.Tx, momentID string) (bool, error) {
+	if _, err := tx.Exec(`
+		DELETE FROM moment_assets
+		WHERE moment_id = ?
+		  AND asset_id IN (SELECT asset_id FROM moment_edits WHERE moment_id=? AND op='exclude')`,
+		momentID, momentID,
+	); err != nil {
+		return false, fmt.Errorf("moments: replay exclude %q: %w", momentID, err)
+	}
+	if _, err := tx.Exec(`
+		INSERT OR IGNORE INTO moment_assets(moment_id, asset_id, featured, score, manual)
+		SELECT moment_id, asset_id, 0, 0, 1 FROM moment_edits WHERE moment_id=? AND op='pin'`,
+		momentID,
+	); err != nil {
+		return false, fmt.Errorf("moments: replay pin %q: %w", momentID, err)
+	}
+	var count int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM moment_edits WHERE moment_id=?`, momentID).Scan(&count); err != nil {
+		return false, fmt.Errorf("moments: replay count edits %q: %w", momentID, err)
+	}
+	return count > 0, nil
+}
+
+// refreshMomentDerived 是 pin/exclude 的成员变动后,重算该时刻派生字段的
+// 公共实现:
+//   - asset_count:成员表 COUNT(*)。
+//   - 时间窗(仅 hadTimeWindow=true 时):按当前成员 JOIN assets 取
+//     MIN/MAX(taken_at);hadTimeWindow=false(主题类时刻)时不触碰
+//     time_from/time_to,保持其 NULL 语义。
+//   - 封面:当前封面仍是成员则不动;否则按"featured 最高分 → 任一成员(按
+//     score DESC, asset_id ASC 取第一,避免测试抖动)→ 无成员则 NULL"依次
+//     回落重挑。
+func refreshMomentDerived(tx *sql.Tx, momentID string, hadTimeWindow bool) error {
+	var count int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM moment_assets WHERE moment_id=?`, momentID).Scan(&count); err != nil {
+		return fmt.Errorf("moments: refresh count %q: %w", momentID, err)
+	}
+
+	setClauses := []string{"asset_count=?"}
+	args := []interface{}{count}
+
+	if hadTimeWindow {
+		var from, to sql.NullString
+		if err := tx.QueryRow(`
+			SELECT MIN(a.taken_at), MAX(a.taken_at)
+			FROM moment_assets ma JOIN assets a ON a.id = ma.asset_id
+			WHERE ma.moment_id=?`, momentID).Scan(&from, &to); err != nil {
+			return fmt.Errorf("moments: refresh time window %q: %w", momentID, err)
+		}
+		var fromTime, toTime time.Time
+		if t := parseSQLiteTime(from); t != nil {
+			fromTime = *t
+		}
+		if t := parseSQLiteTime(to); t != nil {
+			toTime = *t
+		}
+		setClauses = append(setClauses, "time_from=?", "time_to=?")
+		args = append(args, nullTimeArg(fromTime), nullTimeArg(toTime))
+	}
+
+	var currentCover sql.NullString
+	if err := tx.QueryRow(`SELECT cover_asset_id FROM moments WHERE id=?`, momentID).Scan(&currentCover); err != nil {
+		return fmt.Errorf("moments: refresh read cover %q: %w", momentID, err)
+	}
+	coverStillMember := false
+	if currentCover.Valid {
+		var n int
+		if err := tx.QueryRow(`SELECT COUNT(*) FROM moment_assets WHERE moment_id=? AND asset_id=?`,
+			momentID, currentCover.String).Scan(&n); err != nil {
+			return fmt.Errorf("moments: refresh check cover member %q: %w", momentID, err)
+		}
+		coverStillMember = n > 0
+	}
+
+	newCover := currentCover
+	if !currentCover.Valid || !coverStillMember {
+		var pick sql.NullString
+		err := tx.QueryRow(`
+			SELECT asset_id FROM moment_assets WHERE moment_id=? AND featured=1
+			ORDER BY score DESC, asset_id ASC LIMIT 1`, momentID).Scan(&pick)
+		if err == sql.ErrNoRows {
+			err = tx.QueryRow(`
+				SELECT asset_id FROM moment_assets WHERE moment_id=?
+				ORDER BY score DESC, asset_id ASC LIMIT 1`, momentID).Scan(&pick)
+		}
+		if err != nil && err != sql.ErrNoRows {
+			return fmt.Errorf("moments: refresh pick cover %q: %w", momentID, err)
+		}
+		newCover = pick // sql.ErrNoRows 时 pick 保持零值(Valid=false)→ 落回 NULL
+	}
+	setClauses = append(setClauses, "cover_asset_id=?", "updated_at=?")
+	var coverArg interface{}
+	if newCover.Valid {
+		coverArg = newCover.String
+	}
+	args = append(args, coverArg, nowMs())
+	args = append(args, momentID)
+
+	q := fmt.Sprintf(`UPDATE moments SET %s WHERE id=?`, strings.Join(setClauses, ", "))
+	if _, err := tx.Exec(q, args...); err != nil {
+		return fmt.Errorf("moments: refresh update %q: %w", momentID, err)
+	}
+	return nil
 }
 
 // SetMomentTitle 把某时刻的展示名置为 LLM 润色结果,并标记
