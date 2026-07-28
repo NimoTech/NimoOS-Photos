@@ -106,11 +106,18 @@ func main() {
 			}
 		}
 	}()
+
+	// 每日全量缓存清理:孤儿缩略图目录 + face-thumbs 孤儿 + 过期暂存,
+	// 与设置页手动按钮(POST /cache/prune)同一实现。
 	go func() {
 		ticker := time.NewTicker(24 * time.Hour)
 		defer ticker.Stop()
 		for range ticker.C {
-			service.PruneStaging(common.StagingDir, time.Duration(common.StagingMaxAge)*time.Hour) //nolint:errcheck
+			if res, err := svc.Storage().Prune(common.StagingDir, time.Duration(common.StagingMaxAge)*time.Hour); err != nil {
+				zap.L().Warn("daily cache prune failed", zap.Error(err))
+			} else if res.RemovedCount > 0 {
+				zap.L().Info("daily cache prune", zap.Int("removed", res.RemovedCount), zap.Int64("freed_bytes", res.FreedBytes))
+			}
 		}
 	}()
 
