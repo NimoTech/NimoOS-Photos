@@ -19,6 +19,11 @@ services:
         bind:
           create_host_path: true
     restart: unless-stopped
+    # ML 进程(SigLIP2/OCR/人脸)历史上多次把 31G 整机吃到全局 OOM,
+    # 容器必须有硬上限;MODEL_TTL=300 已保证闲时卸载,8g 保证多模型
+    # 并存(CLIP+OCR+人脸+翻译)时不会在正常负载下被误杀。
+    mem_limit: 8g
+    memswap_limit: 8g
     # 仅可观测性:docker ps / AppManagement 能直接看到 unhealthy。
     # docker 原生不会因 unhealthy 重启;真正的自愈由 nimoos-photos 内置看门狗负责。
     healthcheck:
