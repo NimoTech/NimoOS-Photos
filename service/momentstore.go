@@ -41,6 +41,19 @@ type RecipeParams struct {
 	GapDays         int      `json:"gap_days"`
 	TopK            int      `json:"top_k"`
 	MinScore        float64  `json:"min_score"`
+
+	// ── Moments M2 画像层新增字段(profile:pets / profile:family 专用)──────
+	// Lexicon 无默认回落(未指定就是空词表,凭空回落一份猜的词表比空更危险);
+	// 其余字段(含 MinAssets,family 的"合影集门槛"复用该既有字段)照旧
+	// "零值即未指定"回落默认值,见 ParseParams 注释。
+	Lexicon            []string `json:"lexicon"`              // profile:pets:物种/品种英文词表
+	MinPhotos          int      `json:"min_photos"`           // profile:pets:达标最少张数
+	MinMonths          int      `json:"min_months"`           // profile:pets:达标最少跨月数
+	ClipMinScore       float64  `json:"clip_min_score"`       // profile:pets:CLIP 检索最低分
+	ClipTopK           int      `json:"clip_top_k"`           // profile:pets:CLIP 检索 top-K
+	TopPersons         int      `json:"top_persons"`          // profile:family:具名人物时刻取前 K 高频人物
+	MinPersonPhotos    int      `json:"min_person_photos"`    // profile:family:人物达标最少张数
+	MinTogetherPersons int      `json:"min_together_persons"` // profile:family:合影集同框最少人数
 }
 
 // 默认值:recipe 未显式指定(或字段缺省为零值)时的兜底,详见简报。
@@ -50,6 +63,17 @@ const (
 	defaultGapDays     = 14
 	defaultTopK        = 200
 	defaultMinScore    = 0.2
+
+	// profile:pets 默认值(见设计 spec 第一节)。
+	defaultMinPhotos    = 8
+	defaultMinMonths    = 2
+	defaultClipMinScore = 0.45
+	defaultClipTopK     = 100
+
+	// profile:family 默认值(见设计 spec 第一节)。
+	defaultTopPersons         = 5
+	defaultMinPersonPhotos    = 30
+	defaultMinTogetherPersons = 2
 )
 
 // ParseParams 解析 recipe.ParamsJSON 为 RecipeParams,对缺省(零值)字段填充
@@ -78,6 +102,28 @@ func ParseParams(r MomentRecipe) (RecipeParams, error) {
 	if p.MinScore == 0 {
 		p.MinScore = defaultMinScore
 	}
+	if p.MinPhotos == 0 {
+		p.MinPhotos = defaultMinPhotos
+	}
+	if p.MinMonths == 0 {
+		p.MinMonths = defaultMinMonths
+	}
+	if p.ClipMinScore == 0 {
+		p.ClipMinScore = defaultClipMinScore
+	}
+	if p.ClipTopK == 0 {
+		p.ClipTopK = defaultClipTopK
+	}
+	if p.TopPersons == 0 {
+		p.TopPersons = defaultTopPersons
+	}
+	if p.MinPersonPhotos == 0 {
+		p.MinPersonPhotos = defaultMinPersonPhotos
+	}
+	if p.MinTogetherPersons == 0 {
+		p.MinTogetherPersons = defaultMinTogetherPersons
+	}
+	// Lexicon 故意不回落默认值:未指定就是空词表(见字段注释)。
 	return p, nil
 }
 
@@ -186,6 +232,57 @@ func defaultSeedRecipes() []seedRecipe {
 				CaptionKeywords: []string{"sunset", "dusk", "golden hour", "horizon"},
 			},
 		},
+		{
+			// profile:pets 是画像层挖掘配置(kind=pet_entities,与上面
+			// theme:pets 的"全库搜含宠物元素"概念版不同):对 lexicon 每词做
+			// caption 词边界匹配,统计张数+跨月数,达标(≥min_photos 且
+			// ≥min_months)才归纳成"用户自己的那只狗/猫"实体,详见设计
+			// spec 第一节。lexicon 覆盖常见狗/猫品种 + 鸟类 + 小宠,英文,
+			// 供词边界匹配;多词短语(如 "maine coon")按整短语边界匹配。
+			key: "profile:pets", kind: "pet_entities", title: "Pet Entities",
+			params: RecipeParams{
+				Lexicon:   petEntityLexicon(),
+				MinPhotos: defaultMinPhotos, MinMonths: defaultMinMonths,
+				ClipMinScore: defaultClipMinScore, ClipTopK: defaultClipTopK,
+			},
+		},
+		{
+			// profile:family 是画像层家人挖掘配置(kind=family):具名人物
+			// 出现频次达标 top-K 归纳为具名人物时刻,高频人物同框归纳为合影集,
+			// 详见设计 spec 第一节。
+			key: "profile:family", kind: "family", title: "Family Entities",
+			params: RecipeParams{
+				TopPersons: defaultTopPersons, MinPersonPhotos: defaultMinPersonPhotos,
+				MinTogetherPersons: defaultMinTogetherPersons, MinAssets: defaultMinAssets,
+			},
+		},
+	}
+}
+
+// petEntityLexicon 是 profile:pets 挖掘用的物种/品种英文词表:覆盖常见狗/猫
+// 品种 + 鸟类 + 小型宠物,约 60-100 词,供 caption 词边界匹配。刻意不含过于
+// 宽泛的词(如单独的 "dog"/"cat"——那是 theme:pets 概念版的职责,画像层要的
+// 是能收敛到"用户特定那只"的具体品种/物种词,复现性信号才有区分力)。
+func petEntityLexicon() []string {
+	return []string{
+		// ── Dogs(品种,不含泛化的 "dog"/"puppy")──────────────────────
+		"beagle", "labrador", "corgi", "husky", "poodle", "terrier", "retriever",
+		"bulldog", "dachshund", "chihuahua", "pug", "shepherd", "collie", "spaniel",
+		"dalmatian", "boxer", "rottweiler", "doberman", "schnauzer", "mastiff",
+		"greyhound", "whippet", "pomeranian", "shih tzu", "maltese", "chow chow",
+		"akita", "samoyed", "malamute", "bernese mountain dog", "newfoundland",
+		"labradoodle", "goldendoodle", "basset hound", "bloodhound",
+		// ── Cats(品种,不含泛化的 "cat"/"kitten")────────────────────
+		"tabby", "siamese", "persian cat", "maine coon", "ragdoll", "sphynx",
+		"bengal cat", "calico", "tuxedo cat", "ginger cat", "tortoiseshell",
+		"british shorthair", "scottish fold", "abyssinian", "burmese cat",
+		"russian blue", "himalayan cat",
+		// ── Birds ──────────────────────────────────────────────────────
+		"parrot", "parakeet", "cockatiel", "budgie", "canary", "macaw",
+		"cockatoo", "lovebird", "finch",
+		// ── Small pets ────────────────────────────────────────────────
+		"hamster", "rabbit", "bunny", "guinea pig", "turtle", "tortoise",
+		"goldfish", "gecko", "ferret", "chinchilla", "hedgehog", "iguana",
 	}
 }
 

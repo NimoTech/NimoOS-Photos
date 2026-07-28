@@ -48,6 +48,34 @@ func TestMomentStore_ParseParamsDefaults(t *testing.T) {
 	require.Error(t, err)
 }
 
+// ── ParseParams:profile 新字段默认值(老字段/默认值不受影响)────────────
+
+func TestMomentStore_ParseParamsProfileDefaults(t *testing.T) {
+	p, err := ParseParams(MomentRecipe{ParamsJSON: ""})
+	require.NoError(t, err)
+	require.Nil(t, p.Lexicon, "未指定 lexicon 应为空,不应凭空回落默认词表")
+	require.Equal(t, 8, p.MinPhotos)
+	require.Equal(t, 2, p.MinMonths)
+	require.Equal(t, 0.45, p.ClipMinScore)
+	require.Equal(t, 100, p.ClipTopK)
+	require.Equal(t, 5, p.TopPersons)
+	require.Equal(t, 30, p.MinPersonPhotos)
+	require.Equal(t, 2, p.MinTogetherPersons)
+	// 老字段默认值不受影响。
+	require.Equal(t, 10, p.MinAssets)
+	require.Equal(t, 12, p.MaxFeatured)
+	require.Equal(t, 14, p.GapDays)
+	require.Equal(t, 200, p.TopK)
+	require.Equal(t, 0.2, p.MinScore)
+
+	// 部分字段显式指定时,只有指定字段生效,其余仍回落默认值。
+	p2, err := ParseParams(MomentRecipe{ParamsJSON: `{"min_photos":20,"lexicon":["beagle"]}`})
+	require.NoError(t, err)
+	require.Equal(t, 20, p2.MinPhotos)
+	require.Equal(t, []string{"beagle"}, p2.Lexicon)
+	require.Equal(t, 2, p2.MinMonths, "未指定字段应回落默认值")
+}
+
 // ── SeedDefaultRecipes:幂等 + 不覆盖已推送 recipe ──────────────────────
 
 func TestMomentStore_SeedIdempotentAndDoesNotOverwritePushed(t *testing.T) {
@@ -57,7 +85,7 @@ func TestMomentStore_SeedIdempotentAndDoesNotOverwritePushed(t *testing.T) {
 	require.NoError(t, store.SeedDefaultRecipes())
 	recipes, err := store.ListRecipes(false)
 	require.NoError(t, err)
-	require.Len(t, recipes, 6, "内置集:trip + 5 个 theme")
+	require.Len(t, recipes, 8, "内置集:trip + 5 个 theme + 2 个 profile")
 
 	keys := map[string]MomentRecipe{}
 	for _, r := range recipes {
@@ -69,14 +97,39 @@ func TestMomentStore_SeedIdempotentAndDoesNotOverwritePushed(t *testing.T) {
 	require.Contains(t, keys, "theme:snow")
 	require.Contains(t, keys, "theme:beach")
 	require.Contains(t, keys, "theme:sunset")
+	require.Contains(t, keys, "profile:pets")
+	require.Contains(t, keys, "profile:family")
 	require.Equal(t, "theme", keys["theme:pets"].Kind)
 	require.Equal(t, "trip", keys["trip"].Kind)
+	require.Equal(t, "pet_entities", keys["profile:pets"].Kind)
+	require.Equal(t, "family", keys["profile:family"].Kind)
+
+	// profile:pets 的 lexicon 应有实质词表(≈60-100 英文物种/品种词)。
+	petParams, err := ParseParams(keys["profile:pets"])
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, len(petParams.Lexicon), 60, "lexicon 应覆盖足够多的物种/品种词")
+	require.LessOrEqual(t, len(petParams.Lexicon), 100)
+	require.Contains(t, petParams.Lexicon, "beagle")
+	require.Contains(t, petParams.Lexicon, "labrador")
+	require.Contains(t, petParams.Lexicon, "tabby")
+	require.Contains(t, petParams.Lexicon, "parrot")
+	require.Equal(t, 8, petParams.MinPhotos)
+	require.Equal(t, 2, petParams.MinMonths)
+	require.Equal(t, 0.45, petParams.ClipMinScore)
+	require.Equal(t, 100, petParams.ClipTopK)
+
+	familyParams, err := ParseParams(keys["profile:family"])
+	require.NoError(t, err)
+	require.Equal(t, 5, familyParams.TopPersons)
+	require.Equal(t, 30, familyParams.MinPersonPhotos)
+	require.Equal(t, 2, familyParams.MinTogetherPersons)
+	require.Equal(t, 10, familyParams.MinAssets, "family 复用 min_assets 字段(合影集门槛)")
 
 	// 再次 seed 应保持幂等,不报错、不重复。
 	require.NoError(t, store.SeedDefaultRecipes())
 	recipes2, err := store.ListRecipes(false)
 	require.NoError(t, err)
-	require.Len(t, recipes2, 6)
+	require.Len(t, recipes2, 8)
 
 	// 模拟运维/应用商店已推送过对 theme:pets 的热更新。
 	require.NoError(t, store.UpsertRecipes([]MomentRecipe{
@@ -143,11 +196,11 @@ func TestMomentStore_SyncUpsertsAndReplacesMembers(t *testing.T) {
 
 	draft := MomentDraft{
 		Moment: Moment{
-			ID:        "m1",
-			RecipeKey: "trip",
-			Title:     "Yosemite Trip",
-			Subtitle:  "May 2011 · Yosemite",
-			Place:     "Yosemite",
+			ID:         "m1",
+			RecipeKey:  "trip",
+			Title:      "Yosemite Trip",
+			Subtitle:   "May 2011 · Yosemite",
+			Place:      "Yosemite",
 			AssetCount: 2,
 		},
 		Assets: []MomentAsset{
