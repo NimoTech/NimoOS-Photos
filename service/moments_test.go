@@ -156,6 +156,55 @@ func TestRecomputeAll_NamerFailureDoesNotBlock(t *testing.T) {
 	require.Equal(t, "Nara Trip", moments[0].Title, "命名失败应保留模板打底标题")
 }
 
+// TestRecomputeAll_HiddenMomentSkippedInNamingLoop:命名循环的候选来源是
+// store.ListMoments(),该方法已按 hidden=0 过滤(momentstore.go),所以隐藏
+// 时刻天然不会被喂给 LLM——这里补一个断言测试锁定该行为,防止未来有人改动
+// 候选来源(比如换成直接查 moments 表)时悄悄漏了 hidden 过滤。
+func TestRecomputeAll_HiddenMomentSkippedInNamingLoop(t *testing.T) {
+	db := makeTestDB(t)
+	store := NewMomentStore(db)
+	require.NoError(t, store.UpsertRecipes([]MomentRecipe{
+		{Key: "trip", Kind: "trip", Title: "Trip", Enabled: true, ParamsJSON: `{"min_assets":2}`},
+	}))
+
+	base := time.Date(2013, time.June, 1, 9, 0, 0, 0, time.UTC)
+	for i := 0; i < 2; i++ {
+		id := "h" + string(rune('0'+i))
+		takenAt := base.AddDate(0, 0, i)
+		_, err := db.Exec(`INSERT INTO assets(id, file_path, status, taken_at) VALUES(?,?,'indexed',?)`,
+			id, "/g/"+id+".jpg", takenAt.UTC().Format("2006-01-02 15:04:05"))
+		require.NoError(t, err)
+		_, err = db.Exec(`INSERT INTO asset_geo(asset_id, city, country) VALUES(?,?,?)`, id, "Nara", "JP")
+		require.NoError(t, err)
+	}
+
+	// 第一轮:namer 失败,时刻产出但仍是模板打底(named_by_llm=0),
+	// 保证后面隐藏它时还处于"命名循环本会挑中"的状态。
+	failingNamer := &fakeNamer{err: errors.New("ai unavailable")}
+	svc := NewMomentsService(db, store, fakeThemeSearcher{}, noVecLoader, failingNamer)
+	require.NoError(t, svc.RecomputeAll(context.Background()))
+
+	moments, err := store.ListMoments()
+	require.NoError(t, err)
+	require.Len(t, moments, 1)
+	require.False(t, moments[0].NamedByLLM)
+	require.Equal(t, 1, failingNamer.calls)
+
+	require.NoError(t, store.HideMoment(moments[0].ID))
+
+	// 第二轮:namer 换成会成功的,但命名循环取候选走 ListMoments(已过滤
+	// hidden=0),隐藏的时刻不应再被喂给 LLM——calls 应保持 0(全新 namer)。
+	successNamer := &fakeNamer{title: "Should Not Apply"}
+	svc2 := NewMomentsService(db, store, fakeThemeSearcher{}, noVecLoader, successNamer)
+	require.NoError(t, svc2.RecomputeAll(context.Background()))
+
+	require.Equal(t, 0, successNamer.calls, "隐藏的时刻不应进入 LLM 命名循环")
+
+	stillHidden, err := store.ListMoments()
+	require.NoError(t, err)
+	require.Len(t, stillHidden, 0, "隐藏语义应在重算后保持(SyncRecipeMoments 不清 hidden 列)")
+}
+
 func TestRecomputeAll_ReentrancyReturnsNilImmediately(t *testing.T) {
 	db := makeTestDB(t)
 	store := NewMomentStore(db)

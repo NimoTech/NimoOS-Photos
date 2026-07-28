@@ -43,22 +43,36 @@ type momentResponse struct {
 	NamedByLLM   bool    `json:"named_by_llm"`
 	// SortOrder 是拖拽手排序的序号(nil=未手排),供前端调试用,不强依赖。
 	SortOrder *int `json:"sort_order,omitempty"`
+	// FeaturedAssetIDs 是该时刻的精选成员 id(不含封面,已按 score 降序截取
+	// 前 maxFeaturedAssetIDsPerMoment 个),供列表页直接渲染小图带而不必逐条
+	// 请求 /assets?featured=1。恒为数组(可能为空 []),不用 omitempty——前端
+	// 不必对该字段做 null 判断。
+	FeaturedAssetIDs []string `json:"featured_asset_ids"`
 }
+
+// maxFeaturedAssetIDsPerMoment 是 List() 合成 featured_asset_ids 时每个时刻
+// 截取的精选数量上限,喂给 MomentStore.TopFeaturedByMoment 的 perMoment 参数。
+const maxFeaturedAssetIDsPerMoment = 2
 
 // toMomentResponse 转换 service.Moment → momentResponse。TimeFrom/TimeTo 为零值
 // time.Time 时(主题类时刻没有固定时间窗)对应字段留空(nil,JSON 里省略),
-// 非零值格式化为 RFC3339。
-func toMomentResponse(m service.Moment) momentResponse {
+// 非零值格式化为 RFC3339。featuredAssetIDs 由调用方一次性算好传入(List()
+// 对全部时刻只查一次 TopFeaturedByMoment,避免逐条时刻查询的 N+1)。
+func toMomentResponse(m service.Moment, featuredAssetIDs []string) momentResponse {
 	r := momentResponse{
-		ID:           m.ID,
-		Title:        m.Title,
-		Subtitle:     m.Subtitle,
-		CoverAssetID: m.CoverAssetID,
-		AssetCount:   m.AssetCount,
-		Place:        m.Place,
-		RecipeKey:    m.RecipeKey,
-		NamedByLLM:   m.NamedByLLM,
-		SortOrder:    m.SortOrder,
+		ID:               m.ID,
+		Title:            m.Title,
+		Subtitle:         m.Subtitle,
+		CoverAssetID:     m.CoverAssetID,
+		AssetCount:       m.AssetCount,
+		Place:            m.Place,
+		RecipeKey:        m.RecipeKey,
+		NamedByLLM:       m.NamedByLLM,
+		SortOrder:        m.SortOrder,
+		FeaturedAssetIDs: featuredAssetIDs,
+	}
+	if r.FeaturedAssetIDs == nil {
+		r.FeaturedAssetIDs = []string{}
 	}
 	if !m.TimeFrom.IsZero() {
 		s := m.TimeFrom.UTC().Format("2006-01-02T15:04:05Z07:00")
@@ -79,9 +93,15 @@ func (h *MomentsHandler) List(c echo.Context) error {
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
 	}
+	// 一次查询取全库 featured_asset_ids(排除各自封面),按 moment id 分发——
+	// 不对每条时刻单独查询,避免 N+1(TopFeaturedByMoment 本身就是一条 SQL)。
+	featured, err := h.svc.Moments().Store().TopFeaturedByMoment(maxFeaturedAssetIDsPerMoment)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	}
 	out := make([]momentResponse, 0, len(moments))
 	for _, m := range moments {
-		out = append(out, toMomentResponse(m))
+		out = append(out, toMomentResponse(m, featured[m.ID]))
 	}
 	return c.JSON(http.StatusOK, map[string]any{"moments": out})
 }
@@ -103,6 +123,14 @@ func (h *MomentsHandler) findMoment(id string) (service.Moment, error) {
 	return service.Moment{}, service.ErrNotFound
 }
 
+// momentAssetMemberDTO 是 with_members=1 附带的成员元数据,供编辑 UI 区分
+// "引擎本轮产出"与"用户手动 pin"的成员、以及是否属于精选。
+type momentAssetMemberDTO struct {
+	AssetID  string `json:"asset_id"`
+	Manual   bool   `json:"manual"`
+	Featured bool   `json:"featured"`
+}
+
 // Assets returns a moment's member assets, serialized via the same asset
 // shape as GET /v1/photos/assets. Query param featured=1 restricts to the
 // featured (精选) subset; members are already ordered by score DESC by
@@ -110,7 +138,12 @@ func (h *MomentsHandler) findMoment(id string) (service.Moment, error) {
 // Search().ListAssets short-circuits on a non-nil AssetIDs filter without
 // re-sorting.
 //
-// GET /v1/photos/moments/:id/assets?featured=1
+// with_members=1 时响应形状变为 {"assets":[...], "members":[{"asset_id",
+// "manual","featured"}]},供编辑 UI 同时拿到成员的来源/精选标记;不带该
+// 参数时保持既有裸数组完全不变(部署窗口内旧前端仍按裸数组解析,见简报
+// 歧义裁决)。
+//
+// GET /v1/photos/moments/:id/assets?featured=1&with_members=1
 func (h *MomentsHandler) Assets(c echo.Context) error {
 	id := c.Param("id")
 	if _, err := h.findMoment(id); err != nil {
@@ -131,7 +164,92 @@ func (h *MomentsHandler) Assets(c echo.Context) error {
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
 	}
-	return c.JSON(http.StatusOK, assets)
+
+	if c.QueryParam("with_members") != "1" {
+		return c.JSON(http.StatusOK, assets)
+	}
+
+	memberDTOs := make([]momentAssetMemberDTO, 0, len(members))
+	for _, m := range members {
+		memberDTOs = append(memberDTOs, momentAssetMemberDTO{
+			AssetID:  m.AssetID,
+			Manual:   m.Manual,
+			Featured: m.Featured,
+		})
+	}
+	return c.JSON(http.StatusOK, map[string]any{"assets": assets, "members": memberDTOs})
+}
+
+// momentAssetsIDsRequest 是 Pin/ExcludeAssets 共用的请求体形状:一批待操作
+// 的 asset id。
+type momentAssetsIDsRequest struct {
+	IDs []string `json:"ids"`
+}
+
+// PinAssets 把若干 asset 强制并入某时刻:落一条编辑记录并立即改成员(见
+// MomentStore.PinMomentAssets),对下一轮引擎重算也生效(回放钩子见
+// momentstore.go applyMomentEdits)。空 ids 视为无效请求 → 400;moment 不
+// 存在或已隐藏 → 404(findMoment 统一拦,ListMoments 已过滤 hidden,故此处
+// 不会触达 store 对未知 momentID 的 error 路径)。assets 表里不存在的 id
+// 由 store 层静默忽略,不影响本次请求成功。
+//
+// POST /v1/photos/moments/:id/assets
+//
+//	{ "ids": ["assetId1", "assetId2", ...] }
+func (h *MomentsHandler) PinAssets(c echo.Context) error {
+	id := c.Param("id")
+	if _, err := h.findMoment(id); err != nil {
+		return mapMomentErr(err)
+	}
+	var req momentAssetsIDsRequest
+	if err := c.Bind(&req); err != nil || len(req.IDs) == 0 {
+		return echo.NewHTTPError(http.StatusBadRequest, "ids is required")
+	}
+	count, err := h.svc.Moments().Store().PinMomentAssets(id, req.IDs)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	}
+	return c.JSON(http.StatusOK, map[string]any{"ok": true, "asset_count": count})
+}
+
+// ExcludeAssets 把若干 asset 强制剔除出某时刻(见
+// MomentStore.ExcludeMomentAssets),封面重挑已在 store 层完成。空
+// ids/moment 不存在或已隐藏的口径与 PinAssets 完全同形。
+//
+// DELETE /v1/photos/moments/:id/assets
+//
+//	{ "ids": ["assetId1", "assetId2", ...] }
+func (h *MomentsHandler) ExcludeAssets(c echo.Context) error {
+	id := c.Param("id")
+	if _, err := h.findMoment(id); err != nil {
+		return mapMomentErr(err)
+	}
+	var req momentAssetsIDsRequest
+	if err := c.Bind(&req); err != nil || len(req.IDs) == 0 {
+		return echo.NewHTTPError(http.StatusBadRequest, "ids is required")
+	}
+	count, err := h.svc.Moments().Store().ExcludeMomentAssets(id, req.IDs)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	}
+	return c.JSON(http.StatusOK, map[string]any{"ok": true, "asset_count": count})
+}
+
+// Delete 隐藏某时刻(tombstone,行本身保留,见 MomentStore.HideMoment)。
+// moment 不存在或已隐藏 → 404(findMoment 基于 ListMoments,已过滤
+// hidden=0,故重复 DELETE 同一个 id 第二次起也是 404,是预期的幂等表现)。
+// 隐藏生效后 List/Assets/CreateAlbum(export)一律 404/不再列出。
+//
+// DELETE /v1/photos/moments/:id
+func (h *MomentsHandler) Delete(c echo.Context) error {
+	id := c.Param("id")
+	if _, err := h.findMoment(id); err != nil {
+		return mapMomentErr(err)
+	}
+	if err := h.svc.Moments().Store().HideMoment(id); err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	}
+	return c.JSON(http.StatusOK, map[string]any{"ok": true})
 }
 
 // CreateAlbum 把一个时刻固化为普通相册(全量成员,不限精选),名字用
