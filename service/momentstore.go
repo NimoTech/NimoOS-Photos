@@ -263,26 +263,44 @@ func defaultSeedRecipes() []seedRecipe {
 // 品种 + 鸟类 + 小型宠物,约 60-100 词,供 caption 词边界匹配。刻意不含过于
 // 宽泛的词(如单独的 "dog"/"cat"——那是 theme:pets 概念版的职责,画像层要的
 // 是能收敛到"用户特定那只"的具体品种/物种词,复现性信号才有区分力)。
+//
+// 审查后修复(高频误匹配词,美国市场场景):
+//   - 删除 newfoundland(纽芬兰,地名同形)、finch(常见姓氏,如 Atticus Finch)、
+//     canary(加纳利群岛,Canary Islands 同形)、goldfish(Goldfish 品牌饼干同名,
+//     且真金鱼 caption 通常连写 "goldfish in a bowl" 一类短语,裸词误召回风险
+//     大于收益)。
+//   - 单词有歧义的品种消歧为短语:akita→"akita dog"、boxer→"boxer dog"、
+//     greyhound→"greyhound dog"(避免与拳击手 boxer / 田径 greyhound 巴士等
+//     混淆);裸 "shepherd" 换成具体品种 "german shepherd"/"australian shepherd"
+//     (裸词本身就不够具体,不如直接两个高频具体品种)。
+//   - 猫的花纹词(tabby/calico/tuxedo/ginger 等)本身极常见于口语但单独一词
+//     歧义大(如 "tuxedo" 可指礼服),但 VLM 生成的 caption 描述猫时几乎只说
+//     花纹+"cat"(如 "a tabby cat"),极少报具体品种——若删掉这类词,大部分
+//     用户的猫根本挖不出来实体。因此这里的取舍是:花纹词全部保留,但一律
+//     锚成 "<花纹> cat" 双词短语(而非裸花纹词),把"猫品种词有限"的专属性
+//     风险交给挖掘门槛(min_photos/min_months 的复现性判据)兜底,而不是在
+//     词表层面因噎废食。
 func petEntityLexicon() []string {
 	return []string{
-		// ── Dogs(品种,不含泛化的 "dog"/"puppy")──────────────────────
+		// ── Dogs(品种,不含泛化的 "dog"/"puppy";歧义词见上方注释消歧)──
 		"beagle", "labrador", "corgi", "husky", "poodle", "terrier", "retriever",
-		"bulldog", "dachshund", "chihuahua", "pug", "shepherd", "collie", "spaniel",
-		"dalmatian", "boxer", "rottweiler", "doberman", "schnauzer", "mastiff",
-		"greyhound", "whippet", "pomeranian", "shih tzu", "maltese", "chow chow",
-		"akita", "samoyed", "malamute", "bernese mountain dog", "newfoundland",
-		"labradoodle", "goldendoodle", "basset hound", "bloodhound",
-		// ── Cats(品种,不含泛化的 "cat"/"kitten")────────────────────
-		"tabby", "siamese", "persian cat", "maine coon", "ragdoll", "sphynx",
-		"bengal cat", "calico", "tuxedo cat", "ginger cat", "tortoiseshell",
-		"british shorthair", "scottish fold", "abyssinian", "burmese cat",
-		"russian blue", "himalayan cat",
-		// ── Birds ──────────────────────────────────────────────────────
-		"parrot", "parakeet", "cockatiel", "budgie", "canary", "macaw",
-		"cockatoo", "lovebird", "finch",
-		// ── Small pets ────────────────────────────────────────────────
+		"bulldog", "dachshund", "chihuahua", "pug", "german shepherd",
+		"australian shepherd", "collie", "spaniel", "dalmatian", "boxer dog",
+		"rottweiler", "doberman", "schnauzer", "mastiff", "greyhound dog",
+		"whippet", "pomeranian", "shih tzu", "maltese", "chow chow", "akita dog",
+		"samoyed", "malamute", "bernese mountain dog", "labradoodle",
+		"goldendoodle", "basset hound", "bloodhound",
+		// ── Cats(品种 + 花纹词,花纹词均锚成 "<花纹> cat" 短语,见上方注释)──
+		"tabby cat", "siamese", "persian cat", "maine coon", "ragdoll", "sphynx",
+		"bengal cat", "calico cat", "tuxedo cat", "ginger cat", "orange cat",
+		"tortoiseshell cat", "british shorthair", "scottish fold", "abyssinian",
+		"burmese cat", "russian blue", "himalayan cat",
+		// ── Birds(canary/finch 因地名/姓氏同形误召回已删,见上方注释)──────
+		"parrot", "parakeet", "cockatiel", "budgie", "macaw", "cockatoo",
+		"lovebird",
+		// ── Small pets(goldfish 因品牌同名已删,见上方注释)───────────────
 		"hamster", "rabbit", "bunny", "guinea pig", "turtle", "tortoise",
-		"goldfish", "gecko", "ferret", "chinchilla", "hedgehog", "iguana",
+		"gecko", "ferret", "chinchilla", "hedgehog", "iguana",
 	}
 }
 

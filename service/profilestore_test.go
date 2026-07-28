@@ -33,31 +33,35 @@ func TestProfileStore_ReplaceEntitiesIdempotentAndIsolatesKind(t *testing.T) {
 	}
 	require.NoError(t, store.ReplaceEntities("pet", pets))
 
-	families := []ProfileEntity{
-		{ID: ProfileEntityID("family", "family:together"), Kind: "family", Key: "family:together", Label: "Family Moments", PhotoCount: 40},
+	// 跨 kind 隔离用 spec 词汇表内的 kind('pet'|'person')——family 合影集
+	// 不落本表(见设计 spec 第一节:family 挖掘只对具名 person 逐一落实体行,
+	// "合影集"是另一张 moments 表的产出,不经 ProfileStore),这里只是借
+	// person 做隔离对照,不代表 family 引擎会调用这条路径。
+	persons := []ProfileEntity{
+		{ID: ProfileEntityID("person", "p1"), Kind: "person", Key: "p1", Label: "Alice", PhotoCount: 40},
 	}
-	require.NoError(t, store.ReplaceEntities("family", families))
+	require.NoError(t, store.ReplaceEntities("person", persons))
 
-	// 跨 kind 隔离:写 family 不应影响 pet。
+	// 跨 kind 隔离:写 person 不应影响 pet。
 	petList, err := store.ListEntities("pet")
 	require.NoError(t, err)
 	require.Len(t, petList, 1)
 	require.Equal(t, "beagle", petList[0].Key)
 
-	familyList, err := store.ListEntities("family")
+	personList, err := store.ListEntities("person")
 	require.NoError(t, err)
-	require.Len(t, familyList, 1)
-	require.Equal(t, "family:together", familyList[0].Key)
+	require.Len(t, personList, 1)
+	require.Equal(t, "p1", personList[0].Key)
 
-	// 幂等全量替换:再次写 pet(缩减为空集)应清空该 kind,不影响 family。
+	// 幂等全量替换:再次写 pet(缩减为空集)应清空该 kind,不影响 person。
 	require.NoError(t, store.ReplaceEntities("pet", nil))
 	petList2, err := store.ListEntities("pet")
 	require.NoError(t, err)
 	require.Len(t, petList2, 0, "全量替换为空集应清空该 kind 下全部实体")
 
-	familyList2, err := store.ListEntities("family")
+	personList2, err := store.ListEntities("person")
 	require.NoError(t, err)
-	require.Len(t, familyList2, 1, "替换 pet 不应影响 family")
+	require.Len(t, personList2, 1, "替换 pet 不应影响 person")
 
 	// 再次写入不同的 pet 集合,应完全替换旧集合(而非合并)。
 	require.NoError(t, store.ReplaceEntities("pet", []ProfileEntity{

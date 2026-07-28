@@ -111,7 +111,7 @@ func TestMomentStore_SeedIdempotentAndDoesNotOverwritePushed(t *testing.T) {
 	require.LessOrEqual(t, len(petParams.Lexicon), 100)
 	require.Contains(t, petParams.Lexicon, "beagle")
 	require.Contains(t, petParams.Lexicon, "labrador")
-	require.Contains(t, petParams.Lexicon, "tabby")
+	require.Contains(t, petParams.Lexicon, "tabby cat")
 	require.Contains(t, petParams.Lexicon, "parrot")
 	require.Equal(t, 8, petParams.MinPhotos)
 	require.Equal(t, 2, petParams.MinMonths)
