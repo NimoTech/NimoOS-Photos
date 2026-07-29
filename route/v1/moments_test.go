@@ -56,7 +56,9 @@ func newMomentsHarness(t *testing.T) (*MomentsHandler, *sql.DB, *service.MomentS
 // 不涉及语义检索,只用 Search().ListAssets/GetAsset 的按 id 查询路径。
 type zeroMLStub struct{}
 
-func (zeroMLStub) CLIPTextEmbed(string) ([]float32, error) { return make([]float32, common.CLIPDim), nil }
+func (zeroMLStub) CLIPTextEmbed(string) ([]float32, error) {
+	return make([]float32, common.CLIPDim), nil
+}
 
 func newEchoCtx(method, path string, body []byte) (echo.Context, *httptest.ResponseRecorder) {
 	var req *http.Request
@@ -84,8 +86,8 @@ func seedOneMoment(t *testing.T, db *sql.DB, store *service.MomentStore, momentI
 		Moment: service.Moment{
 			ID: momentID, RecipeKey: "trip", Title: "Kyoto Trip", Subtitle: "3 days",
 			CoverAssetID: assetIDs[0], Place: "Kyoto",
-			TimeFrom: time.Date(2026, 4, 1, 0, 0, 0, 0, time.UTC),
-			TimeTo:   time.Date(2026, 4, 3, 0, 0, 0, 0, time.UTC),
+			TimeFrom:   time.Date(2026, 4, 1, 0, 0, 0, 0, time.UTC),
+			TimeTo:     time.Date(2026, 4, 3, 0, 0, 0, 0, time.UTC),
 			AssetCount: len(assetIDs),
 		},
 		Assets: assets,
@@ -492,6 +494,28 @@ func TestMomentsHandler_DeleteNotFound(t *testing.T) {
 	he, ok := err.(*echo.HTTPError)
 	require.True(t, ok)
 	require.Equal(t, http.StatusNotFound, he.Code)
+}
+
+// TestMomentsHandler_DeleteTwiceStillReturns404:补齐九期终审点名的边界——
+// 第一次 DELETE 隐藏成功(200),第二次对同一 id 再 DELETE 应仍是 404(
+// findMoment 基于 ListMoments,已过滤 hidden=0,故第二次起视为"不存在"),
+// 而非误报已隐藏或再次 200。
+func TestMomentsHandler_DeleteTwiceStillReturns404(t *testing.T) {
+	h, db, store := newMomentsHarness(t)
+	seedOneMoment(t, db, store, "m1", []string{"a1", "a2"})
+
+	c1, _ := newEchoCtx(http.MethodDelete, "/v1/photos/moments/m1", nil)
+	c1.SetParamNames("id")
+	c1.SetParamValues("m1")
+	require.NoError(t, h.Delete(c1))
+
+	c2, _ := newEchoCtx(http.MethodDelete, "/v1/photos/moments/m1", nil)
+	c2.SetParamNames("id")
+	c2.SetParamValues("m1")
+	err := h.Delete(c2)
+	he, ok := err.(*echo.HTTPError)
+	require.True(t, ok)
+	require.Equal(t, http.StatusNotFound, he.Code, "二次 DELETE 同一 id 仍应是 404")
 }
 
 // ── momentDTO.featured_asset_ids ─────────────────────────────────────────
