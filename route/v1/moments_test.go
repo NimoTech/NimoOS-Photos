@@ -333,6 +333,277 @@ func TestMomentsHandler_ReorderSuccess(t *testing.T) {
 	require.Equal(t, "m1", moments[1].ID)
 }
 
+// ── POST/DELETE /v1/photos/moments/:id/assets(pin/exclude)──────────────
+
+func TestMomentsHandler_PinAssetsAddsMemberAndReturnsCount(t *testing.T) {
+	h, db, store := newMomentsHarness(t)
+	seedOneMoment(t, db, store, "m1", []string{"a1", "a2"})
+	_, err := db.Exec(`INSERT INTO assets(id,file_path,status) VALUES(?,?,'indexed')`, "a3", "/p/a3.jpg")
+	require.NoError(t, err)
+
+	reqBody, _ := json.Marshal(map[string]any{"ids": []string{"a3"}})
+	c, rec := newEchoCtx(http.MethodPost, "/v1/photos/moments/m1/assets", reqBody)
+	c.SetParamNames("id")
+	c.SetParamValues("m1")
+	require.NoError(t, h.PinAssets(c))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	var body map[string]any
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &body))
+	require.Equal(t, true, body["ok"])
+	require.Equal(t, float64(3), body["asset_count"])
+
+	members, err := store.GetMomentAssets("m1", false)
+	require.NoError(t, err)
+	require.Len(t, members, 3)
+	var pinned service.MomentAsset
+	for _, m := range members {
+		if m.AssetID == "a3" {
+			pinned = m
+		}
+	}
+	require.True(t, pinned.Manual, "pin 落库的成员应标 manual=1")
+}
+
+func TestMomentsHandler_PinAssetsEmptyIdsRejected(t *testing.T) {
+	h, db, store := newMomentsHarness(t)
+	seedOneMoment(t, db, store, "m1", []string{"a1", "a2"})
+
+	c, _ := newEchoCtx(http.MethodPost, "/v1/photos/moments/m1/assets", []byte(`{"ids":[]}`))
+	c.SetParamNames("id")
+	c.SetParamValues("m1")
+	err := h.PinAssets(c)
+	he, ok := err.(*echo.HTTPError)
+	require.True(t, ok)
+	require.Equal(t, http.StatusBadRequest, he.Code)
+}
+
+func TestMomentsHandler_PinAssetsNotFound(t *testing.T) {
+	h, _, _ := newMomentsHarness(t)
+
+	c, _ := newEchoCtx(http.MethodPost, "/v1/photos/moments/nope/assets", []byte(`{"ids":["a1"]}`))
+	c.SetParamNames("id")
+	c.SetParamValues("nope")
+	err := h.PinAssets(c)
+	he, ok := err.(*echo.HTTPError)
+	require.True(t, ok)
+	require.Equal(t, http.StatusNotFound, he.Code)
+}
+
+func TestMomentsHandler_ExcludeAssetsRemovesMemberAndReturnsCount(t *testing.T) {
+	h, db, store := newMomentsHarness(t)
+	seedOneMoment(t, db, store, "m1", []string{"a1", "a2"})
+
+	reqBody, _ := json.Marshal(map[string]any{"ids": []string{"a1"}})
+	c, rec := newEchoCtx(http.MethodDelete, "/v1/photos/moments/m1/assets", reqBody)
+	c.SetParamNames("id")
+	c.SetParamValues("m1")
+	require.NoError(t, h.ExcludeAssets(c))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	var body map[string]any
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &body))
+	require.Equal(t, true, body["ok"])
+	require.Equal(t, float64(1), body["asset_count"])
+
+	members, err := store.GetMomentAssets("m1", false)
+	require.NoError(t, err)
+	require.Len(t, members, 1)
+	require.Equal(t, "a2", members[0].AssetID)
+}
+
+func TestMomentsHandler_ExcludeAssetsEmptyIdsRejected(t *testing.T) {
+	h, db, store := newMomentsHarness(t)
+	seedOneMoment(t, db, store, "m1", []string{"a1", "a2"})
+
+	c, _ := newEchoCtx(http.MethodDelete, "/v1/photos/moments/m1/assets", []byte(`{"ids":[]}`))
+	c.SetParamNames("id")
+	c.SetParamValues("m1")
+	err := h.ExcludeAssets(c)
+	he, ok := err.(*echo.HTTPError)
+	require.True(t, ok)
+	require.Equal(t, http.StatusBadRequest, he.Code)
+}
+
+func TestMomentsHandler_ExcludeAssetsNotFound(t *testing.T) {
+	h, _, _ := newMomentsHarness(t)
+
+	c, _ := newEchoCtx(http.MethodDelete, "/v1/photos/moments/nope/assets", []byte(`{"ids":["a1"]}`))
+	c.SetParamNames("id")
+	c.SetParamValues("nope")
+	err := h.ExcludeAssets(c)
+	he, ok := err.(*echo.HTTPError)
+	require.True(t, ok)
+	require.Equal(t, http.StatusNotFound, he.Code)
+}
+
+// ── DELETE /v1/photos/moments/:id(hide)──────────────────────────────────
+
+func TestMomentsHandler_DeleteHidesMomentAndFollowUpsReturn404(t *testing.T) {
+	h, db, store := newMomentsHarness(t)
+	seedOneMoment(t, db, store, "m1", []string{"a1", "a2"})
+
+	c, rec := newEchoCtx(http.MethodDelete, "/v1/photos/moments/m1", nil)
+	c.SetParamNames("id")
+	c.SetParamValues("m1")
+	require.NoError(t, h.Delete(c))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	var body map[string]any
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &body))
+	require.Equal(t, true, body["ok"])
+
+	// 隐藏后:List 不再包含它。
+	lc, lrec := newEchoCtx(http.MethodGet, "/v1/photos/moments", nil)
+	require.NoError(t, h.List(lc))
+	var listBody struct {
+		Moments []map[string]any `json:"moments"`
+	}
+	require.NoError(t, json.Unmarshal(lrec.Body.Bytes(), &listBody))
+	require.Len(t, listBody.Moments, 0)
+
+	// 隐藏后:assets/album 端点均 404。
+	ac, _ := newEchoCtx(http.MethodGet, "/v1/photos/moments/m1/assets", nil)
+	ac.SetParamNames("id")
+	ac.SetParamValues("m1")
+	err := h.Assets(ac)
+	he, ok := err.(*echo.HTTPError)
+	require.True(t, ok)
+	require.Equal(t, http.StatusNotFound, he.Code)
+
+	cc, _ := newEchoCtx(http.MethodPost, "/v1/photos/moments/m1/album", nil)
+	cc.SetParamNames("id")
+	cc.SetParamValues("m1")
+	err = h.CreateAlbum(cc)
+	he, ok = err.(*echo.HTTPError)
+	require.True(t, ok)
+	require.Equal(t, http.StatusNotFound, he.Code)
+}
+
+func TestMomentsHandler_DeleteNotFound(t *testing.T) {
+	h, _, _ := newMomentsHarness(t)
+
+	c, _ := newEchoCtx(http.MethodDelete, "/v1/photos/moments/nope", nil)
+	c.SetParamNames("id")
+	c.SetParamValues("nope")
+	err := h.Delete(c)
+	he, ok := err.(*echo.HTTPError)
+	require.True(t, ok)
+	require.Equal(t, http.StatusNotFound, he.Code)
+}
+
+// ── momentDTO.featured_asset_ids ─────────────────────────────────────────
+
+func TestMomentsHandler_ListIncludesFeaturedAssetIDsExcludingCover(t *testing.T) {
+	h, db, store := newMomentsHarness(t)
+	// a1 是封面且 featured,a2/a3 也 featured(非封面),a4 不 featured——
+	// TopFeaturedByMoment(2) 应排除封面 a1,按 score 降序截取前 2:a2、a3。
+	for _, id := range []string{"a1", "a2", "a3", "a4"} {
+		_, err := db.Exec(`INSERT INTO assets(id,file_path,status) VALUES(?,?,'indexed')`, id, "/p/"+id+".jpg")
+		require.NoError(t, err)
+	}
+	draft := service.MomentDraft{
+		Moment: service.Moment{
+			ID: "m1", RecipeKey: "trip", Title: "Kyoto Trip", CoverAssetID: "a1",
+			TimeFrom:   time.Date(2026, 4, 1, 0, 0, 0, 0, time.UTC),
+			TimeTo:     time.Date(2026, 4, 3, 0, 0, 0, 0, time.UTC),
+			AssetCount: 4,
+		},
+		Assets: []service.MomentAsset{
+			{AssetID: "a1", Featured: true, Score: 4},
+			{AssetID: "a2", Featured: true, Score: 3},
+			{AssetID: "a3", Featured: true, Score: 2},
+			{AssetID: "a4", Featured: false, Score: 1},
+		},
+	}
+	require.NoError(t, store.SyncRecipeMoments("trip", []service.MomentDraft{draft}))
+
+	c, rec := newEchoCtx(http.MethodGet, "/v1/photos/moments", nil)
+	require.NoError(t, h.List(c))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	var body struct {
+		Moments []struct {
+			ID               string   `json:"id"`
+			FeaturedAssetIDs []string `json:"featured_asset_ids"`
+		} `json:"moments"`
+	}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &body))
+	require.Len(t, body.Moments, 1)
+	require.Equal(t, []string{"a2", "a3"}, body.Moments[0].FeaturedAssetIDs)
+}
+
+func TestMomentsHandler_ListFeaturedAssetIDsEmptyWhenNoneFeatured(t *testing.T) {
+	h, db, store := newMomentsHarness(t)
+	seedOneMoment(t, db, store, "m1", []string{"a1"}) // 唯一成员即封面,被 Top 排除
+
+	c, rec := newEchoCtx(http.MethodGet, "/v1/photos/moments", nil)
+	require.NoError(t, h.List(c))
+
+	var body struct {
+		Moments []map[string]any `json:"moments"`
+	}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &body))
+	require.Len(t, body.Moments, 1)
+	ids, ok := body.Moments[0]["featured_asset_ids"].([]any)
+	require.True(t, ok, "featured_asset_ids 字段应始终是数组(即使为空),不是 null 或缺失")
+	require.Len(t, ids, 0)
+}
+
+// ── GET /moments/:id/assets?with_members=1 ──────────────────────────────
+
+func TestMomentsHandler_AssetsWithMembersReturnsShapeWithManualFeatured(t *testing.T) {
+	h, db, store := newMomentsHarness(t)
+	seedOneMoment(t, db, store, "m1", []string{"a1", "a2"}) // a1 featured/manual=0,a2 非 featured/manual=0
+	_, err := db.Exec(`INSERT INTO assets(id,file_path,status) VALUES(?,?,'indexed')`, "a3", "/p/a3.jpg")
+	require.NoError(t, err)
+	_, err = store.PinMomentAssets("m1", []string{"a3"}) // manual=1/featured=0
+	require.NoError(t, err)
+
+	c, rec := newEchoCtx(http.MethodGet, "/v1/photos/moments/m1/assets?with_members=1", nil)
+	c.SetParamNames("id")
+	c.SetParamValues("m1")
+	require.NoError(t, h.Assets(c))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	var body struct {
+		Assets  []service.Asset `json:"assets"`
+		Members []struct {
+			AssetID  string `json:"asset_id"`
+			Manual   bool   `json:"manual"`
+			Featured bool   `json:"featured"`
+		} `json:"members"`
+	}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &body))
+	require.Len(t, body.Assets, 3)
+	require.Len(t, body.Members, 3)
+
+	type flags struct{ Manual, Featured bool }
+	byID := map[string]flags{}
+	for _, m := range body.Members {
+		byID[m.AssetID] = flags{m.Manual, m.Featured}
+	}
+	require.Equal(t, flags{Manual: false, Featured: true}, byID["a1"])
+	require.Equal(t, flags{Manual: false, Featured: false}, byID["a2"])
+	require.Equal(t, flags{Manual: true, Featured: false}, byID["a3"])
+}
+
+func TestMomentsHandler_AssetsWithoutParamStaysBareArray(t *testing.T) {
+	h, db, store := newMomentsHarness(t)
+	seedOneMoment(t, db, store, "m1", []string{"a1", "a2"})
+
+	c, rec := newEchoCtx(http.MethodGet, "/v1/photos/moments/m1/assets", nil)
+	c.SetParamNames("id")
+	c.SetParamValues("m1")
+	require.NoError(t, h.Assets(c))
+
+	// 不带 with_members 参数时响应必须是裸数组,不能是 {"assets":...} 对象——
+	// 部署窗口内旧前端仍按裸数组解析(见简报歧义裁决)。
+	var raw []any
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &raw), "响应应能直接解析为裸数组")
+	require.Len(t, raw, 2)
+}
+
 func TestMomentsHandler_UpdateRecipesUnknownKindRejected(t *testing.T) {
 	h, _, store := newMomentsHarness(t)
 

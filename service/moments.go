@@ -236,7 +236,7 @@ func (s *MomentsService) recomputeRecipe(ctx context.Context, recipe MomentRecip
 	case "theme":
 		drafts, err = BuildThemeMoments(ctx, s.db, s.searcher, recipe)
 	case "pet_entities":
-		drafts, err = BuildPetEntityMoments(ctx, s.db, s.searcher, s.profileStore, recipe)
+		drafts, err = BuildPetEntityMoments(ctx, s.db, s.searcher, s.profileStore, s.store, recipe)
 	case "family":
 		drafts, err = BuildFamilyMoments(ctx, s.db, s.profileStore, recipe)
 	default:

@@ -3,10 +3,16 @@
 // 文本不命中;draft title/subtitle 格式(同年/跨年)/成员并集(词命中 ∪
 // CLIP fake);无达标实体清空画像。替换规则(theme:pets 双向)的用例追加在
 // moments_test.go(需要完整 RecomputeAll 装配)。
+//
+// pet 实体挖掘消费 pin/exclude 反馈(Task 3):exclude 收窄 first/last
+// seen、exclude 跌破 min_photos 门槛后实体从挖掘输出消失、pin 并入匹配集
+// 增加计数/延展跨度、pin 命中但不在候选池(如已回收站/离线)的资产不计入
+// 统计。用例见 "── MinePetEntities:消费 pin/exclude 反馈" 分组。
 package service
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"testing"
 	"time"
@@ -70,7 +76,7 @@ func TestMinePetEntities_ThresholdsAndPhraseBoundary(t *testing.T) {
 
 	recipe := petTestRecipe([]string{"beagle", "labrador", "boxer dog"}, 8, 2)
 
-	entities, err := MinePetEntities(context.Background(), db, recipe)
+	entities, err := MinePetEntities(context.Background(), db, NewMomentStore(db), recipe)
 	require.NoError(t, err)
 
 	byKey := map[string]ProfileEntity{}
@@ -102,9 +108,156 @@ func TestMinePetEntities_ThresholdsAndPhraseBoundary(t *testing.T) {
 func TestMinePetEntities_EmptyLexiconReturnsEmpty(t *testing.T) {
 	db := makeTestDB(t)
 	recipe := petTestRecipe(nil, 8, 2)
-	entities, err := MinePetEntities(context.Background(), db, recipe)
+	entities, err := MinePetEntities(context.Background(), db, NewMomentStore(db), recipe)
 	require.NoError(t, err)
 	require.Empty(t, entities)
+}
+
+// ── MinePetEntities:消费 pin/exclude 反馈 ────────────────────────────────
+
+// seedStubMoment 直接插入一条最简 moments 行,只为满足 moment_edits 对
+// moments(id) 的外键约束——测试直接调用 store.Pin/ExcludeMomentAssets 写
+// 编辑记录,不经过完整 BuildPetEntityMoments/SyncRecipeMoments 装配流程。
+func seedStubMoment(t *testing.T, db *sql.DB, id string) {
+	t.Helper()
+	now := time.Now().UnixMilli()
+	_, err := db.Exec(`
+		INSERT INTO moments(id, recipe_key, title, asset_count, created_at, updated_at)
+		VALUES (?, 'profile:pets', 'stub', 0, ?, ?)`, id, now, now)
+	require.NoError(t, err)
+}
+
+func TestMinePetEntities_ExcludeNarrowsFirstLastSeenAndCount(t *testing.T) {
+	db := makeTestDB(t)
+	store := NewMomentStore(db)
+
+	month1 := time.Date(2011, time.August, 1, 12, 0, 0, 0, time.UTC)
+	month2 := time.Date(2026, time.July, 1, 12, 0, 0, 0, time.UTC)
+
+	for i := 0; i < 7; i++ {
+		id := "beagle-a" + string(rune('0'+i))
+		insertThemeAsset(t, db, id, month1.AddDate(0, 0, i))
+		insertCaption(t, db, id, "our beagle running in the yard")
+	}
+	for i := 0; i < 7; i++ {
+		id := "beagle-b" + string(rune('0'+i))
+		insertThemeAsset(t, db, id, month2.AddDate(0, 0, i))
+		insertCaption(t, db, id, "the beagle sleeping on the couch")
+	}
+
+	recipe := petTestRecipe([]string{"beagle"}, 8, 2)
+	momentID := ProfileEntityID("pet", "beagle")
+	seedStubMoment(t, db, momentID)
+
+	// 用户认定最早(beagle-a0)与最晚(beagle-b6)两张不是自己的狗,排除。
+	_, err := store.ExcludeMomentAssets(momentID, []string{"beagle-a0", "beagle-b6"})
+	require.NoError(t, err)
+
+	entities, err := MinePetEntities(context.Background(), db, store, recipe)
+	require.NoError(t, err)
+	require.Len(t, entities, 1)
+
+	e := entities[0]
+	require.Equal(t, 12, e.PhotoCount, "14 张排除 2 张后应为 12")
+	require.True(t, e.FirstSeen.Equal(month1.AddDate(0, 0, 1)), "首张应收窄到 beagle-a1")
+	require.True(t, e.LastSeen.Equal(month2.AddDate(0, 0, 5)), "末张应收窄到 beagle-b5")
+}
+
+func TestMinePetEntities_ExcludeBelowMinPhotosEntityDisappears(t *testing.T) {
+	db := makeTestDB(t)
+	store := NewMomentStore(db)
+
+	base := time.Date(2020, time.March, 1, 12, 0, 0, 0, time.UTC)
+	for i := 0; i < 8; i++ {
+		id := "lab-" + string(rune('a'+i))
+		insertThemeAsset(t, db, id, base.AddDate(0, 0, i))
+		insertCaption(t, db, id, "a labrador at the beach")
+	}
+
+	recipe := petTestRecipe([]string{"labrador"}, 8, 1)
+	momentID := ProfileEntityID("pet", "labrador")
+	seedStubMoment(t, db, momentID)
+
+	// 恰好达标线(8 张),排除 1 张后跌破 min_photos=8,实体应从挖掘输出消失
+	// ——这是有意语义:复现性证据不足以支撑"这是我自己的宠物"这一判断。
+	_, err := store.ExcludeMomentAssets(momentID, []string{"lab-a"})
+	require.NoError(t, err)
+
+	entities, err := MinePetEntities(context.Background(), db, store, recipe)
+	require.NoError(t, err)
+	require.Empty(t, entities, "跌破 min_photos 门槛后实体不应再被挖掘出来")
+}
+
+func TestMinePetEntities_PinMergesAdditionalAssetIntoCountAndSpan(t *testing.T) {
+	db := makeTestDB(t)
+	store := NewMomentStore(db)
+
+	month1 := time.Date(2011, time.August, 1, 12, 0, 0, 0, time.UTC)
+	month2 := time.Date(2026, time.July, 1, 12, 0, 0, 0, time.UTC)
+	for i := 0; i < 7; i++ {
+		id := "beagle-a" + string(rune('0'+i))
+		insertThemeAsset(t, db, id, month1.AddDate(0, 0, i))
+		insertCaption(t, db, id, "our beagle running in the yard")
+	}
+	for i := 0; i < 7; i++ {
+		id := "beagle-b" + string(rune('0'+i))
+		insertThemeAsset(t, db, id, month2.AddDate(0, 0, i))
+		insertCaption(t, db, id, "the beagle sleeping on the couch")
+	}
+
+	// 一张 caption 里完全没提 "beagle" 的照片,拍摄时间早于当前 first
+	// seen,验证 pin 并入后计数增加且跨度向前延展。
+	earlier := month1.AddDate(0, 0, -30)
+	insertThemeAsset(t, db, "beagle-pinned", earlier)
+	insertCaption(t, db, "beagle-pinned", "a lazy afternoon nap")
+
+	recipe := petTestRecipe([]string{"beagle"}, 8, 2)
+	momentID := ProfileEntityID("pet", "beagle")
+	seedStubMoment(t, db, momentID)
+
+	_, err := store.PinMomentAssets(momentID, []string{"beagle-pinned"})
+	require.NoError(t, err)
+
+	entities, err := MinePetEntities(context.Background(), db, store, recipe)
+	require.NoError(t, err)
+	require.Len(t, entities, 1)
+
+	e := entities[0]
+	require.Equal(t, 15, e.PhotoCount, "14 张词命中 + 1 张 pin 确认样本")
+	require.True(t, e.FirstSeen.Equal(earlier), "pin 的更早样本应延展 first seen")
+	require.True(t, e.LastSeen.Equal(month2.AddDate(0, 0, 6)), "last seen 不受影响")
+}
+
+func TestMinePetEntities_PinOutsideCandidatePoolNotCounted(t *testing.T) {
+	db := makeTestDB(t)
+	store := NewMomentStore(db)
+
+	base := time.Date(2020, time.March, 1, 12, 0, 0, 0, time.UTC)
+	for i := 0; i < 8; i++ {
+		id := "beagle-" + string(rune('a'+i))
+		insertThemeAsset(t, db, id, base.AddDate(0, 0, i))
+		insertCaption(t, db, id, "our beagle at the park")
+	}
+
+	// 已回收站的资产:仍在 assets 表里(满足 moment_edits 外键),但不在
+	// loadThemeCandidatePool 候选池——pin 不应把它计入统计。
+	_, err := db.Exec(`INSERT INTO assets(id, file_path, status, taken_at, deleted_at) VALUES (?,?,'indexed',?,?)`,
+		"beagle-trashed", "/g/beagle-trashed.jpg",
+		base.AddDate(0, 0, -10).UTC().Format("2006-01-02 15:04:05"),
+		time.Now().UTC().Format("2006-01-02 15:04:05"))
+	require.NoError(t, err)
+
+	recipe := petTestRecipe([]string{"beagle"}, 8, 1)
+	momentID := ProfileEntityID("pet", "beagle")
+	seedStubMoment(t, db, momentID)
+
+	_, err = store.PinMomentAssets(momentID, []string{"beagle-trashed"})
+	require.NoError(t, err)
+
+	entities, err := MinePetEntities(context.Background(), db, store, recipe)
+	require.NoError(t, err)
+	require.Len(t, entities, 1)
+	require.Equal(t, 8, entities[0].PhotoCount, "回收站资产的 pin 不应计入统计")
 }
 
 // ── petEntitySubtitle:年份跨度格式 ───────────────────────────────────────
@@ -146,7 +299,7 @@ func TestBuildPetEntityMoments_DraftsAndMemberUnion(t *testing.T) {
 		},
 	}}
 
-	drafts, err := BuildPetEntityMoments(context.Background(), db, searcher, profileStore, recipe)
+	drafts, err := BuildPetEntityMoments(context.Background(), db, searcher, profileStore, NewMomentStore(db), recipe)
 	require.NoError(t, err)
 	require.Len(t, drafts, 1)
 
@@ -186,7 +339,7 @@ func TestBuildPetEntityMoments_NoQualifyingClearsProfile(t *testing.T) {
 
 	recipe := petTestRecipe([]string{"labrador"}, 8, 2)
 
-	drafts, err := BuildPetEntityMoments(context.Background(), db, fakeThemeSearcher{}, profileStore, recipe)
+	drafts, err := BuildPetEntityMoments(context.Background(), db, fakeThemeSearcher{}, profileStore, NewMomentStore(db), recipe)
 	require.NoError(t, err)
 	require.Empty(t, drafts)
 

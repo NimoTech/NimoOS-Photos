@@ -343,6 +343,22 @@ func migrate(db *sql.DB) error {
 			PRIMARY KEY (moment_id, asset_id)
 		)`,
 
+		// ── Smart Moments 可编辑时刻:pin/exclude 编辑记录(tombstone 式回放)──
+		// moment_assets 每轮重算被全量替换(delete+insert),用户对成员的手动
+		// 编辑(强制并入=pin / 强制剔除=exclude)必须独立持久化,否则会被下一轮
+		// 重算悄悄冲掉。SyncRecipeMoments 在每轮成员替换后据此回放
+		// (applyMomentEdits):exclude 剔除 → pin 并入,回放不改变本表内容。
+		// 联合主键 (moment_id, asset_id) 保证同一资产对同一时刻只保留一条最新
+		// 编辑——upsert 的 ON CONFLICT 让后写的 op 覆盖先写的(如先 exclude 后
+		// 反悔 pin,结果是 pin 生效,不会两条并存)。
+		`CREATE TABLE IF NOT EXISTS moment_edits (
+			moment_id  TEXT NOT NULL REFERENCES moments(id) ON DELETE CASCADE,
+			asset_id   TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+			op         TEXT NOT NULL CHECK(op IN ('pin','exclude')), -- 'pin' | 'exclude'
+			created_at INTEGER NOT NULL,           -- Unix ms
+			PRIMARY KEY (moment_id, asset_id)
+		)`,
+
 		// ── 可恢复上传任务表（与 Common upload.UploadTask gorm column 对应）────
 		`CREATE TABLE IF NOT EXISTS o_upload_tasks (
 			id TEXT PRIMARY KEY,
@@ -577,6 +593,14 @@ func migrate(db *sql.DB) error {
 		// (i+1)*10(留间隙便于未来插入);SyncRecipeMoments 的 upsert 列清单
 		// 不含该列,重算天然保留用户手排顺序。
 		`ALTER TABLE moments ADD COLUMN sort_order INTEGER`,
+		// moments.hidden: 用户"隐藏此时刻"的 tombstone(0=正常显示,1=已隐藏)。
+		// ListMoments 按 hidden=0 过滤;SyncRecipeMoments 的 upsert 列清单同样
+		// 不含该列(与 sort_order/named_by_llm 同法),重算天然保留隐藏状态。
+		`ALTER TABLE moments ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0`,
+		// moment_assets.manual: 标记该成员行是否由用户 pin 编辑回放插入
+		// (1=用户手动并入,非引擎本轮算出;0=引擎本轮正常产出)。仅供展示/排障
+		// 区分来源,不参与 SyncRecipeMoments 的替换逻辑本身。
+		`ALTER TABLE moment_assets ADD COLUMN manual INTEGER NOT NULL DEFAULT 0`,
 	}
 	for _, stmt := range alters {
 		if _, err := db.Exec(stmt); err != nil &&

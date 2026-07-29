@@ -1,14 +1,18 @@
 // MomentStore 的测试:三表(moment_recipes/moments/moment_assets)+ repo 层语义。
 // 覆盖简报 Step 1 清单:seed 幂等且不覆盖已推送 recipe、UpsertRecipes 热更、
 // SyncRecipeMoments 的 upsert/成员替换/删除消失时刻/保留 LLM title 四语义、
-// id 稳定性同周同 id、ParseParams 默认值。
+// id 稳定性同周同 id、ParseParams 默认值,以及本轮"可编辑时刻"存储层:
+// moment_edits 迁移幂等、pin/exclude 回放存活、hidden tombstone、派生字段
+// (asset_count/时间窗/封面)刷新、TopFeaturedByMoment 形状。
 package service
 
 import (
 	"database/sql"
+	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/NimoTech/NimoOS-Photos/pkg/sqlite"
 	"github.com/stretchr/testify/require"
 )
 
@@ -17,6 +21,14 @@ import (
 func insertMomentAsset(t *testing.T, db *sql.DB, id string) {
 	t.Helper()
 	_, err := db.Exec(`INSERT INTO assets(id, file_path, status) VALUES(?,?,'indexed')`, id, "/g/"+id+".jpg")
+	require.NoError(t, err)
+}
+
+// insertMomentAssetAt 插入一条带 taken_at 的资产行,供派生时间窗刷新测试使用。
+func insertMomentAssetAt(t *testing.T, db *sql.DB, id string, takenAt time.Time) {
+	t.Helper()
+	_, err := db.Exec(`INSERT INTO assets(id, file_path, status, taken_at) VALUES(?,?,'indexed',?)`,
+		id, "/g/"+id+".jpg", takenAt.UTC().Format("2006-01-02 15:04:05"))
 	require.NoError(t, err)
 }
 
@@ -489,4 +501,451 @@ func TestMomentStore_SyncPreservesSortOrder(t *testing.T) {
 	require.NotNil(t, moments2[0].SortOrder, "Sync upsert 不应清空已手排的 sort_order")
 	require.Equal(t, 10, *moments2[0].SortOrder)
 	require.Equal(t, "Yosemite Trip (Recomputed)", moments2[0].Title)
+}
+
+// ── 可编辑时刻:moment_edits 迁移幂等 ─────────────────────────────────────
+
+// TestMomentStore_MigrationIdempotent 反复打开(=反复迁移)同一个库文件三次,
+// 确认 moments.hidden / moment_assets.manual 两列的幂等加列与 moment_edits
+// 建表都不会在重复迁移时报错(如 "duplicate column"/"table already exists")。
+func TestMomentStore_MigrationIdempotent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "migrate.db")
+
+	for i := 0; i < 3; i++ {
+		db, err := sqlite.Open(path)
+		require.NoError(t, err, "第 %d 次迁移不应报错", i+1)
+
+		// 校验新增列/新表确实存在,而不仅仅是"没报错"。
+		var hiddenCol, manualCol bool
+		hRows, err := db.Query(`PRAGMA table_info(moments)`)
+		require.NoError(t, err)
+		for hRows.Next() {
+			var cid int
+			var name, ctype string
+			var notnull, pk int
+			var dflt sql.NullString
+			require.NoError(t, hRows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk))
+			if name == "hidden" {
+				hiddenCol = true
+			}
+		}
+		hRows.Close()
+		require.True(t, hiddenCol, "moments.hidden 列应存在")
+
+		mRows, err := db.Query(`PRAGMA table_info(moment_assets)`)
+		require.NoError(t, err)
+		for mRows.Next() {
+			var cid int
+			var name, ctype string
+			var notnull, pk int
+			var dflt sql.NullString
+			require.NoError(t, mRows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk))
+			if name == "manual" {
+				manualCol = true
+			}
+		}
+		mRows.Close()
+		require.True(t, manualCol, "moment_assets.manual 列应存在")
+
+		var tblCount int
+		require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='moment_edits'`).Scan(&tblCount))
+		require.Equal(t, 1, tblCount, "moment_edits 表应存在")
+
+		require.NoError(t, db.Close())
+	}
+}
+
+// ── 可编辑时刻:pin 幸存重算 ─────────────────────────────────────────────
+
+func TestMomentStore_PinSurvivesRecompute(t *testing.T) {
+	db := makeTestDB(t)
+	store := NewMomentStore(db)
+	insertMomentAsset(t, db, "a1")
+	insertMomentAsset(t, db, "a2")
+
+	draft := MomentDraft{
+		Moment: Moment{ID: "m1", RecipeKey: "trip", Title: "Trip", AssetCount: 1},
+		Assets: []MomentAsset{{AssetID: "a1", Score: 0.5}},
+	}
+	require.NoError(t, store.SyncRecipeMoments("trip", []MomentDraft{draft}))
+
+	// 用户强行把 a2(引擎本轮未纳入)钉入。
+	count, err := store.PinMomentAssets("m1", []string{"a2"})
+	require.NoError(t, err)
+	require.Equal(t, 2, count)
+
+	// 下一轮重算:引擎依旧只产出 a1,但 a2 应因 edits 回放而幸存。
+	require.NoError(t, store.SyncRecipeMoments("trip", []MomentDraft{draft}))
+
+	members, err := store.GetMomentAssets("m1", false)
+	require.NoError(t, err)
+	ids := map[string]MomentAsset{}
+	for _, m := range members {
+		ids[m.AssetID] = m
+	}
+	require.Contains(t, ids, "a1")
+	require.Contains(t, ids, "a2", "pin 应在重算后依然存活")
+	require.True(t, ids["a2"].Manual, "回放插入的成员应标记 manual=1")
+}
+
+// ── 可编辑时刻:pin 不降级引擎已纳入成员(INSERT OR IGNORE 语义)──────────
+
+func TestMomentStore_PinDoesNotDowngradeExistingEngineMember(t *testing.T) {
+	db := makeTestDB(t)
+	store := NewMomentStore(db)
+	insertMomentAsset(t, db, "a1")
+
+	// a1 已被引擎本轮纳入为精选成员(featured=1, score>0)。
+	draft := MomentDraft{
+		Moment: Moment{ID: "m1", RecipeKey: "trip", Title: "Trip", AssetCount: 1},
+		Assets: []MomentAsset{{AssetID: "a1", Featured: true, Score: 0.9}},
+	}
+	require.NoError(t, store.SyncRecipeMoments("trip", []MomentDraft{draft}))
+
+	// 对同一 asset 调用 PinMomentAssets:INSERT OR IGNORE 不应把已有行降级
+	// 覆盖为 manual 插入的 featured=0/score=0。
+	count, err := store.PinMomentAssets("m1", []string{"a1"})
+	require.NoError(t, err)
+	require.Equal(t, 1, count)
+
+	members, err := store.GetMomentAssets("m1", false)
+	require.NoError(t, err)
+	require.Len(t, members, 1)
+	require.True(t, members[0].Featured, "pin 已是引擎成员的 asset 不应把 featured 降级为 0")
+	require.Equal(t, 0.9, members[0].Score, "pin 已是引擎成员的 asset 不应把 score 清零")
+
+	// moment_edits 应留下 pin 记录。
+	pins, excludes, err := store.MomentEditsFor("m1")
+	require.NoError(t, err)
+	require.Equal(t, []string{"a1"}, pins)
+	require.Empty(t, excludes)
+
+	// 下一轮重算(引擎依旧纳入 a1)回放后依然不应降级。
+	require.NoError(t, store.SyncRecipeMoments("trip", []MomentDraft{draft}))
+	members2, err := store.GetMomentAssets("m1", false)
+	require.NoError(t, err)
+	require.Len(t, members2, 1)
+	require.True(t, members2[0].Featured, "重算回放后仍不应降级 featured")
+	require.Equal(t, 0.9, members2[0].Score, "重算回放后仍不应降级 score")
+}
+
+// ── 可编辑时刻:exclude 幸存重算 ─────────────────────────────────────────
+
+func TestMomentStore_ExcludeSurvivesRecompute(t *testing.T) {
+	db := makeTestDB(t)
+	store := NewMomentStore(db)
+	insertMomentAsset(t, db, "a1")
+	insertMomentAsset(t, db, "a2")
+
+	draft := MomentDraft{
+		Moment: Moment{ID: "m1", RecipeKey: "trip", Title: "Trip", AssetCount: 2},
+		Assets: []MomentAsset{{AssetID: "a1", Score: 0.5}, {AssetID: "a2", Score: 0.4}},
+	}
+	require.NoError(t, store.SyncRecipeMoments("trip", []MomentDraft{draft}))
+
+	count, err := store.ExcludeMomentAssets("m1", []string{"a2"})
+	require.NoError(t, err)
+	require.Equal(t, 1, count)
+
+	// 下一轮重算:引擎依旧产出 a1+a2,但 a2 应因 exclude 回放而被剔除。
+	require.NoError(t, store.SyncRecipeMoments("trip", []MomentDraft{draft}))
+
+	members, err := store.GetMomentAssets("m1", false)
+	require.NoError(t, err)
+	require.Len(t, members, 1)
+	require.Equal(t, "a1", members[0].AssetID)
+}
+
+// ── 可编辑时刻:pin 覆盖 exclude(同一 asset 后写的编辑生效)──────────────
+
+func TestMomentStore_PinOverridesExclude(t *testing.T) {
+	db := makeTestDB(t)
+	store := NewMomentStore(db)
+	insertMomentAsset(t, db, "a1")
+	insertMomentAsset(t, db, "a2")
+
+	draft := MomentDraft{
+		Moment: Moment{ID: "m1", RecipeKey: "trip", Title: "Trip", AssetCount: 1},
+		Assets: []MomentAsset{{AssetID: "a1", Score: 0.5}},
+	}
+	require.NoError(t, store.SyncRecipeMoments("trip", []MomentDraft{draft}))
+
+	// 先排除 a2,再反悔改成钉入——后写的编辑(pin)应覆盖先写的(exclude)。
+	_, err := store.ExcludeMomentAssets("m1", []string{"a2"})
+	require.NoError(t, err)
+	count, err := store.PinMomentAssets("m1", []string{"a2"})
+	require.NoError(t, err)
+	require.Equal(t, 2, count)
+
+	pins, excludes, err := store.MomentEditsFor("m1")
+	require.NoError(t, err)
+	require.Equal(t, []string{"a2"}, pins)
+	require.Empty(t, excludes, "pin 应覆盖此前的 exclude 记录,而非并存")
+
+	// 重算后 a2 应作为成员留存(pin 生效,而非被 exclude 剔除)。
+	require.NoError(t, store.SyncRecipeMoments("trip", []MomentDraft{draft}))
+	members, err := store.GetMomentAssets("m1", false)
+	require.NoError(t, err)
+	ids := map[string]bool{}
+	for _, m := range members {
+		ids[m.AssetID] = true
+	}
+	require.True(t, ids["a2"])
+}
+
+// ── 可编辑时刻:主题类时刻时间窗免疫(TimeFrom/TimeTo 恒为 NULL)────────────
+
+func TestMomentStore_ThemeMomentTimeWindowImmuneToEditRecompute(t *testing.T) {
+	db := makeTestDB(t)
+	store := NewMomentStore(db)
+	insertMomentAssetAt(t, db, "a1", time.Date(2011, 5, 10, 0, 0, 0, 0, time.UTC))
+	insertMomentAssetAt(t, db, "a2", time.Date(2011, 6, 1, 0, 0, 0, 0, time.UTC))
+
+	// theme 类草稿:TimeFrom/TimeTo 保持零值(不设置),落库应为 NULL。
+	draft := MomentDraft{
+		Moment: Moment{ID: "m1", RecipeKey: "theme:pets", Title: "Pets", AssetCount: 1},
+		Assets: []MomentAsset{{AssetID: "a1", Featured: true, Score: 0.9}},
+	}
+	require.NoError(t, store.SyncRecipeMoments("theme:pets", []MomentDraft{draft}))
+
+	moments, err := store.ListMoments()
+	require.NoError(t, err)
+	require.Len(t, moments, 1)
+	require.True(t, moments[0].TimeFrom.IsZero(), "theme 时刻初始时间窗应为零值(NULL)")
+	require.True(t, moments[0].TimeTo.IsZero())
+
+	// Pin 一个带 taken_at 的资产——若时间窗被误刷,会被撑成非零值。
+	_, err = store.PinMomentAssets("m1", []string{"a2"})
+	require.NoError(t, err)
+	moments, err = store.ListMoments()
+	require.NoError(t, err)
+	require.True(t, moments[0].TimeFrom.IsZero(), "pin 后 theme 时刻时间窗仍应保持 NULL")
+	require.True(t, moments[0].TimeTo.IsZero())
+
+	// Exclude 现有成员,同样应免疫。
+	_, err = store.ExcludeMomentAssets("m1", []string{"a1"})
+	require.NoError(t, err)
+	moments, err = store.ListMoments()
+	require.NoError(t, err)
+	require.True(t, moments[0].TimeFrom.IsZero(), "exclude 后 theme 时刻时间窗仍应保持 NULL")
+	require.True(t, moments[0].TimeTo.IsZero())
+
+	// 再触发一轮带 edits 回放的 SyncRecipeMoments(hasEdits=true 会进入
+	// refreshMomentDerived,须确认 hadTimeWindow 判定继续为 false)。
+	require.NoError(t, store.SyncRecipeMoments("theme:pets", []MomentDraft{draft}))
+	moments, err = store.ListMoments()
+	require.NoError(t, err)
+	require.True(t, moments[0].TimeFrom.IsZero(), "带 edits 回放的重算后 theme 时刻时间窗仍应保持 NULL")
+	require.True(t, moments[0].TimeTo.IsZero())
+}
+
+// ── 可编辑时刻:派生刷新(count + 时间窗 + 封面重挑)──────────────────────
+
+func TestMomentStore_DerivedRefreshOnEdit(t *testing.T) {
+	db := makeTestDB(t)
+	store := NewMomentStore(db)
+	tFrom := time.Date(2011, 5, 10, 0, 0, 0, 0, time.UTC)
+	tMid := time.Date(2011, 5, 12, 0, 0, 0, 0, time.UTC)
+	tLate := time.Date(2011, 5, 20, 0, 0, 0, 0, time.UTC) // 排除之外的时间点,pin 后应把时间窗撑宽
+	insertMomentAssetAt(t, db, "a1", tFrom)
+	insertMomentAssetAt(t, db, "a2", tMid)
+	insertMomentAssetAt(t, db, "a3", tLate)
+
+	draft := MomentDraft{
+		Moment: Moment{
+			ID: "m1", RecipeKey: "trip", Title: "Trip", AssetCount: 2,
+			TimeFrom: tFrom, TimeTo: tMid, CoverAssetID: "a1",
+		},
+		Assets: []MomentAsset{
+			{AssetID: "a1", Featured: true, Score: 0.9},
+			{AssetID: "a2", Featured: false, Score: 0.5},
+		},
+	}
+	require.NoError(t, store.SyncRecipeMoments("trip", []MomentDraft{draft}))
+
+	// pin a3(时间在窗口外)——count 应变 3,时间窗右端应扩到 a3 的 taken_at。
+	count, err := store.PinMomentAssets("m1", []string{"a3"})
+	require.NoError(t, err)
+	require.Equal(t, 3, count)
+
+	moments, err := store.ListMoments()
+	require.NoError(t, err)
+	require.Len(t, moments, 1)
+	require.Equal(t, 3, moments[0].AssetCount)
+	require.True(t, moments[0].TimeTo.Equal(tLate), "pin 应触发时间窗按新成员集合重算")
+	require.Equal(t, "a1", moments[0].CoverAssetID, "cover 仍是成员,不应被重挑")
+
+	// 排除当前封面 a1——封面应重挑为 featured 中分数最高的剩余成员(此处无
+	// 其余 featured 成员,应回落"任一成员"档:按 score DESC, asset_id 确定序。
+	count2, err := store.ExcludeMomentAssets("m1", []string{"a1"})
+	require.NoError(t, err)
+	require.Equal(t, 2, count2)
+
+	moments2, err := store.ListMoments()
+	require.NoError(t, err)
+	require.Equal(t, 2, moments2[0].AssetCount)
+	require.NotEqual(t, "a1", moments2[0].CoverAssetID, "旧封面已被剔除,不应继续挂着")
+	require.Contains(t, []string{"a2", "a3"}, moments2[0].CoverAssetID)
+	require.Equal(t, "a2", moments2[0].CoverAssetID, "无 featured 候选时回落任一成员,按 score DESC 取第一(a2=0.5>a3=0)")
+}
+
+// ── 可编辑时刻:成员清空允许 count=0(全排除后不报错、封面回落 NULL)──────
+
+func TestMomentStore_ExcludeAllMembersAllowsZeroCount(t *testing.T) {
+	db := makeTestDB(t)
+	store := NewMomentStore(db)
+	insertMomentAsset(t, db, "a1")
+
+	draft := MomentDraft{
+		Moment: Moment{ID: "m1", RecipeKey: "trip", Title: "Trip", AssetCount: 1, CoverAssetID: "a1"},
+		Assets: []MomentAsset{{AssetID: "a1", Featured: true, Score: 0.9}},
+	}
+	require.NoError(t, store.SyncRecipeMoments("trip", []MomentDraft{draft}))
+
+	count, err := store.ExcludeMomentAssets("m1", []string{"a1"})
+	require.NoError(t, err)
+	require.Equal(t, 0, count, "成员清空应允许 count=0,不报错")
+
+	moments, err := store.ListMoments()
+	require.NoError(t, err)
+	require.Equal(t, 0, moments[0].AssetCount)
+	require.Equal(t, "", moments[0].CoverAssetID, "无成员时封面应回落 NULL/空")
+}
+
+// ── 可编辑时刻:hidden tombstone——upsert 保留 + ListMoments 过滤 ─────────
+
+func TestMomentStore_HideMomentPersistsAndFiltersListMoments(t *testing.T) {
+	db := makeTestDB(t)
+	store := NewMomentStore(db)
+	insertMomentAsset(t, db, "a1")
+
+	draft := MomentDraft{
+		Moment: Moment{ID: "m1", RecipeKey: "trip", Title: "Trip", AssetCount: 1},
+		Assets: []MomentAsset{{AssetID: "a1"}},
+	}
+	require.NoError(t, store.SyncRecipeMoments("trip", []MomentDraft{draft}))
+	require.NoError(t, store.HideMoment("m1"))
+
+	// hidden 后 ListMoments 应过滤掉该时刻。
+	moments, err := store.ListMoments()
+	require.NoError(t, err)
+	require.Len(t, moments, 0)
+
+	// 重算(同 id upsert)不应把 hidden 重置为 0——upsert 列清单不含 hidden,
+	// 与 named_by_llm 同法自然保留。
+	require.NoError(t, store.SyncRecipeMoments("trip", []MomentDraft{draft}))
+	var hidden int
+	require.NoError(t, db.QueryRow(`SELECT hidden FROM moments WHERE id=?`, "m1").Scan(&hidden))
+	require.Equal(t, 1, hidden, "重算不应清除 hidden tombstone")
+
+	moments2, err := store.ListMoments()
+	require.NoError(t, err)
+	require.Len(t, moments2, 0, "重算后仍应被 ListMoments 过滤")
+}
+
+// ── 可编辑时刻:PinMomentAssets 立即生效与未知 id 忽略 ──────────────────
+
+func TestMomentStore_PinTakesEffectImmediatelyAndIgnoresUnknownID(t *testing.T) {
+	db := makeTestDB(t)
+	store := NewMomentStore(db)
+	insertMomentAsset(t, db, "a1")
+	insertMomentAsset(t, db, "a2")
+
+	draft := MomentDraft{
+		Moment: Moment{ID: "m1", RecipeKey: "trip", Title: "Trip", AssetCount: 1},
+		Assets: []MomentAsset{{AssetID: "a1", Score: 0.5}},
+	}
+	require.NoError(t, store.SyncRecipeMoments("trip", []MomentDraft{draft}))
+
+	// 混入一个 assets 表里不存在的 id,应静默忽略,不报错、不影响已知 id。
+	count, err := store.PinMomentAssets("m1", []string{"a2", "ghost-asset"})
+	require.NoError(t, err)
+	require.Equal(t, 2, count, "未知 id 应被忽略,只有 a2 生效")
+
+	// 立即生效:无需等待下一轮 Sync,GetMomentAssets 应马上看到 a2。
+	members, err := store.GetMomentAssets("m1", false)
+	require.NoError(t, err)
+	ids := map[string]bool{}
+	for _, m := range members {
+		ids[m.AssetID] = true
+	}
+	require.True(t, ids["a1"])
+	require.True(t, ids["a2"])
+	require.False(t, ids["ghost-asset"])
+
+	// 未知 id 也不应留下 moment_edits 记录。
+	pins, _, err := store.MomentEditsFor("m1")
+	require.NoError(t, err)
+	require.Equal(t, []string{"a2"}, pins)
+}
+
+// ── 可编辑时刻:MomentEditsFor 形状 ──────────────────────────────────────
+
+func TestMomentStore_MomentEditsFor(t *testing.T) {
+	db := makeTestDB(t)
+	store := NewMomentStore(db)
+	insertMomentAsset(t, db, "a1")
+	insertMomentAsset(t, db, "a2")
+	insertMomentAsset(t, db, "a3")
+
+	draft := MomentDraft{
+		Moment: Moment{ID: "m1", RecipeKey: "trip", Title: "Trip", AssetCount: 1},
+		Assets: []MomentAsset{{AssetID: "a1"}},
+	}
+	require.NoError(t, store.SyncRecipeMoments("trip", []MomentDraft{draft}))
+
+	_, err := store.PinMomentAssets("m1", []string{"a2"})
+	require.NoError(t, err)
+	_, err = store.ExcludeMomentAssets("m1", []string{"a3"})
+	require.NoError(t, err)
+
+	pins, excludes, err := store.MomentEditsFor("m1")
+	require.NoError(t, err)
+	require.Equal(t, []string{"a2"}, pins)
+	require.Equal(t, []string{"a3"}, excludes)
+
+	// 没有任何编辑记录的 moment 应返回空切片,不报错。
+	pins2, excludes2, err := store.MomentEditsFor("no-such-moment")
+	require.NoError(t, err)
+	require.Empty(t, pins2)
+	require.Empty(t, excludes2)
+}
+
+// ── 可编辑时刻:TopFeaturedByMoment 形状(非封面、score 序、≤N)──────────
+
+func TestMomentStore_TopFeaturedByMoment(t *testing.T) {
+	db := makeTestDB(t)
+	store := NewMomentStore(db)
+	for _, id := range []string{"a1", "a2", "a3", "a4", "b1", "b2"} {
+		insertMomentAsset(t, db, id)
+	}
+
+	d1 := MomentDraft{
+		Moment: Moment{ID: "m1", RecipeKey: "trip", Title: "Trip One", AssetCount: 4, CoverAssetID: "a1"},
+		Assets: []MomentAsset{
+			{AssetID: "a1", Featured: true, Score: 0.95}, // 封面,应被排除
+			{AssetID: "a2", Featured: true, Score: 0.9},
+			{AssetID: "a3", Featured: true, Score: 0.8},
+			{AssetID: "a4", Featured: false, Score: 0.99}, // 非 featured,不应出现
+		},
+	}
+	d2 := MomentDraft{
+		Moment: Moment{ID: "m2", RecipeKey: "theme:pets", Title: "Pets", AssetCount: 2},
+		Assets: []MomentAsset{
+			{AssetID: "b1", Featured: true, Score: 0.7},
+			{AssetID: "b2", Featured: true, Score: 0.6},
+		},
+	}
+	require.NoError(t, store.SyncRecipeMoments("trip", []MomentDraft{d1}))
+	require.NoError(t, store.SyncRecipeMoments("theme:pets", []MomentDraft{d2}))
+
+	top, err := store.TopFeaturedByMoment(1)
+	require.NoError(t, err)
+	require.Equal(t, []string{"a2"}, top["m1"], "封面 a1 应被排除,取剩余 featured 中分数最高的一个")
+	require.Equal(t, []string{"b1"}, top["m2"])
+
+	top2, err := store.TopFeaturedByMoment(2)
+	require.NoError(t, err)
+	require.Equal(t, []string{"a2", "a3"}, top2["m1"], "按 score DESC,封面之外前 2 个")
+	require.Equal(t, []string{"b1", "b2"}, top2["m2"])
 }
