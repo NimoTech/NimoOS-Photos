@@ -19,6 +19,7 @@ MemoryHigh=3G
 MemoryMax=4G
 RestartSec=30
 Environment=GOMEMLIMIT=2500MiB
+OOMScoreAdjust=500
 
 [Install]
 WantedBy=multi-user.target

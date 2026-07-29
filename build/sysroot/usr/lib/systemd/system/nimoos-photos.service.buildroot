@@ -8,6 +8,14 @@ ExecStartPre=/usr/bin/nimoos-photos -v
 ExecStart=/usr/bin/nimoos-photos -c /etc/nimoos/photos.conf
 Restart=always
 Type=notify
+# 与 nimoos-photos.service 保持一致的内存兜底(#26 P3)。2026-07-22 的
+# 22GB×9 次 OOM crash loop 正是发生在没有这段配置的 buildroot 变体上:
+# 两份 unit 必须同步修改,谁漏谁就是下一个逃逸口。
+MemoryHigh=3G
+MemoryMax=4G
+RestartSec=30
+Environment=GOMEMLIMIT=2500MiB
+OOMScoreAdjust=500
 
 [Install]
 WantedBy=multi-user.target
