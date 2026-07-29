@@ -5,8 +5,8 @@
 // 无需改代码(真正需要新算法的 kind 除外)。
 //
 // moments/moment_assets 是活实体:稳定派生 id(TripMomentID/ThemeMomentID),
-// 每轮重算按 id upsert + 成员全量替换(delete+insert),用户看到的时刻不因
-// 重算而闪断;LLM 已命名过的 title(named_by_llm=1)重算时原样保留,只有
+// 每轮重算按 id upsert + 成员 diff 式 upsert(既有成员保留 added_at、缺席者
+// 删除但豁免 pin 成员),用户看到的时刻不因重算而闪断;LLM 已命名过的 title(named_by_llm=1)重算时原样保留,只有
 // 模板打底阶段(named_by_llm=0)的 title 才会被下一轮重算的模板结果覆盖。
 package service
 
@@ -425,7 +425,9 @@ func nullTimeArg(t time.Time) interface{} {
 
 // SyncRecipeMoments 是幂等重算的落库入口:事务内对每个 draft 按 ID upsert
 // moments(named_by_llm=1 的既有行保留其 title/named_by_llm,其余字段更新)
-// + 成员全量替换(delete+insert moment_assets);随后删除该 recipeKey 下
+// + 成员 diff 式 upsert(ON CONFLICT 刷新 featured/score/manual 但不触碰
+// added_at;缺席成员删除但豁免有 pin 编辑者,防止"删了又被回放补插"把
+// added_at 轮刷成假新鲜);随后删除该 recipeKey 下
 // 不在本轮 drafts id 集合里的旧 moments(级联清成员),使消失的时刻(如
 // gap 重新切分后不再成团的旧 trip)从库中退出。
 //

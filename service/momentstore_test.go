@@ -1250,7 +1250,7 @@ func TestMomentStore_PlacesByMoment_NoGeoExcludedAndEmptyReturnsEmpty(t *testing
 	store := NewMomentStore(db)
 	insertMomentAsset(t, db, "a1") // 无 asset_geo 行
 	_, err := db.Exec(`INSERT INTO asset_geo(asset_id, city) VALUES (?, ?)`, "a1", "")
-	require.NoError(t, err) // city 为空字符串同样不应计入
+	require.NoError(t, err)        // city 为空字符串同样不应计入
 	insertMomentAsset(t, db, "a2") // 完全无 asset_geo 行(未 geocode)
 
 	draft := MomentDraft{
