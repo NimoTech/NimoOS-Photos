@@ -507,8 +507,15 @@ func (s *MomentStore) SyncRecipeMoments(recipeKey string, drafts []MomentDraft) 
 			}
 			deleteMembersQ += ` AND asset_id NOT IN (` + strings.Join(placeholders, ",") + `)`
 		}
+		// 删除豁免只认活资产(aliveAssetExpr):pin 但已进回收站/离线的资产不
+		// 再被豁免,随本次 diff upsert 一并删除(edits 行本身不删,供日后资产
+		// 复活时 applyMomentEdits 自动补插回队)。
 		deleteMembersQ += `
-			AND asset_id NOT IN (SELECT asset_id FROM moment_edits WHERE moment_id=? AND op='pin')`
+			AND asset_id NOT IN (
+				SELECT me.asset_id FROM moment_edits me
+				JOIN assets a ON a.id = me.asset_id
+				WHERE me.moment_id=? AND me.op='pin' AND ` + aliveAssetExpr + `
+			)`
 		deleteMembersArgs = append(deleteMembersArgs, d.ID)
 		if _, err := tx.Exec(deleteMembersQ, deleteMembersArgs...); err != nil {
 			tx.Rollback()
@@ -559,6 +566,16 @@ func (s *MomentStore) SyncRecipeMoments(recipeKey string, drafts []MomentDraft) 
 	}
 	return nil
 }
+
+// aliveAssetExpr 是"活资产"判据 SQL 片段,与 moments_theme.go
+// loadThemeCandidatePool(约 L192)同口径:已完成索引(status='indexed')、
+// 非回收站(deleted_at IS NULL)、非离线(offline=0)。依赖外层查询把 assets
+// 表起别名为 a。pin 相关三处(diff upsert 删除豁免/回放补插/立即插入)统一
+// 用这条口径判断资产是否"活着"——债务清扫:此前三处只校验 assets 表存在
+// 性,不认活资产,导致 pin 的照片进回收站/离线后依然賴在时刻里不走;现在
+// 死资产的 pin 编辑记录(moment_edits)本身仍保留,只是不再豁免/补插其
+// 成员身份,资产从回收站/离线状态恢复后下一轮回放会自动归队。
+const aliveAssetExpr = `a.status='indexed' AND a.deleted_at IS NULL AND a.offline=0`
 
 // nullableStr 把空字符串转成 SQL NULL(cover_asset_id 允许 NULL,表示"尚无
 // 封面");非空字符串原样传入。
@@ -686,13 +703,18 @@ func (s *MomentStore) ExcludeMomentAssets(momentID string, assetIDs []string) (i
 
 // applyMomentEditOp 是 Pin/ExcludeMomentAssets 共用的实现:事务内逐个 asset
 // 校验存在性(不存在则跳过)→ upsert moment_edits(后写覆盖先写)→ 立即改
-// 成员 → 派生刷新 → 读回 asset_count。
+// 成员(pin 只对活资产——aliveAssetExpr——立即生效,死资产仅记 edits 意图,
+// 见 aliveAssetExpr 注释)→ 统计本次实际改动的成员行数,为 0(全未知 id/
+// pin 目标是死资产/exclude 目标本不是成员等空操作)时跳过派生刷新与
+// updated_at(债务清扫:此前无论是否有行变化都刷新,导致空操作也把时刻
+// 顶到 ListMoments 排序前端)→ 读回 asset_count。
 func (s *MomentStore) applyMomentEditOp(momentID string, assetIDs []string, op string) (int, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return 0, fmt.Errorf("moments: %s begin: %w", op, err)
 	}
 	now := nowMs()
+	var affected int64 // 本次调用实际改动的成员行数(pin INSERT/exclude DELETE 生效数之和)
 	for _, assetID := range assetIDs {
 		// 未知 id(assets 表不存在)静默忽略:不写 edits、不改成员——moment_edits
 		// 对 assets 有外键约束(本库 DSN 开着 _foreign_keys=on),盲写会报错,
@@ -717,22 +739,55 @@ func (s *MomentStore) applyMomentEditOp(momentID string, assetIDs []string, op s
 			return 0, fmt.Errorf("moments: %s upsert edit %q/%q: %w", op, momentID, assetID, err)
 		}
 		if op == "pin" {
-			if _, err := tx.Exec(`
+			// 立即插入只认活资产(aliveAssetExpr):死资产(回收站/离线)的 pin
+			// 意图已写入 edits,但不立即计入成员/count——与 SyncRecipeMoments
+			// 回放的口径保持一致,资产复活后下一轮回放自动归队。
+			res, err := tx.Exec(`
 				INSERT OR IGNORE INTO moment_assets(moment_id, asset_id, featured, score, manual, added_at)
-				VALUES (?, ?, 0, 0, 1, ?)`,
-				momentID, assetID, now,
-			); err != nil {
+				SELECT ?, a.id, 0, 0, 1, ?
+				FROM assets a
+				WHERE a.id=? AND `+aliveAssetExpr,
+				momentID, now, assetID,
+			)
+			if err != nil {
 				tx.Rollback()
 				return 0, fmt.Errorf("moments: pin insert member %q/%q: %w", momentID, assetID, err)
 			}
+			n, err := res.RowsAffected()
+			if err != nil {
+				tx.Rollback()
+				return 0, fmt.Errorf("moments: pin rows affected %q/%q: %w", momentID, assetID, err)
+			}
+			affected += n
 		} else {
-			if _, err := tx.Exec(`DELETE FROM moment_assets WHERE moment_id=? AND asset_id=?`,
+			res, err := tx.Exec(`DELETE FROM moment_assets WHERE moment_id=? AND asset_id=?`,
 				momentID, assetID,
-			); err != nil {
+			)
+			if err != nil {
 				tx.Rollback()
 				return 0, fmt.Errorf("moments: exclude delete member %q/%q: %w", momentID, assetID, err)
 			}
+			n, err := res.RowsAffected()
+			if err != nil {
+				tx.Rollback()
+				return 0, fmt.Errorf("moments: exclude rows affected %q/%q: %w", momentID, assetID, err)
+			}
+			affected += n
 		}
+	}
+
+	if affected == 0 {
+		// 本次调用未造成任何成员行变化,跳过派生刷新与 updated_at,直接读回
+		// 当前 asset_count(不应因空操作而变化)。
+		var count int
+		if err := tx.QueryRow(`SELECT asset_count FROM moments WHERE id=?`, momentID).Scan(&count); err != nil {
+			tx.Rollback()
+			return 0, fmt.Errorf("moments: %s read count %q: %w", op, momentID, err)
+		}
+		if err := tx.Commit(); err != nil {
+			return 0, fmt.Errorf("moments: %s commit %q: %w", op, momentID, err)
+		}
+		return count, nil
 	}
 
 	hadTimeWindow, err := momentHasTimeWindow(tx, momentID)
@@ -951,9 +1006,15 @@ func applyMomentEdits(tx *sql.Tx, momentID string, now int64) (bool, error) {
 	); err != nil {
 		return false, fmt.Errorf("moments: replay exclude %q: %w", momentID, err)
 	}
+	// 回放补插只认活资产(aliveAssetExpr):死资产(回收站/离线)的 pin edits
+	// 不会被补插回成员——它们已在上面的 SyncRecipeMoments 第 2 步(不再豁免)
+	// 或本函数的 exclude 回放中被清出成员表。
 	if _, err := tx.Exec(`
 		INSERT OR IGNORE INTO moment_assets(moment_id, asset_id, featured, score, manual, added_at)
-		SELECT moment_id, asset_id, 0, 0, 1, ? FROM moment_edits WHERE moment_id=? AND op='pin'`,
+		SELECT me.moment_id, me.asset_id, 0, 0, 1, ?
+		FROM moment_edits me
+		JOIN assets a ON a.id = me.asset_id
+		WHERE me.moment_id=? AND me.op='pin' AND `+aliveAssetExpr,
 		now, momentID,
 	); err != nil {
 		return false, fmt.Errorf("moments: replay pin %q: %w", momentID, err)

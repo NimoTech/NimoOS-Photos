@@ -1197,6 +1197,215 @@ func TestMomentStore_PinMomentAssetsSetsAddedAtNow(t *testing.T) {
 	require.LessOrEqual(t, addedAt, after)
 }
 
+// ── 债务清扫:pin 回放"活资产"口径对齐 ───────────────────────────────────
+//
+// 活资产口径与 moments_theme.go loadThemeCandidatePool 同源:
+// status='indexed' AND deleted_at IS NULL AND offline=0。此前 pin 相关三处
+// (立即插入/diff upsert 删除豁免/回放补插)只校验 assets 表存在性,不认
+// 活资产口径,导致"pin 的照片进回收站后依然赖在时刻里不走"的分叉。
+
+// momentUpdatedAt 读回 moments.updated_at,供"假刷新"回归测试断言。
+func momentUpdatedAt(t *testing.T, db *sql.DB, momentID string) int64 {
+	t.Helper()
+	var v int64
+	require.NoError(t, db.QueryRow(`SELECT updated_at FROM moments WHERE id=?`, momentID).Scan(&v))
+	return v
+}
+
+// TestMomentStore_PinMomentAssetsIgnoresDeadAssetImmediateInsert:对一个已在
+// 回收站(deleted_at 非 NULL)的资产直接 PinMomentAssets——assets 表里 id
+// 存在,故 edits 记录仍应写入(供日后从回收站还原时自动归队),但立即插入
+// 成员这一步应被"活资产"口径拦下,不应马上把死资产计入成员/count。
+func TestMomentStore_PinMomentAssetsIgnoresDeadAssetImmediateInsert(t *testing.T) {
+	db := makeTestDB(t)
+	store := NewMomentStore(db)
+	insertMomentAsset(t, db, "a1")
+	insertMomentAsset(t, db, "a2")
+	_, err := db.Exec(`UPDATE assets SET deleted_at=? WHERE id=?`, "2020-01-01 00:00:00", "a2")
+	require.NoError(t, err)
+
+	draft := MomentDraft{
+		Moment: Moment{ID: "m1", RecipeKey: "trip", Title: "Trip", AssetCount: 1},
+		Assets: []MomentAsset{{AssetID: "a1", Score: 0.5}},
+	}
+	require.NoError(t, store.SyncRecipeMoments("trip", []MomentDraft{draft}))
+
+	count, err := store.PinMomentAssets("m1", []string{"a2"})
+	require.NoError(t, err)
+	require.Equal(t, 1, count, "回收站资产不应被立即计入 count")
+
+	members, err := store.GetMomentAssets("m1", false)
+	require.NoError(t, err)
+	for _, m := range members {
+		require.NotEqual(t, "a2", m.AssetID, "回收站资产不应被立即插入成员")
+	}
+
+	pins, _, err := store.MomentEditsFor("m1")
+	require.NoError(t, err)
+	require.Contains(t, pins, "a2", "edits 记录应保留,供恢复后自动归队")
+}
+
+// TestMomentStore_PinReplayRemovesDeadAssetAndRejoinsOnRestore:pin 一个活资产
+// 幸存重算之后,该资产进回收站(deleted_at 置位)——下一轮 Sync 不应再豁免
+// 它的删除,成员应被移除、count 同步下降;从回收站还原(deleted_at 清空)后
+// 再 Sync,应自动归队(edits 行全程保留,不因资产死而丢失 pin 意图)。
+func TestMomentStore_PinReplayRemovesDeadAssetAndRejoinsOnRestore(t *testing.T) {
+	db := makeTestDB(t)
+	store := NewMomentStore(db)
+	insertMomentAsset(t, db, "a1")
+	insertMomentAsset(t, db, "a2")
+
+	draft := MomentDraft{
+		Moment: Moment{ID: "m1", RecipeKey: "trip", Title: "Trip", AssetCount: 1},
+		Assets: []MomentAsset{{AssetID: "a1", Score: 0.5}},
+	}
+	require.NoError(t, store.SyncRecipeMoments("trip", []MomentDraft{draft}))
+
+	// 用户钉入 a2(引擎本轮未纳入),此时 a2 仍是活资产,立即生效。
+	count, err := store.PinMomentAssets("m1", []string{"a2"})
+	require.NoError(t, err)
+	require.Equal(t, 2, count)
+
+	// a2 进回收站。
+	_, err = db.Exec(`UPDATE assets SET deleted_at=? WHERE id=?`, "2020-01-01 00:00:00", "a2")
+	require.NoError(t, err)
+
+	// 下一轮重算:a2 已非活资产,pin 不再豁免其被删除,应被 diff upsert 移除。
+	require.NoError(t, store.SyncRecipeMoments("trip", []MomentDraft{draft}))
+	members, err := store.GetMomentAssets("m1", false)
+	require.NoError(t, err)
+	ids := map[string]bool{}
+	for _, m := range members {
+		ids[m.AssetID] = true
+	}
+	require.True(t, ids["a1"])
+	require.False(t, ids["a2"], "进回收站的 pin 资产下一轮重算应被移除")
+
+	moments, err := store.ListMoments()
+	require.NoError(t, err)
+	require.Equal(t, 1, moments[0].AssetCount, "count 应随死资产移除同步下降")
+
+	// edits 记录应全程保留(未被清除),供恢复后继续生效。
+	pinsBeforeRestore, _, err := store.MomentEditsFor("m1")
+	require.NoError(t, err)
+	require.Contains(t, pinsBeforeRestore, "a2", "pin 意图应在资产死亡期间保留")
+
+	// 从回收站还原。
+	_, err = db.Exec(`UPDATE assets SET deleted_at=NULL WHERE id=?`, "a2")
+	require.NoError(t, err)
+
+	// 下一轮重算:a2 恢复为活资产,pin 回放应自动把它补插回成员。
+	require.NoError(t, store.SyncRecipeMoments("trip", []MomentDraft{draft}))
+	members2, err := store.GetMomentAssets("m1", false)
+	require.NoError(t, err)
+	ids2 := map[string]bool{}
+	for _, m := range members2 {
+		ids2[m.AssetID] = true
+	}
+	require.True(t, ids2["a2"], "从回收站还原后应自动归队")
+
+	moments2, err := store.ListMoments()
+	require.NoError(t, err)
+	require.Equal(t, 2, moments2[0].AssetCount, "归队后 count 应恢复")
+}
+
+// ── 债务清扫:全未知 ids 假刷新修复 ─────────────────────────────────────
+//
+// 此前 applyMomentEditOp 无论本次调用是否造成任何成员行变化,都会走
+// refreshMomentDerived + 刷新 updated_at,导致"全传未知 id"这种空操作也把
+// 时刻顶到 ListMoments 排序前端(八期终审点名)。改为统计本次实际受影响的
+// 成员行数(pin 的 INSERT 生效数/exclude 的 DELETE 生效数),为 0 时跳过
+// 派生刷新,直接返回当前 asset_count,updated_at 保持不变。
+
+func TestMomentStore_EditOpAllUnknownIDsSkipsFakeRefresh(t *testing.T) {
+	db := makeTestDB(t)
+	store := NewMomentStore(db)
+	insertMomentAsset(t, db, "a1")
+	insertMomentAsset(t, db, "b1")
+
+	// 用两个不同 recipe_key 分别落 m1/m2:SyncRecipeMoments 会清掉同一
+	// recipe_key 下本轮未产出的旧时刻,同 recipe_key 复用会把 m1 误删。
+	draft1 := MomentDraft{
+		Moment: Moment{ID: "m1", RecipeKey: "trip1", Title: "Trip1", AssetCount: 1},
+		Assets: []MomentAsset{{AssetID: "a1", Score: 0.5}},
+	}
+	draft2 := MomentDraft{
+		Moment: Moment{ID: "m2", RecipeKey: "trip2", Title: "Trip2", AssetCount: 1},
+		Assets: []MomentAsset{{AssetID: "b1", Score: 0.5}},
+	}
+	require.NoError(t, store.SyncRecipeMoments("trip1", []MomentDraft{draft1}))
+	time.Sleep(2 * time.Millisecond)
+	require.NoError(t, store.SyncRecipeMoments("trip2", []MomentDraft{draft2}))
+
+	// 两者均未手排(sort_order NULL),按 updated_at DESC:m2(更新)在前。
+	moments, err := store.ListMoments()
+	require.NoError(t, err)
+	require.Equal(t, "m2", moments[0].ID)
+	require.Equal(t, "m1", moments[1].ID)
+
+	beforeUpdatedAt := momentUpdatedAt(t, db, "m1")
+
+	// 对 m1 用全未知 id 调 Pin:assets 表里都不存在,静默忽略,成员行数应
+	// 无任何变化。
+	count, err := store.PinMomentAssets("m1", []string{"ghost1", "ghost2"})
+	require.NoError(t, err)
+	require.Equal(t, 1, count, "全未知 ids 不应改变 count")
+
+	afterUpdatedAt := momentUpdatedAt(t, db, "m1")
+	require.Equal(t, beforeUpdatedAt, afterUpdatedAt, "全未知 ids 不应刷新 updated_at(假刷新回归)")
+
+	moments2, err := store.ListMoments()
+	require.NoError(t, err)
+	require.Equal(t, "m2", moments2[0].ID, "排序位置不应因假刷新而改变")
+	require.Equal(t, "m1", moments2[1].ID)
+
+	// ExcludeMomentAssets 同理:全未知 id 同样不应刷新 updated_at。
+	count2, err := store.ExcludeMomentAssets("m1", []string{"ghost3"})
+	require.NoError(t, err)
+	require.Equal(t, 1, count2)
+	require.Equal(t, beforeUpdatedAt, momentUpdatedAt(t, db, "m1"), "exclude 全未知 ids 同样不应刷新 updated_at")
+}
+
+// ── 债务清扫:补两条便宜测试 ─────────────────────────────────────────────
+
+// TestMomentStore_SyncRecipeMomentsEmptyDraftAssetsDeletesAllNonPinMembers:
+// draft 的成员切片为空(引擎本轮判定该 moment 已无任何成员)时,diff upsert
+// 应删除全部非 pin 成员(pin 成员依旧豁免,覆盖九期终审点名的"空成员 draft"
+// 边界,此前无显式单测)。
+func TestMomentStore_SyncRecipeMomentsEmptyDraftAssetsDeletesAllNonPinMembers(t *testing.T) {
+	db := makeTestDB(t)
+	store := NewMomentStore(db)
+	insertMomentAsset(t, db, "a1")
+	insertMomentAsset(t, db, "a2")
+
+	draft := MomentDraft{
+		Moment: Moment{ID: "m1", RecipeKey: "trip", Title: "Trip", AssetCount: 2},
+		Assets: []MomentAsset{{AssetID: "a1", Score: 0.5}, {AssetID: "a2", Score: 0.4}},
+	}
+	require.NoError(t, store.SyncRecipeMoments("trip", []MomentDraft{draft}))
+
+	// 用户钉入一个引擎本轮以外的资产。
+	insertMomentAsset(t, db, "a3")
+	_, err := store.PinMomentAssets("m1", []string{"a3"})
+	require.NoError(t, err)
+
+	// 下一轮:draft 成员切片为空(引擎判定该 moment 已无成员)。
+	emptyDraft := draft
+	emptyDraft.Assets = nil
+	require.NoError(t, store.SyncRecipeMoments("trip", []MomentDraft{emptyDraft}))
+
+	members, err := store.GetMomentAssets("m1", false)
+	require.NoError(t, err)
+	ids := map[string]bool{}
+	for _, m := range members {
+		ids[m.AssetID] = true
+	}
+	require.False(t, ids["a1"], "空 draft 应删除非 pin 旧成员")
+	require.False(t, ids["a2"], "空 draft 应删除非 pin 旧成员")
+	require.True(t, ids["a3"], "pin 成员即便 draft 成员为空也应豁免删除")
+	require.Len(t, members, 1)
+}
+
 // ── AddedThisWeekByMoment:口径(NULL 不计/7 天窗/无 N+1 形状)────────────
 
 func TestMomentStore_AddedThisWeekByMoment_NullNotCountedAndSevenDayWindow(t *testing.T) {
