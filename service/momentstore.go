@@ -823,6 +823,38 @@ func (s *MomentStore) TopFeaturedByMoment(perMoment int) (map[string][]string, e
 	return out, rows.Err()
 }
 
+// CoverRatioByMoment 一次查询取出全库封面(cover_asset_id)的宽高比 w/h,
+// JOIN asset_exif 取该封面 asset 的 EXIF 尺寸——INNER JOIN 天然实现"缺 exif
+// 行不入 map"的语义(width/height 任一为 0 或该封面根本没有 asset_exif 行,
+// 调用方对未出现的 id 均按 0=未知处理,由路由层落地为 JSON cover_ratio=0)。
+// 与 TopFeaturedByMoment/AddedThisWeekByMoment 同法:一条整表查询,不对每个
+// 时刻单独查询(无 N+1)。
+func (s *MomentStore) CoverRatioByMoment() (map[string]float64, error) {
+	rows, err := s.db.Query(`
+		SELECT m.id, e.width, e.height
+		FROM moments m
+		JOIN asset_exif e ON e.asset_id = m.cover_asset_id`)
+	if err != nil {
+		return nil, fmt.Errorf("moments: cover ratio: %w", err)
+	}
+	defer rows.Close()
+
+	out := map[string]float64{}
+	for rows.Next() {
+		var momentID string
+		var width, height sql.NullInt64
+		if err := rows.Scan(&momentID, &width, &height); err != nil {
+			return nil, fmt.Errorf("moments: scan cover ratio: %w", err)
+		}
+		// width/height 任一缺失(NULL)或 <=0 均视为无效尺寸,不产出比例。
+		if !width.Valid || !height.Valid || width.Int64 <= 0 || height.Int64 <= 0 {
+			continue
+		}
+		out[momentID] = float64(width.Int64) / float64(height.Int64)
+	}
+	return out, rows.Err()
+}
+
 // sevenDaysMs 是 AddedThisWeekByMoment 的统计窗口(7 天,毫秒)。
 const sevenDaysMs = int64(7 * 24 * 60 * 60 * 1000)
 

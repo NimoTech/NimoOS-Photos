@@ -117,6 +117,8 @@ func TestMomentsHandler_ListReturnsShapedFields(t *testing.T) {
 	require.Equal(t, false, m["named_by_llm"])
 	require.NotEmpty(t, m["time_from"])
 	require.NotEmpty(t, m["time_to"])
+	require.Contains(t, m, "cover_ratio", "cover_ratio 应恒输出")
+	require.Equal(t, float64(0), m["cover_ratio"], "seedOneMoment 未造 asset_exif,应回落 0")
 }
 
 func TestMomentsHandler_ListEmpty(t *testing.T) {
@@ -496,9 +498,10 @@ func TestMomentsHandler_DeleteNotFound(t *testing.T) {
 
 func TestMomentsHandler_ListIncludesFeaturedAssetIDsExcludingCover(t *testing.T) {
 	h, db, store := newMomentsHarness(t)
-	// a1 是封面且 featured,a2/a3 也 featured(非封面),a4 不 featured——
-	// TopFeaturedByMoment(2) 应排除封面 a1,按 score 降序截取前 2:a2、a3。
-	for _, id := range []string{"a1", "a2", "a3", "a4"} {
+	// a1 是封面且 featured,a2/a3/a4 也 featured(非封面),a5 不 featured——
+	// TopFeaturedByMoment(3) 应排除封面 a1,按 score 降序截取前 3:a2、a3、a4
+	// (马赛克三联模板需要,证明上限已从 2 提到 3)。
+	for _, id := range []string{"a1", "a2", "a3", "a4", "a5"} {
 		_, err := db.Exec(`INSERT INTO assets(id,file_path,status) VALUES(?,?,'indexed')`, id, "/p/"+id+".jpg")
 		require.NoError(t, err)
 	}
@@ -507,13 +510,14 @@ func TestMomentsHandler_ListIncludesFeaturedAssetIDsExcludingCover(t *testing.T)
 			ID: "m1", RecipeKey: "trip", Title: "Kyoto Trip", CoverAssetID: "a1",
 			TimeFrom:   time.Date(2026, 4, 1, 0, 0, 0, 0, time.UTC),
 			TimeTo:     time.Date(2026, 4, 3, 0, 0, 0, 0, time.UTC),
-			AssetCount: 4,
+			AssetCount: 5,
 		},
 		Assets: []service.MomentAsset{
-			{AssetID: "a1", Featured: true, Score: 4},
-			{AssetID: "a2", Featured: true, Score: 3},
-			{AssetID: "a3", Featured: true, Score: 2},
-			{AssetID: "a4", Featured: false, Score: 1},
+			{AssetID: "a1", Featured: true, Score: 5},
+			{AssetID: "a2", Featured: true, Score: 4},
+			{AssetID: "a3", Featured: true, Score: 3},
+			{AssetID: "a4", Featured: true, Score: 2},
+			{AssetID: "a5", Featured: false, Score: 1},
 		},
 	}
 	require.NoError(t, store.SyncRecipeMoments("trip", []service.MomentDraft{draft}))
@@ -530,7 +534,7 @@ func TestMomentsHandler_ListIncludesFeaturedAssetIDsExcludingCover(t *testing.T)
 	}
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &body))
 	require.Len(t, body.Moments, 1)
-	require.Equal(t, []string{"a2", "a3"}, body.Moments[0].FeaturedAssetIDs)
+	require.Equal(t, []string{"a2", "a3", "a4"}, body.Moments[0].FeaturedAssetIDs)
 }
 
 func TestMomentsHandler_ListFeaturedAssetIDsEmptyWhenNoneFeatured(t *testing.T) {
@@ -644,6 +648,61 @@ func TestMomentsHandler_ListIncludesAddedThisWeekPositiveWhenRecent(t *testing.T
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &body))
 	require.Len(t, body.Moments, 1)
 	require.Equal(t, float64(2), body.Moments[0]["added_this_week"], "两个成员均在本周新增")
+}
+
+// ── GET /moments 附带 cover_ratio ────────────────────────────────────────
+
+func TestMomentsHandler_ListIncludesCoverRatioNormal(t *testing.T) {
+	h, db, store := newMomentsHarness(t)
+	seedOneMoment(t, db, store, "m1", []string{"a1", "a2"}) // cover=a1
+	_, err := db.Exec(`INSERT INTO asset_exif(asset_id, width, height) VALUES (?, ?, ?)`, "a1", 1600, 2000)
+	require.NoError(t, err)
+
+	c, rec := newEchoCtx(http.MethodGet, "/v1/photos/moments", nil)
+	require.NoError(t, h.List(c))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	var body struct {
+		Moments []map[string]any `json:"moments"`
+	}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &body))
+	require.Len(t, body.Moments, 1)
+	require.InDelta(t, 0.8, body.Moments[0]["cover_ratio"], 1e-9)
+}
+
+func TestMomentsHandler_ListCoverRatioZeroWhenExifMissing(t *testing.T) {
+	h, db, store := newMomentsHarness(t)
+	seedOneMoment(t, db, store, "m1", []string{"a1", "a2"}) // 无 asset_exif 行
+
+	c, rec := newEchoCtx(http.MethodGet, "/v1/photos/moments", nil)
+	require.NoError(t, h.List(c))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	var body struct {
+		Moments []map[string]any `json:"moments"`
+	}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &body))
+	require.Len(t, body.Moments, 1)
+	require.Contains(t, body.Moments[0], "cover_ratio", "cover_ratio 应恒输出,不用 omitempty")
+	require.Equal(t, float64(0), body.Moments[0]["cover_ratio"])
+}
+
+func TestMomentsHandler_ListCoverRatioZeroWhenWidthOrHeightZero(t *testing.T) {
+	h, db, store := newMomentsHarness(t)
+	seedOneMoment(t, db, store, "m1", []string{"a1", "a2"}) // cover=a1
+	_, err := db.Exec(`INSERT INTO asset_exif(asset_id, width, height) VALUES (?, ?, ?)`, "a1", 0, 2000)
+	require.NoError(t, err)
+
+	c, rec := newEchoCtx(http.MethodGet, "/v1/photos/moments", nil)
+	require.NoError(t, h.List(c))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	var body struct {
+		Moments []map[string]any `json:"moments"`
+	}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &body))
+	require.Len(t, body.Moments, 1)
+	require.Equal(t, float64(0), body.Moments[0]["cover_ratio"])
 }
 
 // ── GET /moments/:id/assets?with_members=1 附带 places ──────────────────

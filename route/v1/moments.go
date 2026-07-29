@@ -53,18 +53,25 @@ type momentResponse struct {
 	// 落在窗口内才计入,见 MomentStore.AddedThisWeekByMoment)。恒输出(0 也
 	// 带),前端判 >0 才显示绿色 "+N this week" 标记。
 	AddedThisWeek int `json:"added_this_week"`
+	// CoverRatio 是封面宽高比(w/h,见 MomentStore.CoverRatioByMoment),供
+	// 前端马赛克布局判定横竖版卡片档位。任一维度缺失或为 0(封面尚未 EXIF
+	// 索引/无该字段)时输出 0=未知;恒输出,不用 omitempty——前端不必对该
+	// 字段做 null 判断。
+	CoverRatio float64 `json:"cover_ratio"`
 }
 
 // maxFeaturedAssetIDsPerMoment 是 List() 合成 featured_asset_ids 时每个时刻
 // 截取的精选数量上限,喂给 MomentStore.TopFeaturedByMoment 的 perMoment 参数。
-const maxFeaturedAssetIDsPerMoment = 2
+// 马赛克布局的三联模板(T4)最多消费 2 张精选 + 兜底链需要,上限从 2 提到 3
+// (见 2026-07-29 moments-mosaic 设计 spec 第一节)。
+const maxFeaturedAssetIDsPerMoment = 3
 
 // toMomentResponse 转换 service.Moment → momentResponse。TimeFrom/TimeTo 为零值
 // time.Time 时(主题类时刻没有固定时间窗)对应字段留空(nil,JSON 里省略),
-// 非零值格式化为 RFC3339。featuredAssetIDs/addedThisWeek 均由调用方一次性
-// 算好传入(List() 对全部时刻各只查一次 TopFeaturedByMoment/
-// AddedThisWeekByMoment,避免逐条时刻查询的 N+1)。
-func toMomentResponse(m service.Moment, featuredAssetIDs []string, addedThisWeek int) momentResponse {
+// 非零值格式化为 RFC3339。featuredAssetIDs/addedThisWeek/coverRatio 均由调用
+// 方一次性算好传入(List() 对全部时刻各只查一次 TopFeaturedByMoment/
+// AddedThisWeekByMoment/CoverRatioByMoment,避免逐条时刻查询的 N+1)。
+func toMomentResponse(m service.Moment, featuredAssetIDs []string, addedThisWeek int, coverRatio float64) momentResponse {
 	r := momentResponse{
 		ID:               m.ID,
 		Title:            m.Title,
@@ -77,6 +84,7 @@ func toMomentResponse(m service.Moment, featuredAssetIDs []string, addedThisWeek
 		SortOrder:        m.SortOrder,
 		FeaturedAssetIDs: featuredAssetIDs,
 		AddedThisWeek:    addedThisWeek,
+		CoverRatio:       coverRatio,
 	}
 	if r.FeaturedAssetIDs == nil {
 		r.FeaturedAssetIDs = []string{}
@@ -111,9 +119,15 @@ func (h *MomentsHandler) List(c echo.Context) error {
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
 	}
+	// 同法:一次查询取全库封面宽高比,按 moment id 分发,无 N+1;map 里没有的
+	// id(缺 exif 行或尺寸为 0)取零值 float64(0),即"未知"。
+	coverRatio, err := h.svc.Moments().Store().CoverRatioByMoment()
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	}
 	out := make([]momentResponse, 0, len(moments))
 	for _, m := range moments {
-		out = append(out, toMomentResponse(m, featured[m.ID], addedThisWeek[m.ID]))
+		out = append(out, toMomentResponse(m, featured[m.ID], addedThisWeek[m.ID], coverRatio[m.ID]))
 	}
 	return c.JSON(http.StatusOK, map[string]any{"moments": out})
 }

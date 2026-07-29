@@ -967,6 +967,80 @@ func TestMomentStore_TopFeaturedByMoment(t *testing.T) {
 	require.Equal(t, []string{"b1", "b2"}, top2["m2"])
 }
 
+// ── CoverRatioByMoment:封面宽高比(正常/缺 exif 行/零值→0)────────────
+
+// insertMomentAssetWithExif 插入一条带 asset_exif(width/height)的资产,
+// 供 CoverRatioByMoment 测试用。
+func insertMomentAssetWithExif(t *testing.T, db *sql.DB, id string, width, height int) {
+	t.Helper()
+	insertMomentAsset(t, db, id)
+	_, err := db.Exec(`INSERT INTO asset_exif(asset_id, width, height) VALUES (?, ?, ?)`, id, width, height)
+	require.NoError(t, err)
+}
+
+func TestMomentStore_CoverRatioByMoment_Normal(t *testing.T) {
+	db := makeTestDB(t)
+	store := NewMomentStore(db)
+	insertMomentAssetWithExif(t, db, "a1", 1600, 2000) // 竖版封面,ratio=0.8
+
+	draft := MomentDraft{
+		Moment: Moment{ID: "m1", RecipeKey: "trip", Title: "Trip", AssetCount: 1, CoverAssetID: "a1"},
+		Assets: []MomentAsset{{AssetID: "a1", Score: 0.5}},
+	}
+	require.NoError(t, store.SyncRecipeMoments("trip", []MomentDraft{draft}))
+
+	ratios, err := store.CoverRatioByMoment()
+	require.NoError(t, err)
+	require.InDelta(t, 0.8, ratios["m1"], 1e-9)
+}
+
+func TestMomentStore_CoverRatioByMoment_MissingExifRowExcluded(t *testing.T) {
+	db := makeTestDB(t)
+	store := NewMomentStore(db)
+	insertMomentAsset(t, db, "a1") // 无 asset_exif 行(未索引到尺寸)
+
+	draft := MomentDraft{
+		Moment: Moment{ID: "m1", RecipeKey: "trip", Title: "Trip", AssetCount: 1, CoverAssetID: "a1"},
+		Assets: []MomentAsset{{AssetID: "a1", Score: 0.5}},
+	}
+	require.NoError(t, store.SyncRecipeMoments("trip", []MomentDraft{draft}))
+
+	ratios, err := store.CoverRatioByMoment()
+	require.NoError(t, err)
+	_, ok := ratios["m1"]
+	require.False(t, ok, "缺 asset_exif 行的 moment 不应出现在 map 里,调用方应按 0 处理")
+}
+
+func TestMomentStore_CoverRatioByMoment_ZeroWidthOrHeightExcluded(t *testing.T) {
+	db := makeTestDB(t)
+	store := NewMomentStore(db)
+	insertMomentAssetWithExif(t, db, "a1", 0, 2000)    // width=0
+	insertMomentAssetWithExif(t, db, "a2", 1600, 0)    // height=0
+	insertMomentAssetWithExif(t, db, "a3", 1600, 1200) // 正常,ratio=1.333...
+
+	draft1 := MomentDraft{
+		Moment: Moment{ID: "m1", RecipeKey: "trip", Title: "Trip1", AssetCount: 1, CoverAssetID: "a1"},
+		Assets: []MomentAsset{{AssetID: "a1", Score: 0.5}},
+	}
+	draft2 := MomentDraft{
+		Moment: Moment{ID: "m2", RecipeKey: "trip", Title: "Trip2", AssetCount: 1, CoverAssetID: "a2"},
+		Assets: []MomentAsset{{AssetID: "a2", Score: 0.5}},
+	}
+	draft3 := MomentDraft{
+		Moment: Moment{ID: "m3", RecipeKey: "trip", Title: "Trip3", AssetCount: 1, CoverAssetID: "a3"},
+		Assets: []MomentAsset{{AssetID: "a3", Score: 0.5}},
+	}
+	require.NoError(t, store.SyncRecipeMoments("trip", []MomentDraft{draft1, draft2, draft3}))
+
+	ratios, err := store.CoverRatioByMoment()
+	require.NoError(t, err)
+	_, ok1 := ratios["m1"]
+	require.False(t, ok1, "width=0 不应出现在 map 里")
+	_, ok2 := ratios["m2"]
+	require.False(t, ok2, "height=0 不应出现在 map 里")
+	require.InDelta(t, 1600.0/1200.0, ratios["m3"], 1e-9)
+}
+
 // ── diff 式 upsert:added_at 语义(spec 1.2)───────────────────────────────
 
 // momentAssetAddedAt 读回 moment_assets.added_at(NULL 时返回 0,与
