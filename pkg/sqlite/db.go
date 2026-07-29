@@ -601,6 +601,12 @@ func migrate(db *sql.DB) error {
 		// (1=用户手动并入,非引擎本轮算出;0=引擎本轮正常产出)。仅供展示/排障
 		// 区分来源,不参与 SyncRecipeMoments 的替换逻辑本身。
 		`ALTER TABLE moment_assets ADD COLUMN manual INTEGER NOT NULL DEFAULT 0`,
+		// moment_assets.added_at: 成员加入时刻的时间戳(Unix ms)。NULL=存量/
+		// 加入时间未知(升级前已存在的行,不参与"本周新增"计数,避免上线首周
+		// 全库照片都显示 +N)。SyncRecipeMoments 的成员同步已改为 diff 式
+		// upsert(见 momentstore.go 注释):新插入的成员打当前时间戳,已存在
+		// 成员的冲突分支不触碰该列。
+		`ALTER TABLE moment_assets ADD COLUMN added_at INTEGER`,
 	}
 	for _, stmt := range alters {
 		if _, err := db.Exec(stmt); err != nil &&

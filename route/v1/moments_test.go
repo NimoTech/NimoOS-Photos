@@ -604,6 +604,77 @@ func TestMomentsHandler_AssetsWithoutParamStaysBareArray(t *testing.T) {
 	require.Len(t, raw, 2)
 }
 
+// ── momentDTO.added_this_week ────────────────────────────────────────────
+
+func TestMomentsHandler_ListIncludesAddedThisWeekZeroWhenNoneRecent(t *testing.T) {
+	h, db, store := newMomentsHarness(t)
+	seedOneMoment(t, db, store, "m1", []string{"a1", "a2"})
+	// seedOneMoment 走 SyncRecipeMoments,新成员的 added_at 恰好是本次调用的
+	// "现在",天然落在 7 天窗口内——这里把它们回填成很久以前,验证 0 的场景。
+	_, err := db.Exec(`UPDATE moment_assets SET added_at=1 WHERE moment_id='m1'`)
+	require.NoError(t, err)
+
+	c, rec := newEchoCtx(http.MethodGet, "/v1/photos/moments", nil)
+	require.NoError(t, h.List(c))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	var body struct {
+		Moments []map[string]any `json:"moments"`
+	}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &body))
+	require.Len(t, body.Moments, 1)
+	// 字段恒输出(0 也带),前端判 >0 才显示。
+	require.Contains(t, body.Moments[0], "added_this_week")
+	require.Equal(t, float64(0), body.Moments[0]["added_this_week"])
+}
+
+func TestMomentsHandler_ListIncludesAddedThisWeekPositiveWhenRecent(t *testing.T) {
+	h, db, store := newMomentsHarness(t)
+	seedOneMoment(t, db, store, "m1", []string{"a1", "a2"})
+	// seedOneMoment 内的 SyncRecipeMoments 已把 added_at 打成"刚刚",天然落在
+	// 7 天窗口内,无需额外造数据。
+
+	c, rec := newEchoCtx(http.MethodGet, "/v1/photos/moments", nil)
+	require.NoError(t, h.List(c))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	var body struct {
+		Moments []map[string]any `json:"moments"`
+	}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &body))
+	require.Len(t, body.Moments, 1)
+	require.Equal(t, float64(2), body.Moments[0]["added_this_week"], "两个成员均在本周新增")
+}
+
+// ── GET /moments/:id/assets?with_members=1 附带 places ──────────────────
+
+func TestMomentsHandler_AssetsWithMembersIncludesPlaces(t *testing.T) {
+	h, db, store := newMomentsHarness(t)
+	seedOneMoment(t, db, store, "m1", []string{"a1", "a2"})
+	_, err := db.Exec(`INSERT INTO asset_geo(asset_id, city) VALUES (?, ?)`, "a1", "Bozeman")
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO asset_geo(asset_id, city) VALUES (?, ?)`, "a2", "Bozeman")
+	require.NoError(t, err)
+
+	c, rec := newEchoCtx(http.MethodGet, "/v1/photos/moments/m1/assets?with_members=1", nil)
+	c.SetParamNames("id")
+	c.SetParamValues("m1")
+	require.NoError(t, h.Assets(c))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	var body struct {
+		Places []struct {
+			Name  string `json:"name"`
+			Count int    `json:"count"`
+		} `json:"places"`
+	}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &body))
+	require.Equal(t, []struct {
+		Name  string `json:"name"`
+		Count int    `json:"count"`
+	}{{Name: "Bozeman", Count: 2}}, body.Places)
+}
+
 func TestMomentsHandler_UpdateRecipesUnknownKindRejected(t *testing.T) {
 	h, _, store := newMomentsHarness(t)
 

@@ -8,6 +8,7 @@ package service
 
 import (
 	"database/sql"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -547,6 +548,22 @@ func TestMomentStore_MigrationIdempotent(t *testing.T) {
 		mRows.Close()
 		require.True(t, manualCol, "moment_assets.manual 列应存在")
 
+		var addedAtCol bool
+		aaRows, err := db.Query(`PRAGMA table_info(moment_assets)`)
+		require.NoError(t, err)
+		for aaRows.Next() {
+			var cid int
+			var name, ctype string
+			var notnull, pk int
+			var dflt sql.NullString
+			require.NoError(t, aaRows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk))
+			if name == "added_at" {
+				addedAtCol = true
+			}
+		}
+		aaRows.Close()
+		require.True(t, addedAtCol, "moment_assets.added_at 列应存在")
+
 		var tblCount int
 		require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='moment_edits'`).Scan(&tblCount))
 		require.Equal(t, 1, tblCount, "moment_edits 表应存在")
@@ -948,4 +965,301 @@ func TestMomentStore_TopFeaturedByMoment(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, []string{"a2", "a3"}, top2["m1"], "按 score DESC,封面之外前 2 个")
 	require.Equal(t, []string{"b1", "b2"}, top2["m2"])
+}
+
+// ── diff 式 upsert:added_at 语义(spec 1.2)───────────────────────────────
+
+// momentAssetAddedAt 读回 moment_assets.added_at(NULL 时返回 0,与
+// MomentAsset.AddedAt 的 0=NULL 约定一致),供本组测试断言用。
+func momentAssetAddedAt(t *testing.T, db *sql.DB, momentID, assetID string) int64 {
+	t.Helper()
+	var v sql.NullInt64
+	require.NoError(t, db.QueryRow(`SELECT added_at FROM moment_assets WHERE moment_id=? AND asset_id=?`,
+		momentID, assetID).Scan(&v))
+	if !v.Valid {
+		return 0
+	}
+	return v.Int64
+}
+
+// TestMomentStore_SyncDiffUpsertNewMemberGetsAddedAtNow:首次 Sync 产出的新
+// 成员应打上当前时间戳(非 NULL)。
+func TestMomentStore_SyncDiffUpsertNewMemberGetsAddedAtNow(t *testing.T) {
+	db := makeTestDB(t)
+	store := NewMomentStore(db)
+	insertMomentAsset(t, db, "a1")
+
+	before := nowMs()
+	draft := MomentDraft{
+		Moment: Moment{ID: "m1", RecipeKey: "trip", Title: "Trip", AssetCount: 1},
+		Assets: []MomentAsset{{AssetID: "a1", Score: 0.5}},
+	}
+	require.NoError(t, store.SyncRecipeMoments("trip", []MomentDraft{draft}))
+	after := nowMs()
+
+	addedAt := momentAssetAddedAt(t, db, "m1", "a1")
+	require.GreaterOrEqual(t, addedAt, before, "新成员 added_at 应打当前时间戳")
+	require.LessOrEqual(t, addedAt, after)
+}
+
+// TestMomentStore_SyncDiffUpsertExistingMemberAddedAtUnchanged:同一成员跨轮
+// Sync(冲突分支)不应触碰已有的 added_at,即便 featured/score 变化。
+func TestMomentStore_SyncDiffUpsertExistingMemberAddedAtUnchanged(t *testing.T) {
+	db := makeTestDB(t)
+	store := NewMomentStore(db)
+	insertMomentAsset(t, db, "a1")
+
+	draft := MomentDraft{
+		Moment: Moment{ID: "m1", RecipeKey: "trip", Title: "Trip", AssetCount: 1},
+		Assets: []MomentAsset{{AssetID: "a1", Featured: false, Score: 0.5}},
+	}
+	require.NoError(t, store.SyncRecipeMoments("trip", []MomentDraft{draft}))
+	firstAddedAt := momentAssetAddedAt(t, db, "m1", "a1")
+	require.NotZero(t, firstAddedAt)
+
+	time.Sleep(2 * time.Millisecond)
+	draft2 := draft
+	draft2.Assets = []MomentAsset{{AssetID: "a1", Featured: true, Score: 0.9}}
+	require.NoError(t, store.SyncRecipeMoments("trip", []MomentDraft{draft2}))
+
+	secondAddedAt := momentAssetAddedAt(t, db, "m1", "a1")
+	require.Equal(t, firstAddedAt, secondAddedAt, "冲突分支不应触碰既有成员的 added_at")
+
+	// featured/score 仍应正常更新(diff upsert 语义等价于原全量替换)。
+	members, err := store.GetMomentAssets("m1", false)
+	require.NoError(t, err)
+	require.Len(t, members, 1)
+	require.True(t, members[0].Featured)
+	require.Equal(t, 0.9, members[0].Score)
+}
+
+// TestMomentStore_SyncDiffUpsertDisappearedMemberDeleted:引擎本轮未产出的
+// 旧成员(非 pin)应被删除(diff upsert 的第 2 步),重新出现时视为全新成员
+// (added_at 重新打 now)。
+func TestMomentStore_SyncDiffUpsertDisappearedMemberDeleted(t *testing.T) {
+	db := makeTestDB(t)
+	store := NewMomentStore(db)
+	insertMomentAsset(t, db, "a1")
+	insertMomentAsset(t, db, "a2")
+
+	draft := MomentDraft{
+		Moment: Moment{ID: "m1", RecipeKey: "trip", Title: "Trip", AssetCount: 2},
+		Assets: []MomentAsset{{AssetID: "a1", Score: 0.5}, {AssetID: "a2", Score: 0.4}},
+	}
+	require.NoError(t, store.SyncRecipeMoments("trip", []MomentDraft{draft}))
+
+	// 下一轮只产出 a1,a2 消失(非 pin)——应被删除,不是仅仅"不更新"。
+	draft2 := draft
+	draft2.Assets = []MomentAsset{{AssetID: "a1", Score: 0.5}}
+	require.NoError(t, store.SyncRecipeMoments("trip", []MomentDraft{draft2}))
+
+	var count int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM moment_assets WHERE moment_id='m1' AND asset_id='a2'`).Scan(&count))
+	require.Equal(t, 0, count, "消失的非 pin 成员应被 diff upsert 删除")
+}
+
+// TestMomentStore_SyncDiffUpsertPinExemptFromDeletionAddedAtStable:pin 成员
+// 即便引擎本轮未产出也不应被删除(spec 点名的"假新鲜坑"),连续两轮 Sync 后
+// added_at 应保持稳定(不因"删了又被回放补插"而每轮刷新成 now)。
+func TestMomentStore_SyncDiffUpsertPinExemptFromDeletionAddedAtStable(t *testing.T) {
+	db := makeTestDB(t)
+	store := NewMomentStore(db)
+	insertMomentAsset(t, db, "a1")
+	insertMomentAsset(t, db, "a2")
+
+	draft := MomentDraft{
+		Moment: Moment{ID: "m1", RecipeKey: "trip", Title: "Trip", AssetCount: 1},
+		Assets: []MomentAsset{{AssetID: "a1", Score: 0.5}},
+	}
+	require.NoError(t, store.SyncRecipeMoments("trip", []MomentDraft{draft}))
+
+	// 用户钉入 a2(引擎本轮未纳入)。
+	_, err := store.PinMomentAssets("m1", []string{"a2"})
+	require.NoError(t, err)
+	pinnedAddedAt := momentAssetAddedAt(t, db, "m1", "a2")
+	require.NotZero(t, pinnedAddedAt, "PinMomentAssets 应补 added_at=now")
+
+	// 连续两轮重算,引擎依旧只产出 a1,a2 应始终幸存且 added_at 不变。
+	require.NoError(t, store.SyncRecipeMoments("trip", []MomentDraft{draft}))
+	afterRound1 := momentAssetAddedAt(t, db, "m1", "a2")
+	require.Equal(t, pinnedAddedAt, afterRound1, "pin 成员豁免删除,第一轮重算后 added_at 不应刷新")
+
+	time.Sleep(2 * time.Millisecond)
+	require.NoError(t, store.SyncRecipeMoments("trip", []MomentDraft{draft}))
+	afterRound2 := momentAssetAddedAt(t, db, "m1", "a2")
+	require.Equal(t, pinnedAddedAt, afterRound2, "第二轮重算后 added_at 仍不应刷新(假新鲜坑回归)")
+
+	members, err := store.GetMomentAssets("m1", false)
+	require.NoError(t, err)
+	ids := map[string]bool{}
+	for _, m := range members {
+		ids[m.AssetID] = true
+	}
+	require.True(t, ids["a1"])
+	require.True(t, ids["a2"], "pin 成员应在两轮重算后依然存活")
+}
+
+// ── PinMomentAssets 立即插入路径补 added_at=now ─────────────────────────
+
+func TestMomentStore_PinMomentAssetsSetsAddedAtNow(t *testing.T) {
+	db := makeTestDB(t)
+	store := NewMomentStore(db)
+	insertMomentAsset(t, db, "a1")
+	insertMomentAsset(t, db, "a2")
+
+	draft := MomentDraft{
+		Moment: Moment{ID: "m1", RecipeKey: "trip", Title: "Trip", AssetCount: 1},
+		Assets: []MomentAsset{{AssetID: "a1", Score: 0.5}},
+	}
+	require.NoError(t, store.SyncRecipeMoments("trip", []MomentDraft{draft}))
+
+	before := nowMs()
+	_, err := store.PinMomentAssets("m1", []string{"a2"})
+	require.NoError(t, err)
+	after := nowMs()
+
+	addedAt := momentAssetAddedAt(t, db, "m1", "a2")
+	require.GreaterOrEqual(t, addedAt, before)
+	require.LessOrEqual(t, addedAt, after)
+}
+
+// ── AddedThisWeekByMoment:口径(NULL 不计/7 天窗/无 N+1 形状)────────────
+
+func TestMomentStore_AddedThisWeekByMoment_NullNotCountedAndSevenDayWindow(t *testing.T) {
+	db := makeTestDB(t)
+	store := NewMomentStore(db)
+	insertMomentAsset(t, db, "a1") // 存量:added_at 手动置 NULL
+	insertMomentAsset(t, db, "a2") // 本周新增
+	insertMomentAsset(t, db, "a3") // 8 天前新增,窗口外
+	insertMomentAsset(t, db, "a4") // 恰好窗口边界内(now-7d 之后)
+
+	draft := MomentDraft{
+		Moment: Moment{ID: "m1", RecipeKey: "trip", Title: "Trip", AssetCount: 4},
+		Assets: []MomentAsset{
+			{AssetID: "a1"}, {AssetID: "a2"}, {AssetID: "a3"}, {AssetID: "a4"},
+		},
+	}
+	require.NoError(t, store.SyncRecipeMoments("trip", []MomentDraft{draft}))
+
+	now := nowMs()
+	sevenDaysMs := int64(7 * 24 * 60 * 60 * 1000)
+
+	// a1 模拟存量:回填为 NULL(diff upsert 首次 INSERT 打了 now,这里手动覆盖
+	// 模拟"升级前已存在、加入时间未知"的场景)。
+	_, err := db.Exec(`UPDATE moment_assets SET added_at=NULL WHERE moment_id='m1' AND asset_id='a1'`)
+	require.NoError(t, err)
+	// a2:窗口内(2 天前)。
+	_, err = db.Exec(`UPDATE moment_assets SET added_at=? WHERE moment_id='m1' AND asset_id='a2'`,
+		now-2*24*60*60*1000)
+	require.NoError(t, err)
+	// a3:窗口外(8 天前)。
+	_, err = db.Exec(`UPDATE moment_assets SET added_at=? WHERE moment_id='m1' AND asset_id='a3'`,
+		now-8*24*60*60*1000)
+	require.NoError(t, err)
+	// a4:恰好等于窗口边界(now-7d),边界应计入(>=）。
+	_, err = db.Exec(`UPDATE moment_assets SET added_at=? WHERE moment_id='m1' AND asset_id='a4'`,
+		now-sevenDaysMs)
+	require.NoError(t, err)
+
+	counts, err := store.AddedThisWeekByMoment(now)
+	require.NoError(t, err)
+	require.Equal(t, 2, counts["m1"], "只有 a2/a4 落在 7 天窗口内且非 NULL,a1(NULL)与 a3(窗口外)不计")
+}
+
+// TestMomentStore_AddedThisWeekByMoment_MultiMomentGrouping 用一次查询覆盖
+// 多个 moment(无 N+1 的形状验证:同一次调用应正确分组到各自 moment_id)。
+func TestMomentStore_AddedThisWeekByMoment_MultiMomentGrouping(t *testing.T) {
+	db := makeTestDB(t)
+	store := NewMomentStore(db)
+	insertMomentAsset(t, db, "a1")
+	insertMomentAsset(t, db, "a2")
+	insertMomentAsset(t, db, "b1")
+
+	d1 := MomentDraft{Moment: Moment{ID: "m1", RecipeKey: "trip", Title: "One", AssetCount: 2},
+		Assets: []MomentAsset{{AssetID: "a1"}, {AssetID: "a2"}}}
+	d2 := MomentDraft{Moment: Moment{ID: "m2", RecipeKey: "theme:pets", Title: "Two", AssetCount: 1},
+		Assets: []MomentAsset{{AssetID: "b1"}}}
+	require.NoError(t, store.SyncRecipeMoments("trip", []MomentDraft{d1}))
+	require.NoError(t, store.SyncRecipeMoments("theme:pets", []MomentDraft{d2}))
+
+	now := nowMs()
+	counts, err := store.AddedThisWeekByMoment(now)
+	require.NoError(t, err)
+	require.Equal(t, 2, counts["m1"], "m1 有 a1/a2 两个本周新增成员")
+	require.Equal(t, 1, counts["m2"])
+}
+
+// ── PlacesByMoment:排序/tie-break/上限/无 geo 回退 ──────────────────────
+
+// insertMomentAssetWithGeo 插入一条带 asset_geo 的资产,供 PlacesByMoment 测试用。
+func insertMomentAssetWithGeo(t *testing.T, db *sql.DB, id, city string) {
+	t.Helper()
+	insertMomentAsset(t, db, id)
+	_, err := db.Exec(`INSERT INTO asset_geo(asset_id, city) VALUES (?, ?)`, id, city)
+	require.NoError(t, err)
+}
+
+func TestMomentStore_PlacesByMoment_OrderAndTieBreak(t *testing.T) {
+	db := makeTestDB(t)
+	store := NewMomentStore(db)
+	// Bozeman ×3、Rexburg ×1、Twin Falls ×1(平局按 city ASC 排)。
+	insertMomentAssetWithGeo(t, db, "a1", "Bozeman")
+	insertMomentAssetWithGeo(t, db, "a2", "Bozeman")
+	insertMomentAssetWithGeo(t, db, "a3", "Bozeman")
+	insertMomentAssetWithGeo(t, db, "a4", "Twin Falls")
+	insertMomentAssetWithGeo(t, db, "a5", "Rexburg")
+
+	draft := MomentDraft{
+		Moment: Moment{ID: "m1", RecipeKey: "trip", Title: "Trip", AssetCount: 5},
+		Assets: []MomentAsset{{AssetID: "a1"}, {AssetID: "a2"}, {AssetID: "a3"}, {AssetID: "a4"}, {AssetID: "a5"}},
+	}
+	require.NoError(t, store.SyncRecipeMoments("trip", []MomentDraft{draft}))
+
+	places, err := store.PlacesByMoment("m1", 8)
+	require.NoError(t, err)
+	require.Equal(t, []MomentPlace{
+		{Name: "Bozeman", Count: 3},
+		{Name: "Rexburg", Count: 1},
+		{Name: "Twin Falls", Count: 1},
+	}, places, "按 count DESC,同 count 按 city ASC tie-break")
+}
+
+func TestMomentStore_PlacesByMoment_LimitCaps(t *testing.T) {
+	db := makeTestDB(t)
+	store := NewMomentStore(db)
+	cities := []string{"A", "B", "C", "D", "E", "F", "G", "H", "I", "J"}
+	assets := make([]MomentAsset, 0, len(cities))
+	for i, city := range cities {
+		id := fmt.Sprintf("a%d", i)
+		insertMomentAssetWithGeo(t, db, id, city)
+		assets = append(assets, MomentAsset{AssetID: id})
+	}
+	draft := MomentDraft{
+		Moment: Moment{ID: "m1", RecipeKey: "trip", Title: "Trip", AssetCount: len(cities)},
+		Assets: assets,
+	}
+	require.NoError(t, store.SyncRecipeMoments("trip", []MomentDraft{draft}))
+
+	places, err := store.PlacesByMoment("m1", 8)
+	require.NoError(t, err)
+	require.Len(t, places, 8, "10 个不同城市,上限应截到 8 条")
+}
+
+func TestMomentStore_PlacesByMoment_NoGeoExcludedAndEmptyReturnsEmpty(t *testing.T) {
+	db := makeTestDB(t)
+	store := NewMomentStore(db)
+	insertMomentAsset(t, db, "a1") // 无 asset_geo 行
+	_, err := db.Exec(`INSERT INTO asset_geo(asset_id, city) VALUES (?, ?)`, "a1", "")
+	require.NoError(t, err) // city 为空字符串同样不应计入
+	insertMomentAsset(t, db, "a2") // 完全无 asset_geo 行(未 geocode)
+
+	draft := MomentDraft{
+		Moment: Moment{ID: "m1", RecipeKey: "trip", Title: "Trip", AssetCount: 2},
+		Assets: []MomentAsset{{AssetID: "a1"}, {AssetID: "a2"}},
+	}
+	require.NoError(t, store.SyncRecipeMoments("trip", []MomentDraft{draft}))
+
+	places, err := store.PlacesByMoment("m1", 8)
+	require.NoError(t, err)
+	require.Empty(t, places, "city 为空或无 geo 行的成员都不应计入 places")
 }
