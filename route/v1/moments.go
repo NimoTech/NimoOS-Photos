@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"time"
 
 	"github.com/NimoTech/NimoOS-Photos/service"
 	"github.com/labstack/echo/v4"
@@ -48,6 +49,10 @@ type momentResponse struct {
 	// 请求 /assets?featured=1。恒为数组(可能为空 []),不用 omitempty——前端
 	// 不必对该字段做 null 判断。
 	FeaturedAssetIDs []string `json:"featured_asset_ids"`
+	// AddedThisWeek 是该时刻本周(7 天窗)新增的成员数(added_at 非 NULL 且
+	// 落在窗口内才计入,见 MomentStore.AddedThisWeekByMoment)。恒输出(0 也
+	// 带),前端判 >0 才显示绿色 "+N this week" 标记。
+	AddedThisWeek int `json:"added_this_week"`
 }
 
 // maxFeaturedAssetIDsPerMoment 是 List() 合成 featured_asset_ids 时每个时刻
@@ -56,9 +61,10 @@ const maxFeaturedAssetIDsPerMoment = 2
 
 // toMomentResponse 转换 service.Moment → momentResponse。TimeFrom/TimeTo 为零值
 // time.Time 时(主题类时刻没有固定时间窗)对应字段留空(nil,JSON 里省略),
-// 非零值格式化为 RFC3339。featuredAssetIDs 由调用方一次性算好传入(List()
-// 对全部时刻只查一次 TopFeaturedByMoment,避免逐条时刻查询的 N+1)。
-func toMomentResponse(m service.Moment, featuredAssetIDs []string) momentResponse {
+// 非零值格式化为 RFC3339。featuredAssetIDs/addedThisWeek 均由调用方一次性
+// 算好传入(List() 对全部时刻各只查一次 TopFeaturedByMoment/
+// AddedThisWeekByMoment,避免逐条时刻查询的 N+1)。
+func toMomentResponse(m service.Moment, featuredAssetIDs []string, addedThisWeek int) momentResponse {
 	r := momentResponse{
 		ID:               m.ID,
 		Title:            m.Title,
@@ -70,6 +76,7 @@ func toMomentResponse(m service.Moment, featuredAssetIDs []string) momentRespons
 		NamedByLLM:       m.NamedByLLM,
 		SortOrder:        m.SortOrder,
 		FeaturedAssetIDs: featuredAssetIDs,
+		AddedThisWeek:    addedThisWeek,
 	}
 	if r.FeaturedAssetIDs == nil {
 		r.FeaturedAssetIDs = []string{}
@@ -99,9 +106,14 @@ func (h *MomentsHandler) List(c echo.Context) error {
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
 	}
+	// 同法:一次查询取全库 added_this_week,按 moment id 分发,无 N+1。
+	addedThisWeek, err := h.svc.Moments().Store().AddedThisWeekByMoment(time.Now().UnixMilli())
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	}
 	out := make([]momentResponse, 0, len(moments))
 	for _, m := range moments {
-		out = append(out, toMomentResponse(m, featured[m.ID]))
+		out = append(out, toMomentResponse(m, featured[m.ID], addedThisWeek[m.ID]))
 	}
 	return c.JSON(http.StatusOK, map[string]any{"moments": out})
 }
@@ -130,6 +142,17 @@ type momentAssetMemberDTO struct {
 	Manual   bool   `json:"manual"`
 	Featured bool   `json:"featured"`
 }
+
+// momentPlaceDTO 是 with_members=1 附带的 About 多地点聚合数据(见设计 spec
+// 第三节),转自 service.MomentPlace。
+type momentPlaceDTO struct {
+	Name  string `json:"name"`
+	Count int    `json:"count"`
+}
+
+// maxPlacesPerMoment 是 Assets(with_members=1) places 字段的城市数量上限,
+// 防止极端多地点的时刻把响应撑得过长(见设计 spec 第三节)。
+const maxPlacesPerMoment = 8
 
 // Assets returns a moment's member assets, serialized via the same asset
 // shape as GET /v1/photos/assets. Query param featured=1 restricts to the
@@ -177,7 +200,17 @@ func (h *MomentsHandler) Assets(c echo.Context) error {
 			Featured: m.Featured,
 		})
 	}
-	return c.JSON(http.StatusOK, map[string]any{"assets": assets, "members": memberDTOs})
+
+	places, err := h.svc.Moments().Store().PlacesByMoment(id, maxPlacesPerMoment)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	}
+	placeDTOs := make([]momentPlaceDTO, 0, len(places))
+	for _, p := range places {
+		placeDTOs = append(placeDTOs, momentPlaceDTO{Name: p.Name, Count: p.Count})
+	}
+
+	return c.JSON(http.StatusOK, map[string]any{"assets": assets, "members": memberDTOs, "places": placeDTOs})
 }
 
 // momentAssetsIDsRequest 是 Pin/ExcludeAssets 共用的请求体形状:一批待操作

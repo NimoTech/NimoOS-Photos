@@ -5,8 +5,8 @@
 // 无需改代码(真正需要新算法的 kind 除外)。
 //
 // moments/moment_assets 是活实体:稳定派生 id(TripMomentID/ThemeMomentID),
-// 每轮重算按 id upsert + 成员全量替换(delete+insert),用户看到的时刻不因
-// 重算而闪断;LLM 已命名过的 title(named_by_llm=1)重算时原样保留,只有
+// 每轮重算按 id upsert + 成员 diff 式 upsert(既有成员保留 added_at、缺席者
+// 删除但豁免 pin 成员),用户看到的时刻不因重算而闪断;LLM 已命名过的 title(named_by_llm=1)重算时原样保留,只有
 // 模板打底阶段(named_by_llm=0)的 title 才会被下一轮重算的模板结果覆盖。
 package service
 
@@ -159,6 +159,17 @@ type MomentAsset struct {
 	// Manual 对应 manual 列:1=该成员是用户 pin 编辑回放插入(非引擎本轮产出),
 	// 仅供展示/排障区分来源。
 	Manual bool
+	// AddedAt 对应 added_at 列:成员加入时刻的 Unix ms 时间戳,0=NULL(存量/
+	// 加入时间未知,不参与"本周新增"计数)。仅供内部/测试使用,资产端点不
+	// 直接暴露该字段(见简报)。
+	AddedAt int64
+}
+
+// MomentPlace 是 About 多地点展示的一条聚合结果:某城市在时刻成员中出现的
+// 次数,供 PlacesByMoment 按次数降序返回。
+type MomentPlace struct {
+	Name  string
+	Count int
 }
 
 // MomentDraft 是引擎每轮重算产出的候选时刻(尚未落库的草稿):嵌入 Moment 的
@@ -414,7 +425,9 @@ func nullTimeArg(t time.Time) interface{} {
 
 // SyncRecipeMoments 是幂等重算的落库入口:事务内对每个 draft 按 ID upsert
 // moments(named_by_llm=1 的既有行保留其 title/named_by_llm,其余字段更新)
-// + 成员全量替换(delete+insert moment_assets);随后删除该 recipeKey 下
+// + 成员 diff 式 upsert(ON CONFLICT 刷新 featured/score/manual 但不触碰
+// added_at;缺席成员删除但豁免有 pin 编辑者,防止"删了又被回放补插"把
+// added_at 轮刷成假新鲜);随后删除该 recipeKey 下
 // 不在本轮 drafts id 集合里的旧 moments(级联清成员),使消失的时刻(如
 // gap 重新切分后不再成团的旧 trip)从库中退出。
 //
@@ -451,31 +464,62 @@ func (s *MomentStore) SyncRecipeMoments(recipeKey string, drafts []MomentDraft) 
 			return fmt.Errorf("moments: upsert moment %q: %w", d.ID, err)
 		}
 
-		// 成员全量替换:先清空旧成员,再整批插入本轮结果,事务内完成,
-		// 不会出现"清空后插入前"的空窗被并发读到。
-		if _, err := tx.Exec(`DELETE FROM moment_assets WHERE moment_id=?`, d.ID); err != nil {
-			tx.Rollback()
-			return fmt.Errorf("moments: clear members %q: %w", d.ID, err)
-		}
+		// 成员 diff 式 upsert(spec 1.2 四步语义,保住 added_at,语义等价于旧
+		// "整体替换 delete+insert"):
+		//  1. 对本轮 draft 每个成员 upsert:冲突分支只刷新 featured/score/
+		//     manual,不触碰 added_at(既有成员保留原加入时间;NULL 也保留
+		//     NULL);真正新插入的行打当前时间戳。
+		//  2. 删除"本轮未产出"的旧成员,但豁免 pin 成员——否则"删了又被
+		//     下面的 applyMomentEdits 回放补插"会把 pin 成员的 added_at
+		//     每轮刷新成 now(假新鲜坑,见 spec)。
 		for _, a := range d.Assets {
 			featured := 0
 			if a.Featured {
 				featured = 1
 			}
+			manual := 0
+			if a.Manual {
+				manual = 1
+			}
 			if _, err := tx.Exec(`
-				INSERT INTO moment_assets(moment_id, asset_id, featured, score) VALUES (?, ?, ?, ?)`,
-				d.ID, a.AssetID, featured, a.Score,
+				INSERT INTO moment_assets(moment_id, asset_id, featured, score, manual, added_at)
+				VALUES (?, ?, ?, ?, ?, ?)
+				ON CONFLICT(moment_id, asset_id) DO UPDATE SET
+					featured = excluded.featured,
+					score    = excluded.score,
+					manual   = excluded.manual`,
+				d.ID, a.AssetID, featured, a.Score, manual, now,
 			); err != nil {
 				tx.Rollback()
-				return fmt.Errorf("moments: insert member %q/%q: %w", d.ID, a.AssetID, err)
+				return fmt.Errorf("moments: upsert member %q/%q: %w", d.ID, a.AssetID, err)
 			}
 		}
 
-		// edits 回放:引擎重算不知道用户此前的 pin/exclude 编辑,成员全量替换
-		// 之后立刻把编辑叠加回去,防止被本轮重算悄悄冲掉。仅当该 moment 存在
-		// edits 时才触发派生刷新(count/时间窗/封面重挑)——没有编辑记录的
-		// moment 维持引擎本轮算出的派生值,不必多余重算。
-		hasEdits, err := applyMomentEdits(tx, d.ID)
+		deleteMembersQ := `
+			DELETE FROM moment_assets
+			WHERE moment_id = ?`
+		deleteMembersArgs := []interface{}{d.ID}
+		if len(d.Assets) > 0 {
+			placeholders := make([]string, len(d.Assets))
+			for i, a := range d.Assets {
+				placeholders[i] = "?"
+				deleteMembersArgs = append(deleteMembersArgs, a.AssetID)
+			}
+			deleteMembersQ += ` AND asset_id NOT IN (` + strings.Join(placeholders, ",") + `)`
+		}
+		deleteMembersQ += `
+			AND asset_id NOT IN (SELECT asset_id FROM moment_edits WHERE moment_id=? AND op='pin')`
+		deleteMembersArgs = append(deleteMembersArgs, d.ID)
+		if _, err := tx.Exec(deleteMembersQ, deleteMembersArgs...); err != nil {
+			tx.Rollback()
+			return fmt.Errorf("moments: delete stale members %q: %w", d.ID, err)
+		}
+
+		// edits 回放:引擎重算不知道用户此前的 pin/exclude 编辑,成员 diff
+		// upsert 之后立刻把编辑叠加回去,防止被本轮重算悄悄冲掉。仅当该
+		// moment 存在 edits 时才触发派生刷新(count/时间窗/封面重挑)——没有
+		// 编辑记录的 moment 维持引擎本轮算出的派生值,不必多余重算。
+		hasEdits, err := applyMomentEdits(tx, d.ID, now)
 		if err != nil {
 			tx.Rollback()
 			return err
@@ -591,7 +635,7 @@ func scanMoment(row momentScanner) (Moment, error) {
 // GetMomentAssets 返回某时刻的成员,按 score 倒序;featuredOnly=true 时只
 // 返回精选(featured=1)成员。
 func (s *MomentStore) GetMomentAssets(id string, featuredOnly bool) ([]MomentAsset, error) {
-	q := `SELECT asset_id, featured, score, manual FROM moment_assets WHERE moment_id=?`
+	q := `SELECT asset_id, featured, score, manual, added_at FROM moment_assets WHERE moment_id=?`
 	if featuredOnly {
 		q += ` AND featured=1`
 	}
@@ -606,11 +650,15 @@ func (s *MomentStore) GetMomentAssets(id string, featuredOnly bool) ([]MomentAss
 	for rows.Next() {
 		var a MomentAsset
 		var featured, manual int
-		if err := rows.Scan(&a.AssetID, &featured, &a.Score, &manual); err != nil {
+		var addedAt sql.NullInt64
+		if err := rows.Scan(&a.AssetID, &featured, &a.Score, &manual, &addedAt); err != nil {
 			return nil, fmt.Errorf("moments: scan member: %w", err)
 		}
 		a.Featured = featured != 0
 		a.Manual = manual != 0
+		if addedAt.Valid {
+			a.AddedAt = addedAt.Int64
+		}
 		out = append(out, a)
 	}
 	return out, rows.Err()
@@ -670,9 +718,9 @@ func (s *MomentStore) applyMomentEditOp(momentID string, assetIDs []string, op s
 		}
 		if op == "pin" {
 			if _, err := tx.Exec(`
-				INSERT OR IGNORE INTO moment_assets(moment_id, asset_id, featured, score, manual)
-				VALUES (?, ?, 0, 0, 1)`,
-				momentID, assetID,
+				INSERT OR IGNORE INTO moment_assets(moment_id, asset_id, featured, score, manual, added_at)
+				VALUES (?, ?, 0, 0, 1, ?)`,
+				momentID, assetID, now,
 			); err != nil {
 				tx.Rollback()
 				return 0, fmt.Errorf("moments: pin insert member %q/%q: %w", momentID, assetID, err)
@@ -775,6 +823,72 @@ func (s *MomentStore) TopFeaturedByMoment(perMoment int) (map[string][]string, e
 	return out, rows.Err()
 }
 
+// sevenDaysMs 是 AddedThisWeekByMoment 的统计窗口(7 天,毫秒)。
+const sevenDaysMs = int64(7 * 24 * 60 * 60 * 1000)
+
+// AddedThisWeekByMoment 一次查询统计全库每个时刻"本周新增"的成员数:
+// added_at 非 NULL 且 >= nowMs-7d 才计入(NULL=存量/加入时间未知,不计,
+// 避免上线首周全库照片都显示 +N)。与 TopFeaturedByMoment 同法,一条整表
+// 查询 Go 侧按 moment_id 分组,不对每个时刻单独查询(无 N+1)。返回的 map
+// 只包含 count>0 的 moment id;调用方对未出现的 id 应按 0 处理。
+func (s *MomentStore) AddedThisWeekByMoment(nowMs int64) (map[string]int, error) {
+	cutoff := nowMs - sevenDaysMs
+	rows, err := s.db.Query(`
+		SELECT moment_id, COUNT(*)
+		FROM moment_assets
+		WHERE added_at IS NOT NULL AND added_at >= ?
+		GROUP BY moment_id`, cutoff)
+	if err != nil {
+		return nil, fmt.Errorf("moments: added this week: %w", err)
+	}
+	defer rows.Close()
+
+	out := map[string]int{}
+	for rows.Next() {
+		var momentID string
+		var count int
+		if err := rows.Scan(&momentID, &count); err != nil {
+			return nil, fmt.Errorf("moments: scan added this week: %w", err)
+		}
+		out[momentID] = count
+	}
+	return out, rows.Err()
+}
+
+// PlacesByMoment 返回某时刻成员按城市聚合的出现次数,供 About 多地点展示
+// (spec 第三节):JOIN asset_geo,city 为空或该成员无 geo 行的不计入;按
+// count DESC、city ASC(tie-break,保证结果确定性)排序,截取前 limit 条
+// (limit<=0 视为不截断)。
+func (s *MomentStore) PlacesByMoment(momentID string, limit int) ([]MomentPlace, error) {
+	q := `
+		SELECT g.city, COUNT(*) AS c
+		FROM moment_assets ma
+		JOIN asset_geo g ON g.asset_id = ma.asset_id
+		WHERE ma.moment_id = ? AND g.city IS NOT NULL AND g.city <> ''
+		GROUP BY g.city
+		ORDER BY c DESC, g.city ASC`
+	args := []interface{}{momentID}
+	if limit > 0 {
+		q += ` LIMIT ?`
+		args = append(args, limit)
+	}
+	rows, err := s.db.Query(q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("moments: places by moment %q: %w", momentID, err)
+	}
+	defer rows.Close()
+
+	out := make([]MomentPlace, 0)
+	for rows.Next() {
+		var p MomentPlace
+		if err := rows.Scan(&p.Name, &p.Count); err != nil {
+			return nil, fmt.Errorf("moments: scan place %q: %w", momentID, err)
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
 // momentHasTimeWindow 判断某时刻当前是否有具体时间窗(time_from 非 NULL,
 // 即 trip 类时刻);主题类时刻(time_from 恒 NULL)不应被派生刷新意外赋予
 // 一个时间窗。
@@ -786,14 +900,17 @@ func momentHasTimeWindow(tx *sql.Tx, momentID string) (bool, error) {
 	return from.Valid, nil
 }
 
-// applyMomentEdits 是 SyncRecipeMoments 的回放钩子:成员全量替换后,把用户
-// 此前对该 moment 做过的 pin/exclude 编辑重新叠加回去。exclude 先剔除,pin
-// 后并入(INSERT OR IGNORE 不会降级引擎本轮已纳入的成员——已是
+// applyMomentEdits 是 SyncRecipeMoments 的回放钩子:成员 diff upsert 后,把
+// 用户此前对该 moment 做过的 pin/exclude 编辑重新叠加回去。exclude 先剔除,
+// pin 后并入(INSERT OR IGNORE 不会降级引擎本轮已纳入的成员——已是
 // featured/score 有值的行原样保留,只在缺席时补一条 manual=1/featured=0/
-// score=0 的行)。返回值 hasEdits 表示该 moment 是否存在任何编辑记录,供
-// 调用方决定是否需要派生刷新(没有编辑的 moment 维持引擎本轮算出的派生
-// 值,不必多余重算)。
-func applyMomentEdits(tx *sql.Tx, momentID string) (bool, error) {
+// score=0/added_at=now 的行;因 SyncRecipeMoments 第 2 步已豁免 pin 成员的
+// 删除,常态下 pin 成员已在表内,这里的 INSERT OR IGNORE 不会触发,added_at
+// 不会被刷新)。返回值 hasEdits 表示该 moment 是否存在任何编辑记录,供调用方
+// 决定是否需要派生刷新(没有编辑的 moment 维持引擎本轮算出的派生值,不必
+// 多余重算)。now 是 SyncRecipeMoments 本轮的时间戳,仅用于真正新插入的
+// pin 行补 added_at。
+func applyMomentEdits(tx *sql.Tx, momentID string, now int64) (bool, error) {
 	if _, err := tx.Exec(`
 		DELETE FROM moment_assets
 		WHERE moment_id = ?
@@ -803,9 +920,9 @@ func applyMomentEdits(tx *sql.Tx, momentID string) (bool, error) {
 		return false, fmt.Errorf("moments: replay exclude %q: %w", momentID, err)
 	}
 	if _, err := tx.Exec(`
-		INSERT OR IGNORE INTO moment_assets(moment_id, asset_id, featured, score, manual)
-		SELECT moment_id, asset_id, 0, 0, 1 FROM moment_edits WHERE moment_id=? AND op='pin'`,
-		momentID,
+		INSERT OR IGNORE INTO moment_assets(moment_id, asset_id, featured, score, manual, added_at)
+		SELECT moment_id, asset_id, 0, 0, 1, ? FROM moment_edits WHERE moment_id=? AND op='pin'`,
+		now, momentID,
 	); err != nil {
 		return false, fmt.Errorf("moments: replay pin %q: %w", momentID, err)
 	}
