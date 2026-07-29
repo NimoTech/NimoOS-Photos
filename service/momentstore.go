@@ -568,8 +568,11 @@ func (s *MomentStore) SyncRecipeMoments(recipeKey string, drafts []MomentDraft) 
 }
 
 // aliveAssetExpr 是"活资产"判据 SQL 片段,与 moments_theme.go
-// loadThemeCandidatePool(约 L192)同口径:已完成索引(status='indexed')、
-// 非回收站(deleted_at IS NULL)、非离线(offline=0)。依赖外层查询把 assets
+// loadThemeCandidatePool(约 L192)的"活资产"子句同口径:已完成索引
+// (status='indexed')、非回收站(deleted_at IS NULL)、非离线(offline=0)。
+// 注意这只是 pool 完整口径的子集——pool 还额外排除 live-photo 视频侧、文档
+// (hasOcrExpr)与无 taken_at 的资产;pin 有意不套那些条件(用户手动加的
+// 照片即便是文档也应尊重其意图),只要求"活着"。依赖外层查询把 assets
 // 表起别名为 a。pin 相关三处(diff upsert 删除豁免/回放补插/立即插入)统一
 // 用这条口径判断资产是否"活着"——债务清扫:此前三处只校验 assets 表存在
 // 性,不认活资产,导致 pin 的照片进回收站/离线后依然賴在时刻里不走;现在
