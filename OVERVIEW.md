@@ -356,7 +356,7 @@ nimoos-message-bus.service ──▶ nimoos-photos.service
 CGO_ENABLED=1 go build -o nimoos-photos .
 
 # 部署（替换二进制并重启）
-bash nimo_os_docs/scripts/deploy.sh photos
+bash scripts/deploy.sh photos
 ```
 
 ML 后端独立部署（`deploy/ml/`），按核显厂商分 **openvino**（Intel）/ **rocm**（AMD，含 gfx1151 / AI Max+ 395 Strix Halo 的 `HSA_OVERRIDE_GFX_VERSION` 覆盖）两个离线分发包 flavor：
