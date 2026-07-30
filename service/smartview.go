@@ -1123,7 +1123,9 @@ func (s *SmartViewService) ConvertToAlbum(id string) (*Album, error) {
 			return nil, err
 		}
 	}
-	s.logActivity(id, "converted_to_album", album.ID, ids)
+	// 不记 activity:smart_view_activity 对 smart_views 是 ON DELETE CASCADE,
+	// 下面紧跟的 Delete 会把刚写的日志级联抹掉(审查发现的死代码),且 sv 删除
+	// 后本也无处可查其活动流。
 
 	// 新身份已就绪,删除原智能相册(级联 matches)。
 	if err := s.Delete(id); err != nil {
