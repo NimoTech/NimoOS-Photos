@@ -1,63 +1,69 @@
 # NimoOS-Photos
 
-NimoOS 的相册服务 —— **照片/视频索引、EXIF 解析、缩略图生成、语义搜索**。
+The photo service for NimoOS — **indexing, EXIF parsing, thumbnails and semantic search** for photos and video.
 
-> ### About / 关于本项目
+> ### About
 >
 > NimoOS is a fork of [CasaOS](https://github.com/IceWhaleTech/CasaOS)
 > (Apache-2.0), originally developed by IceWhale Technology Co., Ltd.
-> Building on that foundation, NimoOS adds an AI agent, RAG-based
-> retrieval, a knowledge layer, and a built-in web terminal.
+> Building on that foundation, NimoOS adds an AI agent, RAG-based retrieval,
+> a knowledge layer, and a built-in web terminal.
 >
-> NimoOS 基于 [CasaOS](https://github.com/IceWhaleTech/CasaOS)（Apache-2.0）
-> fork 而来，原始项目由 IceWhale Technology Co., Ltd. 开发。在此基础上，
-> NimoOS 重建了 AI Agent、RAG 检索、知识库与内置终端等能力。
+> See [`NOTICE`](./NOTICE) for attribution details. CasaOS and IceWhale are
+> trademarks of IceWhale Technology Co., Ltd.; NimoOS is an independent
+> project and is not affiliated with IceWhale.
 >
-> 归属详情见 [`NOTICE`](./NOTICE)。CasaOS 与 IceWhale 是 IceWhale Technology
-> Co., Ltd. 的商标；NimoOS 是独立项目，与 IceWhale 无隶属关系。
->
-> 本仓库是 NimoTech 原创，不含 CasaOS 衍生代码。
+> This repository is NimoTech's own work and contains no CasaOS-derived code.
+
 
 > ⚠️ Multi-user isolation is incomplete — Photos and Search are not yet
 > per-user scoped. Read
 > [SECURITY.md](https://github.com/NimoTech/NimoOS/blob/main/SECURITY.md#known-limitations)
 > before deploying NimoOS for more than one person.
->
-> ⚠️ 多用户隔离尚不完整（Photos 与搜索未按用户隔离）。若要给多人使用，请先阅读
-> [SECURITY.md](https://github.com/NimoTech/NimoOS/blob/main/SECURITY.md#known-limitations)。
 
-## 这是什么
 
-绑定 localhost 随机端口、由 NimoOS Gateway 转发，API 前缀 `/v1/photos`；
-TUS 断点续传上传前缀 `/v1/upload-tus`。
+## What this is
+Binds a random localhost port and is fronted by the NimoOS gateway under
+`/v1/photos`, with resumable TUS uploads under `/v1/upload-tus`.
 
-## 主要能力
+## Capabilities
 
-| 能力 | 说明 |
+| Capability | Notes |
 |---|---|
-| 索引与 EXIF | 照片 / 视频元数据解析 |
-| 缩略图 | 按需生成与缓存 |
-| 语义搜索 | 本地向量检索（sqlite-vec），支持自然语言搜图 |
-| 图像描述 | 本地视觉模型生成 caption |
-| 断点续传上传 | TUS 协议 |
+| Indexing and EXIF | Photo and video metadata |
+| Thumbnails | Generated and cached on demand |
+| Semantic search | Local vector search (sqlite-vec), natural-language queries |
+| Captioning | Local vision model |
+| Resumable uploads | TUS protocol |
 
-> ⚠️ **相册库当前是全局共享的** —— 所有用户账号看到同一个库，数据层没有
-> per-user 过滤。详见上方多用户提示与主仓 SECURITY.md。
+> ⚠️ **The photo library is currently global** — every user account sees the
+> same albums, with no per-user filtering at the data layer. See the multi-user
+> note above.
 
-## 构建
 
-需要完整的 NimoOS monorepo checkout —— 所有 Go 服务通过 `replace` 指向本地的
-`NimoOS-Common`，`go.mod` 里的版本号是装饰性的。
+## Building
+
+NimoOS is a multi-repository project. Every Go service uses a `replace`
+directive pointing at the local `NimoOS-Common` checkout, so a build needs the
+full workspace — see
+[NimoOS-Build](https://github.com/NimoTech/NimoOS-Build) for the layout and the
+one-line clone helper.
+
+`NimoOS-MessageBus` must be generated first; its generated API code is not
+committed and other services' `go generate` consumes its OpenAPI spec.
 
 ```bash
-CGO_ENABLED=1 go build ./...   # SQLite + sqlite-vec，需要系统 sqlite3.h
+CGO_ENABLED=1 go build ./...   # SQLite + sqlite-vec, needs system sqlite3.h
 go test ./...
 ```
 
-## 文档
+Go services pin `go 1.21` and echo v4.12 — **do not run `go mod tidy`**.
 
-架构、请求流转与运行时细节见 [`OVERVIEW.md`](./OVERVIEW.md)。
 
-## 许可
+## Documentation
 
-Apache-2.0，见 [`LICENSE`](./LICENSE)。
+Architecture, request flow and runtime details: [`OVERVIEW.md`](./OVERVIEW.md).
+
+## License
+
+Apache-2.0 — see [`LICENSE`](./LICENSE).
