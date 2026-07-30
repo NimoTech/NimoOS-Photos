@@ -43,14 +43,14 @@ func postJSON(t *testing.T, e *echo.Echo, path string, payload any) *httptest.Re
 	return rec
 }
 
-// TestFromSmartViewHTTPNotFound smartview_id 不存在应返回 404。
+// TestFromSmartViewHTTPNotFound smartViewId 不存在应返回 404。
 func TestFromSmartViewHTTPNotFound(t *testing.T) {
 	e, _ := newAlbumsTestEcho(t)
-	rec := postJSON(t, e, "/v1/photos/albums/from-smartview", map[string]string{"smartview_id": "missing"})
+	rec := postJSON(t, e, "/v1/photos/albums/from-smartview", map[string]string{"smartViewId": "missing"})
 	require.Equal(t, http.StatusNotFound, rec.Code)
 }
 
-// TestFromSmartViewHTTPBadRequest 缺 smartview_id 应返回 400。
+// TestFromSmartViewHTTPBadRequest 缺 smartViewId 应返回 400。
 func TestFromSmartViewHTTPBadRequest(t *testing.T) {
 	e, _ := newAlbumsTestEcho(t)
 	rec := postJSON(t, e, "/v1/photos/albums/from-smartview", map[string]string{})
@@ -67,7 +67,7 @@ func TestFromSmartViewHTTPSuccess(t *testing.T) {
 	_, err = db.Exec(`INSERT INTO smart_view_matches(smart_view_id,asset_id,match_score,origin) VALUES('sv-h','a1',1.0,1)`)
 	require.NoError(t, err)
 
-	rec := postJSON(t, e, "/v1/photos/albums/from-smartview", map[string]string{"smartview_id": "sv-h"})
+	rec := postJSON(t, e, "/v1/photos/albums/from-smartview", map[string]string{"smartViewId": "sv-h"})
 	require.Equal(t, http.StatusOK, rec.Code)
 	var album map[string]any
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &album))
@@ -86,6 +86,6 @@ func TestFromSmartViewHTTPNameConflict(t *testing.T) {
 	_, err = db.Exec(`INSERT INTO smart_views(id,name,conds_raw,conds_parsed,threshold,live) VALUES('sv-dup','Dup','[]','[]',70,1)`)
 	require.NoError(t, err)
 
-	rec := postJSON(t, e, "/v1/photos/albums/from-smartview", map[string]string{"smartview_id": "sv-dup"})
+	rec := postJSON(t, e, "/v1/photos/albums/from-smartview", map[string]string{"smartViewId": "sv-dup"})
 	require.Equal(t, http.StatusConflict, rec.Code)
 }

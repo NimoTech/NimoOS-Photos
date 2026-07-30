@@ -184,10 +184,10 @@ func (h *AlbumsHandler) Reorder(c echo.Context) error {
 	return c.NoContent(http.StatusNoContent)
 }
 
-// fromSmartViewReq 是"智能相册→手动相册"转换端点的请求体,字段名与设计
-// 文档(spec 1.2)逐字对齐。
+// fromSmartViewReq 是"智能相册→手动相册"转换端点的请求体,字段名对齐库内
+// camelCase 惯例。
 type fromSmartViewReq struct {
-	SmartViewID string `json:"smartview_id"`
+	SmartViewID string `json:"smartViewId"`
 }
 
 // FromSmartView 把智能相册原地固化为手动相册:停止自动更新,当前成员固化,
@@ -197,7 +197,7 @@ type fromSmartViewReq struct {
 func (h *AlbumsHandler) FromSmartView(c echo.Context) error {
 	var req fromSmartViewReq
 	if err := c.Bind(&req); err != nil || req.SmartViewID == "" {
-		return echo.NewHTTPError(http.StatusBadRequest, "smartview_id is required")
+		return echo.NewHTTPError(http.StatusBadRequest, "smartViewId is required")
 	}
 	album, err := h.svc.SmartViews().ConvertToAlbum(req.SmartViewID)
 	if errors.Is(err, service.ErrNotFound) {

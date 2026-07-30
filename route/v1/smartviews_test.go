@@ -156,22 +156,22 @@ func TestExcludedAssetsHTTPSuccess(t *testing.T) {
 	require.Equal(t, "aExcl", assets[0]["id"])
 }
 
-// TestFromAlbumHTTPNotFound album_id 不存在应返回 404。
+// TestFromAlbumHTTPNotFound albumId 不存在应返回 404。
 func TestFromAlbumHTTPNotFound(t *testing.T) {
 	e := newTestEcho(t)
-	body, _ := json.Marshal(map[string]any{"album_id": "missing"})
-	req := httptest.NewRequest(http.MethodPost, "/v1/photos/smartviews/from-album", bytes.NewReader(body))
+	body, _ := json.Marshal(map[string]any{"albumId": "missing"})
+	req := httptest.NewRequest(http.MethodPost, "/v1/photos/smart-views/from-album", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	e.ServeHTTP(rec, req)
 	require.Equal(t, http.StatusNotFound, rec.Code)
 }
 
-// TestFromAlbumHTTPBadRequest 缺 album_id 应返回 400。
+// TestFromAlbumHTTPBadRequest 缺 albumId 应返回 400。
 func TestFromAlbumHTTPBadRequest(t *testing.T) {
 	e := newTestEcho(t)
 	body, _ := json.Marshal(map[string]any{})
-	req := httptest.NewRequest(http.MethodPost, "/v1/photos/smartviews/from-album", bytes.NewReader(body))
+	req := httptest.NewRequest(http.MethodPost, "/v1/photos/smart-views/from-album", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	e.ServeHTTP(rec, req)
@@ -189,8 +189,8 @@ func TestFromAlbumHTTPSuccess(t *testing.T) {
 	_, err = db.Exec(`INSERT INTO album_assets(album_id,asset_id) VALUES('al-1','a1')`)
 	require.NoError(t, err)
 
-	body, _ := json.Marshal(map[string]any{"album_id": "al-1"})
-	req := httptest.NewRequest(http.MethodPost, "/v1/photos/smartviews/from-album", bytes.NewReader(body))
+	body, _ := json.Marshal(map[string]any{"albumId": "al-1"})
+	req := httptest.NewRequest(http.MethodPost, "/v1/photos/smart-views/from-album", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	e.ServeHTTP(rec, req)
