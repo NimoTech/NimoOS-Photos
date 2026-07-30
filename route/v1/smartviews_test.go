@@ -156,6 +156,57 @@ func TestExcludedAssetsHTTPSuccess(t *testing.T) {
 	require.Equal(t, "aExcl", assets[0]["id"])
 }
 
+// TestFromAlbumHTTPNotFound album_id 不存在应返回 404。
+func TestFromAlbumHTTPNotFound(t *testing.T) {
+	e := newTestEcho(t)
+	body, _ := json.Marshal(map[string]any{"album_id": "missing"})
+	req := httptest.NewRequest(http.MethodPost, "/v1/photos/smartviews/from-album", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusNotFound, rec.Code)
+}
+
+// TestFromAlbumHTTPBadRequest 缺 album_id 应返回 400。
+func TestFromAlbumHTTPBadRequest(t *testing.T) {
+	e := newTestEcho(t)
+	body, _ := json.Marshal(map[string]any{})
+	req := httptest.NewRequest(http.MethodPost, "/v1/photos/smartviews/from-album", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusBadRequest, rec.Code)
+}
+
+// TestFromAlbumHTTPSuccess 正常路径:手动相册变身为智能相册,原相册消失,
+// 响应带 createdAt。
+func TestFromAlbumHTTPSuccess(t *testing.T) {
+	e, db := newAssetsTestEcho(t)
+	_, err := db.Exec(`INSERT INTO albums(id,name) VALUES('al-1','Trip')`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO assets(id,file_path,status,is_live_photo_video) VALUES('a1','/p/a1.jpg','indexed',0)`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO album_assets(album_id,asset_id) VALUES('al-1','a1')`)
+	require.NoError(t, err)
+
+	body, _ := json.Marshal(map[string]any{"album_id": "al-1"})
+	req := httptest.NewRequest(http.MethodPost, "/v1/photos/smartviews/from-album", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Contains(t, rec.Body.String(), `"createdAt"`)
+
+	var sv service.SmartView
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &sv))
+	require.Equal(t, "Trip", sv.Name)
+	require.True(t, sv.Live)
+
+	var n int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM albums WHERE id='al-1'`).Scan(&n))
+	require.Equal(t, 0, n, "原相册应已删除")
+}
+
 func TestSmartViewHTTPCreateAndList(t *testing.T) {
 	e := newTestEcho(t)
 	body, _ := json.Marshal(map[string]any{

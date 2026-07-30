@@ -20,6 +20,7 @@ import (
 type SmartView struct {
 	ID            string     `json:"id"`
 	Name          string     `json:"name"`
+	CreatedAt     time.Time  `json:"createdAt"`
 	Description   string     `json:"description,omitempty"`
 	Conds         []string   `json:"conds"`
 	Threshold     int        `json:"threshold"`
@@ -63,8 +64,21 @@ func NewSmartViewService(db *sql.DB, search *SearchService) *SmartViewService {
 }
 
 func (s *SmartViewService) Create(in SmartViewInput) (*SmartView, error) {
+	if err := s.insertRow(&in); err != nil {
+		return nil, err
+	}
+	s.logActivity(in.ID, "created", "", nil)
+	if err := s.Evaluate(in.ID); err != nil {
+		return nil, err
+	}
+	return s.Get(in.ID)
+}
+
+// insertRow 只做 smart_views 行的落库(不触发 Evaluate/日志),供 Create 与
+// 转换端点(ConvertFromAlbum)共用同一段建行逻辑,避免转换流程里重复评估。
+func (s *SmartViewService) insertRow(in *SmartViewInput) error {
 	if in.ID == "" || in.Name == "" {
-		return nil, ErrInvalidInput
+		return ErrInvalidInput
 	}
 	if in.Threshold < 50 || in.Threshold > 99 {
 		in.Threshold = 70
@@ -77,14 +91,7 @@ func (s *SmartViewService) Create(in SmartViewInput) (*SmartView, error) {
 		VALUES(?,?,?,?,?,?,?,?)`,
 		in.ID, in.Name, in.Description, string(rawJSON), string(parsedJSON),
 		in.Threshold, boolToInt(in.Live), boolToInt(in.IncludeVideos))
-	if err != nil {
-		return nil, err
-	}
-	s.logActivity(in.ID, "created", "", nil)
-	if err := s.Evaluate(in.ID); err != nil {
-		return nil, err
-	}
-	return s.Get(in.ID)
+	return err
 }
 
 func (s *SmartViewService) List() ([]SmartView, error) {
@@ -120,9 +127,9 @@ func (s *SmartViewService) Get(id string) (*SmartView, error) {
 		evaluatedAt sql.NullTime
 		desc        sql.NullString
 	)
-	err := s.db.QueryRow(`SELECT id,name,description,conds_raw,threshold,live,include_videos,evaluated_at
+	err := s.db.QueryRow(`SELECT id,name,description,conds_raw,threshold,live,include_videos,evaluated_at,created_at
 		FROM smart_views WHERE id=?`, id).Scan(
-		&sv.ID, &sv.Name, &desc, &rawJSON, &sv.Threshold, &liveI, &vidI, &evaluatedAt)
+		&sv.ID, &sv.Name, &desc, &rawJSON, &sv.Threshold, &liveI, &vidI, &evaluatedAt, &sv.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -982,6 +989,149 @@ func topNByScore(m map[string]float64, n int) []string {
 		out = append(out, arr[i].id)
 	}
 	return out
+}
+
+// ConvertFromAlbumInput 是"手动相册→智能相册"原地互转端点的入参。
+type ConvertFromAlbumInput struct {
+	AlbumID       string
+	Name          string
+	Description   string
+	CondsRaw      []string
+	Threshold     int
+	IncludeVideos bool
+}
+
+// ConvertFromAlbum 把一个手动相册原地变身为智能相册:建 smart_views 行
+// (live=1)→ 原 album_assets 全量锁定为 pin 成员(照 PinAssets 的存储形状,
+// origin=1/match_score=1.0)→ 同步触发一次 Evaluate(与 Create 同链路,吸入
+// 主题命中)→ 删除原 album(级联 album_assets)。
+//
+// 事务边界:Evaluate 内部会调用语义检索(可能是外部 ML 调用),不适合整段包
+// 在一个数据库事务里持锁等待;这里改用"先建新、后删旧"的顺序 + 失败即清理
+// 新建的 smart_views 行,保证任一步失败都不留半成品。
+func (s *SmartViewService) ConvertFromAlbum(in ConvertFromAlbumInput) (*SmartView, error) {
+	albumSvc := NewAlbumService(s.db)
+	album, err := albumSvc.Get(in.AlbumID)
+	if errors.Is(err, ErrNotFound) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	name := strings.TrimSpace(in.Name)
+	if name == "" {
+		name = album.Name
+	}
+
+	svID := newSVID("sv")
+	svIn := SmartViewInput{
+		ID:            svID,
+		Name:          name,
+		Description:   in.Description,
+		CondsRaw:      in.CondsRaw,
+		Threshold:     in.Threshold,
+		Live:          true,
+		IncludeVideos: in.IncludeVideos,
+	}
+	if err := s.insertRow(&svIn); err != nil {
+		return nil, err
+	}
+
+	// 原相册的全部成员(album_assets 全量,不做可见性过滤)照 PinAssets 的存储
+	// 形状锁定为钉住行;无效/软删资产由 PinAssets 静默跳过。
+	memberRows, err := s.db.Query(`SELECT asset_id FROM album_assets WHERE album_id=?`, in.AlbumID)
+	if err != nil {
+		_ = s.Delete(svID)
+		return nil, err
+	}
+	var memberIDs []string
+	for memberRows.Next() {
+		var aid string
+		if err := memberRows.Scan(&aid); err != nil {
+			memberRows.Close()
+			_ = s.Delete(svID)
+			return nil, err
+		}
+		memberIDs = append(memberIDs, aid)
+	}
+	memberRows.Close()
+	if err := memberRows.Err(); err != nil {
+		_ = s.Delete(svID)
+		return nil, err
+	}
+	if len(memberIDs) > 0 {
+		if _, err := s.PinAssets(svID, memberIDs); err != nil {
+			_ = s.Delete(svID)
+			return nil, err
+		}
+	}
+
+	// 同步触发一次 Evaluate,与 Create 现行为一致——吸入主题命中的新照片。
+	if err := s.Evaluate(svID); err != nil {
+		_ = s.Delete(svID)
+		return nil, err
+	}
+	s.logActivity(svID, "converted_from_album", in.AlbumID, memberIDs)
+
+	// 新身份已就绪,删除原手动相册(级联 album_assets)。
+	if err := albumSvc.Delete(in.AlbumID); err != nil {
+		_ = s.Delete(svID)
+		return nil, err
+	}
+
+	return s.Get(svID)
+}
+
+// ConvertToAlbum 把一个智能相册原地固化为手动相册:建 albums 行(name=
+// sv.name)→ 当前成员(含 pinned,排除 excluded)按 score DESC 写入
+// album_assets(复用 MatchedAssets/ExportAsAlbum 的既有取数逻辑)→ 删除原
+// smart_views 行(级联 matches)。同名冲突照 Export/普通 Create 现有的 409
+// 语义(ErrAlbumNameExists,由 route 层映射)。
+//
+// 事务边界同 ConvertFromAlbum:先建新、后删旧 + 失败清理已建的 album,不留
+// 半成品。
+func (s *SmartViewService) ConvertToAlbum(id string) (*Album, error) {
+	sv, err := s.Get(id)
+	if errors.Is(err, ErrNotFound) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	albumSvc := NewAlbumService(s.db)
+	album, err := albumSvc.Create(sv.Name)
+	if err != nil {
+		return nil, err
+	}
+
+	// matches 含 pinned、排除 excluded,按 score DESC —— 与 ExportAsAlbum 相同
+	// 的取数逻辑(MatchedAssets 的 WHERE m.origin<>2 + ORDER BY match_score DESC）。
+	assets, err := s.MatchedAssets(id, 100000, 0, false, "")
+	if err != nil {
+		_ = albumSvc.Delete(album.ID)
+		return nil, err
+	}
+	ids := make([]string, 0, len(assets))
+	for _, a := range assets {
+		ids = append(ids, a.ID)
+	}
+	if len(ids) > 0 {
+		if err := albumSvc.BatchAddAssets(album.ID, ids); err != nil {
+			_ = albumSvc.Delete(album.ID)
+			return nil, err
+		}
+	}
+	s.logActivity(id, "converted_to_album", album.ID, ids)
+
+	// 新身份已就绪,删除原智能相册(级联 matches)。
+	if err := s.Delete(id); err != nil {
+		_ = albumSvc.Delete(album.ID)
+		return nil, err
+	}
+
+	return albumSvc.Get(album.ID)
 }
 
 // ExportAsAlbum creates a new album snapshot from the smart view's current matches.

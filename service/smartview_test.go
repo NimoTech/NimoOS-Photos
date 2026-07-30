@@ -976,3 +976,160 @@ func TestDuplicateDoesNotCopyManualRows(t *testing.T) {
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM smart_view_matches WHERE smart_view_id=?`, dup.ID).Scan(&n))
 	require.Equal(t, 0, n, "副本不应复制原视图的任何 matches 行(手动或自动)")
 }
+
+// ====================== 手动↔智能相册原地互转 ======================
+
+// TestConvertFromAlbumSuccess 覆盖:原相册成员全量锁定为 pin、Evaluate 同步
+// 触发吸入新的主题命中、原相册被删除、返回对象 live=true。
+func TestConvertFromAlbumSuccess(t *testing.T) {
+	s := svTestService(t)
+	db := s.db
+	albumSvc := NewAlbumService(db)
+
+	_, _ = db.Exec(`INSERT INTO persons(id,name) VALUES('p-x','Xan')`)
+	for _, id := range []string{"a-old1", "a-old2", "a-new"} {
+		_, err := db.Exec(`INSERT INTO assets(id,file_path,status,is_live_photo_video) VALUES(?,?,'indexed',0)`,
+			id, "/p/"+id+".jpg")
+		require.NoError(t, err)
+	}
+	// a-new 通过人脸条件命中,不在原相册里 —— 验证转换后的 Evaluate 会把它吸进来。
+	_, _ = db.Exec(`INSERT INTO face_detections(id,asset_id,bbox,embedding) VALUES('fn','a-new','{}',X'00')`)
+	_, _ = db.Exec(`INSERT INTO face_person(face_id,person_id) VALUES('fn','p-x')`)
+
+	album, err := albumSvc.Create("Trip")
+	require.NoError(t, err)
+	require.NoError(t, albumSvc.BatchAddAssets(album.ID, []string{"a-old1", "a-old2"}))
+
+	sv, err := s.ConvertFromAlbum(ConvertFromAlbumInput{
+		AlbumID:   album.ID,
+		CondsRaw:  []string{"Xan"},
+		Threshold: 50,
+	})
+	require.NoError(t, err)
+	require.True(t, sv.Live)
+	require.Equal(t, "Trip", sv.Name)
+
+	// 原相册应已消失。
+	_, err = albumSvc.Get(album.ID)
+	require.ErrorIs(t, err, ErrNotFound)
+
+	// 原成员全部锁定为 pin(origin=1)。
+	for _, aid := range []string{"a-old1", "a-old2"} {
+		var org int
+		require.NoError(t, db.QueryRow(`SELECT origin FROM smart_view_matches WHERE smart_view_id=? AND asset_id=?`, sv.ID, aid).Scan(&org))
+		require.Equal(t, 1, org, aid+" 应被锁定为 pin")
+	}
+	// Evaluate 应同步触发,吸入主题命中的新照片(origin=0 自动匹配)。
+	var newOrg int
+	require.NoError(t, db.QueryRow(`SELECT origin FROM smart_view_matches WHERE smart_view_id=? AND asset_id='a-new'`, sv.ID).Scan(&newOrg))
+	require.Equal(t, 0, newOrg)
+}
+
+// TestConvertFromAlbumNotFound album 不存在应返回 ErrNotFound,且不留下半成品
+// smart_views 行(事务性——存在性断言)。
+func TestConvertFromAlbumNotFound(t *testing.T) {
+	s := svTestService(t)
+	var before int
+	require.NoError(t, s.db.QueryRow(`SELECT COUNT(*) FROM smart_views`).Scan(&before))
+
+	_, err := s.ConvertFromAlbum(ConvertFromAlbumInput{AlbumID: "missing"})
+	require.ErrorIs(t, err, ErrNotFound)
+
+	var after int
+	require.NoError(t, s.db.QueryRow(`SELECT COUNT(*) FROM smart_views`).Scan(&after))
+	require.Equal(t, before, after, "album 不存在时不应留下半成品 smart_views 行")
+}
+
+// TestConvertFromAlbumDefaultsNameFromAlbum name 缺省应回退用相册名。
+func TestConvertFromAlbumDefaultsNameFromAlbum(t *testing.T) {
+	s := svTestService(t)
+	albumSvc := NewAlbumService(s.db)
+	album, err := albumSvc.Create("My Album")
+	require.NoError(t, err)
+
+	sv, err := s.ConvertFromAlbum(ConvertFromAlbumInput{AlbumID: album.ID})
+	require.NoError(t, err)
+	require.Equal(t, "My Album", sv.Name)
+}
+
+// TestConvertToAlbumSuccess 覆盖:pinned+自动匹配成员按 score DESC 写入相册、
+// excluded 不带过去、原智能相册被删除(级联 matches)。
+func TestConvertToAlbumSuccess(t *testing.T) {
+	s := svTestService(t)
+	db := s.db
+	for _, id := range []string{"a-pin", "a-auto", "a-excl"} {
+		_, err := db.Exec(`INSERT INTO assets(id,file_path,status,is_live_photo_video) VALUES(?,?,'indexed',0)`,
+			id, "/p/"+id+".jpg")
+		require.NoError(t, err)
+	}
+	_, err := s.Create(SmartViewInput{ID: "sv-conv", Name: "Sunset", CondsRaw: []string{}, Threshold: 70, Live: true})
+	require.NoError(t, err)
+	_, _ = db.Exec(`INSERT INTO smart_view_matches(smart_view_id,asset_id,match_score,origin) VALUES('sv-conv','a-pin',1.0,1)`)
+	_, _ = db.Exec(`INSERT INTO smart_view_matches(smart_view_id,asset_id,match_score,origin) VALUES('sv-conv','a-auto',0.6,0)`)
+	_, _ = db.Exec(`INSERT INTO smart_view_matches(smart_view_id,asset_id,match_score,origin) VALUES('sv-conv','a-excl',0.9,2)`)
+
+	albumSvc := NewAlbumService(db)
+	album, err := s.ConvertToAlbum("sv-conv")
+	require.NoError(t, err)
+	require.Equal(t, "Sunset", album.Name)
+
+	assets, err := albumSvc.ListAssets(album.ID)
+	require.NoError(t, err)
+	ids := map[string]bool{}
+	for _, a := range assets {
+		ids[a.ID] = true
+	}
+	require.True(t, ids["a-pin"], "钉住成员应固化进相册")
+	require.True(t, ids["a-auto"], "自动匹配成员应固化进相册")
+	require.False(t, ids["a-excl"], "排除成员不应带过去")
+
+	// 原智能相册应已删除(级联 matches)。
+	_, err = s.Get("sv-conv")
+	require.ErrorIs(t, err, ErrNotFound)
+	var n int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM smart_view_matches WHERE smart_view_id='sv-conv'`).Scan(&n))
+	require.Equal(t, 0, n, "matches 应随 smart_views 级联删除")
+}
+
+// TestConvertToAlbumNotFound smartview 不存在应返回 ErrNotFound。
+func TestConvertToAlbumNotFound(t *testing.T) {
+	s := svTestService(t)
+	_, err := s.ConvertToAlbum("missing")
+	require.ErrorIs(t, err, ErrNotFound)
+}
+
+// TestConvertToAlbumNameConflict 同名冲突照 Export 现有 409 语义
+// (ErrAlbumNameExists);失败时原智能相册应保留、不留半成品(事务性——存在
+// 性断言)。
+func TestConvertToAlbumNameConflict(t *testing.T) {
+	s := svTestService(t)
+	albumSvc := NewAlbumService(s.db)
+	_, err := albumSvc.Create("Dup")
+	require.NoError(t, err)
+	_, err = s.Create(SmartViewInput{ID: "sv-dup", Name: "Dup", CondsRaw: []string{}, Threshold: 70, Live: true})
+	require.NoError(t, err)
+
+	_, err = s.ConvertToAlbum("sv-dup")
+	require.ErrorIs(t, err, ErrAlbumNameExists)
+
+	// 原智能相册仍应存在(未被半途删除)。
+	_, err = s.Get("sv-dup")
+	require.NoError(t, err)
+}
+
+// TestSmartViewCreatedAtShape SV 的 List/Get/Create 响应都应携带 createdAt。
+func TestSmartViewCreatedAtShape(t *testing.T) {
+	s := svTestService(t)
+	sv, err := s.Create(SmartViewInput{ID: "sv-time", Name: "T", CondsRaw: []string{}, Threshold: 70, Live: true})
+	require.NoError(t, err)
+	require.False(t, sv.CreatedAt.IsZero(), "Create 响应应带 createdAt")
+
+	got, err := s.Get("sv-time")
+	require.NoError(t, err)
+	require.False(t, got.CreatedAt.IsZero(), "Get 响应应带 createdAt")
+
+	list, err := s.List()
+	require.NoError(t, err)
+	require.Len(t, list, 1)
+	require.False(t, list[0].CreatedAt.IsZero(), "List 响应应带 createdAt")
+}

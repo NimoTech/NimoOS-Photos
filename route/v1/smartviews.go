@@ -32,6 +32,7 @@ func RegisterSmartViewRoutes(g *echo.Group, h *SmartViewsHandler) {
 	g.GET("/smart-views/:id/excluded", h.Excluded)
 	g.GET("/smart-views/:id/activity", h.Activity)
 	g.POST("/smart-views/:id/export", h.Export)
+	g.POST("/smartviews/from-album", h.FromAlbum)
 }
 
 // svAssetIDsReq 是钉住/移除/恢复三个写接口共用的请求体。
@@ -203,6 +204,41 @@ func (h *SmartViewsHandler) Preview(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
 	}
 	return c.JSON(http.StatusOK, map[string]any{"count": count, "seeds": ids, "thresholdActive": thresholdActive})
+}
+
+// fromAlbumReq 是"手动相册→智能相册"转换端点的请求体,字段名与设计文档
+// (spec 1.2)逐字对齐——UI 依赖这套 snake_case 命名。
+type fromAlbumReq struct {
+	AlbumID       string   `json:"album_id"`
+	Name          string   `json:"name"`
+	Description   string   `json:"description"`
+	Conds         []string `json:"conds"`
+	Threshold     int      `json:"threshold"`
+	IncludeVideos bool     `json:"include_videos"`
+}
+
+// FromAlbum 把手动相册原地变身为智能相册:既有成员全部锁定为 pin,原相册
+// 随之删除,Nimo 按主题持续吸入新照片。
+func (h *SmartViewsHandler) FromAlbum(c echo.Context) error {
+	var req fromAlbumReq
+	if err := c.Bind(&req); err != nil || req.AlbumID == "" {
+		return echo.NewHTTPError(http.StatusBadRequest, "album_id is required")
+	}
+	sv, err := h.svc.SmartViews().ConvertFromAlbum(service.ConvertFromAlbumInput{
+		AlbumID:       req.AlbumID,
+		Name:          req.Name,
+		Description:   req.Description,
+		CondsRaw:      req.Conds,
+		Threshold:     req.Threshold,
+		IncludeVideos: req.IncludeVideos,
+	})
+	if errors.Is(err, service.ErrNotFound) {
+		return echo.NewHTTPError(http.StatusNotFound, "album not found")
+	}
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	}
+	return c.JSON(http.StatusOK, sv)
 }
 
 func (h *SmartViewsHandler) Export(c echo.Context) error {
