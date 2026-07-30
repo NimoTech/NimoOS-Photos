@@ -1053,7 +1053,8 @@ func TestConvertFromAlbumDefaultsNameFromAlbum(t *testing.T) {
 }
 
 // TestConvertToAlbumSuccess 覆盖:pinned+自动匹配成员按 score DESC 写入相册、
-// excluded 不带过去、原智能相册被删除(级联 matches)。
+// excluded 不带过去、原智能相册被删除(级联 matches)、写入顺序即 score DESC
+// (album_assets.position 按插入顺序递增,ListAssets 按 position ASC 返回)。
 func TestConvertToAlbumSuccess(t *testing.T) {
 	s := svTestService(t)
 	db := s.db
@@ -1083,12 +1084,57 @@ func TestConvertToAlbumSuccess(t *testing.T) {
 	require.True(t, ids["a-auto"], "自动匹配成员应固化进相册")
 	require.False(t, ids["a-excl"], "排除成员不应带过去")
 
+	// 顺序断言:ListAssets 按 position ASC 返回,写入时按 score DESC 递增
+	// position,故序列应恰为 [a-pin(1.0), a-auto(0.6)]。
+	require.Len(t, assets, 2, "排除成员不应计入序列")
+	require.Equal(t, []string{"a-pin", "a-auto"}, []string{assets[0].ID, assets[1].ID},
+		"相册内顺序应为 score DESC")
+
 	// 原智能相册应已删除(级联 matches)。
 	_, err = s.Get("sv-conv")
 	require.ErrorIs(t, err, ErrNotFound)
 	var n int
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM smart_view_matches WHERE smart_view_id='sv-conv'`).Scan(&n))
 	require.Equal(t, 0, n, "matches 应随 smart_views 级联删除")
+}
+
+// TestConvertToAlbumRetainsOfflineMembers 验证离线成员(offline=1,如外置盘
+// 拔出期间)在转换固化时不会丢失:ConvertToAlbum 直接查 smart_view_matches,
+// 不像 MatchedAssets 那样过滤 a.offline=0——因为转换会删除源 smart_view,若
+// 沿用读路径的 offline 过滤,离线成员将永久无法找回。
+//
+// 断言直接查 album_assets 表而非经 AlbumService.ListAssets:ListAssets 本身
+// 也是读路径,同样过滤 a.offline=0(离线期间相册详情不展示该资产,属预期
+// UX),这里要验证的是"落库是否发生"而非"当前是否可见"——只要行已写入
+// album_assets,资产所在盘重新挂载(offline 复位为 0)后自然重新可见,不算
+// 丢失;此前的 bug 是这行压根没写进去,永久找不回。
+func TestConvertToAlbumRetainsOfflineMembers(t *testing.T) {
+	s := svTestService(t)
+	db := s.db
+	_, err := db.Exec(`INSERT INTO assets(id,file_path,status,is_live_photo_video,offline) VALUES('a-offline','/mnt/ext/a.jpg','indexed',0,1)`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO assets(id,file_path,status,is_live_photo_video,offline) VALUES('a-online','/p/a-online.jpg','indexed',0,0)`)
+	require.NoError(t, err)
+
+	_, err = s.Create(SmartViewInput{ID: "sv-off", Name: "OfflineTest", CondsRaw: []string{}, Threshold: 70, Live: true})
+	require.NoError(t, err)
+	_, _ = db.Exec(`INSERT INTO smart_view_matches(smart_view_id,asset_id,match_score,origin) VALUES('sv-off','a-offline',0.9,0)`)
+	_, _ = db.Exec(`INSERT INTO smart_view_matches(smart_view_id,asset_id,match_score,origin) VALUES('sv-off','a-online',0.5,0)`)
+
+	album, err := s.ConvertToAlbum("sv-off")
+	require.NoError(t, err)
+
+	rows, err := db.Query(`SELECT asset_id FROM album_assets WHERE album_id=?`, album.ID)
+	require.NoError(t, err)
+	defer rows.Close()
+	ids := map[string]bool{}
+	for rows.Next() {
+		var aid string
+		require.NoError(t, rows.Scan(&aid))
+		ids[aid] = true
+	}
+	require.True(t, ids["a-offline"], "离线成员应随转换固化落库进 album_assets,不应永久丢失")
+	require.True(t, ids["a-online"], "在线成员应固化落库进 album_assets")
 }
 
 // TestConvertToAlbumNotFound smartview 不存在应返回 ErrNotFound。

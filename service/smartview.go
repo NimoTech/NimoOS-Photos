@@ -991,6 +991,26 @@ func topNByScore(m map[string]float64, n int) []string {
 	return out
 }
 
+// compensateDeleteSV 是 ConvertFromAlbum "先建新、后删旧"失败回滚路径的收尾:
+// 主错误(调用方原始 err)始终照常返回,这里只把补偿清理本身的失败留痕到日志
+// ——此前静默吞掉(_ = s.Delete(...)),半成品 smart_view 无人知晓也无法排查。
+func (s *SmartViewService) compensateDeleteSV(svID, stage string) {
+	if err := s.Delete(svID); err != nil {
+		zap.L().Warn("smartview: ConvertFromAlbum 补偿清理失败,可能遗留半成品 smart_view",
+			zap.String("id", svID), zap.String("stage", stage), zap.Error(err))
+	}
+}
+
+// compensateDeleteAlbum 是 ConvertToAlbum "先建新、后删旧"失败回滚路径的收尾,
+// 语义同 compensateDeleteSV:补偿清理失败时留 warn 日志,不改变返回给调用方的
+// 主错误。
+func compensateDeleteAlbum(albumSvc *AlbumService, albumID, stage string) {
+	if err := albumSvc.Delete(albumID); err != nil {
+		zap.L().Warn("smartview: ConvertToAlbum 补偿清理失败,可能遗留半成品 album",
+			zap.String("id", albumID), zap.String("stage", stage), zap.Error(err))
+	}
+}
+
 // ConvertFromAlbumInput 是"手动相册→智能相册"原地互转端点的入参。
 type ConvertFromAlbumInput struct {
 	AlbumID       string
@@ -1042,7 +1062,7 @@ func (s *SmartViewService) ConvertFromAlbum(in ConvertFromAlbumInput) (*SmartVie
 	// 形状锁定为钉住行;无效/软删资产由 PinAssets 静默跳过。
 	memberRows, err := s.db.Query(`SELECT asset_id FROM album_assets WHERE album_id=?`, in.AlbumID)
 	if err != nil {
-		_ = s.Delete(svID)
+		s.compensateDeleteSV(svID, "查询原相册成员失败")
 		return nil, err
 	}
 	var memberIDs []string
@@ -1050,33 +1070,33 @@ func (s *SmartViewService) ConvertFromAlbum(in ConvertFromAlbumInput) (*SmartVie
 		var aid string
 		if err := memberRows.Scan(&aid); err != nil {
 			memberRows.Close()
-			_ = s.Delete(svID)
+			s.compensateDeleteSV(svID, "扫描原相册成员失败")
 			return nil, err
 		}
 		memberIDs = append(memberIDs, aid)
 	}
 	memberRows.Close()
 	if err := memberRows.Err(); err != nil {
-		_ = s.Delete(svID)
+		s.compensateDeleteSV(svID, "遍历原相册成员失败")
 		return nil, err
 	}
 	if len(memberIDs) > 0 {
 		if _, err := s.PinAssets(svID, memberIDs); err != nil {
-			_ = s.Delete(svID)
+			s.compensateDeleteSV(svID, "PinAssets 失败")
 			return nil, err
 		}
 	}
 
 	// 同步触发一次 Evaluate,与 Create 现行为一致——吸入主题命中的新照片。
 	if err := s.Evaluate(svID); err != nil {
-		_ = s.Delete(svID)
+		s.compensateDeleteSV(svID, "Evaluate 失败")
 		return nil, err
 	}
 	s.logActivity(svID, "converted_from_album", in.AlbumID, memberIDs)
 
 	// 新身份已就绪,删除原手动相册(级联 album_assets)。
 	if err := albumSvc.Delete(in.AlbumID); err != nil {
-		_ = s.Delete(svID)
+		s.compensateDeleteSV(svID, "删除原手动相册失败")
 		return nil, err
 	}
 
@@ -1106,20 +1126,38 @@ func (s *SmartViewService) ConvertToAlbum(id string) (*Album, error) {
 		return nil, err
 	}
 
-	// matches 含 pinned、排除 excluded,按 score DESC —— 与 ExportAsAlbum 相同
-	// 的取数逻辑(MatchedAssets 的 WHERE m.origin<>2 + ORDER BY match_score DESC）。
-	assets, err := s.MatchedAssets(id, 100000, 0, false, "")
+	// 直接查 smart_view_matches,而非复用 MatchedAssets:MatchedAssets 是读路径,
+	// 会额外过滤 a.offline=0(外置盘未挂载期间不展示离线资产);但转换是"固化
+	// 快照 + 删源"语义,若沿用该过滤,恰好在外置盘拔出期间转换会让离线成员
+	// 永久丢失(源 smart_view 已删,无处再找回)。这里只保留与 MatchedAssets
+	// 一致的回收站过滤(deleted_at IS NULL,合理——软删资产不该固化)与排除行
+	// 过滤(origin<>2),不再滤 offline,按 score DESC 排序写入。
+	rows, err := s.db.Query(`
+		SELECT m.asset_id FROM smart_view_matches m JOIN assets a ON a.id=m.asset_id
+		WHERE m.smart_view_id=? AND m.origin<>2 AND a.deleted_at IS NULL
+		ORDER BY m.match_score DESC`, id)
 	if err != nil {
-		_ = albumSvc.Delete(album.ID)
+		compensateDeleteAlbum(albumSvc, album.ID, "查询匹配成员失败")
 		return nil, err
 	}
-	ids := make([]string, 0, len(assets))
-	for _, a := range assets {
-		ids = append(ids, a.ID)
+	var ids []string
+	for rows.Next() {
+		var aid string
+		if err := rows.Scan(&aid); err != nil {
+			rows.Close()
+			compensateDeleteAlbum(albumSvc, album.ID, "扫描匹配成员失败")
+			return nil, err
+		}
+		ids = append(ids, aid)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		compensateDeleteAlbum(albumSvc, album.ID, "遍历匹配成员失败")
+		return nil, err
 	}
 	if len(ids) > 0 {
 		if err := albumSvc.BatchAddAssets(album.ID, ids); err != nil {
-			_ = albumSvc.Delete(album.ID)
+			compensateDeleteAlbum(albumSvc, album.ID, "BatchAddAssets 失败")
 			return nil, err
 		}
 	}
@@ -1129,7 +1167,7 @@ func (s *SmartViewService) ConvertToAlbum(id string) (*Album, error) {
 
 	// 新身份已就绪,删除原智能相册(级联 matches)。
 	if err := s.Delete(id); err != nil {
-		_ = albumSvc.Delete(album.ID)
+		compensateDeleteAlbum(albumSvc, album.ID, "删除原智能相册失败")
 		return nil, err
 	}
 
