@@ -167,6 +167,9 @@ func InitRouter(ctx context.Context, svc service.Services, runtimePath string, t
 	g.PATCH("/albums/:id", albums.Update)
 	g.PATCH("/albums/:id/assets/order", albums.Reorder)
 
+	// 手动↔智能相册原地互转(智能→手动方向;手动→智能见 smart-views 路由组)
+	g.POST("/albums/from-smartview", albums.FromSmartView)
+
 	// Places
 	places := v1.NewPlacesHandler(svc)
 	g.GET("/places", places.List)
