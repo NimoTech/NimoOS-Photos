@@ -44,7 +44,7 @@ func TestSpriteBackfillCandidates(t *testing.T) {
 		VALUES('v4','/g/v4.mp4','video/mp4',6000,'pending',0)`)
 	require.NoError(t, err)
 
-	got, err := spriteBackfillCandidates(db)
+	got, err := spriteBackfillCandidates(db, time.Now())
 	require.NoError(t, err)
 	require.Len(t, got, 1)
 	require.Equal(t, "v1", got[0].id)

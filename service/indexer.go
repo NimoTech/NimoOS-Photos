@@ -1232,6 +1232,15 @@ func (ix *Indexer) embedClip(assetID string, fallback []byte) error {
 	return ix.writeClipEmbedding(assetID, vec)
 }
 
+// hasSmallThumb 报告资产的 small.jpg 缩略图是否已存在且非空——即 embedClip
+// 能否不碰源文件就算出 CLIP 向量。CLIP 补跑用它决定走轻路径还是回落重管线
+// (见 Embedder.embedOne)。要求非空是因为 embedClip 对 0 字节缩略图会退回
+// fallback,而补跑轻路径没有 fallback 字节可给。
+func (ix *Indexer) hasSmallThumb(assetID string) bool {
+	fi, err := os.Stat(filepath.Join(ix.thumbDir, assetID, "small.jpg"))
+	return err == nil && fi.Size() > 0
+}
+
 // minOCRScore is the recognition-confidence floor below which OCR lines are
 // discarded as noise before being stored.
 const minOCRScore = 0.5
@@ -1785,11 +1794,15 @@ type spriteCandidate struct {
 // spriteBackfillCandidates selects existing videos still missing a hover-preview
 // sprite. Pure SQL filtering only — no stat, no generation — so it can be
 // exercised independently of ffmpeg/filesystem state in tests.
-func spriteBackfillCandidates(db *sql.DB) ([]spriteCandidate, error) {
+// now 用于失败台账的冷却判定(见 backfillretry.go):生成失败过且仍在冷却期的
+// 视频本轮不入选,避免一条永久损坏的视频每轮补跑都被重新拉起 ffmpeg。
+func spriteBackfillCandidates(db *sql.DB, now time.Time) ([]spriteCandidate, error) {
 	rows, err := db.Query(`
-		SELECT id, file_path, COALESCE(duration_ms,0) FROM assets
-		WHERE mime_type LIKE 'video/%' AND status='indexed' AND deleted_at IS NULL
-		  AND COALESCE(duration_ms,0) > 0`)
+		SELECT a.id, a.file_path, COALESCE(a.duration_ms,0) FROM assets a
+		WHERE a.mime_type LIKE 'video/%' AND a.status='indexed' AND a.deleted_at IS NULL
+		  AND COALESCE(a.duration_ms,0) > 0`+
+		backfillCooldownSQL("a"),
+		string(backfillSprite), now.UnixMilli())
 	if err != nil {
 		return nil, err
 	}
@@ -1851,7 +1864,7 @@ func (ix *Indexer) BackfillSprites(ctx context.Context) {
 	}
 	defer ix.spriteBackfillRunning.Store(false)
 
-	candidates, err := spriteBackfillCandidates(ix.db)
+	candidates, err := spriteBackfillCandidates(ix.db, time.Now())
 	if err != nil {
 		zap.L().Warn("sprite 补跑候选查询失败", zap.Error(err))
 		return
@@ -1953,8 +1966,17 @@ func (ix *Indexer) BackfillSprites(ctx context.Context) {
 			}
 		}
 
+		// 失败台账:记账让永久失败的视频(典型:moov atom 损坏的 mp4)按退避
+		// 阶梯退出候选集,不再每轮补跑都被重新拉起 ffmpeg;成功即清账。
+		// 注意源文件缺失(上面 sourceMissing 分支)刻意不记账——那条只花一次
+		// os.Stat、不产生 I/O 风暴,记了反而会把「盘插回来」的自愈推迟到冷却
+		// 到期(sprite 本身还有路由端懒生成兜底)。
 		if itemFailed {
 			failed++
+			recordBackfillFailure(ix.db, backfillSprite, c.id, time.Now(),
+				fmt.Errorf("sprite/preview 生成失败"))
+		} else {
+			clearBackfillFailure(ix.db, backfillSprite, c.id)
 		}
 		current++
 		pub(current, "running", "", nil)

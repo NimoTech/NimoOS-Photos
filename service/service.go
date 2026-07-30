@@ -252,7 +252,18 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 	// batch 上传完成后触发人脸检测+聚类一体任务，让前端能看到从 0% 涨到 100% 的
 	// "识别人物" task（真实进度，而非旧的聚类专属假进度）。
 	// faces.RunPipeline 内部用 CAS 防重入，多个 batch 同时 done 也只会跑一次。
+	// 重补跑链的节流闸:批次完成钩子与 Embedder 的 ML 就绪恢复链共用同一个
+	// 实例,合起来保证「无论谁触发,重补跑链每 defaultBackfillGateInterval 最多
+	// 跑一轮」。批次完成的判定是「队列空闲 6 秒」(defaultIngestIdleTimeout),
+	// 一块持续变动的大盘会让它每几秒触发一次全链补跑——那是生产上磁盘 24h 满速
+	// 顺序读的直接来源。leading edge 仍立即执行,所以用户上传后第一轮不延迟。
+	backfillGateShared := newBackfillGate(defaultBackfillGateInterval)
+	embedder.SetGate(backfillGateShared)
+
 	idx.SetOnBatchDone(func() {
+		// 人脸管线不进节流闸:它按 face_scanned 逐资产记账、天然收敛,而且
+		// 「识别人物」任务是上传后用户立刻期待看到的真实进度,压到窗口末尾会
+		// 变成体感退步。
 		go func() {
 			if err := faces.RunPipeline(parentCtx); err != nil {
 				zap.L().Warn("post-batch face pipeline failed", zap.Error(err))
@@ -263,7 +274,7 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 		// 只在 ML「掉线→恢复」跳变时触发——ML 全程在线就永远没人补,资产无限期
 		// 缺向量、语义搜索搜不到(真实故障:两张鱼图撞上模型冷加载窗口)。批次末尾
 		// 补一手,CAS+rerunPending 已防重入,无欠账时两个调用都是秒级空跑。
-		go func() {
+		go backfillGateShared.Run("post-batch-backfill", func() {
 			if err := embedder.Backfill(parentCtx); err != nil {
 				zap.L().Warn("post-batch clip backfill failed", zap.Error(err))
 			}
@@ -285,7 +296,7 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 			if _, err := puller.PullOnce(parentCtx); err != nil && !errors.Is(err, parserclient.ErrParserUnavailable) {
 				zap.L().Warn("post-batch caption pull failed", zap.Error(err))
 			}
-		}()
+		})
 		go func() {
 			for {
 				n, err := geoSvc.BackfillPending(500)
@@ -302,9 +313,10 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 		// 批量导入视频后补漏 + 借任务栏展示转码进度;CAS 防与启动补跑/多批次并发重入。
 		// (内联预生成已在索引时逐条排队,批次末尾多数已就绪,该轮只处理剩余欠账,
 		// total 反映真实剩余量——正是任务栏该显示的。)
-		go func() {
+		// 进节流闸:每条候选都要拉 ffmpeg 读源视频,是重 I/O 项。
+		go backfillGateShared.Run("sprite-backfill", func() {
 			idx.BackfillSprites(parentCtx)
-		}()
+		})
 		// Smart Moments 链尾:批次末尾重算时刻(trip 时间窗切段 + theme CLIP/
 		// caption 命中会随新资产变化),CAS 防与启动补跑/每日调度并发重入;
 		// LLM 命名是 best-effort,失败只 Warn,不影响其它链尾步骤。

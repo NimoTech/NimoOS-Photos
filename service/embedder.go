@@ -59,6 +59,15 @@ type Embedder struct {
 	ocrRunning   atomic.Bool
 	pollInterval time.Duration
 
+	// downStreak 是连续探测到 ML 未就绪的次数,用于把单次 /ping 抖动与真掉线
+	// 区分开(见 mlDownStreakThreshold 与 observeReady)。
+	downStreak atomic.Int32
+
+	// gate 是恢复链的节流闸,与批次完成钩子共用同一个实例(service.go 注入),
+	// 以保证「无论由哪个触发源发起,重补跑链每个窗口最多跑一轮」。
+	// nil 表示不节流(单测与未接线路径)。
+	gate *backfillGate
+
 	// aestheticRunning / aestheticRerunPending / aestheticHead 支撑 BackfillAesthetic
 	// 的并发防重与 rerun 语义,与 ocrRunning/ocrRerunPending 同款(见下方字段注释)。
 	aestheticRunning      atomic.Bool
@@ -90,35 +99,59 @@ func NewEmbedder(db *sql.DB, ml MLProvider, idx *Indexer, reg *TaskRegistry) *Em
 
 func (e *Embedder) SetPollInterval(d time.Duration) { e.pollInterval = d }
 
+// SetGate 注入恢复链的节流闸。传入与批次完成钩子同一个实例,才能保证两个
+// 触发源合起来每个窗口只跑一轮重补跑链。
+func (e *Embedder) SetGate(g *backfillGate) { e.gate = g }
+
+// runGated 按节流闸执行 fn;未注入闸时直接执行。
+func (e *Embedder) runGated(fn func()) {
+	if e.gate == nil {
+		fn()
+		return
+	}
+	e.gate.Run("ml-recovery", fn)
+}
+
 // SetOnRecovered injects the callback invoked once at the tail of the ML-ready
 // recovery chain (after Backfill/reembed/BackfillOCR), used to catch up on
 // face detection backlog accumulated while ML was down.
 func (e *Embedder) SetOnRecovered(fn func(context.Context)) { e.onRecovered = fn }
 
-// queryMissing 列出 status='indexed' 但 asset_clip_idx 缺行的 asset 路径。
-func (e *Embedder) queryMissing(ctx context.Context) ([]string, error) {
+// clipTarget 是一条 CLIP 补跑候选。带上 id 是为了走「只读缩略图」的轻路径
+// (embedClip 按 asset id 找 small.jpg)与失败台账记账,不必再按 path 反查。
+type clipTarget struct {
+	id   string
+	path string
+}
+
+// queryMissing 列出 status='indexed' 但 asset_clip_idx 缺行的 asset。
+// now 用于失败台账的冷却判定(见 backfillretry.go):处于冷却期的资产本轮
+// 不入选,避免永久失败的资产每轮都被重新选中。
+func (e *Embedder) queryMissing(ctx context.Context, now time.Time) ([]clipTarget, error) {
 	// a.offline=0: an asset on a currently-unplugged removable drive can't be
 	// read, so retrying it here would just burn CPU on a guaranteed failure
 	// every poll interval. MountGuard re-triggers Backfill right after the
 	// drive is reinserted, so the gap is closed the moment the file is
 	// reachable again.
 	rows, err := e.db.QueryContext(ctx, `
-        SELECT a.file_path FROM assets a
+        SELECT a.id, a.file_path FROM assets a
         LEFT JOIN asset_clip_idx i ON i.asset_id = a.id
-        WHERE a.status = 'indexed' AND a.offline = 0 AND i.asset_id IS NULL`)
+        WHERE a.status = 'indexed' AND a.offline = 0 AND i.asset_id IS NULL`+
+		backfillCooldownSQL("a"),
+		string(backfillCLIP), now.UnixMilli())
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var paths []string
+	var targets []clipTarget
 	for rows.Next() {
-		var p string
-		if err := rows.Scan(&p); err != nil {
+		var t clipTarget
+		if err := rows.Scan(&t.id, &t.path); err != nil {
 			return nil, err
 		}
-		paths = append(paths, p)
+		targets = append(targets, t)
 	}
-	return paths, rows.Err()
+	return targets, rows.Err()
 }
 
 // hasEmbeddingForPath 反查指定 path 是否已在 asset_clip_idx 有行。
@@ -159,17 +192,17 @@ func (e *Embedder) Backfill(ctx context.Context) error {
 // backfillOnce 是 Backfill 的单轮主体(查询目标 + 逐个补跑 + 任务上报),
 // 不含并发防重与 rerun 循环。
 func (e *Embedder) backfillOnce(ctx context.Context) error {
-	paths, err := e.queryMissing(ctx)
+	targets, err := e.queryMissing(ctx, time.Now())
 	if err != nil {
 		return err
 	}
-	if len(paths) == 0 {
+	if len(targets) == 0 {
 		return nil
 	}
 
 	taskID := fmt.Sprintf("embedding_%d", time.Now().UnixNano())
 	started := time.Now()
-	total := int64(len(paths))
+	total := int64(len(targets))
 	pubRunning := func(processed int64) {
 		e.reg.Upsert(Task{
 			ID:        taskID,
@@ -185,16 +218,21 @@ func (e *Embedder) backfillOnce(ctx context.Context) error {
 	pubRunning(0)
 
 	var processed, success, failed int64
-	for _, p := range paths {
+	for _, tg := range targets {
 		if ctx.Err() != nil {
 			break
 		}
-		e.indexer.ForceReprocess(p, processOpts{force: true, skipExif: true, skipThumb: true})
+		err := e.embedOne(tg)
 		processed++
-		if e.hasEmbeddingForPath(p) {
+		if err == nil && e.hasEmbeddingForPath(tg.path) {
 			success++
+			clearBackfillFailure(e.db, backfillCLIP, tg.id)
 		} else {
 			failed++
+			if err == nil {
+				err = fmt.Errorf("补跑后仍无向量")
+			}
+			recordBackfillFailure(e.db, backfillCLIP, tg.id, time.Now(), err)
 		}
 		pubRunning(processed)
 	}
@@ -233,11 +271,32 @@ func (e *Embedder) backfillOnce(ctx context.Context) error {
 	return nil
 }
 
+// embedOne 补一个资产的 CLIP 向量。
+//
+// 轻路径优先:CLIP 向量的唯一输入是 small.jpg 缩略图(见 embedClip 的注释——
+// 为了让排序与用户看到的那一帧一致,索引期与补跑期都用缩略图),缩略图在就
+// 只读它,一个源文件字节都不碰。旧实现无条件走 ForceReprocess 重管线,而
+// force=true 会绕过 processFileInternal 的 stat 快速跳过与 checksum 短路,
+// 对每个候选整读一遍源文件算 SHA-256,视频还额外抽关键帧 + ffprobe——补一个
+// 几百 KB 的向量要读几个 GB 的源视频,纯浪费。生产上这就是「7.3T 素材盘被
+// 每轮补跑整盘重读、磁盘 24h 满速顺序读」的直接来源。
+//
+// 缩略图缺失时仍必须回落重管线:那是唯一能重新生成缩略图的路径,否则从未
+// 出过缩略图的资产会永远补不出向量。
+func (e *Embedder) embedOne(tg clipTarget) error {
+	if e.indexer.hasSmallThumb(tg.id) {
+		return e.indexer.embedClip(tg.id, nil)
+	}
+	e.indexer.ForceReprocess(tg.path, processOpts{force: true, skipExif: true, skipThumb: true})
+	return nil
+}
+
 // queryMissingOCR 列出 status='indexed' 但 OCR 数据不完整的 asset：
 // 要么 asset_ocr 缺行（从未跑过 OCR——即使没识别到文字也会写 text 为空字符串的行），
 // 要么 coverage 为 NULL（旧版跑的 OCR 没存文字框面积，需要重跑补齐），
 // 要么 boxes_ver=0（旧版没把逐行坐标存进 asset_ocr_lines，需重跑供搜索命中高亮）。
-func (e *Embedder) queryMissingOCR(ctx context.Context) ([]ocrTarget, error) {
+// now 用于失败台账的冷却判定,语义同 queryMissing。
+func (e *Embedder) queryMissingOCR(ctx context.Context, now time.Time) ([]ocrTarget, error) {
 	// a.offline=0: same reasoning as queryMissing above — skip assets whose
 	// source is unreachable because their removable drive is unplugged.
 	rows, err := e.db.QueryContext(ctx, `
@@ -246,7 +305,9 @@ func (e *Embedder) queryMissingOCR(ctx context.Context) ([]ocrTarget, error) {
         LEFT JOIN asset_ocr o ON o.asset_id = a.id
         WHERE a.status = 'indexed' AND a.deleted_at IS NULL AND a.offline = 0
           AND COALESCE(a.mime_type,'') NOT LIKE 'video/%'
-          AND (o.asset_id IS NULL OR o.coverage IS NULL OR COALESCE(o.boxes_ver,0) = 0)`)
+          AND (o.asset_id IS NULL OR o.coverage IS NULL OR COALESCE(o.boxes_ver,0) = 0)`+
+		backfillCooldownSQL("a"),
+		string(backfillOCR), now.UnixMilli())
 	if err != nil {
 		return nil, err
 	}
@@ -266,6 +327,13 @@ type ocrTarget struct {
 	id      string
 	path    string
 	isVideo bool
+}
+
+// ocrOutcome 是 OCR 补跑对单个目标的一次尝试结果。err==nil 表示成功。
+// 逐条收集而非只记计数,是为了在「最终一遍」结束后按条写失败退避台账。
+type ocrOutcome struct {
+	target ocrTarget
+	err    error
 }
 
 // BackfillOCR 对所有缺 OCR 文本的 asset 补跑 ML OCR。
@@ -292,7 +360,7 @@ func (e *Embedder) BackfillOCR(ctx context.Context) error {
 
 // backfillOCROnce 是 BackfillOCR 的单轮主体,不含并发防重与 rerun 循环。
 func (e *Embedder) backfillOCROnce(ctx context.Context) error {
-	targets, err := e.queryMissingOCR(ctx)
+	targets, err := e.queryMissingOCR(ctx, time.Now())
 	if err != nil {
 		return err
 	}
@@ -317,8 +385,10 @@ func (e *Embedder) backfillOCROnce(ctx context.Context) error {
 	}
 	pubRunning(0)
 
-	// pass 跑一遍给定目标,返回处理/失败计数(readFail=源文件读不到,ocrFail=ML 调用失败)。
-	pass := func(ts []ocrTarget) (processed, failed, readFail, ocrFail int64) {
+	// pass 跑一遍给定目标,返回逐条结果与处理/失败计数(readFail=源文件读不到,
+	// ocrFail=ML 调用失败)。outcomes 交给调用方在「最终一遍」之后统一记账:
+	// 首遍疑似 ML 未热好时还会重试一遍,不能拿首遍的失败去写退避台账。
+	pass := func(ts []ocrTarget) (outcomes []ocrOutcome, processed, failed, readFail, ocrFail int64) {
 		for _, t := range ts {
 			if ctx.Err() != nil {
 				break
@@ -330,6 +400,10 @@ func (e *Embedder) backfillOCROnce(ctx context.Context) error {
 			data, rerr := os.ReadFile(src)
 			if rerr != nil || len(data) == 0 {
 				// 源图/缩略图读不到(文件被删、缩略图缺失等),与 ML 无关。
+				if rerr == nil {
+					rerr = fmt.Errorf("源图为空: %s", src)
+				}
+				outcomes = append(outcomes, ocrOutcome{target: t, err: rerr})
 				readFail++
 				failed++
 				processed++
@@ -344,6 +418,9 @@ func (e *Embedder) backfillOCROnce(ctx context.Context) error {
 				} else {
 					zap.L().Warn("OCR 补跑:超大图且无缩略图可降级,跳过",
 						zap.String("asset_id", t.id), zap.String("path", t.path))
+					outcomes = append(outcomes, ocrOutcome{
+						target: t, err: fmt.Errorf("超过 ML 像素上限且无缩略图可降级"),
+					})
 					readFail++
 					failed++
 					processed++
@@ -351,7 +428,9 @@ func (e *Embedder) backfillOCROnce(ctx context.Context) error {
 					continue
 				}
 			}
-			if oerr := e.indexer.ocrAsset(t.id, data); oerr != nil {
+			oerr := e.indexer.ocrAsset(t.id, data)
+			outcomes = append(outcomes, ocrOutcome{target: t, err: oerr})
+			if oerr != nil {
 				ocrFail++
 				failed++
 			} else if derr := e.indexer.computeDocVerdict(t.id); derr != nil {
@@ -363,10 +442,15 @@ func (e *Embedder) backfillOCROnce(ctx context.Context) error {
 		return
 	}
 
-	processed, failed, readFail, ocrFail := pass(targets)
+	outcomes, processed, failed, readFail, ocrFail := pass(targets)
 
-	// 首遍因 ML 全失败(疑似重启瞬间 OCR 模型还没热好):等一会、对仍缺 OCR 的目标重试一次,
-	// 仍失败才报错。避免每次重部署都弹一个其实是「ML 未热好」的假失败。
+	// 首遍因 ML 全失败(疑似重启瞬间 OCR 模型还没热好):等一会重试一次,仍失败
+	// 才报错。避免每次重部署都弹一个其实是「ML 未热好」的假失败。
+	//
+	// 重试的是同一批 targets,不再重新查询:候选查询现在带失败台账的冷却过滤
+	// (queryMissingOCR),而本轮的失败要等最终一遍结束后才记账,此刻重新查询
+	// 拿回来的仍是同一批,白跑一次 SQL;而且这个分支只在「全部失败」时才进,
+	// 没有已成功的目标需要被剔除。
 	if processed > 0 && failed == processed && ocrFail > 0 && ctx.Err() == nil {
 		zap.L().Info("OCR 补跑首遍全失败(疑似 ML 未就绪),稍后重试一次",
 			zap.Int64("ml_fail", ocrFail))
@@ -375,15 +459,24 @@ func (e *Embedder) backfillOCROnce(ctx context.Context) error {
 			return ctx.Err()
 		case <-time.After(ocrBackfillRetryDelay):
 		}
-		if ts2, qerr := e.queryMissingOCR(ctx); qerr == nil && len(ts2) > 0 {
-			total = int64(len(ts2))
-			pubRunning(0)
-			processed, failed, readFail, ocrFail = pass(ts2)
-		}
+		pubRunning(0)
+		outcomes, processed, failed, readFail, ocrFail = pass(targets)
 	}
 
 	if ctx.Err() != nil {
+		// 被取消:不记账。停服/取消导致的失败不该让资产背上退避冷却。
 		return ctx.Err()
+	}
+
+	// 以最终一遍的逐条结果记账:成功清账,失败按退避阶梯推迟下次入选。
+	// 这是「同一批 62 张每轮全失败、每轮把原图重读一遍」的止血点。
+	now := time.Now()
+	for _, o := range outcomes {
+		if o.err == nil {
+			clearBackfillFailure(e.db, backfillOCR, o.target.id)
+		} else {
+			recordBackfillFailure(e.db, backfillOCR, o.target.id, now, o.err)
+		}
 	}
 
 	final := Task{
@@ -598,12 +691,35 @@ func (e *Embedder) Run(ctx context.Context) {
 	}
 }
 
+// mlDownStreakThreshold 是认定「ML 真的掉线」所需的连续探测失败次数。
+//
+// IsReady 是 3 秒超时的 /ping。而 ML 冷加载 / 满负载时 /ping 延迟实测能到
+// ~2.5s(见 mlwatchdog.go 的注释),偶发一次超时并不代表后端掉线。若把单次
+// 抖动当掉线,负载一回落就是一次 false→true 跳变、触发整条恢复链,恢复链再把
+// ML 打满——生产上「immich_ml 返回 500/EOF 而补跑每轮重来」的正反馈就是这么
+// 转起来的。要求连续 2 次失败才认定掉线,单次抖动被吃掉;真掉线最多晚一个
+// 轮询周期被发现,而后续动作(补跑)本来就不是实时的。
+const mlDownStreakThreshold = 2
+
+// observeReady 消费一次 ML 就绪探测结果,返回是否发生了「掉线→恢复」跳变
+// (即是否应当触发一轮恢复链)。带连续失败去抖,见 mlDownStreakThreshold。
+// 初始状态视为「未就绪」,所以启动后第一次探测到就绪会触发一轮——这是刻意的,
+// 用来补齐上次运行期间积压的欠账。
+func (e *Embedder) observeReady(ready bool) bool {
+	if !ready {
+		if e.downStreak.Add(1) >= mlDownStreakThreshold {
+			e.lastReady.Store(false)
+		}
+		return false
+	}
+	e.downStreak.Store(0)
+	return !e.lastReady.Swap(true)
+}
+
 // tick 检测 ML ready 跳变，有跳变时异步触发 Backfill。
 func (e *Embedder) tick(ctx context.Context) {
-	ready := e.ml.IsReady()
-	prev := e.lastReady.Swap(ready)
-	if ready && !prev {
-		go func() {
+	if e.observeReady(e.ml.IsReady()) {
+		go e.runGated(func() {
 			// Backfill first (fills assets that never got an embedding), then the
 			// one-time re-embed of all existing assets from their thumbnails,
 			// then OCR for assets indexed before OCR support existed, then doc
@@ -621,7 +737,7 @@ func (e *Embedder) tick(ctx context.Context) {
 			if e.onRecovered != nil {
 				e.onRecovered(ctx)
 			}
-		}()
+		})
 	}
 }
 

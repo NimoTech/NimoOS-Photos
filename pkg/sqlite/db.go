@@ -393,6 +393,24 @@ func migrate(db *sql.DB) error {
 			updated_at  INTEGER NOT NULL DEFAULT 0   -- Unix ms
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_profile_entities_kind ON user_profile_entities(kind)`,
+
+		// ── 补跑失败台账(CLIP / OCR / sprite 三类补跑共用)────────────────
+		// 三条补跑的候选查询都是「缺产物就选中」的纯 SQL 判定,失败不留痕:
+		// 一条永久失败的资产每轮都会被重新选中、重新整读源文件、重新失败,
+		// 候选集永不收敛(生产实测:磁盘 24h 满速顺序读、进度零推进)。这张表
+		// 给失败资产记账并按 next_retry_at 退避出候选集;补跑成功即删行,不会
+		// 永久拉黑(损坏文件被替换 / ML 升级后仍能自愈)。
+		// 退避阶梯与读写逻辑见 service/backfillretry.go。
+		`CREATE TABLE IF NOT EXISTS backfill_failures (
+			kind          TEXT NOT NULL,           -- 'clip' | 'ocr' | 'sprite'
+			asset_id      TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+			fail_count    INTEGER NOT NULL DEFAULT 0,
+			last_fail_at  INTEGER NOT NULL DEFAULT 0, -- Unix ms
+			next_retry_at INTEGER NOT NULL DEFAULT 0, -- Unix ms;> now 即处于冷却
+			last_error    TEXT NOT NULL DEFAULT '',
+			PRIMARY KEY (kind, asset_id)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_backfill_failures_retry ON backfill_failures(kind, next_retry_at)`,
 	}
 
 	for _, stmt := range statements {

@@ -47,10 +47,9 @@ func TestEmbedder_QueryMissing(t *testing.T) {
 	insertClipIdx(t, db, hasIdx) // 已有 idx，不该返回
 
 	e := NewEmbedder(db, &mockML{}, nil, nil)
-	paths, err := e.queryMissing(context.Background())
+	targets, err := e.queryMissing(context.Background(), time.Now())
 	require.NoError(t, err)
-	require.Equal(t, []string{"/a.jpg"}, paths)
-	_ = missing
+	require.Equal(t, []clipTarget{{id: missing, path: "/a.jpg"}}, targets)
 }
 
 // TestEmbedder_QueryMissingExcludesOffline 验证:资产的移动盘已拔出
@@ -64,10 +63,9 @@ func TestEmbedder_QueryMissingExcludesOffline(t *testing.T) {
 	require.NoError(t, err)
 
 	e := NewEmbedder(db, &mockML{}, nil, nil)
-	paths, err := e.queryMissing(context.Background())
+	targets, err := e.queryMissing(context.Background(), time.Now())
 	require.NoError(t, err)
-	require.Equal(t, []string{"/a.jpg"}, paths)
-	_ = online
+	require.Equal(t, []clipTarget{{id: online, path: "/a.jpg"}}, targets)
 }
 
 // TestEmbedder_QueryMissingOCRExcludesOffline 同上,针对 OCR 补跑目标查询。
@@ -79,7 +77,7 @@ func TestEmbedder_QueryMissingOCRExcludesOffline(t *testing.T) {
 	require.NoError(t, err)
 
 	e := NewEmbedder(db, &mockML{}, nil, nil)
-	targets, err := e.queryMissingOCR(context.Background())
+	targets, err := e.queryMissingOCR(context.Background(), time.Now())
 	require.NoError(t, err)
 	ids := map[string]bool{}
 	for _, tg := range targets {
@@ -107,7 +105,7 @@ func TestQueryMissingOCRIncludesLegacyBoxless(t *testing.T) {
 	require.NoError(t, err)
 
 	e := NewEmbedder(db, &mockML{}, nil, nil)
-	targets, err := e.queryMissingOCR(context.Background())
+	targets, err := e.queryMissingOCR(context.Background(), time.Now())
 	require.NoError(t, err)
 
 	ids := make([]string, 0, len(targets))
@@ -127,7 +125,7 @@ func TestVideoOCRExcludedAndPruned(t *testing.T) {
 	require.NoError(t, err)
 
 	e := NewEmbedder(db, &mockML{}, nil, nil)
-	targets, err := e.queryMissingOCR(context.Background())
+	targets, err := e.queryMissingOCR(context.Background(), time.Now())
 	require.NoError(t, err)
 	ids := map[string]bool{}
 	for _, tg := range targets {
@@ -171,6 +169,10 @@ func (m *gateML) CLIPImageEmbed(_ []byte) ([]float32, error) {
 // 进行中的那轮可能早已查过目标列表,查不到刚变成可补的资产(典型:MountGuard
 // 刚把插回的盘标回 online)。第二次调用应置 pending,当前轮结束后自动重新
 // 查询、再跑一轮。
+//
+// 观测点就是这个机制存在的理由本身:在第一轮已经查过目标之后才出现的新可补
+// 资产,必须被重跑轮捡起来。注意不能拿「刚失败的那个资产被再试一次」当观测
+// 点——失败台账(backfillretry.go)会按退避把它挡在候选集外,那是刻意的。
 func TestEmbedder_BackfillRerunsWhenTriggeredMidRun(t *testing.T) {
 	prev := config.Cfg
 	t.Cleanup(func() { config.Cfg = prev })
@@ -178,8 +180,9 @@ func TestEmbedder_BackfillRerunsWhenTriggeredMidRun(t *testing.T) {
 	config.Cfg = &config.Config{ScenesEnabled: true}
 
 	db := makeTestDB(t)
-	path := makeTestJPEG(t, t.TempDir())
-	insertAsset(t, db, path, "indexed") // 缺 CLIP 向量 → Backfill 目标
+	tmp := t.TempDir()
+	path := makeTestJPEG(t, tmp)
+	insertAsset(t, db, path, "indexed") // 缺 CLIP 向量 → 第一轮的目标
 
 	ml := &gateML{entered: make(chan struct{}, 1), release: make(chan struct{})}
 	idx := NewIndexer(db, ml, t.TempDir(), 1)
@@ -189,6 +192,10 @@ func TestEmbedder_BackfillRerunsWhenTriggeredMidRun(t *testing.T) {
 	go func() { errCh <- e.Backfill(context.Background()) }()
 	<-ml.entered // 第一轮已进入 ML 调用:Backfill 确认处于运行中
 
+	// 第一轮查过目标之后才出现的新资产:只有重跑轮重新查询才能看到它。
+	newPath := makeUniqueJPEG(t, tmp, 1)
+	insertAsset(t, db, newPath, "indexed")
+
 	// 运行中的第二次触发:立即返回 nil,但必须置 rerunPending 而不是被吞掉。
 	require.NoError(t, e.Backfill(context.Background()))
 	require.True(t, e.rerunPending.Load(), "运行中收到的触发必须置 rerunPending")
@@ -196,8 +203,8 @@ func TestEmbedder_BackfillRerunsWhenTriggeredMidRun(t *testing.T) {
 	close(ml.release)
 	require.NoError(t, <-errCh)
 
-	// 第一轮结束后自动重跑了一轮:同一个仍缺向量的资产被再次尝试(共 2 次 CLIP 调用)。
-	require.Equal(t, int32(2), ml.clipCalls.Load(), "当前轮结束后应自动再跑一轮补跑")
+	// 第一轮结束后自动重跑了一轮,并且重新查询捡起了新资产(共 2 次 CLIP 调用)。
+	require.Equal(t, int32(2), ml.clipCalls.Load(), "重跑轮必须重新查询并处理新可补资产")
 	require.False(t, e.rerunPending.Load(), "重跑轮结束后 pending 应被消费")
 	require.False(t, e.running.Load())
 }
