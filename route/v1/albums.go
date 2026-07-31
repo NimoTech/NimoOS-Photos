@@ -1,18 +1,34 @@
 package v1
 
 import (
+	"archive/zip"
+	"crypto/ecdsa"
 	"errors"
+	"fmt"
+	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 
+	"github.com/NimoTech/NimoOS-Common/external"
+	"github.com/NimoTech/NimoOS-Common/utils/jwt"
 	"github.com/NimoTech/NimoOS-Photos/service"
 	"github.com/labstack/echo/v4"
+	"go.uber.org/zap"
 )
 
 // AlbumsHandler handles album CRUD and asset membership operations.
-type AlbumsHandler struct{ svc service.Services }
+type AlbumsHandler struct {
+	svc service.Services
+	// runtimePath 供 Export 的 query-token JWT 校验取公钥用（同 FavoritesHandler
+	// 约定）；空串表示测试/单机直连场景，跳过真实 JWT 校验。
+	runtimePath string
+}
 
 // NewAlbumsHandler constructs an AlbumsHandler.
-func NewAlbumsHandler(svc service.Services) *AlbumsHandler { return &AlbumsHandler{svc} }
+func NewAlbumsHandler(svc service.Services, runtimePath string) *AlbumsHandler {
+	return &AlbumsHandler{svc: svc, runtimePath: runtimePath}
+}
 
 // List returns all albums.
 //
@@ -62,6 +78,84 @@ func (h *AlbumsHandler) Get(c echo.Context) error {
 		"album":  album,
 		"assets": assets,
 	})
+}
+
+// Export — GET /v1/photos/albums/:id/export?token=<jwt>
+//
+// 手动相册 ZIP 下载,与 favorites.Export 同构：浏览器 window.location.href
+// 导航发不出 Authorization 头,靠 router.go 的 mediaGetSkip 按路由后缀放行
+// JWT 中间件,handler 内部改用 query token 自行校验（token 缺失/无效 401）。
+// runtimePath=="" 时是测试/单机直连场景,跳过真实校验（同 FavoritesHandler
+// 的既有约定）。相册本身不区分用户,这里只校验 token 合法性,不取 userID。
+//
+// zip 内容 = ListAssets 返回的可见成员全集（已排除软删/离线/Live Photo 伴生
+// 视频，按相册既有排序），文件名冲突复用 favorites.go 的 dedupZipEntryName，
+// 单文件读取失败跳过并留 warn 日志（同 favorites.Export 的既有容错策略）。
+func (h *AlbumsHandler) Export(c echo.Context) error {
+	token := c.QueryParam("token")
+	if token == "" {
+		return echo.NewHTTPError(http.StatusUnauthorized, "token required")
+	}
+	if h.runtimePath != "" {
+		valid, _, err := jwt.Validate(token, func() (*ecdsa.PublicKey, error) {
+			return external.GetPublicKey(h.runtimePath)
+		})
+		if err != nil || !valid {
+			return echo.NewHTTPError(http.StatusUnauthorized, "invalid token")
+		}
+	}
+
+	id := c.Param("id")
+	if _, err := h.svc.Albums().Get(id); errors.Is(err, service.ErrNotFound) {
+		return echo.NewHTTPError(http.StatusNotFound)
+	} else if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	}
+
+	assets, err := h.svc.Albums().ListAssets(id)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	}
+	if len(assets) == 0 {
+		return echo.NewHTTPError(http.StatusBadRequest, "no assets to export")
+	}
+
+	filename := fmt.Sprintf("album-%s.zip", id)
+	c.Response().Header().Set("Content-Type", "application/zip")
+	c.Response().Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, filename))
+	c.Response().WriteHeader(http.StatusOK)
+
+	zw := zip.NewWriter(c.Response().Writer)
+	defer zw.Close()
+
+	usedNames := map[string]int{}
+	for _, a := range assets {
+		name := dedupZipEntryName(a.OriginalName, usedNames)
+		if name == "" {
+			name = a.ID + filepath.Ext(a.FilePath)
+		}
+
+		w, err := zw.Create(name)
+		if err != nil {
+			zap.L().Warn("album zip create entry failed", zap.String("name", name), zap.Error(err))
+			continue
+		}
+		f, err := os.Open(a.FilePath)
+		if err != nil {
+			zap.L().Warn("album zip skip missing file", zap.String("path", a.FilePath), zap.Error(err))
+			continue
+		}
+		_, copyErr := io.Copy(w, f)
+		f.Close()
+		if copyErr != nil {
+			zap.L().Warn("album zip copy failed", zap.String("path", a.FilePath), zap.Error(copyErr))
+			continue
+		}
+		if flusher, ok := c.Response().Writer.(http.Flusher); ok {
+			flusher.Flush()
+		}
+	}
+	return nil
 }
 
 // Delete removes an album (does not delete the underlying assets).

@@ -27,7 +27,7 @@ func newAlbumsTestEcho(t *testing.T) (*echo.Echo, *sql.DB) {
 	svc := service.NewTestServices(db)
 	e := echo.New()
 	g := e.Group("/v1/photos")
-	h := v1.NewAlbumsHandler(svc)
+	h := v1.NewAlbumsHandler(svc, "")
 	g.POST("/albums/from-smartview", h.FromSmartView)
 	return e, db
 }

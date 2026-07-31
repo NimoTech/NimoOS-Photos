@@ -1,20 +1,31 @@
 package v1
 
 import (
+	"crypto/ecdsa"
 	"errors"
 	"net/http"
 	"strconv"
 
 	"github.com/labstack/echo/v4"
 
+	"github.com/NimoTech/NimoOS-Common/external"
+	"github.com/NimoTech/NimoOS-Common/utils/jwt"
 	"github.com/NimoTech/NimoOS-Photos/service"
 )
 
 // SmartViewsHandler handles smart view CRUD, preview, and export endpoints.
-type SmartViewsHandler struct{ svc service.Services }
+type SmartViewsHandler struct {
+	svc service.Services
+	// runtimePath 供 ExportZip 的 query-token JWT 校验取公钥用（同
+	// AlbumsHandler/FavoritesHandler 的既有约定）；空串表示测试/单机直连
+	// 场景，跳过真实 JWT 校验。
+	runtimePath string
+}
 
 // NewSmartViewsHandler constructs a SmartViewsHandler.
-func NewSmartViewsHandler(svc service.Services) *SmartViewsHandler { return &SmartViewsHandler{svc} }
+func NewSmartViewsHandler(svc service.Services, runtimePath string) *SmartViewsHandler {
+	return &SmartViewsHandler{svc: svc, runtimePath: runtimePath}
+}
 
 // RegisterSmartViewRoutes registers all smart-view routes on the given group.
 func RegisterSmartViewRoutes(g *echo.Group, h *SmartViewsHandler) {
@@ -31,7 +42,12 @@ func RegisterSmartViewRoutes(g *echo.Group, h *SmartViewsHandler) {
 	g.POST("/smart-views/:id/assets/restore", h.RestoreAssets)
 	g.GET("/smart-views/:id/excluded", h.Excluded)
 	g.GET("/smart-views/:id/activity", h.Activity)
+	// 既有 POST /export(format=zip|album)保持不动，向后兼容。
 	g.POST("/smart-views/:id/export", h.Export)
+	// 新增 GET+token 的 ZIP 直下载端点，修 UI window.location.href 断链：
+	// 浏览器导航发不出 Authorization 头，POST-only 路由也接不住 GET，旧链路
+	// 会被 JWT 中间件 401。镜像 albums.go AlbumsHandler.Export 的实现形状。
+	g.GET("/smart-views/:id/export", h.ExportZip)
 	g.POST("/smart-views/from-album", h.FromAlbum)
 }
 
@@ -267,4 +283,44 @@ func (h *SmartViewsHandler) Export(c echo.Context) error {
 	default:
 		return echo.NewHTTPError(http.StatusBadRequest, "unsupported format")
 	}
+}
+
+// ExportZip — GET /v1/photos/smart-views/:id/export?token=<jwt>
+//
+// 与 albums.go AlbumsHandler.Export 同款的浏览器直下载入口：修复既有 UI 断链
+// ——PhotosSmartViewDetail.vue 的 runExport('zip') 用 window.location.href
+// 触发下载,浏览器导航发不出 Authorization 头,而旧的 POST /export 既没注册
+// GET,也不在 router.go 的 mediaGetSkip 白名单里,导致请求在 JWT 中间件就被
+// 拦成 401。这里改用 query token 自行校验(runtimePath=="" 时是测试/单机
+// 直连场景,跳过真实校验,同 Albums/Favorites 的既有约定),流式落地复用
+// service.SmartViewService.ExportZip(与旧 POST /export?format=zip 分支完全
+// 同一份实现,行为不变)。既有 POST 路由保持不动,两者并存、互不影响。
+func (h *SmartViewsHandler) ExportZip(c echo.Context) error {
+	token := c.QueryParam("token")
+	if token == "" {
+		return echo.NewHTTPError(http.StatusUnauthorized, "token required")
+	}
+	if h.runtimePath != "" {
+		valid, _, err := jwt.Validate(token, func() (*ecdsa.PublicKey, error) {
+			return external.GetPublicKey(h.runtimePath)
+		})
+		if err != nil || !valid {
+			return echo.NewHTTPError(http.StatusUnauthorized, "invalid token")
+		}
+	}
+
+	id := c.Param("id")
+	if _, err := h.svc.SmartViews().Get(id); errors.Is(err, service.ErrNotFound) {
+		return echo.NewHTTPError(http.StatusNotFound, "not found")
+	} else if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	}
+
+	if err := h.svc.SmartViews().ExportZip(c.Response(), id); err != nil {
+		if errors.Is(err, service.ErrInvalidInput) {
+			return echo.NewHTTPError(http.StatusBadRequest, "no matches to export")
+		}
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	}
+	return nil
 }
