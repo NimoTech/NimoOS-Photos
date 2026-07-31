@@ -24,7 +24,7 @@ import (
 // mediaGetSkip reports whether a request may skip JWT because it targets a
 // read-only media-serving endpoint that <img>/<video> tags load without an
 // Authorization header (thumbnail/face-thumbnail/original/live/sprite/
-// preview/favorites/export/albums export). These are matched by PATH SUFFIX ONLY (Echo's
+// preview/favorites/export/albums export/smart-views export). These are matched by PATH SUFFIX ONLY (Echo's
 // c.Path() is the route pattern, e.g. "/v1/photos/assets/:id/preview", and
 // does not encode the HTTP method), so this check MUST be GET-only:
 // method 前置校验不可省略 —— 否则会连带放行同后缀的写接口，例如
@@ -46,7 +46,12 @@ func mediaGetSkip(method, path string) bool {
 		// Authorization 头，与 favorites/export 同款 query-token 兜底方案
 		// （见 albums.go AlbumsHandler.Export）。字面量后缀精确匹配路由
 		// pattern（":id" 是字面文本，不是真实 id），不会误伤其它 /export 路由。
-		strings.HasSuffix(path, "/albums/:id/export")
+		strings.HasSuffix(path, "/albums/:id/export") ||
+		// 智能相册 ZIP 下载（GET+token 新端点，修 UI location.href 断链，见
+		// smartviews.go SmartViewsHandler.ExportZip）：与 albums 同款字面量
+		// 后缀精确匹配，且 GET-only 前置校验继续挡住同后缀的既有 POST /export
+		// （format=zip|album）不被误放行。
+		strings.HasSuffix(path, "/smart-views/:id/export")
 }
 
 // mcpReadSkip reports whether a localhost caller may skip JWT on the read-only
@@ -244,7 +249,7 @@ func InitRouter(ctx context.Context, svc service.Services, runtimePath string, t
 	about := v1.NewAboutHandler(svc)
 	g.GET("/about", about.Get)
 
-	smartViews := v1.NewSmartViewsHandler(svc)
+	smartViews := v1.NewSmartViewsHandler(svc, runtimePath)
 	v1.RegisterSmartViewRoutes(g, smartViews)
 
 	// Smart Moments

@@ -25,7 +25,7 @@ func newTestEcho(t *testing.T) *echo.Echo {
 	svc := service.NewTestServices(db)
 	e := echo.New()
 	g := e.Group("/v1/photos")
-	h := v1.NewSmartViewsHandler(svc)
+	h := v1.NewSmartViewsHandler(svc, "")
 	v1.RegisterSmartViewRoutes(g, h)
 	return e
 }
@@ -40,7 +40,7 @@ func newAssetsTestEcho(t *testing.T) (*echo.Echo, *sql.DB) {
 	svc := service.NewTestServices(db)
 	e := echo.New()
 	g := e.Group("/v1/photos")
-	h := v1.NewSmartViewsHandler(svc)
+	h := v1.NewSmartViewsHandler(svc, "")
 	v1.RegisterSmartViewRoutes(g, h)
 	return e, db
 }
