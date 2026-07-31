@@ -184,6 +184,34 @@ func (h *AlbumsHandler) Reorder(c echo.Context) error {
 	return c.NoContent(http.StatusNoContent)
 }
 
+// fromSmartViewReq 是"智能相册→手动相册"转换端点的请求体,字段名对齐库内
+// camelCase 惯例。
+type fromSmartViewReq struct {
+	SmartViewID string `json:"smartViewId"`
+}
+
+// FromSmartView 把智能相册原地固化为手动相册:停止自动更新,当前成员固化,
+// 主题/条件随原智能相册一并删除。
+//
+// POST /v1/photos/albums/from-smartview
+func (h *AlbumsHandler) FromSmartView(c echo.Context) error {
+	var req fromSmartViewReq
+	if err := c.Bind(&req); err != nil || req.SmartViewID == "" {
+		return echo.NewHTTPError(http.StatusBadRequest, "smartViewId is required")
+	}
+	album, err := h.svc.SmartViews().ConvertToAlbum(req.SmartViewID)
+	if errors.Is(err, service.ErrNotFound) {
+		return echo.NewHTTPError(http.StatusNotFound, "smart view not found")
+	}
+	if errors.Is(err, service.ErrAlbumNameExists) {
+		return echo.NewHTTPError(http.StatusConflict, "album name already exists")
+	}
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	}
+	return c.JSON(http.StatusOK, album)
+}
+
 // mapAlbumErr maps service-layer errors to HTTP responses.
 func mapAlbumErr(err error) error {
 	switch {
