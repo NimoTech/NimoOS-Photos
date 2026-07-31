@@ -25,7 +25,7 @@ func TestAlbumSummaryHandler(t *testing.T) {
 	_, err = db.Exec(`INSERT INTO album_assets(album_id, asset_id) VALUES ('al1','p1')`)
 	require.NoError(t, err)
 
-	h := NewAlbumsHandler(service.NewTestServices(db))
+	h := NewAlbumsHandler(service.NewTestServices(db), "")
 	e := echo.New()
 	rec := httptest.NewRecorder()
 	c := e.NewContext(httptest.NewRequest(http.MethodGet, "/", nil), rec)
@@ -45,7 +45,7 @@ func TestAlbumSummaryHandlerNotFound(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { db.Close() })
 
-	h := NewAlbumsHandler(service.NewTestServices(db))
+	h := NewAlbumsHandler(service.NewTestServices(db), "")
 	e := echo.New()
 	rec := httptest.NewRecorder()
 	c := e.NewContext(httptest.NewRequest(http.MethodGet, "/", nil), rec)

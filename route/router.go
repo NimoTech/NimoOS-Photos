@@ -24,7 +24,7 @@ import (
 // mediaGetSkip reports whether a request may skip JWT because it targets a
 // read-only media-serving endpoint that <img>/<video> tags load without an
 // Authorization header (thumbnail/face-thumbnail/original/live/sprite/
-// preview/favorites/export). These are matched by PATH SUFFIX ONLY (Echo's
+// preview/favorites/export/albums export). These are matched by PATH SUFFIX ONLY (Echo's
 // c.Path() is the route pattern, e.g. "/v1/photos/assets/:id/preview", and
 // does not encode the HTTP method), so this check MUST be GET-only:
 // method 前置校验不可省略 —— 否则会连带放行同后缀的写接口，例如
@@ -41,7 +41,12 @@ func mediaGetSkip(method, path string) bool {
 		strings.HasSuffix(path, "/live") ||
 		strings.HasSuffix(path, "/sprite") ||
 		strings.HasSuffix(path, "/preview") ||
-		strings.HasSuffix(path, "/favorites/export")
+		strings.HasSuffix(path, "/favorites/export") ||
+		// 手动相册 ZIP 下载：window.location.href 浏览器导航同样发不出
+		// Authorization 头，与 favorites/export 同款 query-token 兜底方案
+		// （见 albums.go AlbumsHandler.Export）。字面量后缀精确匹配路由
+		// pattern（":id" 是字面文本，不是真实 id），不会误伤其它 /export 路由。
+		strings.HasSuffix(path, "/albums/:id/export")
 }
 
 // mcpReadSkip reports whether a localhost caller may skip JWT on the read-only
@@ -126,7 +131,7 @@ func InitRouter(ctx context.Context, svc service.Services, runtimePath string, t
 	assets := v1.NewAssetsHandler(svc, thumbDir)
 	search := v1.NewSearchHandler(svc)
 	tl := v1.NewTimelineHandler(svc)
-	albums := v1.NewAlbumsHandler(svc)
+	albums := v1.NewAlbumsHandler(svc, runtimePath)
 	faceThumbDir := filepath.Join(filepath.Dir(thumbDir), "face-thumbs")
 	persons := v1.NewPersonsHandler(svc, faceThumbDir, thumbDir, ctx)
 	index := v1.NewIndexHandler(svc, "/DATA/Gallery")
@@ -161,6 +166,7 @@ func InitRouter(ctx context.Context, svc service.Services, runtimePath string, t
 	g.DELETE("/albums/:id", albums.Delete)
 	g.POST("/albums/:id/assets", albums.AddAsset)
 	g.DELETE("/albums/:id/assets/:asset", albums.RemoveAsset)
+	g.GET("/albums/:id/export", albums.Export)
 
 	// Album batch
 	g.POST("/albums/:id/assets/batch", albums.BatchAdd)

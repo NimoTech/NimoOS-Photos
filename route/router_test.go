@@ -46,6 +46,8 @@ func TestMediaGetSkip(t *testing.T) {
 		{"GET assets/:id/sprite allowed", http.MethodGet, base + "/assets/:id/sprite", true},
 		{"GET assets/:id/thumbnail allowed", http.MethodGet, base + "/assets/:id/thumbnail", true},
 		{"GET favorites/export allowed", http.MethodGet, base + "/favorites/export", true},
+		{"GET albums/:id/export allowed", http.MethodGet, base + "/albums/:id/export", true},
+		{"POST albums/:id/export NOT allowed (方法前置校验)", http.MethodPost, base + "/albums/:id/export", false},
 		{"POST smart-views/preview NOT allowed (碰撞回归)", http.MethodPost, base + "/smart-views/preview", false},
 		{"POST assets/:id/preview (若存在) NOT allowed", http.MethodPost, base + "/assets/:id/preview", false},
 		{"PUT assets/:id/sprite (若存在) NOT allowed", http.MethodPut, base + "/assets/:id/sprite", false},
