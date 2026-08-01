@@ -11,8 +11,9 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// semML 的 CLIPTextEmbed 按提示词组返回可分辨的单位向量:文档组 → e0,照片组 → e1。
-// 图向量由测试自行插入,贴近 e0 即语义文档、贴近 e1 即语义照片。
+// semML's CLIPTextEmbed returns a distinguishable unit vector per prompt group:
+// doc group → e0, photo group → e1. The image vector is inserted by the test
+// itself; close to e0 means semantically a document, close to e1 a photo.
 type semML struct{ mockML }
 
 func (m *semML) CLIPTextEmbed(text string) ([]float32, error) {
@@ -27,7 +28,8 @@ func (m *semML) CLIPTextEmbed(text string) ([]float32, error) {
 	return v, nil
 }
 
-// 插入一个带图向量 + OCR 行的资产。vecDir=0 → 贴文档提示词,1 → 贴照片提示词。
+// seedDocAsset inserts an asset with an image vector + OCR lines. vecDir=0 →
+// aligned with the doc prompts, 1 → aligned with the photo prompts.
 func seedDocAsset(t *testing.T, ix *Indexer, id string, vecDir int, boxes [][]float64) {
 	t.Helper()
 	_, err := ix.db.Exec(`INSERT INTO assets(id,file_path,status) VALUES(?,?,'indexed')`, id, "/p/"+id+".jpg")
@@ -54,8 +56,8 @@ func TestComputeDocVerdict(t *testing.T) {
 	db := makeTestDB(t)
 	ix := NewIndexer(db, &semML{}, t.TempDir(), 1)
 
-	seedDocAsset(t, ix, "doc1", 0, regularBoxes(10))   // 语义文档 + 几何规整
-	seedDocAsset(t, ix, "photo1", 1, scatteredBoxes()) // 语义照片 + 几何散乱
+	seedDocAsset(t, ix, "doc1", 0, regularBoxes(10))   // semantically a document + regular geometry
+	seedDocAsset(t, ix, "photo1", 1, scatteredBoxes()) // semantically a photo + scattered geometry
 
 	require.NoError(t, ix.computeDocVerdict("doc1"))
 	require.NoError(t, ix.computeDocVerdict("photo1"))
@@ -65,15 +67,15 @@ func TestComputeDocVerdict(t *testing.T) {
 	require.Equal(t, 1, isDoc)
 	require.Equal(t, 1, docVer)
 	require.NoError(t, db.QueryRow(`SELECT is_doc, doc_ver FROM asset_ocr WHERE asset_id='photo1'`).Scan(&isDoc, &docVer))
-	require.Equal(t, 0, isDoc, "语义照片+几何散乱应被否决")
+	require.Equal(t, 0, isDoc, "semantically a photo + scattered geometry should be rejected")
 
-	// 提示词向量已进 DB 缓存
+	// Prompt vectors should now be in the DB cache
 	var n int
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM clip_text_cache WHERE gen=?`, common.MLModelGen).Scan(&n))
 	require.Equal(t, len(docPrompts)+len(photoPrompts), n)
 }
 
-// offlineML:文本嵌入不可用(模拟 ML 离线)。
+// offlineML: text embedding is unavailable (simulates ML being offline).
 type offlineML struct{ mockML }
 
 func (m *offlineML) CLIPTextEmbed(_ string) ([]float32, error) {
@@ -86,21 +88,21 @@ func TestComputeDocVerdictMLOffline(t *testing.T) {
 	ix := NewIndexer(db, &offlineML{}, t.TempDir(), 1)
 	seedDocAsset(t, ix, "a1", 0, regularBoxes(5))
 
-	require.NoError(t, ix.computeDocVerdict("a1"), "ML 离线不算错误")
+	require.NoError(t, ix.computeDocVerdict("a1"), "ML being offline is not an error")
 
 	var isDoc *int
 	var docVer int
 	var docGeo *float64
 	require.NoError(t, db.QueryRow(`SELECT is_doc, doc_ver, doc_geo FROM asset_ocr WHERE asset_id='a1'`).Scan(&isDoc, &docVer, &docGeo))
-	require.Nil(t, isDoc, "is_doc 留 NULL 等补算")
-	require.Equal(t, 0, docVer, "doc_ver 留 0")
-	require.NotNil(t, docGeo, "几何分不依赖 ML,先落库")
+	require.Nil(t, isDoc, "is_doc stays NULL pending backfill")
+	require.Equal(t, 0, docVer, "doc_ver stays 0")
+	require.NotNil(t, docGeo, "geometry score doesn't depend on ML, persisted first")
 }
 
 func TestComputeDocVerdictNoVector(t *testing.T) {
 	db := makeTestDB(t)
 	ix := NewIndexer(db, &semML{}, t.TempDir(), 1)
-	// 只有 OCR 行、没有图向量
+	// OCR lines only, no image vector
 	_, err := db.Exec(`INSERT INTO assets(id,file_path,status) VALUES('a1','/p/a1.jpg','indexed')`)
 	require.NoError(t, err)
 	_, err = db.Exec(`INSERT INTO asset_ocr(asset_id,text,coverage,line_count,boxes_ver) VALUES('a1','x',0.1,5,1)`)
@@ -109,14 +111,14 @@ func TestComputeDocVerdictNoVector(t *testing.T) {
 	require.NoError(t, ix.computeDocVerdict("a1"))
 	var docVer int
 	require.NoError(t, db.QueryRow(`SELECT doc_ver FROM asset_ocr WHERE asset_id='a1'`).Scan(&docVer))
-	require.Equal(t, 0, docVer, "无向量留待补算")
+	require.Equal(t, 0, docVer, "no vector: leave for backfill")
 }
 
 func TestBackfillDocVerdicts(t *testing.T) {
 	db := makeTestDB(t)
 	ix := NewIndexer(db, &semML{}, t.TempDir(), 1)
 	seedDocAsset(t, ix, "doc1", 0, regularBoxes(10))
-	// 无向量资产:不应入选,也不应阻塞
+	// An asset with no vector: must not be picked up, and must not block the run
 	_, err := db.Exec(`INSERT INTO assets(id,file_path,status) VALUES('novec','/p/n.jpg','indexed')`)
 	require.NoError(t, err)
 	_, err = db.Exec(`INSERT INTO asset_ocr(asset_id,text,coverage,line_count,boxes_ver) VALUES('novec','x',0.1,5,1)`)
@@ -127,10 +129,10 @@ func TestBackfillDocVerdicts(t *testing.T) {
 
 	var docVer int
 	require.NoError(t, db.QueryRow(`SELECT doc_ver FROM asset_ocr WHERE asset_id='doc1'`).Scan(&docVer))
-	require.Equal(t, 1, docVer, "有向量的补算收敛")
+	require.Equal(t, 1, docVer, "the one with a vector converges via backfill")
 	require.NoError(t, db.QueryRow(`SELECT doc_ver FROM asset_ocr WHERE asset_id='novec'`).Scan(&docVer))
-	require.Equal(t, 0, docVer, "无向量的不入选,留待向量补齐后下一轮")
+	require.Equal(t, 0, docVer, "the one without a vector is skipped, left for a later round once its vector arrives")
 
-	// 幂等:再跑一轮无变化不报错
+	// Idempotent: running another round with no changes must not error
 	require.NoError(t, e.BackfillDocVerdicts(context.Background()))
 }

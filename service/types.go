@@ -15,10 +15,10 @@ type Asset struct {
 	// HasOCR reports whether OCR recognized any text in this asset (a row in
 	// asset_ocr with non-empty text). Replaces the old screenshot heuristic as
 	// the third media category: Photos / OCR / Videos.
-	HasOCR bool `json:"hasOcr"`
-	IndexedAt        *time.Time `json:"indexedAt,omitempty"`
-	Status           string     `json:"status"`
-	Checksum         string     `json:"checksum,omitempty"`
+	HasOCR    bool       `json:"hasOcr"`
+	IndexedAt *time.Time `json:"indexedAt,omitempty"`
+	Status    string     `json:"status"`
+	Checksum  string     `json:"checksum,omitempty"`
 
 	// Joined from asset_exif (populated by GetAsset; absent in ListAssets/SmartSearch).
 	Width        int     `json:"width,omitempty"`
@@ -52,8 +52,9 @@ type Asset struct {
 	// filter favorited photos by person; empty elsewhere.
 	Faces []string `json:"faces,omitempty"`
 
-	// 软删除（回收站）相关：DeletedAt 非 nil 表示在回收站；
-	// OriginalPath 为软删除前的原始 file_path，用于恢复与来源文件夹名展示。
+	// Soft-delete (trash) related: DeletedAt non-nil means it's in the trash;
+	// OriginalPath is the original file_path before soft delete, used for
+	// restore and displaying the source folder name.
 	DeletedAt    *time.Time `json:"deletedAt,omitempty"`
 	OriginalPath string     `json:"originalPath,omitempty"`
 
@@ -108,23 +109,23 @@ type FaceDetection struct {
 }
 
 type Person struct {
-	ID           string     `json:"id"`
-	Name         string     `json:"name"`
-	CoverAssetID string     `json:"coverAssetId,omitempty"`
-	CoverFaceID  string     `json:"coverFaceId,omitempty"`
+	ID           string `json:"id"`
+	Name         string `json:"name"`
+	CoverAssetID string `json:"coverAssetId,omitempty"`
+	CoverFaceID  string `json:"coverFaceId,omitempty"`
 	// HeroAssetID is the user-chosen background/hero photo for this person.
 	// Empty when not set or when the referenced asset has been soft-deleted.
 	HeroAssetID string     `json:"heroAssetId,omitempty"`
-	Favorite     bool       `json:"favorite"`
-	Relation     string     `json:"relation"`
-	Confidence   float64    `json:"confidence"`
-	Count        int        `json:"count"`
-	FirstSeen    *time.Time `json:"firstSeen,omitempty"`
-	LastSeen     *time.Time `json:"lastSeen,omitempty"`
-	PlacesCount  int        `json:"placesCount"`
+	Favorite    bool       `json:"favorite"`
+	Relation    string     `json:"relation"`
+	Confidence  float64    `json:"confidence"`
+	Count       int        `json:"count"`
+	FirstSeen   *time.Time `json:"firstSeen,omitempty"`
+	LastSeen    *time.Time `json:"lastSeen,omitempty"`
+	PlacesCount int        `json:"placesCount"`
 }
 
-// PersonRelation 是 PersonService.PersonRelations 返回的共现统计行。
+// PersonRelation is a co-occurrence stats row returned by PersonService.PersonRelations.
 type PersonRelation struct {
 	PersonID    string `json:"personId"`
 	Name        string `json:"name"`
@@ -132,7 +133,7 @@ type PersonRelation struct {
 	Count       int    `json:"count"`
 }
 
-// MergeSuggestion 是 PersonService.MergeSuggestions 返回的候选合并对。
+// MergeSuggestion is a candidate merge pair returned by PersonService.MergeSuggestions.
 type MergeSuggestion struct {
 	ID         string  `json:"id"`
 	FromID     string  `json:"fromId"`
@@ -144,7 +145,7 @@ type MergeSuggestion struct {
 	Reason     string  `json:"reason"`
 }
 
-// PersonPlace 是 PersonService.PersonPlaces 返回的 GPS 点。
+// PersonPlace is a GPS point returned by PersonService.PersonPlaces.
 type PersonPlace struct {
 	Latitude  float64    `json:"latitude"`
 	Longitude float64    `json:"longitude"`

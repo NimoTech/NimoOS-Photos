@@ -38,14 +38,14 @@ func TestAboutReturnsVersionAndStats(t *testing.T) {
 	require.Contains(t, body, `"indexLastBuilt":"2026-06-01T00:00:00Z"`)
 }
 
-// TestAboutExcludesOffline 验证 librarySince/indexCoverage 两处统计不计入
-// offline=1(移动盘已拔出)的资产,口径与其余展示面一致。
+// TestAboutExcludesOffline verifies that the librarySince/indexCoverage stats
+// exclude offline=1 assets (removable drive unplugged), consistent with the rest of the display.
 func TestAboutExcludesOffline(t *testing.T) {
 	db, err := sqlite.Open(filepath.Join(t.TempDir(), "off.db"))
 	require.NoError(t, err)
 	t.Cleanup(func() { db.Close() })
 
-	// offline 资产的 indexed_at 更早:若未过滤,librarySince 会取到它。
+	// The offline asset's indexed_at is earlier: if not filtered out, librarySince would pick it up.
 	_, err = db.Exec(`INSERT INTO assets(id, file_path, status, indexed_at) VALUES
 		('offline','/media/X/a.jpg','indexed','2020-01-01 08:00:00'),
 		('online','/x/b.jpg','indexed','2024-04-12 08:00:00')`)
@@ -63,11 +63,11 @@ func TestAboutExcludesOffline(t *testing.T) {
 	require.NoError(t, h.Get(e.NewContext(httptest.NewRequest(http.MethodGet, "/", nil), rec)))
 
 	body := rec.Body.String()
-	require.Contains(t, body, `"librarySince":"2024-04-12`, "librarySince 不应取到 offline 资产的时间")
-	require.Contains(t, body, `"indexCoverage":1`, "indexCoverage 不应计入 offline 资产")
+	require.Contains(t, body, `"librarySince":"2024-04-12`, "librarySince should not pick up the offline asset's time")
+	require.Contains(t, body, `"indexCoverage":1`, "indexCoverage should not count the offline asset")
 }
 
-// TestAboutEmptyLibrary 空库时 librarySince/indexLastBuilt 为 null、coverage 为 0。
+// TestAboutEmptyLibrary: with an empty library, librarySince/indexLastBuilt are null and coverage is 0.
 func TestAboutEmptyLibrary(t *testing.T) {
 	db, err := sqlite.Open(filepath.Join(t.TempDir(), "empty.db"))
 	require.NoError(t, err)

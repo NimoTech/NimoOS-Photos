@@ -24,7 +24,7 @@ func setupConfigTest(t *testing.T) *ConfigHandler {
 	return NewConfigHandler(service.NewTestServices(db))
 }
 
-// GET 返回三个新开关字段。
+// GET returns the three new toggle fields.
 func TestGetConfigIncludesNewFlags(t *testing.T) {
 	h := setupConfigTest(t)
 	e := echo.New()
@@ -37,10 +37,13 @@ func TestGetConfigIncludesNewFlags(t *testing.T) {
 	require.Contains(t, body, `"smartViewEnabled":true`)
 }
 
-// PUT watchDirs 为空清单必须放行（= 显式切换到自动模式，范围由
-// EnumerateScanRoots 动态决定），不得 400。回归覆盖：终审发现 main 遗留的
-// “watchDirs must not be empty” 校验会拦掉规格承诺的自动模式切换，以及新装机
-// 默认 watchDirs 为空时前端 GET 回填 [] 再 PUT 回写会被 400 挡住的场景。
+// PUT with an empty watchDirs list must be let through (= an explicit switch
+// to auto mode, scope decided dynamically by EnumerateScanRoots), not 400.
+// Regression coverage: final review found a "watchDirs must not be empty"
+// check left over on main that would block the auto-mode switch promised by
+// the spec, as well as the fresh-install scenario where the frontend GETs an
+// empty default watchDirs, fills it back as [], and PUTs it — which would be
+// blocked with 400.
 func TestUpdateConfigEmptyWatchDirsSwitchesToAutoMode(t *testing.T) {
 	h := setupConfigTest(t)
 	e := echo.New()
@@ -50,10 +53,10 @@ func TestUpdateConfigEmptyWatchDirsSwitchesToAutoMode(t *testing.T) {
 	rec := httptest.NewRecorder()
 	require.NoError(t, h.UpdateConfig(e.NewContext(req, rec)))
 	require.Equal(t, http.StatusOK, rec.Code)
-	require.Empty(t, config.Cfg.WatchDirs, "空清单应落地为自动模式，不得保留旧值或报错")
+	require.Empty(t, config.Cfg.WatchDirs, "an empty list should land as auto mode, not keep the old value or error")
 }
 
-// PUT 可单独更新 scenesEnabled，未传字段保持现值。
+// PUT can update scenesEnabled alone; omitted fields keep their current value.
 func TestUpdateConfigPartialFlags(t *testing.T) {
 	h := setupConfigTest(t)
 	e := echo.New()
@@ -63,7 +66,7 @@ func TestUpdateConfigPartialFlags(t *testing.T) {
 	rec := httptest.NewRecorder()
 	require.NoError(t, h.UpdateConfig(e.NewContext(req, rec)))
 	require.False(t, config.Cfg.ScenesEnabled)
-	require.True(t, config.Cfg.OCREnabled)       // 未传，保持 true
-	require.True(t, config.Cfg.FacesEnabled)      // 未传，保持 true
-	require.True(t, config.Cfg.SmartViewEnabled) // 未传，保持 true
+	require.True(t, config.Cfg.OCREnabled)       // not sent, stays true
+	require.True(t, config.Cfg.FacesEnabled)     // not sent, stays true
+	require.True(t, config.Cfg.SmartViewEnabled) // not sent, stays true
 }

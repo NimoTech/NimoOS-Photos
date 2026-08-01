@@ -1,13 +1,18 @@
-// Smart Moments 数据层:三表(moment_recipes/moments/moment_assets)的 repo。
+// Smart Moments data layer: repo for three tables (moment_recipes/moments/moment_assets).
 //
-// moment_recipes 是"时刻类型=数据"的热更新载体——engine 按 kind 分派算法,
-// clip_prompts/caption_keywords/阈值等参数纯数据上新,PUT recipes 即可生效,
-// 无需改代码(真正需要新算法的 kind 除外)。
+// moment_recipes is the hot-update carrier for "moment kind = data" — the engine
+// dispatches algorithms by kind, and pure-data params like clip_prompts/
+// caption_keywords/thresholds take effect via PUT recipes, no code change needed
+// (except for kinds that genuinely need a new algorithm).
 //
-// moments/moment_assets 是活实体:稳定派生 id(TripMomentID/ThemeMomentID),
-// 每轮重算按 id upsert + 成员 diff 式 upsert(既有成员保留 added_at、缺席者
-// 删除但豁免 pin 成员),用户看到的时刻不因重算而闪断;LLM 已命名过的 title(named_by_llm=1)重算时原样保留,只有
-// 模板打底阶段(named_by_llm=0)的 title 才会被下一轮重算的模板结果覆盖。
+// moments/moment_assets are live entities with stable derived ids
+// (TripMomentID/ThemeMomentID): each recalculation round upserts by id + does a
+// diff-style member upsert (existing members keep added_at, absent ones are
+// deleted but pinned members are exempt), so the moments the user sees don't
+// flicker across recalculations; a title the LLM has already named
+// (named_by_llm=1) is kept as-is on recalculation, and only a title still in
+// the template-seeded stage (named_by_llm=0) gets overwritten by the next
+// round's template result.
 package service
 
 import (
@@ -20,8 +25,9 @@ import (
 	"time"
 )
 
-// MomentRecipe 对应 moment_recipes 表一行。ParamsJSON 是原始 JSON 字符串,
-// 具体字段经 ParseParams 解析为 RecipeParams(带默认值填充)。
+// MomentRecipe corresponds to one row of the moment_recipes table. ParamsJSON
+// is the raw JSON string; its concrete fields are parsed into RecipeParams
+// (with defaults filled in) via ParseParams.
 type MomentRecipe struct {
 	Key        string
 	Kind       string // "trip" | "theme"
@@ -31,8 +37,9 @@ type MomentRecipe struct {
 	UpdatedAt  int64 // Unix ms
 }
 
-// RecipeParams 是 moment_recipes.params 列的解析结果。json tag 用蛇形命名,
-// 与 PUT /v1/photos/moments/recipes 的推送 JSON 格式一致。
+// RecipeParams is the parsed result of the moment_recipes.params column. The
+// json tags use snake_case, matching the JSON format pushed via
+// PUT /v1/photos/moments/recipes.
 type RecipeParams struct {
 	ClipPrompts     []string `json:"clip_prompts"`
 	CaptionKeywords []string `json:"caption_keywords"`
@@ -42,21 +49,24 @@ type RecipeParams struct {
 	TopK            int      `json:"top_k"`
 	MinScore        float64  `json:"min_score"`
 
-	// ── Moments M2 画像层新增字段(profile:pets / profile:family 专用)──────
-	// Lexicon 无默认回落(未指定就是空词表,凭空回落一份猜的词表比空更危险);
-	// 其余字段(含 MinAssets,family 的"合影集门槛"复用该既有字段)照旧
-	// "零值即未指定"回落默认值,见 ParseParams 注释。
-	Lexicon            []string `json:"lexicon"`              // profile:pets:物种/品种英文词表
-	MinPhotos          int      `json:"min_photos"`           // profile:pets:达标最少张数
-	MinMonths          int      `json:"min_months"`           // profile:pets:达标最少跨月数
-	ClipMinScore       float64  `json:"clip_min_score"`       // profile:pets:CLIP 检索最低分
-	ClipTopK           int      `json:"clip_top_k"`           // profile:pets:CLIP 检索 top-K
-	TopPersons         int      `json:"top_persons"`          // profile:family:具名人物时刻取前 K 高频人物
-	MinPersonPhotos    int      `json:"min_person_photos"`    // profile:family:人物达标最少张数
-	MinTogetherPersons int      `json:"min_together_persons"` // profile:family:合影集同框最少人数
+	// ── Moments M2 profile-layer fields (profile:pets / profile:family only) ──
+	// Lexicon has no default fallback: unspecified means an empty word list —
+	// falling back to a guessed word list out of thin air is riskier than an
+	// empty one. The remaining fields (including MinAssets, reused by family's
+	// "group-photo threshold") still fall back to defaults under the
+	// "zero value means unspecified" rule; see the ParseParams comment.
+	Lexicon            []string `json:"lexicon"`              // profile:pets: English species/breed word list
+	MinPhotos          int      `json:"min_photos"`           // profile:pets: min photo count to qualify
+	MinMonths          int      `json:"min_months"`           // profile:pets: min month span to qualify
+	ClipMinScore       float64  `json:"clip_min_score"`       // profile:pets: CLIP retrieval min score
+	ClipTopK           int      `json:"clip_top_k"`           // profile:pets: CLIP retrieval top-K
+	TopPersons         int      `json:"top_persons"`          // profile:family: top-K most frequent named persons for named-person moments
+	MinPersonPhotos    int      `json:"min_person_photos"`    // profile:family: min photo count for a person to qualify
+	MinTogetherPersons int      `json:"min_together_persons"` // profile:family: min number of people appearing together for a group-photo moment
 }
 
-// 默认值:recipe 未显式指定(或字段缺省为零值)时的兜底,详见简报。
+// Defaults: fallback when a recipe doesn't explicitly specify a field (or the
+// field is zero-valued); see the design brief for details.
 const (
 	defaultMinAssets   = 10
 	defaultMaxFeatured = 12
@@ -64,22 +74,25 @@ const (
 	defaultTopK        = 200
 	defaultMinScore    = 0.2
 
-	// profile:pets 默认值(见设计 spec 第一节)。
+	// profile:pets defaults (see section 1 of the design spec).
 	defaultMinPhotos    = 8
 	defaultMinMonths    = 2
 	defaultClipMinScore = 0.45
 	defaultClipTopK     = 100
 
-	// profile:family 默认值(见设计 spec 第一节)。
+	// profile:family defaults (see section 1 of the design spec).
 	defaultTopPersons         = 5
 	defaultMinPersonPhotos    = 30
 	defaultMinTogetherPersons = 2
 )
 
-// ParseParams 解析 recipe.ParamsJSON 为 RecipeParams,对缺省(零值)字段填充
-// 默认值。注意:这里用"零值即未指定"判断是否回落默认值——recipe 参数语义
-// 上没有"故意设为 0"的合理场景(min_assets=0/gap_days=0 等没有实际意义),
-// 所以零值回落是安全的简化,不需要区分"未出现的 key"与"显式写 0"。
+// ParseParams parses recipe.ParamsJSON into RecipeParams, filling in defaults
+// for missing (zero-valued) fields. Note: this uses "zero value means
+// unspecified" to decide whether to fall back to a default — there's no
+// legitimate recipe-param scenario for "deliberately set to 0"
+// (min_assets=0/gap_days=0 etc. are meaningless), so falling back on zero is
+// a safe simplification; there's no need to distinguish "key absent" from
+// "explicitly written as 0".
 func ParseParams(r MomentRecipe) (RecipeParams, error) {
 	var p RecipeParams
 	if s := strings.TrimSpace(r.ParamsJSON); s != "" {
@@ -123,12 +136,14 @@ func ParseParams(r MomentRecipe) (RecipeParams, error) {
 	if p.MinTogetherPersons == 0 {
 		p.MinTogetherPersons = defaultMinTogetherPersons
 	}
-	// Lexicon 故意不回落默认值:未指定就是空词表(见字段注释)。
+	// Lexicon deliberately does not fall back to a default: unspecified means
+	// an empty word list (see the field comment).
 	return p, nil
 }
 
-// Moment 对应 moments 表一行(活实体)。TimeFrom/TimeTo 为零值 time.Time 时
-// 表示该列在库中是 NULL(主题类时刻没有固定时间窗)。
+// Moment corresponds to one row of the moments table (a live entity).
+// TimeFrom/TimeTo being a zero-value time.Time means the column is NULL in
+// the DB (theme-kind moments have no fixed time window).
 type Moment struct {
 	ID           string
 	RecipeKey    string
@@ -142,62 +157,74 @@ type Moment struct {
 	NamedByLLM   bool
 	CreatedAt    int64 // Unix ms
 	UpdatedAt    int64 // Unix ms
-	// SortOrder 对应 sort_order 列:nil=未手排(NULL 语义保真,与"手排到 0"
-	// 区分);非 nil 时是 ReorderMoments 写入的 (i+1)*10 序号。
+	// SortOrder corresponds to the sort_order column: nil means "not manually
+	// ordered" (preserving NULL semantics faithfully, distinct from "manually
+	// ordered to 0"); when non-nil it's the (i+1)*10 sequence number written
+	// by ReorderMoments.
 	SortOrder *int
-	// Hidden 对应 hidden 列:用户"隐藏此时刻"的 tombstone。ListMoments 按
-	// hidden=0 过滤,SyncRecipeMoments 重算不会清除(不在 upsert 列清单里,
-	// 与 named_by_llm/sort_order 同法)。
+	// Hidden corresponds to the hidden column: a tombstone for the user
+	// "hiding this moment". ListMoments filters on hidden=0, and
+	// SyncRecipeMoments recalculation never clears it (it's not in the upsert
+	// column list, same treatment as named_by_llm/sort_order).
 	Hidden bool
 }
 
-// MomentAsset 对应 moment_assets 表一行。
+// MomentAsset corresponds to one row of the moment_assets table.
 type MomentAsset struct {
 	AssetID  string
 	Featured bool
 	Score    float64
-	// Manual 对应 manual 列:1=该成员是用户 pin 编辑回放插入(非引擎本轮产出),
-	// 仅供展示/排障区分来源。
+	// Manual corresponds to the manual column: 1 means this member was
+	// inserted by replaying a user pin edit (not produced by the engine this
+	// round); used only for display/debugging to distinguish the source.
 	Manual bool
-	// AddedAt 对应 added_at 列:成员加入时刻的 Unix ms 时间戳,0=NULL(存量/
-	// 加入时间未知,不参与"本周新增"计数)。仅供内部/测试使用,资产端点不
-	// 直接暴露该字段(见简报)。
+	// AddedAt corresponds to the added_at column: the Unix ms timestamp of
+	// when the member was added, 0=NULL (legacy data / join time unknown,
+	// excluded from the "added this week" count). For internal/test use
+	// only; the asset endpoint does not expose this field directly (see the
+	// design brief).
 	AddedAt int64
 }
 
-// MomentPlace 是 About 多地点展示的一条聚合结果:某城市在时刻成员中出现的
-// 次数,供 PlacesByMoment 按次数降序返回。
+// MomentPlace is one aggregated result for the About multi-location display:
+// how many times a city appears among a moment's members, returned by
+// PlacesByMoment in descending order of count.
 type MomentPlace struct {
 	Name  string
 	Count int
 }
 
-// MomentDraft 是引擎每轮重算产出的候选时刻(尚未落库的草稿):嵌入 Moment 的
-// 展示字段 + 本轮全量成员集合。SyncRecipeMoments 按 ID 幂等合并进库。
+// MomentDraft is the candidate moment produced by the engine each
+// recalculation round (a draft not yet persisted): it embeds Moment's
+// display fields plus this round's full member set. SyncRecipeMoments
+// idempotently merges it into the DB by ID.
 type MomentDraft struct {
 	Moment
 	Assets []MomentAsset
 }
 
-// MomentStore 是 Smart Moments 三表的 repo 层,纯 SQL,无 ORM(照本库
-// captionpull.go 等既有 store 的风格)。
+// MomentStore is the repo layer for the three Smart Moments tables, plain
+// SQL with no ORM (following the style of existing stores in this repo like
+// captionpull.go).
 type MomentStore struct {
 	db *sql.DB
 }
 
-// NewMomentStore 构造 MomentStore。
+// NewMomentStore constructs a MomentStore.
 func NewMomentStore(db *sql.DB) *MomentStore {
 	return &MomentStore{db: db}
 }
 
-// nowMs 返回当前 Unix 毫秒时间戳(moments/moment_recipes 的 *_at 列约定)。
+// nowMs returns the current Unix millisecond timestamp (the convention for
+// the *_at columns of moments/moment_recipes).
 func nowMs() int64 {
 	return time.Now().UnixMilli()
 }
 
-// ── recipe 种子 ──────────────────────────────────────────────────────────
+// ── recipe seeds ─────────────────────────────────────────────────────────
 
-// seedRecipe 是内置 recipe 的声明式描述,拼装成 MomentRecipe 落库。
+// seedRecipe is a declarative description of a built-in recipe, assembled
+// into a MomentRecipe for persistence.
 type seedRecipe struct {
 	key    string
 	kind   string
@@ -205,17 +232,21 @@ type seedRecipe struct {
 	params RecipeParams
 }
 
-// defaultSeedRecipes 是启动时 seed 的内置集:trip(时间窗×地点)+ 首批
-// theme(caption 关键词 + CLIP prompt 并集匹配)。clip_prompts 是给 CLIP 的
-// 自然描述句(而非关键词堆砌),caption_keywords 是小写单词,供
-// instr(lower(text),...) 匹配 asset_caption。文案面向英文用户,产品默认
-// 展示语言是英文,中文由前端 i18n 负责。
+// defaultSeedRecipes is the built-in set seeded at startup: trip (time
+// window × location) + the first batch of themes (caption keywords + CLIP
+// prompt union matching). clip_prompts are natural descriptive sentences for
+// CLIP (not keyword stuffing), caption_keywords are lowercase words matched
+// against asset_caption via instr(lower(text),...). Copy targets
+// English-speaking users — the product's default display language is
+// English, and Chinese is handled by the frontend i18n layer.
 func defaultSeedRecipes() []seedRecipe {
 	return []seedRecipe{
 		{
 			key: "trip", kind: "trip", title: "Trip",
-			// trip 的展示名由引擎按 "{主城} Trip" 模板动态生成(见设计 spec
-			// 第二节),这里的 title 只是 recipe 管理列表里的通用标签。
+			// trip's display name is generated dynamically by the engine from
+			// the "{main city} Trip" template (see section 2 of the design
+			// spec); the title here is just a generic label in the recipe
+			// management list.
 			params: RecipeParams{},
 		},
 		{
@@ -254,12 +285,17 @@ func defaultSeedRecipes() []seedRecipe {
 			},
 		},
 		{
-			// profile:pets 是画像层挖掘配置(kind=pet_entities,与上面
-			// theme:pets 的"全库搜含宠物元素"概念版不同):对 lexicon 每词做
-			// caption 词边界匹配,统计张数+跨月数,达标(≥min_photos 且
-			// ≥min_months)才归纳成"用户自己的那只狗/猫"实体,详见设计
-			// spec 第一节。lexicon 覆盖常见狗/猫品种 + 鸟类 + 小宠,英文,
-			// 供词边界匹配;多词短语(如 "maine coon")按整短语边界匹配。
+			// profile:pets is the profile-layer mining config (kind=pet_entities,
+			// distinct from theme:pets above, which is the "whole-library
+			// search for pet-related content" concept version): it does
+			// word-boundary caption matching for each lexicon entry, tallies
+			// photo count + month span, and only when it qualifies
+			// (>=min_photos and >=min_months) does it get distilled into a
+			// "the user's own dog/cat" entity — see section 1 of the design
+			// spec for details. lexicon covers common dog/cat breeds + birds
+			// + small pets, in English, for word-boundary matching;
+			// multi-word phrases (like "maine coon") are matched as a
+			// whole-phrase boundary.
 			key: "profile:pets", kind: "pet_entities", title: "Pet Entities",
 			params: RecipeParams{
 				Lexicon:   petEntityLexicon(),
@@ -268,9 +304,12 @@ func defaultSeedRecipes() []seedRecipe {
 			},
 		},
 		{
-			// profile:family 是画像层家人挖掘配置(kind=family):具名人物
-			// 出现频次达标 top-K 归纳为具名人物时刻,高频人物同框归纳为合影集,
-			// 详见设计 spec 第一节。
+			// profile:family is the profile-layer family mining config
+			// (kind=family): named persons whose appearance frequency
+			// qualifies for the top-K are distilled into named-person
+			// moments, and frequent persons appearing together are distilled
+			// into group-photo moments — see section 1 of the design spec
+			// for details.
 			key: "profile:family", kind: "family", title: "Family Entities",
 			params: RecipeParams{
 				TopPersons: defaultTopPersons, MinPersonPhotos: defaultMinPersonPhotos,
@@ -280,30 +319,43 @@ func defaultSeedRecipes() []seedRecipe {
 	}
 }
 
-// petEntityLexicon 是 profile:pets 挖掘用的物种/品种英文词表:覆盖常见狗/猫
-// 品种 + 鸟类 + 小型宠物,约 60-100 词,供 caption 词边界匹配。刻意不含过于
-// 宽泛的词(如单独的 "dog"/"cat"——那是 theme:pets 概念版的职责,画像层要的
-// 是能收敛到"用户特定那只"的具体品种/物种词,复现性信号才有区分力)。
+// petEntityLexicon is the species/breed English word list used by profile:pets
+// mining: covers common dog/cat breeds + birds + small pets, roughly 60-100
+// words, for caption word-boundary matching. Deliberately excludes overly
+// broad words (like a bare "dog"/"cat" — that's the job of the theme:pets
+// concept version; what the profile layer needs is specific breed/species
+// words that converge on "the user's particular one", since only a
+// recurrence signal has discriminative power).
 //
-// 审查后修复(高频误匹配词,美国市场场景):
-//   - 删除 newfoundland(纽芬兰,地名同形)、finch(常见姓氏,如 Atticus Finch)、
-//     canary(加纳利群岛,Canary Islands 同形)、goldfish(Goldfish 品牌饼干同名,
-//     且真金鱼 caption 通常连写 "goldfish in a bowl" 一类短语,裸词误召回风险
-//     大于收益)。
-//   - 单词有歧义的品种消歧为短语:akita→"akita dog"、boxer→"boxer dog"、
-//     greyhound→"greyhound dog"(避免与拳击手 boxer / 田径 greyhound 巴士等
-//     混淆);裸 "shepherd" 换成具体品种 "german shepherd"/"australian shepherd"
-//     (裸词本身就不够具体,不如直接两个高频具体品种)。
-//   - 猫的花纹词(tabby/calico/tuxedo/ginger 等)本身极常见于口语但单独一词
-//     歧义大(如 "tuxedo" 可指礼服),但 VLM 生成的 caption 描述猫时几乎只说
-//     花纹+"cat"(如 "a tabby cat"),极少报具体品种——若删掉这类词,大部分
-//     用户的猫根本挖不出来实体。因此这里的取舍是:花纹词全部保留,但一律
-//     锚成 "<花纹> cat" 双词短语(而非裸花纹词),把"猫品种词有限"的专属性
-//     风险交给挖掘门槛(min_photos/min_months 的复现性判据)兜底,而不是在
-//     词表层面因噎废食。
+// Fixed after review (high-frequency false-match words, US market scenario):
+//   - Removed newfoundland (homograph with the place name Newfoundland),
+//     finch (a common surname, e.g. Atticus Finch), canary (homograph with
+//     the Canary Islands), goldfish (homonym with the Goldfish cracker
+//     brand, and real-goldfish captions usually write phrases like
+//     "goldfish in a bowl" anyway, so the bare-word false-recall risk
+//     outweighs the benefit).
+//   - Disambiguated breeds whose single word is ambiguous into phrases:
+//     akita->"akita dog", boxer->"boxer dog", greyhound->"greyhound dog"
+//     (avoiding confusion with the boxer sport / greyhound bus etc.); bare
+//     "shepherd" replaced with the specific breeds "german shepherd"/
+//     "australian shepherd" (the bare word isn't specific enough on its
+//     own, so might as well use the two high-frequency specific breeds
+//     directly).
+//   - Cat coat-pattern words (tabby/calico/tuxedo/ginger etc.) are
+//     themselves extremely common in everyday speech but ambiguous as a
+//     single word (e.g. "tuxedo" can mean the suit), yet VLM-generated
+//     captions describing cats almost always say pattern+"cat" (e.g. "a
+//     tabby cat") and rarely report the specific breed — dropping these
+//     words would make most users' cats un-minable as entities. So the
+//     trade-off here is: keep all the pattern words, but always anchor them
+//     as "<pattern> cat" two-word phrases (rather than the bare pattern
+//     word), leaving the "cat breed words are limited" exposure risk to be
+//     backstopped by the mining threshold (the recurrence criteria of
+//     min_photos/min_months) instead of throwing out the baby with the
+//     bathwater at the word-list level.
 func petEntityLexicon() []string {
 	return []string{
-		// ── Dogs(品种,不含泛化的 "dog"/"puppy";歧义词见上方注释消歧)──
+		// ── Dogs (breeds, excludes generic "dog"/"puppy"; ambiguous words disambiguated per comment above) ──
 		"beagle", "labrador", "corgi", "husky", "poodle", "terrier", "retriever",
 		"bulldog", "dachshund", "chihuahua", "pug", "german shepherd",
 		"australian shepherd", "collie", "spaniel", "dalmatian", "boxer dog",
@@ -311,23 +363,24 @@ func petEntityLexicon() []string {
 		"whippet", "pomeranian", "shih tzu", "maltese", "chow chow", "akita dog",
 		"samoyed", "malamute", "bernese mountain dog", "labradoodle",
 		"goldendoodle", "basset hound", "bloodhound",
-		// ── Cats(品种 + 花纹词,花纹词均锚成 "<花纹> cat" 短语,见上方注释)──
+		// ── Cats (breeds + coat-pattern words, pattern words all anchored as "<pattern> cat" phrases, see comment above) ──
 		"tabby cat", "siamese", "persian cat", "maine coon", "ragdoll", "sphynx",
 		"bengal cat", "calico cat", "tuxedo cat", "ginger cat", "orange cat",
 		"tortoiseshell cat", "british shorthair", "scottish fold", "abyssinian",
 		"burmese cat", "russian blue", "himalayan cat",
-		// ── Birds(canary/finch 因地名/姓氏同形误召回已删,见上方注释)──────
+		// ── Birds (canary/finch removed due to place-name/surname homograph false recall, see comment above) ──
 		"parrot", "parakeet", "cockatiel", "budgie", "macaw", "cockatoo",
 		"lovebird",
-		// ── Small pets(goldfish 因品牌同名已删,见上方注释)───────────────
+		// ── Small pets (goldfish removed due to brand-name homonym, see comment above) ──
 		"hamster", "rabbit", "bunny", "guinea pig", "turtle", "tortoise",
 		"gecko", "ferret", "chinchilla", "hedgehog", "iguana",
 	}
 }
 
-// SeedDefaultRecipes 用 INSERT OR IGNORE 写入内置 recipe 集,已存在的 key
-// (含运维/应用商店已推送过热更新的)原样跳过,不覆盖。可在每次启动时
-// 安全重复调用(幂等)。
+// SeedDefaultRecipes writes the built-in recipe set with INSERT OR IGNORE;
+// keys that already exist (including ones already hot-updated by ops/the app
+// store) are skipped as-is, never overwritten. Safe to call repeatedly on
+// every startup (idempotent).
 func (s *MomentStore) SeedDefaultRecipes() error {
 	now := nowMs()
 	for _, sr := range defaultSeedRecipes() {
@@ -346,9 +399,10 @@ func (s *MomentStore) SeedDefaultRecipes() error {
 	return nil
 }
 
-// ── recipe 读写 ──────────────────────────────────────────────────────────
+// ── recipe read/write ────────────────────────────────────────────────────
 
-// ListRecipes 列出全部 recipe;enabledOnly=true 时只返回 enabled=1 的。
+// ListRecipes lists all recipes; when enabledOnly=true, only returns those
+// with enabled=1.
 func (s *MomentStore) ListRecipes(enabledOnly bool) ([]MomentRecipe, error) {
 	q := `SELECT key, kind, title, params, enabled, updated_at FROM moment_recipes`
 	if enabledOnly {
@@ -374,9 +428,10 @@ func (s *MomentStore) ListRecipes(enabledOnly bool) ([]MomentRecipe, error) {
 	return out, rows.Err()
 }
 
-// UpsertRecipes 是 recipe 的热更新入口:按 Key upsert 全字段,updated_at 一律
-// 写入服务器当前时间(忽略调用方传入的 UpdatedAt),供 `PUT
-// /v1/photos/moments/recipes` 推送新/改类型定义使用。
+// UpsertRecipes is the hot-update entry point for recipes: upserts all
+// fields by Key, always writing the server's current time for updated_at
+// (ignoring the caller-supplied UpdatedAt), used by `PUT
+// /v1/photos/moments/recipes` to push new/changed type definitions.
 func (s *MomentStore) UpsertRecipes(recipes []MomentRecipe) error {
 	if len(recipes) == 0 {
 		return nil
@@ -412,10 +467,11 @@ func (s *MomentStore) UpsertRecipes(recipes []MomentRecipe) error {
 	return nil
 }
 
-// ── moments 读写 ─────────────────────────────────────────────────────────
+// ── moments read/write ───────────────────────────────────────────────────
 
-// nullTimeArg 把零值 time.Time 转成 SQL NULL 参数,非零值格式化为本库既有
-// DATETIME 惯例的字符串(与 assets.taken_at 同型,见 places.go 写法)。
+// nullTimeArg converts a zero-value time.Time into a SQL NULL parameter, and
+// formats non-zero values as a string following this repo's existing
+// DATETIME convention (same shape as assets.taken_at, see places.go).
 func nullTimeArg(t time.Time) interface{} {
 	if t.IsZero() {
 		return nil
@@ -423,16 +479,21 @@ func nullTimeArg(t time.Time) interface{} {
 	return t.UTC().Format("2006-01-02 15:04:05")
 }
 
-// SyncRecipeMoments 是幂等重算的落库入口:事务内对每个 draft 按 ID upsert
-// moments(named_by_llm=1 的既有行保留其 title/named_by_llm,其余字段更新)
-// + 成员 diff 式 upsert(ON CONFLICT 刷新 featured/score/manual 但不触碰
-// added_at;缺席成员删除但豁免有 pin 编辑者,防止"删了又被回放补插"把
-// added_at 轮刷成假新鲜);随后删除该 recipeKey 下
-// 不在本轮 drafts id 集合里的旧 moments(级联清成员),使消失的时刻(如
-// gap 重新切分后不再成团的旧 trip)从库中退出。
+// SyncRecipeMoments is the persistence entry point for idempotent
+// recalculation: inside a transaction, for each draft it upserts moments
+// (existing rows with named_by_llm=1 keep their title/named_by_llm, other
+// fields are updated) + does a diff-style member upsert (ON CONFLICT
+// refreshes featured/score/manual but doesn't touch added_at; absent
+// members are deleted but pinned editors are exempt, preventing "deleted
+// then re-inserted by edit replay" from cycling pinned members' added_at
+// into false freshness); it then deletes old moments under this recipeKey
+// that aren't in this round's draft id set (cascading member cleanup),
+// making disappeared moments (e.g. an old trip that no longer clusters
+// together after the gap is re-split) exit the DB.
 //
-// 用户可见的时刻不因重算而闪断:同 id 的 upsert 不会先删再插,只是字段
-// 原地刷新。
+// Moments visible to the user don't flicker across recalculation: an upsert
+// for the same id never deletes-then-inserts, it just refreshes fields in
+// place.
 func (s *MomentStore) SyncRecipeMoments(recipeKey string, drafts []MomentDraft) error {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -442,7 +503,7 @@ func (s *MomentStore) SyncRecipeMoments(recipeKey string, drafts []MomentDraft) 
 	keepIDs := make([]string, 0, len(drafts))
 
 	for _, d := range drafts {
-		namedByLLM := 0 // 草稿(模板打底)永远不是 LLM 命名;沿用/覆盖靠下面的 CASE。
+		namedByLLM := 0 // A draft (template-seeded) is never LLM-named; keep-or-override is handled by the CASE below.
 		if _, err := tx.Exec(`
 			INSERT INTO moments(id, recipe_key, title, subtitle, cover_asset_id, time_from, time_to, place, asset_count, named_by_llm, created_at, updated_at)
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -464,14 +525,18 @@ func (s *MomentStore) SyncRecipeMoments(recipeKey string, drafts []MomentDraft) 
 			return fmt.Errorf("moments: upsert moment %q: %w", d.ID, err)
 		}
 
-		// 成员 diff 式 upsert(spec 1.2 四步语义,保住 added_at,语义等价于旧
-		// "整体替换 delete+insert"):
-		//  1. 对本轮 draft 每个成员 upsert:冲突分支只刷新 featured/score/
-		//     manual,不触碰 added_at(既有成员保留原加入时间;NULL 也保留
-		//     NULL);真正新插入的行打当前时间戳。
-		//  2. 删除"本轮未产出"的旧成员,但豁免 pin 成员——否则"删了又被
-		//     下面的 applyMomentEdits 回放补插"会把 pin 成员的 added_at
-		//     每轮刷新成 now(假新鲜坑,见 spec)。
+		// Diff-style member upsert (spec 1.2's four-step semantics, preserving
+		// added_at, semantically equivalent to the old "wholesale
+		// delete+insert replacement"):
+		//  1. Upsert each member of this round's draft: the conflict branch
+		//     only refreshes featured/score/manual, never touching added_at
+		//     (existing members keep their original join time; NULL stays
+		//     NULL); truly new rows get stamped with the current timestamp.
+		//  2. Delete old members "not produced this round", but pinned
+		//     members are exempt — otherwise "deleted then re-inserted by
+		//     applyMomentEdits replay below" would cycle pinned members'
+		//     added_at to now every round (the false-freshness trap, see the
+		//     spec).
 		for _, a := range d.Assets {
 			featured := 0
 			if a.Featured {
@@ -507,9 +572,11 @@ func (s *MomentStore) SyncRecipeMoments(recipeKey string, drafts []MomentDraft) 
 			}
 			deleteMembersQ += ` AND asset_id NOT IN (` + strings.Join(placeholders, ",") + `)`
 		}
-		// 删除豁免只认活资产(aliveAssetExpr):pin 但已进回收站/离线的资产不
-		// 再被豁免,随本次 diff upsert 一并删除(edits 行本身不删,供日后资产
-		// 复活时 applyMomentEdits 自动补插回队)。
+		// The deletion exemption only recognizes live assets (aliveAssetExpr):
+		// a pinned asset that has since gone to trash/offline is no longer
+		// exempt, and gets deleted along with this diff upsert (the edits row
+		// itself isn't deleted, so applyMomentEdits can automatically re-add
+		// it once the asset comes back alive).
 		deleteMembersQ += `
 			AND asset_id NOT IN (
 				SELECT me.asset_id FROM moment_edits me
@@ -522,19 +589,25 @@ func (s *MomentStore) SyncRecipeMoments(recipeKey string, drafts []MomentDraft) 
 			return fmt.Errorf("moments: delete stale members %q: %w", d.ID, err)
 		}
 
-		// edits 回放:引擎重算不知道用户此前的 pin/exclude 编辑,成员 diff
-		// upsert 之后立刻把编辑叠加回去,防止被本轮重算悄悄冲掉。仅当该
-		// moment 存在 edits 时才触发派生刷新(count/时间窗/封面重挑)——没有
-		// 编辑记录的 moment 维持引擎本轮算出的派生值,不必多余重算。
+		// edits replay: the engine's recalculation doesn't know about the
+		// user's previous pin/exclude edits, so right after the member diff
+		// upsert we layer the edits back on, preventing this round's
+		// recalculation from silently wiping them out. Derived-field refresh
+		// (count/time window/cover re-pick) is only triggered when this
+		// moment has edits — a moment with no edit records keeps the derived
+		// values the engine computed this round, no need for a redundant
+		// recalculation.
 		hasEdits, err := applyMomentEdits(tx, d.ID, now)
 		if err != nil {
 			tx.Rollback()
 			return err
 		}
 		if hasEdits {
-			// hadTimeWindow:只有 trip 类时刻(draft 带具体 TimeFrom)才按成员
-			// taken_at 重算时间窗;主题类时刻(TimeFrom 为零值)时间窗恒为
-			// NULL,不应被这里的重算意外赋值。
+			// hadTimeWindow: only trip-kind moments (whose draft carries a
+			// concrete TimeFrom) recalculate the time window from members'
+			// taken_at; theme-kind moments (TimeFrom is a zero value) always
+			// have a NULL time window and shouldn't get accidentally assigned
+			// one by this recalculation.
 			if err := refreshMomentDerived(tx, d.ID, !d.TimeFrom.IsZero()); err != nil {
 				tx.Rollback()
 				return fmt.Errorf("moments: sync refresh derived %q: %w", d.ID, err)
@@ -543,9 +616,10 @@ func (s *MomentStore) SyncRecipeMoments(recipeKey string, drafts []MomentDraft) 
 		keepIDs = append(keepIDs, d.ID)
 	}
 
-	// 删除该 recipe 下本轮未产出的旧时刻(moment_assets 靠 FK ON DELETE
-	// CASCADE 级联清理,无需单独 DELETE)。drafts 为空时清空该 recipe 下
-	// 全部时刻。
+	// Delete old moments under this recipe that weren't produced this round
+	// (moment_assets is cleaned up via FK ON DELETE CASCADE, no separate
+	// DELETE needed). When drafts is empty, this clears all moments under
+	// this recipe.
 	deleteQ := `DELETE FROM moments WHERE recipe_key=?`
 	args := []interface{}{recipeKey}
 	if len(keepIDs) > 0 {
@@ -567,21 +641,29 @@ func (s *MomentStore) SyncRecipeMoments(recipeKey string, drafts []MomentDraft) 
 	return nil
 }
 
-// aliveAssetExpr 是"活资产"判据 SQL 片段,与 moments_theme.go
-// loadThemeCandidatePool(约 L192)的"活资产"子句同口径:已完成索引
-// (status='indexed')、非回收站(deleted_at IS NULL)、非离线(offline=0)。
-// 注意这只是 pool 完整口径的子集——pool 还额外排除 live-photo 视频侧、文档
-// (hasOcrExpr)与无 taken_at 的资产;pin 有意不套那些条件(用户手动加的
-// 照片即便是文档也应尊重其意图),只要求"活着"。依赖外层查询把 assets
-// 表起别名为 a。pin 相关三处(diff upsert 删除豁免/回放补插/立即插入)统一
-// 用这条口径判断资产是否"活着"——债务清扫:此前三处只校验 assets 表存在
-// 性,不认活资产,导致 pin 的照片进回收站/离线后依然賴在时刻里不走;现在
-// 死资产的 pin 编辑记录(moment_edits)本身仍保留,只是不再豁免/补插其
-// 成员身份,资产从回收站/离线状态恢复后下一轮回放会自动归队。
+// aliveAssetExpr is the SQL fragment for the "live asset" criterion, matching
+// the same bar as the "live asset" clause in moments_theme.go's
+// loadThemeCandidatePool (around L192): fully indexed (status='indexed'),
+// not in trash (deleted_at IS NULL), not offline (offline=0). Note this is
+// only a subset of the pool's full criteria — the pool also excludes the
+// live-photo video side, documents (hasOcrExpr), and assets with no
+// taken_at; pin deliberately doesn't apply those conditions (a photo the
+// user manually added should have its intent respected even if it's a
+// document), it only requires being "alive". Relies on the outer query
+// aliasing the assets table as a. All three pin-related spots (diff upsert
+// deletion exemption / replay re-insertion / immediate insertion) uniformly
+// use this criterion to judge whether an asset is "alive" — a debt cleanup:
+// previously these three spots only checked that the row existed in the
+// assets table, without recognizing live-asset status, so a pinned photo
+// that went to trash/offline would still cling to the moment and never
+// leave; now the pin edit record (moment_edits) for a dead asset is still
+// kept, it's just no longer exempted/re-inserted as a member — once the
+// asset is restored from trash/offline, the next replay round automatically
+// rejoins it.
 const aliveAssetExpr = `a.status='indexed' AND a.deleted_at IS NULL AND a.offline=0`
 
-// nullableStr 把空字符串转成 SQL NULL(cover_asset_id 允许 NULL,表示"尚无
-// 封面");非空字符串原样传入。
+// nullableStr converts an empty string into SQL NULL (cover_asset_id allows
+// NULL, meaning "no cover yet"); non-empty strings pass through unchanged.
 func nullableStr(s string) interface{} {
 	if s == "" {
 		return nil
@@ -589,10 +671,13 @@ func nullableStr(s string) interface{} {
 	return s
 }
 
-// ListMoments 列出全部时刻。排序语义(见设计 spec 第一节):手排序
-// (sort_order 非 NULL)的排在最前面,按 sort_order 升序(用户拖拽给定的
-// 顺序);未手排(sort_order NULL)的排在手排序之后,按 updated_at 倒序
-// (最近重算/命名过的排前面)。全库都未手排时 = 现状不变。
+// ListMoments lists all moments. Ordering semantics (see section 1 of the
+// design spec): manually-ordered ones (sort_order non-NULL) come first, in
+// ascending sort_order (the order the user gave via drag); manually
+// unordered ones (sort_order NULL) come after the manually-ordered ones, in
+// descending updated_at (most recently recalculated/named first). When
+// nothing in the whole DB is manually ordered, this equals the previous
+// behavior unchanged.
 func (s *MomentStore) ListMoments() ([]Moment, error) {
 	rows, err := s.db.Query(`
 		SELECT id, recipe_key, title, subtitle, cover_asset_id, time_from, time_to,
@@ -616,13 +701,13 @@ func (s *MomentStore) ListMoments() ([]Moment, error) {
 	return out, rows.Err()
 }
 
-// momentScanner 是 *sql.Row / *sql.Rows 共用的最小 Scan 接口。
+// momentScanner is the minimal Scan interface shared by *sql.Row / *sql.Rows.
 type momentScanner interface {
 	Scan(dest ...interface{}) error
 }
 
-// scanMoment 按 ListMoments 的列顺序扫描一行 moments,处理 cover_asset_id/
-// time_from/time_to/sort_order 可能为 NULL 的情况。
+// scanMoment scans one moments row in ListMoments' column order, handling
+// the cases where cover_asset_id/time_from/time_to/sort_order may be NULL.
 func scanMoment(row momentScanner) (Moment, error) {
 	var m Moment
 	var cover sql.NullString
@@ -652,8 +737,8 @@ func scanMoment(row momentScanner) (Moment, error) {
 	return m, nil
 }
 
-// GetMomentAssets 返回某时刻的成员,按 score 倒序;featuredOnly=true 时只
-// 返回精选(featured=1)成员。
+// GetMomentAssets returns a moment's members, in descending score order;
+// when featuredOnly=true, only returns featured (featured=1) members.
 func (s *MomentStore) GetMomentAssets(id string, featuredOnly bool) ([]MomentAsset, error) {
 	q := `SELECT asset_id, featured, score, manual, added_at FROM moment_assets WHERE moment_id=?`
 	if featuredOnly {
@@ -684,44 +769,56 @@ func (s *MomentStore) GetMomentAssets(id string, featuredOnly bool) ([]MomentAss
 	return out, rows.Err()
 }
 
-// ── 可编辑时刻:pin/exclude/hidden ────────────────────────────────────────
+// ── Editable moments: pin/exclude/hidden ───────────────────────────────────
 
-// PinMomentAssets 把若干 asset 强制并入某时刻:落一条 op='pin' 的
-// moment_edits 记录(覆盖此前该 asset 上的任何编辑),并立即改成员——已是
-// 引擎本轮纳入的成员(featured/score 已有值)用 INSERT OR IGNORE 保留原样
-// 不降级,缺席的成员补一条 manual=1/featured=0/score=0 的行。assets 表里
-// 不存在的 id 静默忽略(既不写 edits,也不改成员)。随后触发派生刷新
-// (count/时间窗/封面重挑),返回刷新后的 asset_count。
+// PinMomentAssets force-adds a number of assets into a moment: writes an
+// op='pin' moment_edits record (overwriting any prior edit on that asset)
+// and immediately updates membership — a member the engine already included
+// this round (with featured/score already set) is kept as-is via
+// INSERT OR IGNORE without being downgraded, while an absent member gets a
+// new manual=1/featured=0/score=0 row added. Ids that don't exist in the
+// assets table are silently ignored (neither edits nor membership is
+// touched). Triggers a derived-field refresh afterward (count/time
+// window/cover re-pick), returning the refreshed asset_count.
 func (s *MomentStore) PinMomentAssets(momentID string, assetIDs []string) (int, error) {
 	return s.applyMomentEditOp(momentID, assetIDs, "pin")
 }
 
-// ExcludeMomentAssets 把若干 asset 强制剔除出某时刻:落一条 op='exclude' 的
-// moment_edits 记录(覆盖此前该 asset 上的任何编辑),并立即从成员表删除。
-// assets 表里不存在的 id 静默忽略。随后触发派生刷新,返回刷新后的
-// asset_count(允许降为 0)。
+// ExcludeMomentAssets force-removes a number of assets from a moment: writes
+// an op='exclude' moment_edits record (overwriting any prior edit on that
+// asset) and immediately deletes it from the member table. Ids that don't
+// exist in the assets table are silently ignored. Triggers a derived-field
+// refresh afterward, returning the refreshed asset_count (which is allowed
+// to drop to 0).
 func (s *MomentStore) ExcludeMomentAssets(momentID string, assetIDs []string) (int, error) {
 	return s.applyMomentEditOp(momentID, assetIDs, "exclude")
 }
 
-// applyMomentEditOp 是 Pin/ExcludeMomentAssets 共用的实现:事务内逐个 asset
-// 校验存在性(不存在则跳过)→ upsert moment_edits(后写覆盖先写)→ 立即改
-// 成员(pin 只对活资产——aliveAssetExpr——立即生效,死资产仅记 edits 意图,
-// 见 aliveAssetExpr 注释)→ 统计本次实际改动的成员行数,为 0(全未知 id/
-// pin 目标是死资产/exclude 目标本不是成员等空操作)时跳过派生刷新与
-// updated_at(债务清扫:此前无论是否有行变化都刷新,导致空操作也把时刻
-// 顶到 ListMoments 排序前端)→ 读回 asset_count。
+// applyMomentEditOp is the shared implementation for Pin/ExcludeMomentAssets:
+// inside a transaction, check each asset's existence one by one (skip if
+// absent) -> upsert moment_edits (later write overwrites earlier) ->
+// immediately update membership (pin only takes immediate effect for live
+// assets — aliveAssetExpr — a dead asset only has its edits intent recorded,
+// see the aliveAssetExpr comment) -> tally the member rows actually changed
+// this call; when it's 0 (a no-op such as all-unknown ids / a pin target
+// that's a dead asset / an exclude target that isn't even a member), skip
+// the derived-field refresh and updated_at (a debt cleanup: previously this
+// refreshed regardless of whether any row changed, so even a no-op would
+// bump the moment to the front of ListMoments' ordering) -> read back
+// asset_count.
 func (s *MomentStore) applyMomentEditOp(momentID string, assetIDs []string, op string) (int, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return 0, fmt.Errorf("moments: %s begin: %w", op, err)
 	}
 	now := nowMs()
-	var affected int64 // 本次调用实际改动的成员行数(pin INSERT/exclude DELETE 生效数之和)
+	var affected int64 // member rows actually changed this call (sum of pin INSERT / exclude DELETE rows affected)
 	for _, assetID := range assetIDs {
-		// 未知 id(assets 表不存在)静默忽略:不写 edits、不改成员——moment_edits
-		// 对 assets 有外键约束(本库 DSN 开着 _foreign_keys=on),盲写会报错,
-		// 这里显式判存在性,语义上也更清楚地对应"未知 id 忽略"。
+		// Unknown ids (not in the assets table) are silently ignored: no
+		// edits written, no membership changed — moment_edits has a foreign
+		// key constraint on assets (this repo's DSN has _foreign_keys=on), so
+		// a blind write would error; checking existence explicitly here also
+		// more clearly matches the "unknown id ignored" semantics.
 		var exists int
 		if err := tx.QueryRow(`SELECT COUNT(*) FROM assets WHERE id=?`, assetID).Scan(&exists); err != nil {
 			tx.Rollback()
@@ -742,9 +839,12 @@ func (s *MomentStore) applyMomentEditOp(momentID string, assetIDs []string, op s
 			return 0, fmt.Errorf("moments: %s upsert edit %q/%q: %w", op, momentID, assetID, err)
 		}
 		if op == "pin" {
-			// 立即插入只认活资产(aliveAssetExpr):死资产(回收站/离线)的 pin
-			// 意图已写入 edits,但不立即计入成员/count——与 SyncRecipeMoments
-			// 回放的口径保持一致,资产复活后下一轮回放自动归队。
+			// Immediate insertion only recognizes live assets (aliveAssetExpr):
+			// a dead asset's (trash/offline) pin intent has been written to
+			// edits, but isn't immediately counted into membership/count —
+			// consistent with the criterion used by SyncRecipeMoments replay;
+			// once the asset comes back alive, the next replay round
+			// automatically rejoins it.
 			res, err := tx.Exec(`
 				INSERT OR IGNORE INTO moment_assets(moment_id, asset_id, featured, score, manual, added_at)
 				SELECT ?, a.id, 0, 0, 1, ?
@@ -780,8 +880,9 @@ func (s *MomentStore) applyMomentEditOp(momentID string, assetIDs []string, op s
 	}
 
 	if affected == 0 {
-		// 本次调用未造成任何成员行变化,跳过派生刷新与 updated_at,直接读回
-		// 当前 asset_count(不应因空操作而变化)。
+		// This call caused no member row changes, so skip the derived-field
+		// refresh and updated_at, and just read back the current asset_count
+		// (which shouldn't change from a no-op).
 		var count int
 		if err := tx.QueryRow(`SELECT asset_count FROM moments WHERE id=?`, momentID).Scan(&count); err != nil {
 			tx.Rollback()
@@ -814,9 +915,10 @@ func (s *MomentStore) applyMomentEditOp(momentID string, assetIDs []string, op s
 	return count, nil
 }
 
-// HideMoment 把某时刻标记为隐藏(tombstone):ListMoments 之后不再返回它,
-// 但行本身保留(SyncRecipeMoments 重算不会清除该标记,upsert 列清单里
-// 没有 hidden 列)。
+// HideMoment marks a moment as hidden (a tombstone): ListMoments will no
+// longer return it afterward, but the row itself is kept (SyncRecipeMoments
+// recalculation never clears this flag, since hidden isn't in the upsert
+// column list).
 func (s *MomentStore) HideMoment(momentID string) error {
 	_, err := s.db.Exec(`UPDATE moments SET hidden=1, updated_at=? WHERE id=?`, nowMs(), momentID)
 	if err != nil {
@@ -825,9 +927,11 @@ func (s *MomentStore) HideMoment(momentID string) error {
 	return nil
 }
 
-// MomentEditsFor 返回某时刻当前生效的编辑记录,按 op 分两个切片(供 Task 3
-// 挖掘引擎读取,判断某 asset 是否已被用户手动排除/钉入,避免重算把编辑
-// 意图悄悄吞掉)。没有编辑记录时返回两个空切片,不报错。
+// MomentEditsFor returns the edit records currently in effect for a moment,
+// split into two slices by op (for the Task 3 mining engine to read, to
+// tell whether an asset has been manually excluded/pinned by the user, so
+// recalculation doesn't silently swallow the edit intent). Returns two empty
+// slices, not an error, when there are no edit records.
 func (s *MomentStore) MomentEditsFor(momentID string) (pins []string, excludes []string, err error) {
 	rows, err := s.db.Query(`SELECT asset_id, op FROM moment_edits WHERE moment_id=? ORDER BY asset_id`, momentID)
 	if err != nil {
@@ -849,11 +953,15 @@ func (s *MomentStore) MomentEditsFor(momentID string) (pins []string, excludes [
 	return pins, excludes, rows.Err()
 }
 
-// TopFeaturedByMoment 一次查询取出全库 featured 成员(按 score 降序),JOIN
-// moments 排除各自的封面(封面已经单独展示,不需要在"精选"列表里重复出现),
-// 在 Go 侧按 moment 分组各截取前 perMoment 个。因为 SQL 已按 score 降序
-// 返回,同一 moment 的行在结果流中天然保持相对顺序,分组截取即为"该
-// moment 内 score 最高的前 N 个"。perMoment<=0 视为不截断。
+// TopFeaturedByMoment fetches featured members across the whole DB in one
+// query (in descending score order), joining moments to exclude each one's
+// own cover (the cover is already shown separately, no need to repeat it in
+// the "featured" list), then groups by moment on the Go side and truncates
+// each group to the first perMoment entries. Since SQL already returns rows
+// in descending score order, rows for the same moment naturally keep their
+// relative order in the result stream, so truncating per group is exactly
+// "the top N highest-scoring within that moment". perMoment<=0 means no
+// truncation.
 func (s *MomentStore) TopFeaturedByMoment(perMoment int) (map[string][]string, error) {
 	rows, err := s.db.Query(`
 		SELECT ma.moment_id, ma.asset_id, ma.score
@@ -881,12 +989,15 @@ func (s *MomentStore) TopFeaturedByMoment(perMoment int) (map[string][]string, e
 	return out, rows.Err()
 }
 
-// CoverRatioByMoment 一次查询取出全库封面(cover_asset_id)的宽高比 w/h,
-// JOIN asset_exif 取该封面 asset 的 EXIF 尺寸——INNER JOIN 天然实现"缺 exif
-// 行不入 map"的语义(width/height 任一为 0 或该封面根本没有 asset_exif 行,
-// 调用方对未出现的 id 均按 0=未知处理,由路由层落地为 JSON cover_ratio=0)。
-// 与 TopFeaturedByMoment/AddedThisWeekByMoment 同法:一条整表查询,不对每个
-// 时刻单独查询(无 N+1)。
+// CoverRatioByMoment fetches the width/height ratio of every cover
+// (cover_asset_id) across the whole DB in one query, joining asset_exif to
+// get the cover asset's EXIF dimensions — the INNER JOIN naturally
+// implements "a row missing exif doesn't enter the map" semantics (whether
+// width/height is 0 or the cover has no asset_exif row at all, the caller
+// treats any id that doesn't appear as 0=unknown, which the route layer
+// renders as JSON cover_ratio=0). Same approach as
+// TopFeaturedByMoment/AddedThisWeekByMoment: one whole-table query, not a
+// per-moment query (no N+1).
 func (s *MomentStore) CoverRatioByMoment() (map[string]float64, error) {
 	rows, err := s.db.Query(`
 		SELECT m.id, e.width, e.height
@@ -904,7 +1015,8 @@ func (s *MomentStore) CoverRatioByMoment() (map[string]float64, error) {
 		if err := rows.Scan(&momentID, &width, &height); err != nil {
 			return nil, fmt.Errorf("moments: scan cover ratio: %w", err)
 		}
-		// width/height 任一缺失(NULL)或 <=0 均视为无效尺寸,不产出比例。
+		// If either width/height is missing (NULL) or <=0, treat it as an
+		// invalid dimension and don't produce a ratio.
 		if !width.Valid || !height.Valid || width.Int64 <= 0 || height.Int64 <= 0 {
 			continue
 		}
@@ -913,14 +1025,17 @@ func (s *MomentStore) CoverRatioByMoment() (map[string]float64, error) {
 	return out, rows.Err()
 }
 
-// sevenDaysMs 是 AddedThisWeekByMoment 的统计窗口(7 天,毫秒)。
+// sevenDaysMs is the AddedThisWeekByMoment stats window (7 days, in milliseconds).
 const sevenDaysMs = int64(7 * 24 * 60 * 60 * 1000)
 
-// AddedThisWeekByMoment 一次查询统计全库每个时刻"本周新增"的成员数:
-// added_at 非 NULL 且 >= nowMs-7d 才计入(NULL=存量/加入时间未知,不计,
-// 避免上线首周全库照片都显示 +N)。与 TopFeaturedByMoment 同法,一条整表
-// 查询 Go 侧按 moment_id 分组,不对每个时刻单独查询(无 N+1)。返回的 map
-// 只包含 count>0 的 moment id;调用方对未出现的 id 应按 0 处理。
+// AddedThisWeekByMoment counts the "added this week" member count for every
+// moment across the whole DB in one query: only counted when added_at is
+// non-NULL and >= nowMs-7d (NULL=legacy data / join time unknown, not
+// counted, to avoid every photo in the whole DB showing +N during launch
+// week). Same approach as TopFeaturedByMoment: one whole-table query grouped
+// by moment_id on the Go side, not a per-moment query (no N+1). The returned
+// map only contains moment ids with count>0; the caller should treat any id
+// that doesn't appear as 0.
 func (s *MomentStore) AddedThisWeekByMoment(nowMs int64) (map[string]int, error) {
 	cutoff := nowMs - sevenDaysMs
 	rows, err := s.db.Query(`
@@ -945,10 +1060,12 @@ func (s *MomentStore) AddedThisWeekByMoment(nowMs int64) (map[string]int, error)
 	return out, rows.Err()
 }
 
-// PlacesByMoment 返回某时刻成员按城市聚合的出现次数,供 About 多地点展示
-// (spec 第三节):JOIN asset_geo,city 为空或该成员无 geo 行的不计入;按
-// count DESC、city ASC(tie-break,保证结果确定性)排序,截取前 limit 条
-// (limit<=0 视为不截断)。
+// PlacesByMoment returns the occurrence count of a moment's members
+// aggregated by city, for the About multi-location display (spec section
+// 3): joins asset_geo, and a member with an empty city or no geo row is not
+// counted; sorted by count DESC, city ASC (tie-break, to guarantee
+// deterministic results), truncated to the first limit rows (limit<=0 means
+// no truncation).
 func (s *MomentStore) PlacesByMoment(momentID string, limit int) ([]MomentPlace, error) {
 	q := `
 		SELECT g.city, COUNT(*) AS c
@@ -979,9 +1096,10 @@ func (s *MomentStore) PlacesByMoment(momentID string, limit int) ([]MomentPlace,
 	return out, rows.Err()
 }
 
-// momentHasTimeWindow 判断某时刻当前是否有具体时间窗(time_from 非 NULL,
-// 即 trip 类时刻);主题类时刻(time_from 恒 NULL)不应被派生刷新意外赋予
-// 一个时间窗。
+// momentHasTimeWindow determines whether a moment currently has a concrete
+// time window (time_from non-NULL, i.e. a trip-kind moment); theme-kind
+// moments (time_from is always NULL) shouldn't get accidentally assigned a
+// time window by a derived-field refresh.
 func momentHasTimeWindow(tx *sql.Tx, momentID string) (bool, error) {
 	var from sql.NullString
 	if err := tx.QueryRow(`SELECT time_from FROM moments WHERE id=?`, momentID).Scan(&from); err != nil {
@@ -990,16 +1108,20 @@ func momentHasTimeWindow(tx *sql.Tx, momentID string) (bool, error) {
 	return from.Valid, nil
 }
 
-// applyMomentEdits 是 SyncRecipeMoments 的回放钩子:成员 diff upsert 后,把
-// 用户此前对该 moment 做过的 pin/exclude 编辑重新叠加回去。exclude 先剔除,
-// pin 后并入(INSERT OR IGNORE 不会降级引擎本轮已纳入的成员——已是
-// featured/score 有值的行原样保留,只在缺席时补一条 manual=1/featured=0/
-// score=0/added_at=now 的行;因 SyncRecipeMoments 第 2 步已豁免 pin 成员的
-// 删除,常态下 pin 成员已在表内,这里的 INSERT OR IGNORE 不会触发,added_at
-// 不会被刷新)。返回值 hasEdits 表示该 moment 是否存在任何编辑记录,供调用方
-// 决定是否需要派生刷新(没有编辑的 moment 维持引擎本轮算出的派生值,不必
-// 多余重算)。now 是 SyncRecipeMoments 本轮的时间戳,仅用于真正新插入的
-// pin 行补 added_at。
+// applyMomentEdits is SyncRecipeMoments' replay hook: after the member diff
+// upsert, it layers the user's previous pin/exclude edits on this moment
+// back on top. exclude is removed first, pin merged in after
+// (INSERT OR IGNORE won't downgrade a member the engine already included
+// this round — a row that already has featured/score set is kept as-is,
+// only adding a manual=1/featured=0/score=0/added_at=now row when absent;
+// since SyncRecipeMoments step 2 already exempts pinned members from
+// deletion, a pinned member is normally already in the table, so this
+// INSERT OR IGNORE won't fire and added_at won't be refreshed). The
+// returned hasEdits indicates whether this moment has any edit records, for
+// the caller to decide whether a derived-field refresh is needed (a moment
+// with no edits keeps the derived values the engine computed this round, no
+// need for a redundant recalculation). now is this round's SyncRecipeMoments
+// timestamp, used only to stamp added_at on a truly newly-inserted pin row.
 func applyMomentEdits(tx *sql.Tx, momentID string, now int64) (bool, error) {
 	if _, err := tx.Exec(`
 		DELETE FROM moment_assets
@@ -1009,9 +1131,10 @@ func applyMomentEdits(tx *sql.Tx, momentID string, now int64) (bool, error) {
 	); err != nil {
 		return false, fmt.Errorf("moments: replay exclude %q: %w", momentID, err)
 	}
-	// 回放补插只认活资产(aliveAssetExpr):死资产(回收站/离线)的 pin edits
-	// 不会被补插回成员——它们已在上面的 SyncRecipeMoments 第 2 步(不再豁免)
-	// 或本函数的 exclude 回放中被清出成员表。
+	// Replay re-insertion only recognizes live assets (aliveAssetExpr): pin
+	// edits for a dead asset (trash/offline) won't be re-added as a member —
+	// it's already been cleared from the member table by SyncRecipeMoments
+	// step 2 above (no longer exempt) or by this function's exclude replay.
 	if _, err := tx.Exec(`
 		INSERT OR IGNORE INTO moment_assets(moment_id, asset_id, featured, score, manual, added_at)
 		SELECT me.moment_id, me.asset_id, 0, 0, 1, ?
@@ -1029,15 +1152,17 @@ func applyMomentEdits(tx *sql.Tx, momentID string, now int64) (bool, error) {
 	return count > 0, nil
 }
 
-// refreshMomentDerived 是 pin/exclude 的成员变动后,重算该时刻派生字段的
-// 公共实现:
-//   - asset_count:成员表 COUNT(*)。
-//   - 时间窗(仅 hadTimeWindow=true 时):按当前成员 JOIN assets 取
-//     MIN/MAX(taken_at);hadTimeWindow=false(主题类时刻)时不触碰
-//     time_from/time_to,保持其 NULL 语义。
-//   - 封面:当前封面仍是成员则不动;否则按"featured 最高分 → 任一成员(按
-//     score DESC, asset_id ASC 取第一,避免测试抖动)→ 无成员则 NULL"依次
-//     回落重挑。
+// refreshMomentDerived is the shared implementation that recalculates a
+// moment's derived fields after a pin/exclude membership change:
+//   - asset_count: COUNT(*) on the member table.
+//   - Time window (only when hadTimeWindow=true): take MIN/MAX(taken_at) by
+//     joining assets on current members; when hadTimeWindow=false
+//     (theme-kind moment), time_from/time_to are left untouched, preserving
+//     their NULL semantics.
+//   - Cover: left unchanged if the current cover is still a member;
+//     otherwise re-picked by falling back in order through "highest-scoring
+//     featured -> any member (take the first by score DESC, asset_id ASC, to
+//     avoid test flakiness) -> NULL if no members".
 func refreshMomentDerived(tx *sql.Tx, momentID string, hadTimeWindow bool) error {
 	var count int
 	if err := tx.QueryRow(`SELECT COUNT(*) FROM moment_assets WHERE moment_id=?`, momentID).Scan(&count); err != nil {
@@ -1094,7 +1219,7 @@ func refreshMomentDerived(tx *sql.Tx, momentID string, hadTimeWindow bool) error
 		if err != nil && err != sql.ErrNoRows {
 			return fmt.Errorf("moments: refresh pick cover %q: %w", momentID, err)
 		}
-		newCover = pick // sql.ErrNoRows 时 pick 保持零值(Valid=false)→ 落回 NULL
+		newCover = pick // on sql.ErrNoRows, pick stays zero-valued (Valid=false) -> falls back to NULL
 	}
 	setClauses = append(setClauses, "cover_asset_id=?", "updated_at=?")
 	var coverArg interface{}
@@ -1111,9 +1236,9 @@ func refreshMomentDerived(tx *sql.Tx, momentID string, hadTimeWindow bool) error
 	return nil
 }
 
-// SetMomentTitle 把某时刻的展示名置为 LLM 润色结果,并标记
-// named_by_llm=1——之后的 SyncRecipeMoments 重算会保留这个 title,不再被
-// 模板结果覆盖。
+// SetMomentTitle sets a moment's display name to the LLM-polished result and
+// marks named_by_llm=1 — subsequent SyncRecipeMoments recalculations will
+// keep this title, no longer overwritten by the template result.
 func (s *MomentStore) SetMomentTitle(id, title string) error {
 	_, err := s.db.Exec(`UPDATE moments SET title=?, named_by_llm=1, updated_at=? WHERE id=?`,
 		title, nowMs(), id)
@@ -1123,11 +1248,15 @@ func (s *MomentStore) SetMomentTitle(id, title string) error {
 	return nil
 }
 
-// ReorderMoments 是拖拽排序的落库入口:事务内按 ids 的顺序依次把
-// sort_order 赋为 (i+1)*10(留间隙,便于未来"插入到两者之间"而不必整体重排)。
-// ids 里不存在的 moment id(如前端列表略旧、时刻已被重算删除)UPDATE 影响
-// 0 行,忽略不报错——不因单个失效 id 让整批操作失败。空 ids 由调用方
-// (handler)提前拦截为 400,这里不做该校验。
+// ReorderMoments is the persistence entry point for drag-and-drop ordering:
+// inside a transaction, it assigns sort_order as (i+1)*10 in the order of
+// ids (leaving gaps, so a future "insert between two" doesn't require a
+// full re-sort). A moment id in ids that doesn't exist (e.g. the frontend's
+// list is slightly stale, or the moment was already deleted by
+// recalculation) results in an UPDATE affecting 0 rows, which is ignored
+// without an error — a single stale id shouldn't fail the whole batch
+// operation. An empty ids is intercepted upstream by the caller (the
+// handler) as a 400; this function doesn't perform that check.
 func (s *MomentStore) ReorderMoments(ids []string) error {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -1146,28 +1275,35 @@ func (s *MomentStore) ReorderMoments(ids []string) error {
 	return nil
 }
 
-// ── 稳定 id 派生 ─────────────────────────────────────────────────────────
+// ── Stable id derivation ─────────────────────────────────────────────────
 
-// hashID16 返回输入字符串 sha1 摘要的前 16 位十六进制字符(64 bit,足够
-// 在本库单机 sqlite 规模下避免碰撞,且比全 40 位 hex 更适合做展示层 id)。
+// hashID16 returns the first 16 hex characters of the input string's sha1
+// digest (64 bits, sufficient to avoid collisions at this repo's
+// single-machine sqlite scale, and better suited as a display-layer id than
+// the full 40-hex digest).
 func hashID16(s string) string {
 	sum := sha1.Sum([]byte(s))
 	return hex.EncodeToString(sum[:])[:16]
 }
 
-// TripMomentID 派生旅行类时刻的稳定 id:hash(recipeKey + "|" + ISO 周)。
-// 用 ISO 周(而非公历周或具体日期)是因为同一趟旅程重算时,切分出的
-// 起始日期可能因新增/减少边界照片而微移几天,但只要还落在同一个 ISO 周
-// 内,id 就不变——避免用户看到的时刻在重算间"改名换姓"。
+// TripMomentID derives a trip-kind moment's stable id: hash(recipeKey + "|"
+// + ISO week). ISO week is used (rather than the calendar week or a
+// specific date) because when the same trip is recalculated, the split-out
+// start date may shift by a few days as boundary photos are added or
+// removed, but as long as it still falls within the same ISO week, the id
+// stays the same — preventing the moment the user sees from "changing
+// identity" between recalculations.
 func TripMomentID(recipeKey string, from time.Time) string {
 	year, week := from.ISOWeek()
 	weekKey := fmt.Sprintf("%d-W%02d", year, week)
 	return hashID16(recipeKey + "|" + weekKey)
 }
 
-// ThemeMomentID 派生主题类时刻的稳定 id:hash(recipeKey)。主题类是"每
-// recipe 一个滚动更新的活集合"(不像 trip 按时间窗分段),所以 id 只取决于
-// recipe key,同一主题永远映射到同一个 moment 行,重算即原地刷新成员。
+// ThemeMomentID derives a theme-kind moment's stable id: hash(recipeKey).
+// Theme kind is "one continuously-updated live set per recipe" (unlike trip,
+// which is segmented by time window), so the id only depends on the recipe
+// key — the same theme always maps to the same moment row, and
+// recalculation just refreshes its members in place.
 func ThemeMomentID(recipeKey string) string {
 	return hashID16(recipeKey)
 }

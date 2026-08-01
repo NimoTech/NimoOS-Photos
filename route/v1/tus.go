@@ -53,10 +53,11 @@ func (w *relativeLocationWriter) Write(b []byte) (int, error) {
 	return w.ResponseWriter.Write(b)
 }
 
-// Unwrap 让 tusd v2 能通过 http.NewResponseController 拿到原始 ResponseWriter
-// 的 SetReadDeadline / SetWriteDeadline 等控制 API。否则日志里会刷
-// "NetworkControlError / feature not supported" warning（虽不影响上传成功，
-// 但用 fixed timeout 而不是 tusd 的动态超时）。
+// Unwrap lets tusd v2 reach the original ResponseWriter's SetReadDeadline /
+// SetWriteDeadline and other control APIs via http.NewResponseController.
+// Otherwise the logs get spammed with "NetworkControlError / feature not
+// supported" warnings (harmless to upload success, but it falls back to a
+// fixed timeout instead of tusd's dynamic timeout).
 func (w *relativeLocationWriter) Unwrap() http.ResponseWriter {
 	return w.ResponseWriter
 }
@@ -220,7 +221,7 @@ func NewTUSHandler(svc service.Services, galleryDir string, uploadStore commonUp
 		return nil, err
 	}
 
-	// 创建:写任务行。
+	// Create: write the task row.
 	go func() {
 		for ev := range tusH.CreatedUploads {
 			ownerID := ev.HTTPRequest.Header.Get("X-NimoOS-User-ID")
@@ -243,7 +244,7 @@ func NewTUSHandler(svc service.Services, galleryDir string, uploadStore commonUp
 		}
 	}()
 
-	// 进度:更新 offset 并续期。
+	// Progress: update offset and renew expiry.
 	go func() {
 		for ev := range tusH.UploadProgress {
 			_ = uploadStore.UpdateOffset(ev.Upload.ID, ev.Upload.Offset,
@@ -251,7 +252,7 @@ func NewTUSHandler(svc service.Services, galleryDir string, uploadStore commonUp
 		}
 	}()
 
-	// 终止(协议 DELETE):标记 canceled。
+	// Termination (protocol DELETE): mark canceled.
 	go func() {
 		for ev := range tusH.TerminatedUploads {
 			_ = uploadStore.SetStatus(ev.Upload.ID, commonUpload.UploadStatusCanceled,
@@ -259,8 +260,8 @@ func NewTUSHandler(svc service.Services, galleryDir string, uploadStore commonUp
 		}
 	}()
 
-	// 完成:ingest(现有 MarkAndReserve/SetPendingAlbum/rename/SubmitReserved 四步)
-	// 成功后置 completed,失败置 failed。
+	// Complete: ingest (the existing four-step MarkAndReserve/SetPendingAlbum/rename/SubmitReserved)
+	// sets completed on success, failed on failure.
 	go func() {
 		for event := range tusH.CompleteUploads {
 			uploadID := event.Upload.ID

@@ -8,10 +8,10 @@ import (
 	"github.com/labstack/echo/v4"
 )
 
-// TrashHandler 处理回收站列表/恢复/永久删除。
+// TrashHandler handles trash listing/restore/permanent deletion.
 type TrashHandler struct{ svc service.Services }
 
-// NewTrashHandler 构造 TrashHandler。
+// NewTrashHandler constructs a TrashHandler.
 func NewTrashHandler(svc service.Services) *TrashHandler { return &TrashHandler{svc} }
 
 // List GET /v1/photos/trash
@@ -46,7 +46,7 @@ func (h *TrashHandler) Purge(c echo.Context) error {
 	return c.NoContent(http.StatusNoContent)
 }
 
-// RestoreBatch POST /v1/photos/trash/restore  body {"ids":[...]}（ids 为空=全部恢复）
+// RestoreBatch POST /v1/photos/trash/restore  body {"ids":[...]} (empty ids = restore all)
 func (h *TrashHandler) RestoreBatch(c echo.Context) error {
 	var req struct {
 		IDs []string `json:"ids"`

@@ -21,9 +21,11 @@ const (
 	dbscanEpsilon    = 0.6
 	dbscanMinPoints  = 1
 	clusterBatchSize = 50
-	// assignEpsilon 是游离脸吸附到锚定 person 质心的最大余弦距离。
+	// assignEpsilon is the max cosine distance for snapping a free-floating face
+	// onto an anchored person's centroid.
 	assignEpsilon = 0.55
-	// suggestEpsilon 是「合并建议」配对的余弦距离上界（下界为 dbscanEpsilon）。
+	// suggestEpsilon is the cosine distance upper bound for "merge suggestion"
+	// pairs (the lower bound is dbscanEpsilon).
 	suggestEpsilon = 0.75
 )
 
@@ -53,8 +55,9 @@ func cosDist(a, b []float32) float64 {
 	return 1.0 - cos
 }
 
-// ComputeCentroid 返回向量集合的逐维平均（质心）。
-// 空集合或维度不一致返回 nil。调用方需保证所有向量等长。
+// ComputeCentroid returns the per-dimension average (centroid) of a set of
+// vectors. Returns nil for an empty set or mismatched dimensions; the caller
+// must ensure all vectors have equal length.
 func ComputeCentroid(vecs [][]float32) []float32 {
 	if len(vecs) == 0 {
 		return nil
@@ -78,8 +81,9 @@ func ComputeCentroid(vecs [][]float32) []float32 {
 	return out
 }
 
-// ClusterConfidence 返回簇内聚合度 [0,1]：成员到质心平均余弦相似度。
-// 单元素簇返回 1.0；空簇返回 0.0。
+// ClusterConfidence returns cluster cohesion in [0,1]: the average cosine
+// similarity of members to the centroid. Returns 1.0 for a singleton cluster,
+// 0.0 for an empty cluster.
 func ClusterConfidence(vecs [][]float32, centroid []float32) float64 {
 	if len(vecs) == 0 || centroid == nil {
 		return 0.0
@@ -175,8 +179,9 @@ func DBSCAN(vecs [][]float32, epsilon float64, minPoints int) []int {
 	return labels
 }
 
-// DBSCANWithProgress 行为同 DBSCAN，但每跨 1% 进度调一次 onProgress。
-// onProgress 必非 nil；终止前保证最后一次回调 done==n。
+// DBSCANWithProgress behaves like DBSCAN, but calls onProgress once per 1%
+// of progress crossed. onProgress must not be nil; the final call before
+// return is guaranteed to have done==n.
 func DBSCANWithProgress(vecs [][]float32, epsilon float64, minPoints int, onProgress func(done, n int)) []int {
 	n := len(vecs)
 	labels := make([]int, n)
@@ -230,7 +235,7 @@ func DBSCANWithProgress(vecs [][]float32, epsilon float64, minPoints int, onProg
 		}
 		clusterID++
 	}
-	onProgress(n, n) // 保证终态 done==n
+	onProgress(n, n) // guarantee the final state has done==n
 	return labels
 }
 
@@ -247,28 +252,36 @@ type FaceService struct {
 	reg     *TaskRegistry
 	running atomic.Bool
 
-	// ml 供 RunPipeline 检测阶段调用 DetectAndRecognizeFaces；未注入(nil)时
-	// 每张检测都会失败，走「跳过、留 face_scanned=0 供下轮重试」路径。
+	// ml is used by RunPipeline's detection stage to call
+	// DetectAndRecognizeFaces; when not injected (nil), every detection fails
+	// and takes the "skip, leave face_scanned=0 for the next retry" path.
 	ml MLProvider
-	// thumbDir 是缩略图根目录：视频资产的检测输入取 <thumbDir>/<id>/large.jpg
-	// （关键帧），缺失回退 small.jpg（取法照 Indexer 的 thumbDir 字段）。
+	// thumbDir is the thumbnail root directory: for video assets, the
+	// detection input is <thumbDir>/<id>/large.jpg (a keyframe), falling back
+	// to small.jpg when missing (mirrors the Indexer's thumbDir field).
 	thumbDir string
 
-	// 失败 backoff：RunClustering 出错后短期内不再触发，避免每分钟重试风暴。
+	// Failure backoff: after RunClustering errors, don't retrigger for a
+	// while, to avoid a retry storm every minute.
 	failMu      sync.Mutex
 	nextAttempt time.Time
 
-	// indexIdleFor 返回「距上次索引活动多久」。安全网触发(scheduler)据此去抖,
-	// 避免大上传途中索引队列空档(pending==0 瞬间)被误判为上传结束而提前聚类。
-	// 为 nil 时(测试 / 未接入)视为始终空闲。
+	// indexIdleFor returns "how long since the last indexing activity". The
+	// safety-net trigger (scheduler) debounces on this, to avoid a momentary
+	// gap in the index queue (pending==0 for an instant) during a large
+	// upload being mistaken for the upload finishing and clustering firing
+	// early. When nil (tests / not wired up), treated as always idle.
 	indexIdleFor func() time.Duration
 }
 
-// clusterFailBackoff 是 RunClustering 失败后的最短再次尝试间隔。
+// clusterFailBackoff is the minimum retry interval after RunClustering fails.
 const clusterFailBackoff = 30 * time.Minute
 
-// clusterQuietPeriod 是安全网触发前要求的「索引活动安静时长」:索引活动停止超过这段
-// 时间才认为整批上传/索引真正结束。需大于活动中典型的逐张处理间隔(ML 每张约数秒)。
+// clusterQuietPeriod is the "indexing activity quiet duration" required
+// before the safety net fires: indexing activity must have stopped for
+// longer than this before the whole upload/index batch is considered truly
+// finished. Must exceed the typical per-item processing interval during
+// activity (ML takes roughly a few seconds per image).
 const clusterQuietPeriod = 12 * time.Second
 
 // NewFaceService creates a new FaceService backed by the given database.
@@ -286,14 +299,18 @@ func (s *FaceService) SetIndexIdleSource(fn func() time.Duration) { s.indexIdleF
 // SetML injects the ML provider used by RunPipeline's detection stage.
 func (s *FaceService) SetML(ml MLProvider) { s.ml = ml }
 
-// SetThumbDir injects the thumbnail root directory (照 Indexer 现有字段取法),
-// used by RunPipeline to locate video keyframe thumbnails for detection.
+// SetThumbDir injects the thumbnail root directory (mirrors the Indexer's
+// existing field), used by RunPipeline to locate video keyframe thumbnails
+// for detection.
 func (s *FaceService) SetThumbDir(dir string) { s.thumbDir = dir }
 
-// countUnassignedFaces 返回尚未关联到任何 person 的活跃(未排除)人脸数——即新
-// 上传/检测出、还没被聚类扫到的脸。同时用作:①聚类完成后 Task.Added 的「本次
-// 新增」语义(供前端「有新增才提示、显示新增数而非总数」)；②RunPipeline 判断
-// 「待检测为空时是否还有事可做」的依据。
+// countUnassignedFaces returns the count of active (non-excluded) faces not
+// yet associated with any person — i.e. faces newly uploaded/detected that
+// haven't been swept by clustering yet. Also used as: (1) the "newly added
+// this run" semantics of Task.Added after clustering finishes (so the
+// frontend can toast only when there's something new, showing the added
+// count rather than the total); (2) what RunPipeline checks to decide
+// whether there's still work to do when there's nothing left to detect.
 func (s *FaceService) countUnassignedFaces(ctx context.Context) (int64, error) {
 	var n int64
 	err := s.db.QueryRowContext(ctx, `
@@ -304,16 +321,21 @@ func (s *FaceService) countUnassignedFaces(ctx context.Context) (int64, error) {
 	return n, err
 }
 
-// clusterStage 执行一次完整的聚类:读取全部人脸向量、DBSCAN、重建
-// persons/face_person。pub 收到本阶段的局部进度 [0,1](读取 0–0.10、DBSCAN
-// 0.10–0.85、持久化 0.85–1.0)，调用方按需映射进自己的全局进度区间
-// (RunClustering 原样使用 0–1；RunPipeline 折算进检测完成后的 95%–100% 尾段)。
-// total==0(库里彻底没有人脸，例如照片被全删)时清理孤儿 person 并原样返回
-// (0, 0, nil)，既不调用 onStart 也不调用 pub——调用方据此判断"没有可发布的任务"。
-// onStart 在确认 total>0、真正开始工作前调用一次(用于建任务/发首帧 running)。
+// clusterStage runs one full clustering pass: load all face vectors, run
+// DBSCAN, rebuild persons/face_person. pub receives this stage's local
+// progress [0,1] (loading 0–0.10, DBSCAN 0.10–0.85, persisting 0.85–1.0);
+// the caller maps that into its own global progress range as needed
+// (RunClustering uses 0–1 as-is; RunPipeline folds it into the 95%–100%
+// tail after detection completes). When total==0 (no faces at all in the
+// DB, e.g. all photos were deleted), orphan persons are cleaned up and the
+// function returns (0, 0, nil) as-is, calling neither onStart nor pub — the
+// caller uses this to detect "nothing to publish as a task". onStart is
+// called once after confirming total>0 and before real work starts (used to
+// create the task / emit the first running frame).
 func (s *FaceService) clusterStage(ctx context.Context, onStart func(total int64), pub func(p float64)) (total, newFaces int64, err error) {
 	var t int64
-	// 与 loadFacesWithProgress 一致：只算关联到现存 asset 的 face_detections。
+	// Consistent with loadFacesWithProgress: only counts face_detections tied
+	// to an existing asset.
 	if err := s.db.QueryRowContext(ctx, `
 		SELECT COUNT(*) FROM face_detections fd
 		JOIN assets a ON a.id = fd.asset_id
@@ -321,9 +343,11 @@ func (s *FaceService) clusterStage(ctx context.Context, onStart func(total int64
 		return 0, 0, err
 	}
 	if t == 0 {
-		// 没有人脸了(例如照片被全部删除):自动聚类产生的非锚定 person 已无任何成员,
-		// 必须在这里清掉,否则人物表会残留孤儿——清理 persons 的唯一路径
-		// rebuildPersonsWithProgress 正好被这个早退跳过了。
+		// No faces left (e.g. all photos were deleted): the non-anchored
+		// persons produced by auto-clustering now have no members left and
+		// must be cleaned up here, or the persons table will accumulate
+		// orphans — this early return is exactly the path that
+		// rebuildPersonsWithProgress's cleanup would otherwise skip.
 		return 0, 0, s.purgeAutoPersons(ctx)
 	}
 
@@ -384,7 +408,7 @@ func (s *FaceService) RunClustering(ctx context.Context) error {
 		t := Task{
 			ID:        taskID,
 			Type:      "face",
-			Label:     "识别人物",
+			Label:     "Recognizing people",
 			Progress:  progress,
 			Status:    status,
 			StartedAt: started,
@@ -392,8 +416,10 @@ func (s *FaceService) RunClustering(ctx context.Context) error {
 		if errKey != "" {
 			t.SetError(errKey, errParams)
 		}
-		// 终态填入 current/total（总人脸数）与 added（本次新增数）。
-		// running 中间态不填，避免节流 publish 把 0 错带到前端造成数字闪。
+		// Fill in current/total (total face count) and added (newly added
+		// this run) only on terminal states. Leaving them unset on running
+		// intermediate states avoids a throttled publish carrying a stray 0
+		// to the frontend and making the number flicker.
 		if status == "done" || status == "error" {
 			t.Current = total
 			t.Total = total
@@ -417,7 +443,8 @@ func (s *FaceService) RunClustering(ctx context.Context) error {
 		return err
 	}
 	if !taskStarted {
-		// total==0：没有人脸，clusterStage 已静默清理孤儿 person，不发任务。
+		// total==0: no faces; clusterStage has already silently cleaned up
+		// orphan persons, so no task is published.
 		return nil
 	}
 
@@ -438,8 +465,9 @@ type faceScanTarget struct {
 	isVideo bool
 }
 
-// queryFaceScanTargets 列出待检测人脸的资产:已索引、未删除、非离线、尚未跑过
-// 人脸检测(face_scanned=0)。
+// queryFaceScanTargets lists assets awaiting face detection: indexed, not
+// deleted, not offline, and not yet run through face detection
+// (face_scanned=0).
 func (s *FaceService) queryFaceScanTargets(ctx context.Context) ([]faceScanTarget, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT a.id, a.file_path, COALESCE(a.mime_type,'') LIKE 'video/%'
@@ -460,16 +488,23 @@ func (s *FaceService) queryFaceScanTargets(ctx context.Context) ([]faceScanTarge
 	return out, rows.Err()
 }
 
-// detectFaceScanTarget 对单个资产跑检测+识别并写入 face_detections,成功后置
-// face_scanned=1。图片读原文件;视频读 <thumbDir>/<id>/large.jpg(关键帧),
-// 缺失回退 small.jpg。读文件失败或 ML 调用出错都返回 error——调用方据此跳过、
-// 留 face_scanned=0 供下一轮 RunPipeline 重试，不中断整批处理。
+// detectFaceScanTarget runs detection+recognition on a single asset and
+// writes face_detections, setting face_scanned=1 on success. Images read the
+// original file; videos read <thumbDir>/<id>/large.jpg (a keyframe), falling
+// back to small.jpg when missing. A file read failure or ML call error both
+// return an error — the caller skips the asset on this basis, leaving
+// face_scanned=0 for the next RunPipeline retry, without interrupting the
+// rest of the batch.
 //
-// 图片且原图像素超过 maxMLInputPixels（immich-ml 容器内 PIL 178.9MP 硬上限的
-// 安全边际,真实案例见 16320x12240=199.8MP 的 Pexels 照片）时,改用已生成的
-// large.jpg 缩略图代替原图,避免请求必然 500、face_scanned 永远置不上、
-// RunPipeline 无限重试同一张图。缩略图也取不到时按现有失败路径处理(返回
-// error,跳过、留下轮重试),不会把超限原图硬塞给 ML。
+// When the asset is an image and the original's pixel count exceeds
+// maxMLInputPixels (a safety margin under the immich-ml container's PIL
+// 178.9MP hard limit — a real case in the wild was a 16320x12240=199.8MP
+// Pexels photo), the already-generated large.jpg thumbnail is used in place
+// of the original, to avoid a request that would otherwise always 500,
+// face_scanned never getting set, and RunPipeline retrying the same image
+// forever. When the thumbnail is also unavailable, this falls back to the
+// existing failure path (return error, skip, leave for the next retry)
+// rather than forcing the oversized original onto the ML service.
 func (s *FaceService) detectFaceScanTarget(ctx context.Context, t faceScanTarget) error {
 	src := t.path
 	if t.isVideo {
@@ -480,20 +515,20 @@ func (s *FaceService) detectFaceScanTarget(ctx context.Context, t faceScanTarget
 	}
 	data, err := os.ReadFile(src)
 	if err != nil {
-		return fmt.Errorf("读取源文件失败: %w", err)
+		return fmt.Errorf("failed to read source file: %w", err)
 	}
 	if len(data) == 0 {
-		return fmt.Errorf("读取源文件失败: 源文件为空")
+		return fmt.Errorf("failed to read source file: source file is empty")
 	}
 	if !t.isVideo && oversizedForML(data) {
 		thumb := readLargeOrSmallThumb(s.thumbDir, t.id)
 		if len(thumb) == 0 {
-			return fmt.Errorf("原图超过 ML 像素上限且降级缩略图不可用")
+			return fmt.Errorf("original image exceeds ML pixel limit and no fallback thumbnail is available")
 		}
 		data = thumb
 	}
 	if s.ml == nil {
-		return fmt.Errorf("ML provider 未注入")
+		return fmt.Errorf("ML provider not injected")
 	}
 	faces, err := s.ml.DetectAndRecognizeFaces(data)
 	if err != nil {
@@ -506,11 +541,14 @@ func (s *FaceService) detectFaceScanTarget(ctx context.Context, t faceScanTarget
 	return nil
 }
 
-// RunPipeline 是人脸检测+聚类一体任务:先对 status='indexed' AND offline=0 AND
-// face_scanned=0 的资产逐张检测(真实进度 0→95%)，再折算聚类尾段(95%→100%)。
-// CAS 防重入(沿用 RunClustering 的 s.running)；FacesEnabled 关闭时直接跳过；
-// 待检测为空且无未分配人脸时不发任务(避免秒闪空任务)。done 时 Added 沿用
-// 「新增人脸数」语义供前端 toast。
+// RunPipeline is the combined face detection + clustering task: it first
+// detects faces one by one on assets with status='indexed' AND offline=0
+// AND face_scanned=0 (real progress 0→95%), then folds in the clustering
+// tail (95%→100%). Reentrancy is guarded by CAS (shares RunClustering's
+// s.running); skipped outright when FacesEnabled is off; no task is
+// published when there's nothing to detect and no unassigned faces (avoids
+// a task flashing empty for an instant). On done, Added keeps the same
+// "newly added face count" semantics for the frontend toast.
 func (s *FaceService) RunPipeline(ctx context.Context) error {
 	if config.Cfg != nil && !config.Cfg.FacesEnabled {
 		return nil
@@ -537,13 +575,17 @@ func (s *FaceService) RunPipeline(ctx context.Context) error {
 	taskID := fmt.Sprintf("face_%d", time.Now().UnixNano())
 	started := time.Now()
 	total := int64(len(targets))
-	// pub 的 running 中间态里 current/curTotal 会原样填进 Task.Current/Total；
-	// done/error 终态则统一改填 total(待检测资产数)与 added，语义不变。
-	// 检测阶段(0–95%)传真实 current/curTotal，聚类尾段(95–100%)传 0/0——
-	// 前端 NimoTaskBar 在 total>0 时优先用 current/total 算百分比，尾段处理数
-	// 已经跟 total 相等，若仍填两者会让还在 running 的尾段被计算成 100%；
-	// 置 0 后前端回退到用 progress 字段本身，能看到 95→100% 的真实爬升，
-	// 与 RunClustering 原有的 pub 模式一致。
+	// pub's running intermediate state passes current/curTotal straight into
+	// Task.Current/Total; done/error terminal states uniformly overwrite them
+	// with total (assets awaiting detection) and added, with unchanged
+	// semantics. The detection stage (0–95%) passes real current/curTotal;
+	// the clustering tail (95–100%) passes 0/0 — because the frontend
+	// NimoTaskBar prefers current/total to compute the percentage when
+	// total>0, and by the tail stage processed already equals total, so
+	// still filling both would make the still-running tail read as 100%.
+	// Zeroing them makes the frontend fall back to the progress field
+	// itself, so the real 95→100% climb is visible, matching RunClustering's
+	// existing pub pattern.
 	pub := func(progress float64, status string, errKey string, errParams map[string]string, current, curTotal, added int64) {
 		if s.reg == nil {
 			return
@@ -551,7 +593,7 @@ func (s *FaceService) RunPipeline(ctx context.Context) error {
 		t := Task{
 			ID:        taskID,
 			Type:      "face",
-			Label:     "识别人物",
+			Label:     "Recognizing people",
 			Progress:  progress,
 			Status:    status,
 			StartedAt: started,
@@ -578,7 +620,7 @@ func (s *FaceService) RunPipeline(ctx context.Context) error {
 			break
 		}
 		if derr := s.detectFaceScanTarget(ctx, tgt); derr != nil {
-			zap.L().Warn("人脸检测跳过，下轮重试",
+			zap.L().Warn("face detection skipped, will retry next round",
 				zap.String("asset_id", tgt.id), zap.Error(derr))
 		}
 		processed++
@@ -595,9 +637,11 @@ func (s *FaceService) RunPipeline(ctx context.Context) error {
 
 	_, newFaces, cerr := s.clusterStage(ctx, nil, func(p float64) {
 		if total == 0 {
-			// 没有检测目标(纯聚类尾段场景，如历史遗留的未聚类脸)：没有 0–95%
-			// 的检测阶段可映射，直接把聚类进度铺满整段 0–100%；current/curTotal
-			// 同样置 0，理由见上面 pub 定义处的注释。
+			// No detection targets (a pure clustering-tail scenario, e.g.
+			// leftover unclustered faces from history): there's no 0–95%
+			// detection stage to map into, so the clustering progress fills
+			// the whole 0–100% span directly; current/curTotal are likewise
+			// zeroed, for the reason noted above at pub's definition.
 			pub(p, "running", "", nil, 0, 0, 0)
 			return
 		}
@@ -618,9 +662,11 @@ func (s *FaceService) RunPipeline(ctx context.Context) error {
 	return nil
 }
 
-// purgeAutoPersons 删除所有自动聚类产生的(非锚定:无名字/收藏/关系/隐藏)person
-// 及其 face_person 行。锚定人物(用户命名/收藏/关系/隐藏)保留。
-// 用于 0 人脸场景下清理孤儿人物;删除顺序与 rebuildPersonsWithProgress 一致。
+// purgeAutoPersons deletes every person produced by auto-clustering
+// (non-anchored: no name/favorite/relation/hidden) along with its
+// face_person rows. Anchored persons (user-named/favorited/related/hidden)
+// are kept. Used to clean up orphan persons in the 0-face case; the deletion
+// order matches rebuildPersonsWithProgress.
 func (s *FaceService) purgeAutoPersons(ctx context.Context) (err error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -645,27 +691,44 @@ func (s *FaceService) purgeAutoPersons(ctx context.Context) (err error) {
 	return err
 }
 
-// purgeEmptyAutoPersons 删除「非锚定(无名字/收藏/关系/隐藏)且已无任何成员脸」的 person。
+// purgeEmptyAutoPersons deletes any person that is "non-anchored (no
+// name/favorite/relation/hidden) and has no member faces left".
 //
-// 用于删照片后的孤儿自愈:删 asset 会经 FK 级联删掉 face_detections 和 face_person,
-// 但 persons 不在级联链上,会遗留空壳孤儿。而清 persons 的常规路径(rebuildPersons)
-// 只在 RunClustering 跑起来时才执行,删除本身不触发聚类,故需独立的周期性自愈。
+// Used for orphan self-healing after photo deletion: deleting an asset
+// cascades via FK to delete face_detections and face_person, but persons is
+// not on that cascade chain, leaving behind an empty-shell orphan. The
+// regular path that cleans up persons (rebuildPersons) only runs when
+// RunClustering executes — deletion alone doesn't trigger clustering — so an
+// independent periodic self-heal is needed.
 //
-// 安全性:正常聚类后的非锚定 person 都在同一事务里带着 face_person 成员,EXISTS 子查询
-// 会判定其非空而保留;此处只清理「已无成员」的空壳,可在任意时刻反复调用。
-// shouldClusterUnassigned 判断是否应触发一次聚类(不含每日 03:xx 定时那条):
-//   - 未分配人脸 > 0 且已无 pending 资产(索引彻底结束)时,才聚类一次。
+// Safety: after a normal clustering pass, a non-anchored person always has
+// its face_person members set within the same transaction, so the EXISTS
+// subquery finds it non-empty and keeps it; this only cleans up shells that
+// already have "no members left", and can be called repeatedly at any time.
+// shouldClusterUnassigned decides whether to trigger one clustering pass
+// (excluding the daily 03:xx scheduled one):
+//   - only clusters once when unassigned faces > 0 and there are no pending
+//     assets left (indexing has fully finished).
 //
-// 设计:聚类只在「索引彻底安静」后跑一次,不在索引进行中提前触发。
-// 早先有「未分配人脸 ≥ clusterBatchSize 就立即聚类」的提前触发,会导致一次上传里
-// 索引途中先聚一次、settle 后又聚一次(双跑:用户会看到两条「识别人物」),故移除。
-// 代价:超大上传也要等索引全部结束才聚类一次(完成提示稍晚几秒),换来「合并成单条」。
+// Design: clustering only runs once after indexing has gone fully quiet, not
+// triggered early while indexing is still in progress. There used to be an
+// early trigger ("cluster immediately once unassigned faces >=
+// clusterBatchSize"), which could cause a single upload to cluster once
+// mid-index and again after settling (a double run: the user would see two
+// "Recognizing people" entries), so it was removed. The tradeoff: even a
+// very large upload has to wait for indexing to fully finish before
+// clustering once (the completion notice lands a few seconds later), in
+// exchange for merging into a single entry.
 //
-// 依赖 pending==0 而非上传批次回调(SetOnBatchDone 基于 ingestTracker 的 current>=total,
-// 声明总数>实际处理数时永不归零),否则少量人脸会一直不聚类、persons 始终为 0、
-// 「识别人物」任务从不出现。
+// Relies on pending==0 rather than the upload batch callback (SetOnBatchDone
+// is based on ingestTracker's current>=total, which never reaches zero when
+// the declared total overstates what was actually processed) — otherwise a
+// small number of faces would never get clustered, persons would stay at 0
+// forever, and the "Recognizing people" task would never appear.
 func (s *FaceService) shouldClusterUnassigned(ctx context.Context) bool {
-	// 去抖:索引活动还没安静够久(整批上传/索引可能仍在进行,只是出现了瞬时空档)→ 不触发。
+	// Debounce: indexing activity hasn't been quiet long enough (the whole
+	// upload/index batch may still be in progress, just hitting a momentary
+	// gap) -> don't trigger.
 	if s.indexIdleFor != nil && s.indexIdleFor() < clusterQuietPeriod {
 		return false
 	}
@@ -696,16 +759,22 @@ func (s *FaceService) purgeEmptyAutoPersons(ctx context.Context) error {
 func (s *FaceService) loadFacesWithProgress(ctx context.Context, total int64,
 	onProgress func(int64),
 ) ([]faceRow, error) {
-	// JOIN assets 过滤孤儿 face_detections（asset_id 指向已删除 asset 的行）。
-	// 不 JOIN 的话，rebuildPersons 拿着孤儿的 asset_id 做 cover 会触发
-	// persons.cover_asset_id REFERENCES assets(id) 的外键违反。
+	// The JOIN with assets filters out orphan face_detections (rows whose
+	// asset_id points at a deleted asset). Without the JOIN,
+	// rebuildPersons would pick an orphan's asset_id for cover and trip the
+	// persons.cover_asset_id REFERENCES assets(id) foreign key.
 	//
-	// 有意不过滤 offline=1：人脸向量数据本来就完整保留在磁盘上（不依赖原图文件),
-	// 聚类结果与 offline 状态无关。若在这里排除 offline 资产，插回移动盘后
-	// (MountGuard 标回 offline=0) 会触发一轮重新聚类，导致 person 分组抖动
-	// （同一批脸先被踢出聚类、插回后又被重新分配，可能落到不同的 person）。
-	// 展示层的过滤已经在 persons.go / search.go 等查询里通过 offline=0 完成，
-	// 聚类引擎本身保持"数据在就参与聚类"的稳定语义。
+	// Deliberately does not filter offline=1: face vector data is fully
+	// retained on disk regardless (it doesn't depend on the original image
+	// file), so clustering results are unrelated to offline status. Excluding
+	// offline assets here would, once the removable drive is reinserted
+	// (MountGuard flips offline back to 0), trigger a re-clustering pass that
+	// churns person groupings (the same batch of faces gets kicked out of
+	// clustering, then reassigned once reinserted, possibly landing on a
+	// different person). Presentation-layer filtering is already done via
+	// offline=0 in queries like persons.go / search.go; the clustering engine
+	// itself keeps the stable semantics of "if the data is there, it
+	// participates in clustering".
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT fd.id, fd.asset_id, fd.embedding
 		FROM face_detections fd
@@ -751,7 +820,8 @@ func (s *FaceService) rebuildPersonsWithProgress(ctx context.Context, faces []fa
 		}
 	}()
 
-	// 1. 载入锚定 person（有名字/收藏/关系/隐藏）及其当前成员脸，算质心。
+	// 1. Load anchored persons (has name/favorite/relation/hidden) and their
+	//    current member faces, and compute centroids.
 	type anchor struct {
 		id       string
 		centroid []float32
@@ -776,7 +846,7 @@ func (s *FaceService) rebuildPersonsWithProgress(ctx context.Context, faces []fa
 	}
 	anchorRows.Close()
 
-	anchored := map[string]bool{} // 锚定 person 名下的 face_id 集合
+	anchored := map[string]bool{} // set of face_id belonging to anchored persons
 	anchors := make([]anchor, 0, len(anchorIDs))
 	for _, pid := range anchorIDs {
 		fr, ferr := tx.QueryContext(ctx, `
@@ -803,7 +873,7 @@ func (s *FaceService) rebuildPersonsWithProgress(ctx context.Context, faces []fa
 			return cerr
 		}
 		fr.Close()
-		// 记录锚定成员
+		// Record anchored members
 		mr, merr := tx.QueryContext(ctx, `SELECT face_id FROM face_person WHERE person_id=?`, pid)
 		if merr != nil {
 			err = merr
@@ -825,7 +895,7 @@ func (s *FaceService) rebuildPersonsWithProgress(ctx context.Context, faces []fa
 		anchors = append(anchors, anchor{id: pid, centroid: ComputeCentroid(vecs)})
 	}
 
-	// 2. 删除自动 person（非锚定）及其 face_person 行。
+	// 2. Delete auto persons (non-anchored) and their face_person rows.
 	if _, err = tx.Exec(`
 		DELETE FROM face_person
 		WHERE person_id IN (SELECT id FROM persons WHERE NOT (name!='' OR favorite=1 OR relation!='' OR hidden=1))`); err != nil {
@@ -837,8 +907,9 @@ func (s *FaceService) rebuildPersonsWithProgress(ctx context.Context, faces []fa
 		return err
 	}
 
-	// 3. 游离脸 = 不在锚定成员集合内的脸；先尝试吸附到最近锚定质心。
-	// 预编译 face_person INSERT，步骤 3 和 4 共用。
+	// 3. Free faces = faces not in the anchored member set; first try to snap
+	//    them onto the nearest anchored centroid.
+	// Pre-compile the face_person INSERT, shared by steps 3 and 4.
 	fpStmt, err := tx.PrepareContext(ctx, `INSERT INTO face_person(face_id, person_id) VALUES(?,?)`)
 	if err != nil {
 		return err
@@ -878,8 +949,9 @@ func (s *FaceService) rebuildPersonsWithProgress(ctx context.Context, faces []fa
 		}
 	}
 
-	// 4. 剩余游离脸按 DBSCAN label 聚成新自动 person。
-	// cover_asset_id / cover_face_id 由 recomputePersonStatsTx 统一设置，这里 INSERT 时不填。
+	// 4. Group the remaining free faces into new auto persons by DBSCAN label.
+	// cover_asset_id / cover_face_id are set uniformly by
+	// recomputePersonStatsTx, so left unset in this INSERT.
 	personStmt, err := tx.PrepareContext(ctx, `INSERT INTO persons(id, name, created_at, updated_at) VALUES(?, '', ?, ?)`)
 	if err != nil {
 		return err
@@ -903,8 +975,10 @@ func (s *FaceService) rebuildPersonsWithProgress(ctx context.Context, faces []fa
 		}
 	}
 
-	// 5. 为所有 person（含 hidden）回写 centroid/confidence/cover_face_id：
-	//    隐藏 person 也需要保持最新质心，否则下次聚类的吸附阶段会用陈旧质心。
+	// 5. Write back centroid/confidence/cover_face_id for every person
+	//    (including hidden ones): hidden persons also need an up-to-date
+	//    centroid, or the next clustering pass's snap stage would use a
+	//    stale one.
 	if err = s.recomputePersonStatsTx(ctx, tx); err != nil {
 		return err
 	}
@@ -1040,7 +1114,7 @@ func (s *FaceService) recomputePersonStatsTx(ctx context.Context, tx *sql.Tx) er
 }
 
 // StartScheduler runs a background goroutine that triggers RunPipeline
-// (检测+聚类一体，见 RunPipeline)：
+// (combined detection + clustering, see RunPipeline):
 //   - once per hour at 03:xx (minute < 5), or
 //   - when the number of unassigned faces reaches clusterBatchSize.
 func (s *FaceService) StartScheduler(ctx context.Context) {
@@ -1053,13 +1127,16 @@ func (s *FaceService) StartScheduler(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			case t := <-ticker.C:
-				// 孤儿人物自愈(独立于聚类节流/开关):删照片会级联删脸但不删 persons,
-				// 这里每分钟清理已无成员的非锚定 person,覆盖所有删除路径。
+				// Orphan person self-heal (independent of the clustering
+				// throttle/switch): deleting a photo cascades to delete its
+				// faces but not persons, so every minute this cleans up
+				// non-anchored persons that have no members left, covering
+				// every deletion path.
 				if err := s.purgeEmptyAutoPersons(ctx); err != nil {
 					zap.L().Warn("purge empty auto-persons failed", zap.Error(err))
 				}
 
-				// 失败 backoff：上次失败后短期内不再尝试。
+				// Failure backoff: don't retry for a while after the last failure.
 				s.failMu.Lock()
 				nextOK := s.nextAttempt
 				s.failMu.Unlock()

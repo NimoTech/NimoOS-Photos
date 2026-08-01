@@ -8,7 +8,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// loadConfigFromINI 写临时 ini 文件并调用 Init，返回加载后的 Cfg。
+// loadConfigFromINI writes a temp ini file and calls Init, returning the loaded Cfg.
 func loadConfigFromINI(t *testing.T, ini string) *Config {
 	t.Helper()
 	cf := filepath.Join(t.TempDir(), "photos.conf")
@@ -17,17 +17,18 @@ func loadConfigFromINI(t *testing.T, ini string) *Config {
 	return Cfg
 }
 
-// TestWatchDirsEmptyMeansAuto：watchdirs 不配置（或置空）⇒ Cfg.WatchDirs 为空，
-// watcher 进入自动模式（范围=EnumerateScanRoots）；显式配置 ⇒ 手工清单原样保留。
+// TestWatchDirsEmptyMeansAuto: watchdirs unconfigured (or blank) => Cfg.WatchDirs
+// is empty, watcher enters auto mode (scope=EnumerateScanRoots); explicit
+// config => the manual list is kept as-is.
 func TestWatchDirsEmptyMeansAuto(t *testing.T) {
 	cfg := loadConfigFromINI(t, "[photos]\nDataPath=/tmp/x\n")
-	require.Empty(t, cfg.WatchDirs, "未配置 watchdirs 必须为空（自动模式），不得回填旧三目录默认")
+	require.Empty(t, cfg.WatchDirs, "unconfigured watchdirs must be empty (auto mode), must not backfill the old three-directory default")
 
 	cfg = loadConfigFromINI(t, "[photos]\nDataPath=/tmp/x\nWatchDirs=/DATA/Gallery,/DATA/Media\n")
 	require.Equal(t, []string{"/DATA/Gallery", "/DATA/Media"}, cfg.WatchDirs)
 }
 
-// 配置文件无新 key 时，新开关默认 true（与 FacesEnabled 同语义）。
+// When the config file has none of the new keys, the new toggles default to true (same semantics as FacesEnabled).
 func TestNewFlagsDefaultTrue(t *testing.T) {
 	cf := filepath.Join(t.TempDir(), "photos.conf")
 	require.NoError(t, Init(cf, "[photos]\n"))
@@ -37,7 +38,7 @@ func TestNewFlagsDefaultTrue(t *testing.T) {
 	require.True(t, Cfg.AestheticEnabled)
 }
 
-// Save 写盘后重新 Init 能读回完全一致的值（含 false）。
+// After Save writes to disk, re-Init reads back exactly the same values (including false).
 func TestSaveRoundTrip(t *testing.T) {
 	cf := filepath.Join(t.TempDir(), "photos.conf")
 	require.NoError(t, Init(cf, "[photos]\n"))
@@ -58,7 +59,7 @@ func TestSaveRoundTrip(t *testing.T) {
 	require.False(t, Cfg.SmartViewEnabled)
 }
 
-// 配置文件无新 key 时，三个语义搜索标定值维持改配置化之前的硬编码默认值。
+// When the config file has none of the new keys, the three semantic search calibration values keep the hardcoded defaults from before this became configurable.
 func TestSearchCalibrationDefaults(t *testing.T) {
 	cf := filepath.Join(t.TempDir(), "photos.conf")
 	require.NoError(t, Init(cf, "[photos]\n"))
@@ -67,7 +68,7 @@ func TestSearchCalibrationDefaults(t *testing.T) {
 	require.Equal(t, 0.13, Cfg.SimDisplayCeil)
 }
 
-// 配置文件显式给出这三个 key 时按配置值生效。
+// When the config file explicitly sets these three keys, the config values take effect.
 func TestSearchCalibrationOverride(t *testing.T) {
 	cf := filepath.Join(t.TempDir(), "photos.conf")
 	sample := "[photos]\nMinMatchSimilarity = 0.2\nSimDisplayFloor = 0.05\nSimDisplayCeil = 0.2\n"
@@ -77,30 +78,30 @@ func TestSearchCalibrationOverride(t *testing.T) {
 	require.Equal(t, 0.2, Cfg.SimDisplayCeil)
 }
 
-// 配置文件无 SearchCutAlpha key 时默认 0.7（照 MinMatchSimilarity 的兜底模式）。
+// When the config file has no SearchCutAlpha key, defaults to 0.7 (same fallback pattern as MinMatchSimilarity).
 func TestSearchCutAlphaDefault(t *testing.T) {
 	cf := filepath.Join(t.TempDir(), "photos.conf")
 	require.NoError(t, Init(cf, "[photos]\n"))
 	require.Equal(t, 0.7, Cfg.SearchCutAlpha)
 }
 
-// 配置文件显式给出 SearchCutAlpha 时按配置值生效。
+// When the config file explicitly sets SearchCutAlpha, the config value takes effect.
 func TestSearchCutAlphaOverride(t *testing.T) {
 	cf := filepath.Join(t.TempDir(), "photos.conf")
 	require.NoError(t, Init(cf, "[photos]\nSearchCutAlpha = 0.55\n"))
 	require.Equal(t, 0.55, Cfg.SearchCutAlpha)
 }
 
-// PreviewPregen 缺省应为 false（纯懒生成：只在用户悬浮时由路由端现场生成）。
+// PreviewPregen should default to false (purely lazy generation: only generated on the spot by the route handler when the user hovers).
 func TestPreviewPregenDefaultOff(t *testing.T) {
 	cfg := loadConfigFromINI(t, "[photos]\nDataPath=/tmp/x\n")
-	require.False(t, cfg.PreviewPregen, "PreviewPregen 缺省应为 false（纯懒生成）")
+	require.False(t, cfg.PreviewPregen, "PreviewPregen should default to false (purely lazy generation)")
 }
 
-// 配置文件显式打开时应生效。
+// Should take effect when the config file explicitly enables it.
 func TestPreviewPregenExplicitOn(t *testing.T) {
 	cfg := loadConfigFromINI(t, "[photos]\nDataPath=/tmp/x\nPreviewPregen = true\n")
-	require.True(t, cfg.PreviewPregen, "PreviewPregen=true 应生效")
+	require.True(t, cfg.PreviewPregen, "PreviewPregen=true should take effect")
 }
 
 func TestScanIntervalDefaultAndSave(t *testing.T) {

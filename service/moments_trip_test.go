@@ -1,6 +1,7 @@
-// trip 引擎测试:覆盖简报 Step 1 清单——两段相隔 20 天的 GPS 簇产出 2 个
-// draft、5 张小簇被 min_assets 过滤、双城命名、subtitle 格式(含跨月)、
-// 同数据重算 id 稳定。
+// Tests for the trip engine: covers the Step 1 brief checklist — two GPS
+// clusters 20 days apart produce 2 drafts, a small 5-photo cluster is
+// filtered by min_assets, dual-city naming, subtitle formatting (including
+// cross-month), id stability across recomputes of the same data.
 package service
 
 import (
@@ -12,8 +13,9 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// insertTripAsset 插入一条满足候选池条件的资产(status='indexed'、非回收站、
-// 无 OCR 即非文档)+ 对应 asset_geo 行,供 trip 引擎测试使用。
+// insertTripAsset inserts an asset satisfying the candidate pool criteria
+// (status='indexed', not trashed, no OCR i.e. not a document) + a
+// corresponding asset_geo row, for use by trip engine tests.
 func insertTripAsset(t *testing.T, db *sql.DB, id string, takenAt time.Time, city, country string) {
 	t.Helper()
 	_, err := db.Exec(`INSERT INTO assets(id, file_path, status, taken_at) VALUES(?,?,'indexed',?)`,
@@ -23,7 +25,7 @@ func insertTripAsset(t *testing.T, db *sql.DB, id string, takenAt time.Time, cit
 	require.NoError(t, err)
 }
 
-// day 是构造测试时间戳的简写:2011 年 month 月 d 日 12:00 UTC。
+// day is a shorthand for building test timestamps: 2011, month, day d, 12:00 UTC.
 func day(month time.Month, d int) time.Time {
 	return time.Date(2011, month, d, 12, 0, 0, 0, time.UTC)
 }
@@ -31,21 +33,22 @@ func day(month time.Month, d int) time.Time {
 func TestBuildTripMoments_SplitFilterAndNaming(t *testing.T) {
 	db := makeTestDB(t)
 
-	// 段 A:东京 6 张,4 月 1 日~4 月 6 日(单城,同月)。
+	// Segment A: 6 Tokyo photos, Apr 1 ~ Apr 6 (single city, same month).
 	segA := []time.Time{day(4, 1), day(4, 2), day(4, 3), day(4, 4), day(4, 5), day(4, 6)}
 	for i, ts := range segA {
 		insertTripAsset(t, db, "a"+string(rune('0'+i)), ts, "Tokyo", "Japan")
 	}
 
-	// 小簇:京都 5 张,与段 A 相隔 20 天(4/6 → 4/26),数量不足 min_assets=6,
-	// 应被过滤。
+	// Small cluster: 5 Kyoto photos, 20 days apart from segment A (4/6 →
+	// 4/26), a count below min_assets=6, should be filtered.
 	small := []time.Time{day(4, 26), day(4, 27), day(4, 28), day(4, 29), day(4, 30)}
 	for i, ts := range small {
 		insertTripAsset(t, db, "s"+string(rune('0'+i)), ts, "Kyoto", "Japan")
 	}
 
-	// 段 C:6 张,与小簇相隔 20 天(4/30 → 5/20),跨 5 月/6 月,双城
-	// (Paris 4 张 + Lyon 2 张,Lyon 占比 2/6=33.3% > 30%)。
+	// Segment C: 6 photos, 20 days apart from the small cluster (4/30 →
+	// 5/20), spanning May/June, dual-city (Paris 4 + Lyon 2, Lyon's share
+	// 2/6=33.3% > 30%).
 	segC := []struct {
 		ts   time.Time
 		city string
@@ -65,11 +68,11 @@ func TestBuildTripMoments_SplitFilterAndNaming(t *testing.T) {
 
 	drafts, err := BuildTripMoments(context.Background(), db, recipe)
 	require.NoError(t, err)
-	require.Len(t, drafts, 2, "小簇应被 min_assets 过滤,只剩段 A + 段 C")
+	require.Len(t, drafts, 2, "the small cluster should be filtered by min_assets, leaving only segment A + segment C")
 
 	dA, dC := drafts[0], drafts[1]
 
-	// 段 A:单城、同月 subtitle、6 张成员。
+	// Segment A: single city, same-month subtitle, 6 members.
 	require.Equal(t, "Tokyo", dA.Place)
 	require.Equal(t, "Tokyo Trip", dA.Title)
 	require.Equal(t, "Apr 2011", dA.Subtitle)
@@ -81,7 +84,7 @@ func TestBuildTripMoments_SplitFilterAndNaming(t *testing.T) {
 		require.Zero(t, a.Score)
 	}
 
-	// 段 C:双城命名 + 跨月 subtitle(en dash 两侧各一空格)。
+	// Segment C: dual-city naming + cross-month subtitle (en dash, a space on each side).
 	require.Equal(t, "Paris & Lyon", dC.Place)
 	require.Equal(t, "Paris & Lyon Trip", dC.Title)
 	require.Equal(t, "May – Jun 2011", dC.Subtitle)
@@ -89,8 +92,8 @@ func TestBuildTripMoments_SplitFilterAndNaming(t *testing.T) {
 	require.True(t, dC.TimeFrom.Equal(segC[0].ts))
 	require.True(t, dC.TimeTo.Equal(segC[len(segC)-1].ts))
 
-	// id 稳定性:同一份数据重算应得到完全相同的 id 集合(不因重算顺序/走查
-	// 而"改名换姓")。
+	// id stability: recomputing the same data should yield exactly the same id
+	// set (not "renamed" depending on recompute order/traversal).
 	drafts2, err := BuildTripMoments(context.Background(), db, recipe)
 	require.NoError(t, err)
 	require.Len(t, drafts2, 2)
@@ -111,25 +114,26 @@ func TestBuildTripMoments_EmptyPool(t *testing.T) {
 func TestBuildTripMoments_ExcludesTrashOfflineAndDocs(t *testing.T) {
 	db := makeTestDB(t)
 
-	// 6 张正常东京照片(达到默认 min_assets=10 以下的自定义阈值)。
+	// 6 normal Tokyo photos (a custom threshold below the default min_assets=10).
 	recipe := MomentRecipe{Key: "trip", Kind: "trip", ParamsJSON: `{"min_assets":6}`}
 	base := []time.Time{day(7, 1), day(7, 2), day(7, 3), day(7, 4), day(7, 5), day(7, 6)}
 	for i, ts := range base {
 		insertTripAsset(t, db, "t"+string(rune('0'+i)), ts, "Tokyo", "Japan")
 	}
 
-	// 回收站资产(deleted_at 非空):不应计入候选池,也不应拖累 gap 判定。
+	// A trashed asset (deleted_at non-null): should not count toward the
+	// candidate pool, and should not affect the gap check either.
 	insertTripAsset(t, db, "trashed", day(7, 7), "Tokyo", "Japan")
 	_, err := db.Exec(`UPDATE assets SET deleted_at=? WHERE id='trashed'`, "2011-07-08 00:00:00")
 	require.NoError(t, err)
 
-	// 离线资产(offline=1):同理排除。
+	// An offline asset (offline=1): excluded for the same reason.
 	insertTripAsset(t, db, "offline1", day(7, 8), "Tokyo", "Japan")
 	_, err = db.Exec(`UPDATE assets SET offline=1 WHERE id='offline1'`)
 	require.NoError(t, err)
 
-	// 文档类资产(hasOcrExpr 判据成立):密度闸达标(coverage/line_count)+
-	// is_doc=1,排除。
+	// A document-type asset (the hasOcrExpr criterion holds): the density gate
+	// qualifies (coverage/line_count) + is_doc=1, excluded.
 	insertTripAsset(t, db, "doc1", day(7, 9), "Tokyo", "Japan")
 	_, err = db.Exec(`INSERT INTO asset_ocr(asset_id, text, coverage, line_count, is_doc)
 		VALUES('doc1','some long ocr text with many lines',0.9,20,1)`)
@@ -138,15 +142,17 @@ func TestBuildTripMoments_ExcludesTrashOfflineAndDocs(t *testing.T) {
 	drafts, err := BuildTripMoments(context.Background(), db, recipe)
 	require.NoError(t, err)
 	require.Len(t, drafts, 1)
-	require.Len(t, drafts[0].Assets, 6, "回收站/离线/文档资产均不应计入候选池")
+	require.Len(t, drafts[0].Assets, 6, "trashed/offline/document assets should not count toward the candidate pool")
 }
 
-// TestBuildTripMoments_ExcludesLivePhotoVideoSide 覆盖审查发现的遗漏:live
-// photo 的 MOV 视频侧与其静态照片同一瞬间各自都会落一条 asset_geo(见
-// geo.go BackfillPending 不排除视频侧),候选池若不排除
-// is_live_photo_video=1 就会把同一瞬间双计进段,拉高计数、扭曲主城占比、
-// 段内成员出现重复。与本库其它 geo JOIN 查询(places.go/persons.go/
-// search.go/smartview.go 等)统一判据。
+// TestBuildTripMoments_ExcludesLivePhotoVideoSide covers a gap found during
+// review: a live photo's MOV video side lands its own asset_geo row for the
+// same instant as its still photo (see geo.go's BackfillPending, which
+// doesn't exclude the video side); if the candidate pool didn't exclude
+// is_live_photo_video=1, the same instant would be double-counted into a
+// segment, inflating the count, skewing the dominant-city share, and
+// duplicating segment members. Aligned with this codebase's other geo JOIN
+// queries (places.go/persons.go/search.go/smartview.go etc.).
 func TestBuildTripMoments_ExcludesLivePhotoVideoSide(t *testing.T) {
 	db := makeTestDB(t)
 	recipe := MomentRecipe{Key: "trip", Kind: "trip", ParamsJSON: `{"min_assets":6}`}
@@ -156,7 +162,7 @@ func TestBuildTripMoments_ExcludesLivePhotoVideoSide(t *testing.T) {
 		insertTripAsset(t, db, "p"+string(rune('0'+i)), ts, "Tokyo", "Japan")
 	}
 
-	// p2(base[2]=8/3)的 live photo 视频侧:同一瞬间、同城市,也有 asset_geo。
+	// p2's (base[2]=8/3) live photo video side: same instant, same city, also has an asset_geo row.
 	insertTripAsset(t, db, "p2_video", day(8, 3), "Tokyo", "Japan")
 	_, err := db.Exec(`UPDATE assets SET is_live_photo_video=1 WHERE id='p2_video'`)
 	require.NoError(t, err)
@@ -164,14 +170,14 @@ func TestBuildTripMoments_ExcludesLivePhotoVideoSide(t *testing.T) {
 	drafts, err := BuildTripMoments(context.Background(), db, recipe)
 	require.NoError(t, err)
 	require.Len(t, drafts, 1)
-	require.Len(t, drafts[0].Assets, 6, "live photo 视频侧不应计入候选池,只计静态照片侧")
+	require.Len(t, drafts[0].Assets, 6, "a live photo video side should not count toward the candidate pool, only the still photo side counts")
 	for _, a := range drafts[0].Assets {
 		require.NotEqual(t, "p2_video", a.AssetID)
 	}
 }
 
-// TestTripSubtitle_CrossYear 锁定跨年场景:两侧各带年份,如
-// "Dec 2011 – Jan 2012"。
+// TestTripSubtitle_CrossYear pins down the cross-year scenario: the year on
+// both sides, e.g. "Dec 2011 – Jan 2012".
 func TestTripSubtitle_CrossYear(t *testing.T) {
 	from := time.Date(2011, time.December, 20, 0, 0, 0, 0, time.UTC)
 	to := time.Date(2012, time.January, 3, 0, 0, 0, 0, time.UTC)

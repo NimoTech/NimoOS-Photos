@@ -15,27 +15,30 @@ const (
 	ThumbSmallSize = 250
 	ThumbLargeSize = 1280
 
-	// ── ML 模型选型 ──────────────────────────────────────────────────────
-	// 与 ml-cache 预置模型必须一致;换任何一个模型时同步 bump MLModelGen,
-	// 服务启动时检测到代次变化会自动触发全量重建(见 service/rebuild.go)。
-	// SigLIP2 SO400M:短词/中英混搜判别力实测全面优于 nllb-clip-large
-	// (nllb 在单词式查询上无判别力,狼会排到小孩前面),视觉塔同为 SO400M。
+	// ── ML model selection ──────────────────────────────────────────────
+	// Must match the preloaded model in ml-cache; bump MLModelGen whenever
+	// either model changes. On startup the service detects a generation
+	// mismatch and automatically triggers a full rebuild (see service/rebuild.go).
+	// SigLIP2 SO400M: measurably outperforms nllb-clip-large on short-word
+	// and mixed CN/EN queries (nllb has no discrimination power on single-word
+	// queries — "wolf" ranks above "child"); the vision tower is also SO400M.
 	CLIPModelName = "ViT-SO400M-16-SigLIP2-384__webli"
-	CLIPDim       = 1152 // SO400M 输出维度(vec0 表维度)
-	FaceModelName = "antelopev2"                 // InsightFace ResNet100@Glint360K
-	FaceDim       = 512                          // antelopev2 embedding 维度
-	OCRModelName  = "PP-OCRv5_server"            // PaddleOCR v5 server 版
-	// MLModelGen 标识当前模型代次;photos_meta.ml_model_gen 与之不符时自动全量重建。
-	// gen 1 = ViT-B-32__openai + buffalo_l + PP-OCRv5_mobile(隐式,老库无此键)。
-	// gen 2 = nllb-clip-large-siglip__v1 + antelopev2 + PP-OCRv5_server。
+	CLIPDim       = 1152              // SO400M output dimension (vec0 table dimension)
+	FaceModelName = "antelopev2"      // InsightFace ResNet100@Glint360K
+	FaceDim       = 512               // antelopev2 embedding dimension
+	OCRModelName  = "PP-OCRv5_server" // PaddleOCR v5 server variant
+	// MLModelGen identifies the current model generation; if photos_meta.ml_model_gen
+	// doesn't match, a full rebuild is triggered automatically.
+	// gen 1 = ViT-B-32__openai + buffalo_l + PP-OCRv5_mobile (implicit; old DBs have no such key).
+	// gen 2 = nllb-clip-large-siglip__v1 + antelopev2 + PP-OCRv5_server.
 	MLModelGen = "3"
 )
 
 // TUS upload staging
 const (
-	// LegacyStagingDir 是 2026-07 之前写死的暂存目录;现行目录跟随
-	// photos.DataPath(见 main.go 对 StagingDir 的重设),这里仅供启动时
-	// 清扫历史残留。
+	// LegacyStagingDir was the hardcoded staging directory before 2026-07;
+	// the current directory now follows photos.DataPath (see main.go's reset
+	// of StagingDir) — this is kept only to sweep up leftovers on startup.
 	LegacyStagingDir = "/DATA/.system_data/photos-tus-staging"
 	MaxUploadSize    = int64(20 * 1024 * 1024 * 1024) // 20 GB
 	StagingMaxAge    = 7 * 24                         // hours
@@ -45,8 +48,10 @@ const (
 	V1TUSPath = "/v1/upload-tus"
 )
 
-// StagingDir 是 tus 上传暂存目录。var 而非 const:main.go 在 config.Init 之后
-// 把它重设为 <DataPath>/tus-staging,使暂存与派生数据同盘(DataPath 迁走时暂存
-// 一起走,不再固定挤占系统盘);完成侧 rename 失败已有跨盘 copy 兜底
-// (route/v1/tus.go)。默认值保持旧路径,测试可重定向。
+// StagingDir is the tus upload staging directory. var rather than const:
+// main.go resets it to <DataPath>/tus-staging after config.Init, so staging
+// lives on the same volume as derived data (it moves along if DataPath is
+// relocated, instead of permanently occupying the system disk); the
+// completion-side rename already has a cross-device copy fallback
+// (route/v1/tus.go). The default keeps the legacy path so tests can redirect it.
 var StagingDir = LegacyStagingDir

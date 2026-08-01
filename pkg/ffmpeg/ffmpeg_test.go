@@ -56,13 +56,13 @@ func TestGenerateSpriteProducesTile(t *testing.T) {
 		t.Skip("ffmpeg not found in PATH")
 	}
 	dir := t.TempDir()
-	// 造一个 6 秒测试视频
+	// Build a 6-second test video
 	src := filepath.Join(dir, "src.mp4")
 	mk := exec.Command("ffmpeg", "-hide_banner", "-loglevel", "error",
 		"-f", "lavfi", "-i", "testsrc=duration=6:size=320x240:rate=25", "-y", src)
 	require.NoError(t, mk.Run())
 
-	out := filepath.Join(dir, "sub", "sprite.jpg") // 子目录不存在，验证自动建目录
+	out := filepath.Join(dir, "sub", "sprite.jpg") // subdirectory doesn't exist, verifies auto-mkdir
 	require.NoError(t, ffmpeg.GenerateSprite(src, out, 10, 6.0))
 
 	f, err := os.Open(out)
@@ -70,9 +70,9 @@ func TestGenerateSpriteProducesTile(t *testing.T) {
 	defer f.Close()
 	cfg, _, err := image.DecodeConfig(f)
 	require.NoError(t, err)
-	// scale=240:-2 保留原始比例不补黑边：320×240(4:3) 源 → 单帧 240×180。
-	require.Equal(t, 10*240, cfg.Width) // tile=10x1 → 宽恒为 N*240
-	require.Equal(t, 180, cfg.Height)   // 240 * 240/320 = 180（按原比例）
+	// scale=240:-2 preserves the original aspect ratio without padding: a 320x240 (4:3) source -> a single frame of 240x180.
+	require.Equal(t, 10*240, cfg.Width) // tile=10x1 -> width is always N*240
+	require.Equal(t, 180, cfg.Height)   // 240 * 240/320 = 180 (matching original aspect ratio)
 }
 
 func TestGenerateSpriteRejectsZeroDuration(t *testing.T) {
@@ -87,7 +87,7 @@ func TestGeneratePreviewProducesLowBitrateH264(t *testing.T) {
 		t.Skip("ffprobe not found in PATH")
 	}
 	dir := t.TempDir()
-	// 造一个带音轨的 3 秒测试视频，这样才能断言 -an 真的去掉了音频。
+	// Build a 3-second test video with an audio track, so we can assert that -an actually strips the audio.
 	src := filepath.Join(dir, "src.mp4")
 	mk := exec.Command("ffmpeg", "-hide_banner", "-loglevel", "error",
 		"-f", "lavfi", "-i", "testsrc=duration=3:size=640x480:rate=25",
@@ -98,7 +98,7 @@ func TestGeneratePreviewProducesLowBitrateH264(t *testing.T) {
 	require.NoError(t, err)
 	require.NotEmpty(t, srcInfo.AudioCodec, "fixture source should carry an audio stream")
 
-	out := filepath.Join(dir, "sub", "preview.mp4") // 子目录不存在，验证自动建目录
+	out := filepath.Join(dir, "sub", "preview.mp4") // subdirectory doesn't exist, verifies auto-mkdir
 	require.NoError(t, ffmpeg.GeneratePreview(src, out))
 
 	info, err := ffmpeg.Probe(out)

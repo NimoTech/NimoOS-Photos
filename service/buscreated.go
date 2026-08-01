@@ -8,21 +8,27 @@ import (
 )
 
 // StartMediaCreatedSubscriber subscribes to nimoos:media:created on its OWN
-// WS connection. 独立连接是刻意的:主服务未升级(事件未注册)时本订阅会被
-// MessageBus 以 400 拒绝并退避重试,但绝不能连累 deleted 订阅那条连接。
+// WS connection. A separate connection is deliberate: if the main service
+// hasn't been upgraded yet (event not registered), this subscription gets
+// rejected by MessageBus with 400 and backs off/retries, but that must never
+// take down the deleted-subscriber connection.
 func StartMediaCreatedSubscriber(ctx context.Context, runtimePath string, ix *Indexer) {
 	runBusPathsSubscriber(ctx, runtimePath, "nimoos:media:created", func(paths []string) {
-		// 异步处理:大目录 walkSupported 可能跑数十秒,同步执行会停读本连接,
-		// 而 MessageBus 服务端对读慢的订阅者是非阻塞发送、直接丢事件。
-		// Enqueue 幂等(seen 去重)、队列有界,并发多个 walk 无害。
-		// deleted 订阅保持同步(其处理是快速 DB 清理,不受此影响)。
+		// Processed asynchronously: walkSupported on a large directory can run
+		// for tens of seconds, and synchronous execution would stall reads on
+		// this connection — MessageBus sends to slow-reading subscribers
+		// non-blockingly and just drops events. Enqueue is idempotent (seen
+		// dedup) and the queue is bounded, so concurrent walks are harmless.
+		// The deleted subscriber stays synchronous (its handling is a quick
+		// DB cleanup, unaffected by this).
 		go handleCreatedPaths(ctx, ix, paths)
 	})
 }
 
 // handleCreatedPaths enqueues landed files for indexing. Directories are
-// expanded recursively (整目录复制/移动时发布方只发目的地根路径)。
-// Enqueue 自带 seen 去重,与 fsnotify 重复触发无副作用。
+// expanded recursively (when an entire directory is copied/moved, the
+// publisher only sends the destination root path). Enqueue has built-in
+// seen dedup, so duplicate fsnotify triggers are harmless.
 func handleCreatedPaths(ctx context.Context, ix *Indexer, paths []string) {
 	for _, p := range paths {
 		select {
@@ -35,8 +41,10 @@ func handleCreatedPaths(ctx context.Context, ix *Indexer, paths []string) {
 			continue
 		}
 		if fi.IsDir() {
-			// 已知限制:p 本身是「指向目录的符号链接」时 WalkDir(Lstat 语义)不下钻,
-			// 交给周期全盘扫描兜底;这里不解引用,避免 symlink 环。
+			// Known limitation: when p itself is a "symlink pointing to a
+			// directory", WalkDir (Lstat semantics) won't descend into it;
+			// the periodic full scan covers it as a fallback. We don't
+			// dereference here, to avoid symlink loops.
 			if werr := walkSupported(ctx, p, func(f string) { ix.Enqueue(f) }); werr != nil {
 				zap.L().Warn("media:created: walk failed", zap.String("dir", p), zap.Error(werr))
 			}

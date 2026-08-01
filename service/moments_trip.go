@@ -1,11 +1,15 @@
-// trip 引擎:把候选池中带 GPS 的照片按拍摄时间"全局"(不预先按城市分组)
-// 切成若干旅行段,每段落地一个 trip 类型的 MomentDraft。
+// The trip engine: cuts GPS-tagged photos in the candidate pool into travel
+// segments by taken time "globally" (not pre-grouped by city), with each
+// segment landing as one trip-type MomentDraft.
 //
-// 之所以"全局切段、事后按城市命名"而不是像 places.go 的 Visits 那样先按
-// city_id 分组再各自切段:一趟真实的旅行常常跨越多个城市(如"东京→大阪"),
-// 若先按城分组会把同一趟旅行拆成好几个"独立到访",trip 时刻要呈现的是用户
-// 体感的"一趟旅程",所以先按时间全局聚出段,再用段内城市频次挑一个(或两个)
-// 代表性地名。
+// Why "globally segment first, name by city afterward" rather than grouping
+// by city_id first and segmenting within each group like places.go's Visits
+// does: a real trip often spans multiple cities (e.g. "Tokyo → Osaka"), and
+// grouping by city first would split the same trip into several "separate
+// visits". A trip moment should present the trip the way the user
+// experienced it — as a single journey — so segments are first clustered
+// globally by time, and then the segment's city frequency is used to pick
+// one (or two) representative place names.
 package service
 
 import (
@@ -17,7 +21,8 @@ import (
 	"time"
 )
 
-// tripCandidate 是候选池中一条待切段资产的最小信息。
+// tripCandidate is the minimal information for one to-be-segmented asset in
+// the candidate pool.
 type tripCandidate struct {
 	id      string
 	takenAt time.Time
@@ -25,18 +30,23 @@ type tripCandidate struct {
 	country string
 }
 
-// tripSegment 是切段结果在有序候选切片中的下标区间(闭区间 [start, end])。
+// tripSegment is a segmentation result's index range within the ordered
+// candidate slice (closed interval [start, end]).
 type tripSegment struct {
 	start, end int
 }
 
-// secondCityRatio 是"第二城"被认可为双城命名的最低段内占比阈值:超过此
-// 比例才认为该城不是偶然路过,值得并列进标题。
+// secondCityRatio is the minimum within-segment share a "second city" needs
+// to be recognized for dual-city naming: only above this ratio is the city
+// considered more than an incidental pass-through, worth pairing in the
+// title.
 const secondCityRatio = 0.3
 
-// BuildTripMoments 是 trip 引擎的纯函数入口:从候选池取有 GPS 的资产按拍摄
-// 时间排序,按 recipe 的 GapDays 全局切段,段内量达 MinAssets 的产出一个
-// MomentDraft(不落库,由调用方经 MomentStore.SyncRecipeMoments 幂等合并)。
+// BuildTripMoments is the trip engine's pure-function entry point: takes
+// GPS-tagged assets from the candidate pool sorted by taken time, segments
+// them globally by the recipe's GapDays, and produces a MomentDraft for each
+// segment whose size reaches MinAssets (not persisted; the caller merges
+// idempotently via MomentStore.SyncRecipeMoments).
 func BuildTripMoments(ctx context.Context, db *sql.DB, recipe MomentRecipe) ([]MomentDraft, error) {
 	params, err := ParseParams(recipe)
 	if err != nil {
@@ -58,7 +68,7 @@ func BuildTripMoments(ctx context.Context, db *sql.DB, recipe MomentRecipe) ([]M
 	for _, seg := range segs {
 		n := seg.end - seg.start + 1
 		if n < params.MinAssets {
-			continue // 小簇(如周末路过某地拍了几张)不足以成一趟旅行时刻。
+			continue // A small cluster (e.g. a few shots taken while passing through somewhere over a weekend) isn't enough to become a trip moment.
 		}
 		segItems := items[seg.start : seg.end+1]
 		from := segItems[0].takenAt
@@ -72,7 +82,8 @@ func BuildTripMoments(ctx context.Context, db *sql.DB, recipe MomentRecipe) ([]M
 
 		assets := make([]MomentAsset, len(segItems))
 		for i, it := range segItems {
-			// Score/Featured 先置零值,精选由 Task 3 的共用选优函数事后回填。
+			// Score/Featured start as zero values; featured is filled in afterward
+			// by Task 3's shared curation function.
 			assets[i] = MomentAsset{AssetID: it.id}
 		}
 
@@ -93,15 +104,20 @@ func BuildTripMoments(ctx context.Context, db *sql.DB, recipe MomentRecipe) ([]M
 	return drafts, nil
 }
 
-// loadTripCandidates 查询候选池:status='indexed'、非回收站(deleted_at IS
-// NULL AND offline=0,与本库既有查询——见 embedder.go/faces.go 等——同一
-// 判据)、排除文档(hasOcrExpr 取反,见 docscore.go:202)、排除
-// is_live_photo_video(live photo 的 MOV 侧与其静态照片同一瞬间各自落一条
-// asset_geo,不排除会在同一段内被双计,拉高计数/扭曲主城占比;与本库其它
-// 15+ 处 geo JOIN 查询——places.go/persons.go/search.go/smartview.go
-// 等——统一判据一致,而非参照 embedder/faces 这类非 geo 流水线),且必须
-// 有 asset_geo(JOIN 天然过滤掉无 GPS 的资产),按拍摄时间升序返回。
-// taken_at 相同时按 id 兜底排序,保证多轮调用切段结果确定、可复现。
+// loadTripCandidates queries the candidate pool: status='indexed', not
+// trashed (deleted_at IS NULL AND offline=0, the same criterion as existing
+// queries elsewhere in this codebase — see embedder.go/faces.go etc.),
+// excludes documents (the negation of hasOcrExpr, see docscore.go:202),
+// excludes is_live_photo_video (a live photo's MOV side lands its own
+// asset_geo row for the same instant as its still photo; not excluding it
+// would double-count it within the same segment, inflating the count/
+// skewing the dominant-city share; consistent with this codebase's other
+// 15+ geo JOIN queries — places.go/persons.go/search.go/smartview.go etc. —
+// rather than following non-geo pipelines like embedder/faces), and must
+// have an asset_geo row (the JOIN naturally filters out GPS-less assets),
+// returned sorted by taken time ascending. Ties on taken_at fall back to
+// sorting by id, guaranteeing a deterministic, reproducible segmentation
+// result across calls.
 func loadTripCandidates(ctx context.Context, db *sql.DB) ([]tripCandidate, error) {
 	rows, err := db.QueryContext(ctx, `
 		SELECT a.id, a.taken_at, COALESCE(g.city,''), COALESCE(g.country,'')
@@ -126,7 +142,7 @@ func loadTripCandidates(ctx context.Context, db *sql.DB) ([]tripCandidate, error
 		}
 		t := parseSQLiteTime(ts)
 		if t == nil {
-			continue // taken_at 已在 WHERE 里限定非空,这里只是双重保险。
+			continue // taken_at is already constrained non-null in the WHERE clause; this is just a belt-and-suspenders check.
 		}
 		it.takenAt = *t
 		out = append(out, it)
@@ -137,9 +153,11 @@ func loadTripCandidates(ctx context.Context, db *sql.DB) ([]tripCandidate, error
 	return out, nil
 }
 
-// splitByGap 把一个已按时间升序排好的序列,按相邻两点间隔 > gapDays 天切成
-// 若干段;算法与 places.go:194-207 的 splitTrips 一致,区别是这里的输入是
-// 跨城市合并后的全局序列,而不是单城市内的序列。
+// splitByGap cuts an already time-ascending-sorted sequence into segments
+// wherever adjacent points are > gapDays apart; the algorithm matches
+// places.go:194-207's splitTrips, the difference being that the input here
+// is a globally merged cross-city sequence, not a sequence within a single
+// city.
 func splitByGap(times []time.Time, gapDays int) []tripSegment {
 	if len(times) == 0 {
 		return nil
@@ -156,11 +174,15 @@ func splitByGap(times []time.Time, gapDays int) []tripSegment {
 	return segs
 }
 
-// dominantPlace 返回段内的主城命名:出现频次最高的城市为主城;若存在第二
-// 高频城市且其出现次数占段内资产总数超过 secondCityRatio,则返回
-// "CityA & CityB"(A 为主城)。频次并列时按城市名字典序稳定排序,避免同
-// 一份数据多次重算得到不同的命名顺序。空 city(reverse geocode 未产出地名)
-// 不参与计数;若段内全部为空 city,返回空字符串(调用方回退 "Trip" 标题)。
+// dominantPlace returns the segment's dominant-city naming: the
+// highest-frequency city is the dominant one; if there's a second-most-
+// frequent city whose appearance count exceeds secondCityRatio of the
+// segment's total assets, returns "CityA & CityB" (A being the dominant
+// one). Frequency ties are broken stably by city name lexical order, to
+// avoid getting a different naming order across multiple recomputes of the
+// same data. An empty city (reverse geocoding produced no place name)
+// doesn't count; if the whole segment has empty cities, returns an empty
+// string (the caller falls back to the "Trip" title).
 func dominantPlace(items []tripCandidate) string {
 	counts := map[string]int{}
 	var order []string
@@ -194,9 +216,10 @@ func dominantPlace(items []tripCandidate) string {
 	return top
 }
 
-// tripSubtitle 生成时刻卡片副标题:同月同年 "May 2011";跨月同年
-// "May – Jun 2011"(en dash,两侧各一空格);跨年则两侧各带年份,如
-// "Dec 2011 – Jan 2012"。
+// tripSubtitle generates the moment card subtitle: same month and year "May
+// 2011"; cross-month same year "May – Jun 2011" (en dash, a space on each
+// side); cross-year carries the year on both sides, e.g. "Dec 2011 – Jan
+// 2012".
 func tripSubtitle(from, to time.Time) string {
 	if from.Year() == to.Year() && from.Month() == to.Month() {
 		return from.Format("Jan 2006")

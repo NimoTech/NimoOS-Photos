@@ -14,32 +14,33 @@ import (
 	"go.uber.org/zap/zaptest/observer"
 )
 
-// TestSpriteBackfillCandidates 验证候选筛选 SQL 只挑出「已索引、未软删、
-// duration_ms>0 的视频」这一类，纯 SQL 筛选，不 stat 不生成。
+// TestSpriteBackfillCandidates verifies the candidate-selection SQL only
+// picks out the class "indexed, not soft-deleted, duration_ms>0 videos" —
+// pure SQL filtering, no stat, no generation.
 func TestSpriteBackfillCandidates(t *testing.T) {
 	db := makeTestDB(t)
 
-	// 入选：已索引视频，duration_ms>0。
+	// Included: an indexed video with duration_ms>0.
 	_, err := db.Exec(`INSERT INTO assets(id,file_path,mime_type,duration_ms,status,is_live_photo_video)
 		VALUES('v1','/g/v1.mp4','video/mp4',6000,'indexed',0)`)
 	require.NoError(t, err)
 
-	// 不入选：软删视频（deleted_at 非空）。
+	// Excluded: a soft-deleted video (deleted_at non-null).
 	_, err = db.Exec(`INSERT INTO assets(id,file_path,mime_type,duration_ms,status,is_live_photo_video,deleted_at)
 		VALUES('v2','/g/v2.mp4','video/mp4',6000,'indexed',0,CURRENT_TIMESTAMP)`)
 	require.NoError(t, err)
 
-	// 不入选：图片。
+	// Excluded: an image.
 	_, err = db.Exec(`INSERT INTO assets(id,file_path,mime_type,duration_ms,status,is_live_photo_video)
 		VALUES('p1','/g/p1.jpg','image/jpeg',0,'indexed',0)`)
 	require.NoError(t, err)
 
-	// 不入选：duration_ms=0 的视频。
+	// Excluded: a video with duration_ms=0.
 	_, err = db.Exec(`INSERT INTO assets(id,file_path,mime_type,duration_ms,status,is_live_photo_video)
 		VALUES('v3','/g/v3.mp4','video/mp4',0,'indexed',0)`)
 	require.NoError(t, err)
 
-	// 不入选：status='pending' 的视频。
+	// Excluded: a video with status='pending'.
 	_, err = db.Exec(`INSERT INTO assets(id,file_path,mime_type,duration_ms,status,is_live_photo_video)
 		VALUES('v4','/g/v4.mp4','video/mp4',6000,'pending',0)`)
 	require.NoError(t, err)
@@ -52,9 +53,10 @@ func TestSpriteBackfillCandidates(t *testing.T) {
 	require.Equal(t, int64(6000), got[0].durationMs)
 }
 
-// TestBackfillSpritesGeneratesAndIdempotent 对 fixture 视频跑一轮，断言
-// sprite.jpg 与 preview.mp4 都生成；再跑第二轮，断言两者都幂等（文件
-// mtime 不变，不重新生成）。
+// TestBackfillSpritesGeneratesAndIdempotent runs one backfill pass over a
+// fixture video, asserting both sprite.jpg and preview.mp4 are generated;
+// then runs a second pass, asserting both are idempotent (file mtime
+// unchanged, not regenerated).
 func TestBackfillSpritesGeneratesAndIdempotent(t *testing.T) {
 	if _, err := exec.LookPath("ffmpeg"); err != nil {
 		t.Skip("ffmpeg not found")
@@ -62,7 +64,7 @@ func TestBackfillSpritesGeneratesAndIdempotent(t *testing.T) {
 	db := makeTestDB(t)
 	thumbDir := t.TempDir()
 	ix := NewIndexer(db, &mockML{}, thumbDir, 1)
-	ix.SetPreviewPregen(true) // 本测试专测 preview.mp4 补跑,需显式开启(默认纯懒生成)
+	ix.SetPreviewPregen(true) // this test specifically covers the preview.mp4 backfill, needs to be explicitly enabled (default is pure lazy generation)
 
 	srcDir := t.TempDir()
 	src := filepath.Join(srcDir, "v1.mp4")
@@ -93,8 +95,8 @@ func TestBackfillSpritesGeneratesAndIdempotent(t *testing.T) {
 	require.Equal(t, fp1.ModTime(), fp2.ModTime(), "preview second run must be idempotent (no re-generation)")
 }
 
-// makeTestVideo 用 ffmpeg lavfi 生成一段固定时长的测试视频，供任务栏相关测试
-// 复用（避免每个测试重复这段样板）。
+// makeTestVideo uses ffmpeg lavfi to generate a fixed-duration test video,
+// reused by task-bar related tests (avoids repeating this boilerplate in every test).
 func makeTestVideo(t *testing.T, dir, name string) string {
 	t.Helper()
 	src := filepath.Join(dir, name)
@@ -103,8 +105,9 @@ func makeTestVideo(t *testing.T, dir, name string) string {
 	return src
 }
 
-// TestBackfillSprites_AllReadyEmitsNoTask 覆盖 TDD 用例①:候选视频的 sprite/preview
-// 都已就绪(无欠账)时，BackfillSprites 不应发出任何任务事件——即使注入了 registry。
+// TestBackfillSprites_AllReadyEmitsNoTask covers TDD case #1: when a
+// candidate video's sprite/preview are already complete (no backlog),
+// BackfillSprites should not emit any task event — even with a registry injected.
 func TestBackfillSprites_AllReadyEmitsNoTask(t *testing.T) {
 	if _, err := exec.LookPath("ffmpeg"); err != nil {
 		t.Skip("ffmpeg not found")
@@ -112,7 +115,7 @@ func TestBackfillSprites_AllReadyEmitsNoTask(t *testing.T) {
 	db := makeTestDB(t)
 	thumbDir := t.TempDir()
 	ix := NewIndexer(db, &mockML{}, thumbDir, 1)
-	ix.SetPreviewPregen(true) // 本测试要求 preview.mp4 也纳入"无欠账"判定,需显式开启
+	ix.SetPreviewPregen(true) // this test requires preview.mp4 to also count toward the "no backlog" judgment, needs explicit enabling
 
 	srcDir := t.TempDir()
 	src := makeTestVideo(t, srcDir, "v1.mp4")
@@ -120,7 +123,7 @@ func TestBackfillSprites_AllReadyEmitsNoTask(t *testing.T) {
 		VALUES('v1',?,'video/mp4',6000,'indexed',0)`, src)
 	require.NoError(t, err)
 
-	// 先跑一轮把 sprite/preview 都补齐，让候选处于"无欠账"状态。
+	// Run one pass first to fully backfill sprite/preview, putting the candidate in a "no backlog" state.
 	ix.BackfillSprites(context.Background())
 	require.FileExists(t, filepath.Join(thumbDir, "v1", "sprite.jpg"))
 	require.FileExists(t, filepath.Join(thumbDir, "v1", "preview.mp4"))
@@ -134,12 +137,13 @@ func TestBackfillSprites_AllReadyEmitsNoTask(t *testing.T) {
 
 	mu.Lock()
 	defer mu.Unlock()
-	require.Empty(t, emitted, "候选全部已就绪时不应发出任何任务事件")
+	require.Empty(t, emitted, "no task event should be emitted when every candidate is already ready")
 }
 
-// TestBackfillSprites_PendingEmitsTaskWithRealProgress 覆盖 TDD 用例②:存在欠账
-// 视频时应出现「生成视频预览」任务，label/type 正确，total=欠账数，current 随
-// 处理推进到 total，终态 done。
+// TestBackfillSprites_PendingEmitsTaskWithRealProgress covers TDD case #2:
+// when a video is behind, a "Generating video previews" task should appear,
+// with the correct label/type, total=backlog count, current advancing to
+// total as processing proceeds, and a done terminal state.
 func TestBackfillSprites_PendingEmitsTaskWithRealProgress(t *testing.T) {
 	if _, err := exec.LookPath("ffmpeg"); err != nil {
 		t.Skip("ffmpeg not found")
@@ -164,14 +168,14 @@ func TestBackfillSprites_PendingEmitsTaskWithRealProgress(t *testing.T) {
 
 	mu.Lock()
 	defer mu.Unlock()
-	require.NotEmpty(t, emitted, "存在欠账视频时应发出任务事件")
+	require.NotEmpty(t, emitted, "a task event should be emitted when a video is behind")
 
 	var sawDone bool
 	var maxCurrent int64
 	for _, e := range emitted {
 		require.Equal(t, "preview-backfill", e.Type)
 		require.Equal(t, "Generating video previews", e.Label)
-		require.Equal(t, int64(2), e.Total, "total 应为欠账候选数(v1、v2 两条)")
+		require.Equal(t, int64(2), e.Total, "total should equal the backlog candidate count (v1 and v2)")
 		if e.Current > maxCurrent {
 			maxCurrent = e.Current
 		}
@@ -179,19 +183,21 @@ func TestBackfillSprites_PendingEmitsTaskWithRealProgress(t *testing.T) {
 			sawDone = true
 		}
 	}
-	require.True(t, sawDone, "应有 done 终态事件")
-	require.Equal(t, int64(2), maxCurrent, "current 应随处理推进到 total")
+	require.True(t, sawDone, "there should be a done terminal event")
+	require.Equal(t, int64(2), maxCurrent, "current should advance to total as processing proceeds")
 }
 
-// TestBackfillSprites_FfmpegMissingSetsErrorTask 覆盖 TDD 用例③:ffmpeg 不可用
-// (PATH 置空模拟 exec.ErrNotFound)时，任务应带 TaskErrPreviewFfmpegMissing 错误终态。
+// TestBackfillSprites_FfmpegMissingSetsErrorTask covers TDD case #3: when
+// ffmpeg is unavailable (PATH emptied to simulate exec.ErrNotFound), the
+// task should carry the TaskErrPreviewFfmpegMissing error terminal state.
 func TestBackfillSprites_FfmpegMissingSetsErrorTask(t *testing.T) {
 	db := makeTestDB(t)
 	thumbDir := t.TempDir()
 	ix := NewIndexer(db, &mockML{}, thumbDir, 1)
 
-	// 源文件本身只需通过第一层 os.Stat(源文件)检查，随后触发 ffmpeg 调用即可
-	// 命中 exec.ErrNotFound,不要求是可解码的真实视频。
+	// The source file only needs to pass the first-layer os.Stat(source
+	// file) check; triggering the ffmpeg call right after is enough to
+	// hit exec.ErrNotFound — it doesn't need to be a decodable real video.
 	src := filepath.Join(t.TempDir(), "v1.mp4")
 	require.NoError(t, os.WriteFile(src, []byte("fake video bytes"), 0o644))
 	_, err := db.Exec(`INSERT INTO assets(id,file_path,mime_type,duration_ms,status,is_live_photo_video)
@@ -203,7 +209,7 @@ func TestBackfillSprites_FfmpegMissingSetsErrorTask(t *testing.T) {
 	reg := NewTaskRegistry(func(tk Task) { mu.Lock(); emitted = append(emitted, tk); mu.Unlock() })
 	ix.SetTaskRegistry(reg)
 
-	t.Setenv("PATH", "") // 模拟 ffmpeg 不可用：exec.Command 查不到可执行文件
+	t.Setenv("PATH", "") // simulate ffmpeg unavailable: exec.Command can't find the executable
 
 	ix.BackfillSprites(context.Background())
 
@@ -216,19 +222,20 @@ func TestBackfillSprites_FfmpegMissingSetsErrorTask(t *testing.T) {
 			require.Equal(t, TaskErrPreviewFfmpegMissing, e.ErrorKey)
 		}
 	}
-	require.True(t, sawError, "ffmpeg 不可用时应有 error 终态事件,带 TaskErrPreviewFfmpegMissing")
+	require.True(t, sawError, "there should be an error terminal event with TaskErrPreviewFfmpegMissing when ffmpeg is unavailable")
 }
 
-// TestBackfillSprites_NilRegistryDoesNotPanic 覆盖 TDD 用例④:未注入 registry 时
-// BackfillSprites 必须照常工作，不 panic——回归既有全部 sprite/preview 测试路径。
+// TestBackfillSprites_NilRegistryDoesNotPanic covers TDD case #4:
+// BackfillSprites must still work normally without panicking when no
+// registry is injected — a regression test for the existing sprite/preview test paths.
 func TestBackfillSprites_NilRegistryDoesNotPanic(t *testing.T) {
 	if _, err := exec.LookPath("ffmpeg"); err != nil {
 		t.Skip("ffmpeg not found")
 	}
 	db := makeTestDB(t)
 	thumbDir := t.TempDir()
-	ix := NewIndexer(db, &mockML{}, thumbDir, 1) // 未调用 SetTaskRegistry，taskReg 保持 nil
-	ix.SetPreviewPregen(true)                    // 本测试要求覆盖 preview.mp4 补跑路径,需显式开启
+	ix := NewIndexer(db, &mockML{}, thumbDir, 1) // SetTaskRegistry not called, taskReg stays nil
+	ix.SetPreviewPregen(true)                    // this test requires covering the preview.mp4 backfill path, needs explicit enabling
 
 	srcDir := t.TempDir()
 	src := makeTestVideo(t, srcDir, "v1.mp4")
@@ -242,10 +249,12 @@ func TestBackfillSprites_NilRegistryDoesNotPanic(t *testing.T) {
 	require.FileExists(t, filepath.Join(thumbDir, "v1", "preview.mp4"))
 }
 
-// TestBackfillSprites_PartialFailureStaysDone 覆盖裁决用例:3 条候选中仅 1 条
-// 生成失败(损坏视频)时,任务终态应仍为 done、不带 errorKey,失败数只计入汇总
-// 日志——对齐 BackfillOCR "只有全部候选都失败才 error" 的惯例,避免一条永久
-// 损坏的视频每轮补跑都把任务栏刷成 Failed。
+// TestBackfillSprites_PartialFailureStaysDone covers the adjudicated case:
+// when only 1 of 3 candidates fails to generate (a corrupt video), the
+// task's terminal state should still be done with no errorKey, with the
+// failure count only folded into the summary log — matching BackfillOCR's
+// convention of "error only when every candidate fails", avoiding a
+// permanently-corrupt video turning the task bar Failed on every backfill pass.
 func TestBackfillSprites_PartialFailureStaysDone(t *testing.T) {
 	if _, err := exec.LookPath("ffmpeg"); err != nil {
 		t.Skip("ffmpeg not found")
@@ -257,8 +266,9 @@ func TestBackfillSprites_PartialFailureStaysDone(t *testing.T) {
 	srcDir := t.TempDir()
 	src1 := makeTestVideo(t, srcDir, "v1.mp4")
 	src2 := makeTestVideo(t, srcDir, "v2.mp4")
-	// v3 是损坏视频(非法字节但文件存在):ffmpeg 能被找到,只是解码会失败,
-	// 命中"个别失败"分支,而非 exec.ErrNotFound 触发的整轮放弃分支。
+	// v3 is a corrupt video (invalid bytes but the file exists): ffmpeg
+	// can be found, decoding just fails, hitting the "individual failure"
+	// branch rather than the whole-pass-abandoned branch triggered by exec.ErrNotFound.
 	src3 := filepath.Join(srcDir, "v3.mp4")
 	require.NoError(t, os.WriteFile(src3, []byte("not a real video"), 0o644))
 
@@ -289,13 +299,13 @@ func TestBackfillSprites_PartialFailureStaysDone(t *testing.T) {
 	}
 	mu.Unlock()
 
-	require.True(t, sawFinal, "应有终态事件")
-	require.Equal(t, "done", final.Status, "3 条候选仅 1 条失败,任务终态应仍为 done")
-	require.Empty(t, final.ErrorKey, "部分失败不应携带 errorKey")
+	require.True(t, sawFinal, "there should be a terminal event")
+	require.Equal(t, "done", final.Status, "with only 1 of 3 candidates failing, the task's terminal state should still be done")
+	require.Empty(t, final.ErrorKey, "a partial failure should not carry an errorKey")
 
 	var loggedFailed bool
 	for _, entry := range logs.All() {
-		if entry.Message != "sprite/preview 补跑完成" {
+		if entry.Message != "sprite/preview backfill complete" {
 			continue
 		}
 		for _, f := range entry.Context {
@@ -304,12 +314,13 @@ func TestBackfillSprites_PartialFailureStaysDone(t *testing.T) {
 			}
 		}
 	}
-	require.True(t, loggedFailed, "汇总日志应记录失败数=1")
+	require.True(t, loggedFailed, "the summary log should record failed=1")
 }
 
-// TestBackfillSprites_AllFailedSetsErrorTask 覆盖裁决用例:候选全部生成失败时,
-// 任务终态应为 error 并携带 TaskErrPreviewPartialFailed——对齐 BackfillOCR
-// "全部失败才 error"的惯例,而非出现任意失败就 error。
+// TestBackfillSprites_AllFailedSetsErrorTask covers the adjudicated case:
+// when every candidate fails to generate, the task's terminal state should
+// be error carrying TaskErrPreviewPartialFailed — matching BackfillOCR's
+// convention of "error only when everything fails", not error on any single failure.
 func TestBackfillSprites_AllFailedSetsErrorTask(t *testing.T) {
 	if _, err := exec.LookPath("ffmpeg"); err != nil {
 		t.Skip("ffmpeg not found")
@@ -346,14 +357,15 @@ func TestBackfillSprites_AllFailedSetsErrorTask(t *testing.T) {
 			sawFinal = true
 		}
 	}
-	require.True(t, sawFinal, "应有终态事件")
-	require.Equal(t, "error", final.Status, "候选全部失败时任务终态应为 error")
+	require.True(t, sawFinal, "there should be a terminal event")
+	require.Equal(t, "error", final.Status, "the task's terminal state should be error when every candidate fails")
 	require.Equal(t, TaskErrPreviewPartialFailed, final.ErrorKey)
 	require.Equal(t, "2", final.ErrorParams["failed"])
 }
 
-// TestBackfillSpritesCASReentrant 并发两次调用 BackfillSprites，断言不 panic
-// 且不产生数据竞争（-race 兜底）；CAS 防重入下二者中至少一个应立即空转返回。
+// TestBackfillSpritesCASReentrant calls BackfillSprites concurrently twice,
+// asserting no panic and no data race (backed by -race); under the CAS
+// re-entrancy guard, at least one of the two should return as an immediate no-op.
 func TestBackfillSpritesCASReentrant(t *testing.T) {
 	if _, err := exec.LookPath("ffmpeg"); err != nil {
 		t.Skip("ffmpeg not found")
@@ -361,7 +373,7 @@ func TestBackfillSpritesCASReentrant(t *testing.T) {
 	db := makeTestDB(t)
 	thumbDir := t.TempDir()
 	ix := NewIndexer(db, &mockML{}, thumbDir, 1)
-	ix.SetPreviewPregen(true) // 本测试要求覆盖 preview.mp4 补跑路径,需显式开启
+	ix.SetPreviewPregen(true) // this test requires covering the preview.mp4 backfill path, needs explicit enabling
 
 	srcDir := t.TempDir()
 	src := filepath.Join(srcDir, "v1.mp4")

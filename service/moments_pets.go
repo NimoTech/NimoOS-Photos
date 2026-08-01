@@ -1,28 +1,40 @@
-// pet 实体画像引擎:把"全库搜含宠物元素"的概念版(theme:pets)升级为"用户
-// 自己的那只狗/猫"的实体归纳——区分信号是复现性:自己的宠物跨月/跨年反复
-// 出现,路遇的狗只出现一次(见设计 spec 产品动机)。
+// The pet entity profile engine: upgrades the "library-wide search for pet
+// elements" concept version (theme:pets) into an entity inference of "the
+// user's own dog/cat" — the distinguishing signal is recurrence: the user's
+// own pet reappears across months/years, while a dog encountered on the
+// street shows up only once (see the design spec's product motivation).
 //
-// 两段职责:
-//   - MinePetEntities:纯挖掘,lexicon 逐词(含短语)做 caption 词边界匹配,
-//     统计张数/跨月数,达标才归纳为一个 ProfileEntity,不落库、不碰
-//     moments 表。挖掘同时消费用户对该实体既有的 pin/exclude 反馈(见下)。
-//   - BuildPetEntityMoments:挖掘 → ReplaceEntities 落画像表 → 每个达标实体
-//     组装一个 MomentDraft(词命中 ∪ CLIP 检索的成员并集),供
-//     MomentsService.recomputeRecipe 走共用选优/落库管线,与 trip/theme
-//     两个引擎同一套装配方式。
+// Two responsibilities:
+//   - MinePetEntities: pure mining. For each lexicon word (possibly a phrase)
+//     does a caption word-boundary match, tallies photo count/distinct
+//     months, and only infers a ProfileEntity once it qualifies; doesn't
+//     persist and doesn't touch the moments table. Mining also consumes the
+//     user's existing pin/exclude feedback for that entity (see below).
+//   - BuildPetEntityMoments: mine → profileStore.ReplaceEntities persists the
+//     profile table → for each qualifying entity, assembles a MomentDraft
+//     (union of word-hit members ∪ CLIP-searched members), fed into
+//     MomentsService.recomputeRecipe's shared curation/persist pipeline — the
+//     same assembly approach as the trip/theme engines.
 //
-// pin/exclude 反馈消费(Task 3):实体的 moment id 由既有派生函数
-// (ProfileEntityID)预先算出 → MomentStore.MomentEditsFor 读取该实体当前
-// 生效的编辑 → exclude 命中的资产从匹配集剔除、pin 命中的资产(需在候选池
-// 里真实存在,即有合法 taken_at)并入匹配集,一并参与 min_photos/min_months
-// 达标判定与 first/last seen 统计。这是必要的:moment_assets 成员表的最终
-// 订正已由存储层 applyMomentEdits 在每轮 SyncRecipeMoments 里统一回放
-// (family/theme/trip 也吃这条通用回放,不需要各自的挖掘级消费),但"这个
-// 实体是否还够格被认定为用户自己的宠物"这一判定、以及画像/卡片副标题用的
-// first/last seen,只在这里的挖掘统计里产生,存储层的通用回放够不着——
-// exclude 剔干净了导致跌破门槛,实体就该从这里的输出中消失(联动
-// BuildPetEntityMoments 不再产出 draft、SyncRecipeMoments 的 stale-delete
-// 把陈旧时刻连同 moment_assets/moment_edits 一并级联清掉)。
+// pin/exclude feedback consumption (Task 3): the entity's moment id is
+// pre-derived by the existing derivation function (ProfileEntityID) →
+// MomentStore.MomentEditsFor reads that entity's currently effective edits →
+// assets hit by exclude are removed from the matched set, assets hit by pin
+// (which must genuinely exist in the candidate pool, i.e. have a valid
+// taken_at) are merged into the matched set, and both participate in the
+// min_photos/min_months qualification check and first/last-seen stats
+// together. This is necessary: the final correction of the moment_assets
+// membership table is already replayed uniformly by the storage layer's
+// applyMomentEdits on every SyncRecipeMoments round (family/theme/trip also
+// rely on this generic replay and don't need their own mining-level
+// consumption), but the determination of "does this entity still qualify as
+// the user's own pet" and the first/last seen used for the profile/card
+// subtitle are produced only in this mining-stage tally — the storage
+// layer's generic replay can't reach that far. Once exclude has stripped it
+// below the threshold, the entity should disappear from this output (which
+// in turn makes BuildPetEntityMoments stop producing a draft for it, and
+// SyncRecipeMoments's stale-delete cascades the stale moment away along with
+// its moment_assets/moment_edits).
 package service
 
 import (
@@ -36,8 +48,9 @@ import (
 	"unicode"
 )
 
-// petEvidence 是 pet 实体挖掘依据的 JSON 快照结构,落 ProfileEntity.EvidenceJSON,
-// 供排障与后续升级读取,不参与查询过滤。
+// petEvidence is the JSON snapshot structure for the pet entity mining
+// evidence, persisted to ProfileEntity.EvidenceJSON for troubleshooting and
+// future upgrades to read; it doesn't participate in query filtering.
 type petEvidence struct {
 	PhotoCount int    `json:"photo_count"`
 	Months     int    `json:"months"`
@@ -45,18 +58,24 @@ type petEvidence struct {
 	Last       string `json:"last"`
 }
 
-// MinePetEntities 是 pet 画像挖掘的纯函数入口:对 recipe.Lexicon 每个物种/
-// 品种词(可能是多词短语,如 "maine coon"/"boxer dog")做 caption 词边界
-// 匹配(复用 matchCaptionKeywords 的精滤思路——SQL instr 粗筛 + Go 正则
-// `\bkw\b` 精滤,\b 对多词短语天然按整短语边界匹配,不会被短语里的单个词
-// 误触发,如裸 "boxer" 不会命中 "boxer dog"),与既有候选池
-// (loadThemeCandidatePool,排除回收站/离线/文档/live photo 视频侧,同
-// theme/trip 引擎判据)取交集,统计张数与 distinct 年月数;
-// photo_count >= MinPhotos 且 months >= MinMonths 才归纳为一个
-// ProfileEntity(复现性判据)。返回按 Key 字典序排列,保证多轮挖掘结果顺序
-// 确定、可复现。Lexicon 为空时返回空(未配置词表,不是错误)。store 用于读取
-// 每个实体既有的 pin/exclude 编辑反馈(见文件头注释),据此订正匹配集后再
-// 判定达标与统计 first/last seen。
+// MinePetEntities is the pure-function entry point for pet profile mining:
+// for each species/breed word in recipe.Lexicon (possibly a multi-word
+// phrase, e.g. "maine coon"/"boxer dog"), does a caption word-boundary match
+// (reusing matchCaptionKeywords's precise-filter approach — SQL instr for a
+// coarse pass + a Go `\bkw\b` regex for the precise pass; \b naturally
+// matches a multi-word phrase by its whole-phrase boundary, so it won't be
+// misfired by a single word inside the phrase — e.g. bare "boxer" won't
+// match "boxer dog"), intersects with the existing candidate pool
+// (loadThemeCandidatePool, which excludes trash/offline/documents/live photo
+// companion videos — the same criteria as the theme/trip engines), and
+// tallies photo count and distinct year-month count; only once
+// photo_count >= MinPhotos and months >= MinMonths does it infer a
+// ProfileEntity (the recurrence criterion). Returns results sorted by Key
+// lexically, guaranteeing deterministic, reproducible ordering across mining
+// rounds. Returns empty when Lexicon is empty (no word list configured, not
+// an error). store is used to read each entity's existing pin/exclude edit
+// feedback (see the file header comment), which corrects the matched set
+// before qualification and first/last-seen stats are computed.
 func MinePetEntities(ctx context.Context, db *sql.DB, store *MomentStore, recipe MomentRecipe) ([]ProfileEntity, error) {
 	params, err := ParseParams(recipe)
 	if err != nil {
@@ -78,12 +97,15 @@ func MinePetEntities(ctx context.Context, db *sql.DB, store *MomentStore, recipe
 			return nil, fmt.Errorf("moments: pet lexicon match %q: %w", species, err)
 		}
 
-		// 消费该实体既有的 pin/exclude 反馈:moment id 与 BuildPetEntityMoments
-		// 落库时用的 e.ID 同一派生法,预先算出即可直接查编辑记录。exclude
-		// 命中的资产从匹配集剔除,pin 命中的资产(视作用户确认样本)并入,
-		// 二者一起参与下面的达标判定与 first/last seen 统计——否则用户"这
-		// 不是我的狗"的反馈只会体现在成员表,下一轮重算的挖掘统计仍会把它
-		// 悄悄吞回来。
+		// Consume this entity's existing pin/exclude feedback: the moment id
+		// uses the same derivation as e.ID used when BuildPetEntityMoments
+		// persists, so it can be pre-computed and used to query edit records
+		// directly. Assets hit by exclude are removed from the matched set,
+		// assets hit by pin (treated as user-confirmed samples) are merged in,
+		// and both participate in the qualification check and first/last-seen
+		// stats below — otherwise the user's "this isn't my dog" feedback would
+		// only show up in the membership table, and the next round's mining
+		// stats would quietly pull it back in.
 		momentID := ProfileEntityID("pet", species)
 		pins, excludes, err := store.MomentEditsFor(momentID)
 		if err != nil {
@@ -100,7 +122,7 @@ func MinePetEntities(ctx context.Context, db *sql.DB, store *MomentStore, recipe
 			}
 		}
 		for _, id := range pins {
-			if !excludeSet[id] { // pin 与 exclude 同时存在理论不该发生(后写覆盖先写),这里保守以 exclude 优先。
+			if !excludeSet[id] { // pin and exclude coexisting shouldn't happen in theory (later write overwrites earlier), but we conservatively prioritize exclude here.
 				matched[id] = true
 			}
 		}
@@ -111,7 +133,7 @@ func MinePetEntities(ctx context.Context, db *sql.DB, store *MomentStore, recipe
 		for id := range matched {
 			takenAt, ok := pool[id]
 			if !ok {
-				continue // 不在候选池(回收站/离线/文档/live photo 视频侧/无 taken_at)——pin 的资产也需要真实存在于候选池才能纳入统计。
+				continue // Not in the candidate pool (trash/offline/document/live photo companion video/no taken_at) — a pinned asset must genuinely exist in the candidate pool to count toward the stats.
 			}
 			photoCount++
 			months[takenAt.Format("2006-01")] = true
@@ -124,7 +146,7 @@ func MinePetEntities(ctx context.Context, db *sql.DB, store *MomentStore, recipe
 		}
 
 		if photoCount < params.MinPhotos || len(months) < params.MinMonths {
-			continue // 复现性不足:路人的狗/一次性偶遇,不归纳为用户自己的宠物。
+			continue // Insufficient recurrence: a stranger's dog/a one-off encounter, not inferred as the user's own pet.
 		}
 
 		ev, _ := json.Marshal(petEvidence{
@@ -150,21 +172,30 @@ func MinePetEntities(ctx context.Context, db *sql.DB, store *MomentStore, recipe
 	return out, nil
 }
 
-// BuildPetEntityMoments 是 pet 实体时刻引擎入口:先 MinePetEntities 挖掘全库
-// 达标宠物实体 → profileStore.ReplaceEntities("pet", ...) 幂等落画像表
-// (无达标实体也要以空集调用,清空上一轮画像——如用户的狗走丢了/词表调整
-// 导致不再命中时,画像不该残留过时数据)→ 每个达标实体产出一个
-// MomentDraft:成员 = 该词 caption 词边界命中 ∪ CLIP("a photo of a "+
-// species,ClipMinScore/ClipTopK 过滤)之交候选池,Score 取 CLIP 分,词边界
-// 命中但未被 CLIP 命中的资产记 ClipMinScore 保底分(与 theme 引擎两路取
-// 并集同一手法,见 BuildThemeMoments)。TimeFrom/TimeTo 取自挖掘阶段算出的
-// first/last(词命中口径,与实体的达标判据一致,不随 CLIP 并集额外延展)。
-// 精选/封面由调用方 MomentsService.recomputeRecipe 事后经
-// PickFeaturedAndCover 统一填充,这里只产出成员与初始分数。无达标实体返回
-// 空切片(不是错误)。store 透传给 MinePetEntities 用于消费 pin/exclude 反馈
-// (TimeFrom/TimeTo 取自挖掘阶段已订正的 first/last,天然带出订正结果;成员
-// 列表本身的 pin/exclude 订正由存储层 SyncRecipeMoments 的通用回放兜底,这里
-// 不重复处理,与 trip/theme/family 三个引擎一致)。
+// BuildPetEntityMoments is the pet entity moment engine's entry point: first
+// MinePetEntities mines the library-wide qualifying pet entities →
+// profileStore.ReplaceEntities("pet", ...) persists the profile table
+// idempotently (must be called with an empty set even when there are no
+// qualifying entities, to clear the previous round's profile — e.g. if the
+// user's dog is gone/a lexicon change means it no longer matches, the profile
+// shouldn't retain stale data) → for each qualifying entity, produces one
+// MomentDraft: members = the intersection with the candidate pool of (that
+// word's caption word-boundary hits ∪ CLIP("a photo of a "+species,
+// filtered by ClipMinScore/ClipTopK)), Score takes the CLIP score, and an
+// asset hit by the word boundary but not by CLIP gets the ClipMinScore floor
+// score (the same two-path union approach as the theme engine, see
+// BuildThemeMoments). TimeFrom/TimeTo come from the first/last computed
+// during mining (the word-hit criterion, consistent with the entity's
+// qualification criterion, not further extended by the CLIP union).
+// Featured/cover are filled in afterward by the caller
+// MomentsService.recomputeRecipe via PickFeaturedAndCover; this function only
+// produces members and initial scores. Returns an empty slice (not an
+// error) when there are no qualifying entities. store is passed through to
+// MinePetEntities to consume pin/exclude feedback (TimeFrom/TimeTo come from
+// the already-corrected first/last from mining, so the correction is carried
+// through naturally; correction of the member list itself is backstopped by
+// the storage layer's SyncRecipeMoments generic replay, not duplicated here —
+// consistent with the trip/theme/family engines).
 func BuildPetEntityMoments(ctx context.Context, db *sql.DB, searcher clipTextSearcher, profileStore *ProfileStore, store *MomentStore, recipe MomentRecipe) ([]MomentDraft, error) {
 	entities, err := MinePetEntities(ctx, db, store, recipe)
 	if err != nil {
@@ -197,7 +228,7 @@ func BuildPetEntityMoments(ctx context.Context, db *sql.DB, searcher clipTextSea
 			return nil, fmt.Errorf("moments: pet entity word hits %q: %w", species, err)
 		}
 		for _, id := range wordHits {
-			score[id] = params.ClipMinScore // 保底分,可能被下面更高的 CLIP 分覆盖。
+			score[id] = params.ClipMinScore // Floor score, may be overwritten by a higher CLIP score below.
 		}
 
 		clipHits, err := searcher.SearchAssetsByText(ctx, "a photo of a "+species, params.ClipTopK)
@@ -216,7 +247,7 @@ func BuildPetEntityMoments(ctx context.Context, db *sql.DB, searcher clipTextSea
 		var assets []MomentAsset
 		for id, s := range score {
 			if _, ok := pool[id]; !ok {
-				continue // 不在候选池(回收站/离线/文档/live photo 视频侧)。
+				continue // Not in the candidate pool (trash/offline/document/live photo companion video).
 			}
 			assets = append(assets, MomentAsset{AssetID: id, Score: s})
 		}
@@ -244,10 +275,12 @@ func BuildPetEntityMoments(ctx context.Context, db *sql.DB, searcher clipTextSea
 	return drafts, nil
 }
 
-// petEntitySubtitle 生成 pet 实体时刻卡片副标题:年份跨度,同年只写一年
-// ("2020"),跨年则 en dash 两侧各一空格("2011 – 2026")。与 tripSubtitle
-// 的月份粒度不同——pet 实体常年复现,首末张跨度往往数年,年份粒度更贴切,
-// 精确到月反而琐碎。
+// petEntitySubtitle generates the pet entity moment card subtitle: a year
+// span, writing just one year for the same year ("2020"), or an en dash with
+// a space on each side across years ("2011 – 2026"). Different granularity
+// from tripSubtitle's month-level — pet entities recur year after year, and
+// the span between first and last photo is often several years, so year
+// granularity fits better; month precision would be needlessly fussy.
 func petEntitySubtitle(from, to time.Time) string {
 	if from.Year() == to.Year() {
 		return fmt.Sprintf("%d", from.Year())
@@ -255,10 +288,11 @@ func petEntitySubtitle(from, to time.Time) string {
 	return fmt.Sprintf("%d", from.Year()) + " – " + fmt.Sprintf("%d", to.Year())
 }
 
-// titleCasePhrase 把一个(可能多词的)小写短语转成 Title Case,逐词首字母
-// 大写:"beagle" -> "Beagle"、"maine coon" -> "Maine Coon"、"boxer dog" ->
-// "Boxer Dog"。不用标准库 strings.Title(已 deprecated 且对本场景够用的
-// ASCII 单词就是多此一举),手写更清晰。
+// titleCasePhrase converts a (possibly multi-word) lowercase phrase to Title
+// Case, capitalizing the first letter of each word: "beagle" -> "Beagle",
+// "maine coon" -> "Maine Coon", "boxer dog" -> "Boxer Dog". Not using the
+// standard library's strings.Title (deprecated, and overkill for the plain
+// ASCII words this scenario needs) — a hand-rolled version is clearer.
 func titleCasePhrase(s string) string {
 	words := strings.Fields(s)
 	for i, w := range words {

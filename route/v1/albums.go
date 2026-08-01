@@ -20,8 +20,9 @@ import (
 // AlbumsHandler handles album CRUD and asset membership operations.
 type AlbumsHandler struct {
 	svc service.Services
-	// runtimePath 供 Export 的 query-token JWT 校验取公钥用（同 FavoritesHandler
-	// 约定）；空串表示测试/单机直连场景，跳过真实 JWT 校验。
+	// runtimePath is used by Export's query-token JWT check to fetch the
+	// public key (same convention as FavoritesHandler); an empty string
+	// means test/standalone mode, skipping real JWT validation.
 	runtimePath string
 }
 
@@ -82,15 +83,19 @@ func (h *AlbumsHandler) Get(c echo.Context) error {
 
 // Export — GET /v1/photos/albums/:id/export?token=<jwt>
 //
-// 手动相册 ZIP 下载,与 favorites.Export 同构：浏览器 window.location.href
-// 导航发不出 Authorization 头,靠 router.go 的 mediaGetSkip 按路由后缀放行
-// JWT 中间件,handler 内部改用 query token 自行校验（token 缺失/无效 401）。
-// runtimePath=="" 时是测试/单机直连场景,跳过真实校验（同 FavoritesHandler
-// 的既有约定）。相册本身不区分用户,这里只校验 token 合法性,不取 userID。
+// Manual album ZIP download, mirroring favorites.Export: browser
+// window.location.href navigation can't send an Authorization header, so
+// router.go's mediaGetSkip lets the route suffix bypass the JWT middleware,
+// and the handler validates a query token itself instead (missing/invalid
+// token -> 401). When runtimePath=="" it's a test/standalone scenario and
+// real validation is skipped (same convention as FavoritesHandler). Albums
+// aren't user-scoped, so this only checks token validity, not the userID.
 //
-// zip 内容 = ListAssets 返回的可见成员全集（已排除软删/离线/Live Photo 伴生
-// 视频，按相册既有排序），文件名冲突复用 favorites.go 的 dedupZipEntryName，
-// 单文件读取失败跳过并留 warn 日志（同 favorites.Export 的既有容错策略）。
+// zip contents = the full set of visible members returned by ListAssets
+// (soft-deleted/offline/Live Photo companion videos already excluded, in
+// the album's existing order); filename collisions reuse favorites.go's
+// dedupZipEntryName; a single file read failure is skipped with a warn log
+// (same fallback strategy as favorites.Export).
 func (h *AlbumsHandler) Export(c echo.Context) error {
 	token := c.QueryParam("token")
 	if token == "" {
@@ -278,14 +283,15 @@ func (h *AlbumsHandler) Reorder(c echo.Context) error {
 	return c.NoContent(http.StatusNoContent)
 }
 
-// fromSmartViewReq 是"智能相册→手动相册"转换端点的请求体,字段名对齐库内
-// camelCase 惯例。
+// fromSmartViewReq is the request body for the "smart view -> manual album"
+// conversion endpoint; field names follow the codebase's camelCase convention.
 type fromSmartViewReq struct {
 	SmartViewID string `json:"smartViewId"`
 }
 
-// FromSmartView 把智能相册原地固化为手动相册:停止自动更新,当前成员固化,
-// 主题/条件随原智能相册一并删除。
+// FromSmartView solidifies a smart view into a manual album in place: auto
+// updates stop, current members are frozen, and the topic/conditions are
+// deleted along with the original smart view.
 //
 // POST /v1/photos/albums/from-smartview
 func (h *AlbumsHandler) FromSmartView(c echo.Context) error {

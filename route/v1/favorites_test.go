@@ -240,7 +240,7 @@ func TestTopHandlerReturnsJSON(t *testing.T) {
 	h, _, cleanup := newFavHarness(t)
 	defer cleanup()
 
-	// 先收藏 a1/a2，再请求 top。
+	// Favorite a1/a2 first, then request top.
 	for _, id := range []string{"a1", "a2"} {
 		req := httptest.NewRequest(http.MethodPost, "/v1/photos/favorites/"+id, nil)
 		rec := httptest.NewRecorder()

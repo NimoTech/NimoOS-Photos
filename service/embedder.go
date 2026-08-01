@@ -17,12 +17,16 @@ import (
 
 const defaultEmbedderPollInterval = 30 * time.Second
 
-// aestheticHeadVerKey 是 photos_meta 中登记美学头版本的键。
+// aestheticHeadVerKey is the key under which the aesthetic head version is
+// recorded in photos_meta.
 const aestheticHeadVerKey = "aesthetic_head_ver"
 
-// EnsureAestheticHeadVer 对齐库内头版本:不符时同一事务内全库分数置 NULL 并盖章。
-// 与 ml_model_gen 的「成功后盖章」不同:置 NULL 已原子清除全部旧分,无脏数据窗口,
-// 提前盖章安全;重打靠 BackfillAesthetic 的 NULL 查询自恢复。
+// EnsureAestheticHeadVer aligns the in-DB head version: on a mismatch, nulls
+// out every score in the DB and stamps the new version in the same
+// transaction. Unlike ml_model_gen's "stamp after success" pattern: nulling
+// the scores atomically clears every old score with no dirty-data window, so
+// stamping the version up front is safe; rescoring self-recovers via
+// BackfillAesthetic's NULL query.
 func EnsureAestheticHeadVer(db *sql.DB, ver string) error {
 	var cur string
 	_ = db.QueryRow(`SELECT value FROM photos_meta WHERE key=?`, aestheticHeadVerKey).Scan(&cur)
@@ -45,8 +49,10 @@ func EnsureAestheticHeadVer(db *sql.DB, ver string) error {
 	return tx.Commit()
 }
 
-// ocrBackfillRetryDelay 是 OCR 补跑「首遍因 ML 全失败」后重试前的等待,给重启瞬间
-// 尚未热好的 ML OCR 模型一点时间,避免把暂时性失败当成真失败弹给用户。
+// ocrBackfillRetryDelay is the wait before retrying after the OCR backfill's
+// "first pass failed entirely due to ML" case, giving an ML OCR model that
+// hasn't warmed up yet right after a restart a bit of time, so a transient
+// failure isn't surfaced to the user as a real one.
 var ocrBackfillRetryDelay = 8 * time.Second
 
 type Embedder struct {
@@ -59,25 +65,31 @@ type Embedder struct {
 	ocrRunning   atomic.Bool
 	pollInterval time.Duration
 
-	// aestheticRunning / aestheticRerunPending / aestheticHead 支撑 BackfillAesthetic
-	// 的并发防重与 rerun 语义,与 ocrRunning/ocrRerunPending 同款(见下方字段注释)。
+	// aestheticRunning / aestheticRerunPending / aestheticHead back
+	// BackfillAesthetic's concurrency guard and rerun semantics, matching
+	// ocrRunning/ocrRerunPending (see the field comments below).
 	aestheticRunning      atomic.Bool
 	aestheticRerunPending atomic.Bool
 	aestheticHead         *aesthetic.Head
 
-	// rerunPending / ocrRerunPending 记录「补跑运行中又收到了一次触发」。
-	// 不能像以前那样让撞上 CAS 的第二次调用静默返回 nil:进行中的那轮可能早已
-	// 查过目标列表,查不到调用方刚变成可补的资产(典型:MountGuard 刚把插回的
-	// 盘上的资产标回 offline=0),吞掉触发等于治愈永远不发生。置位后,当前轮
-	// 结束时重新查询、再跑一轮。
+	// rerunPending / ocrRerunPending record "a trigger arrived while a
+	// backfill pass was already running". A second call that loses the CAS
+	// can't just silently return nil like before: the in-progress pass may
+	// have already queried its target list before the assets the caller
+	// just made backfillable existed (typically: MountGuard just marked
+	// assets on a replugged drive back to offline=0) — swallowing the
+	// trigger would mean that recovery never happens. Once set, a fresh
+	// query and another pass run right after the current one ends.
 	rerunPending    atomic.Bool
 	ocrRerunPending atomic.Bool
 
-	// onRecovered 在 ML ready 恢复链尾（Backfill → reembed → BackfillOCR 之后）
-	// 被调用一次，覆盖 ML 掉线期间积压的人脸检测欠账。用函数字段注入而非直接
-	// import FaceService（同 MountGuard 的 SetBackfill/SetBackfillOCR 模式），
-	// 避免 Embedder 与 FaceService 产生类型耦合；service.go 接线为
-	// faces.RunPipeline。为 nil 时（未接线 / 测试）安全跳过。
+	// onRecovered is called once at the tail of the ML-ready recovery chain
+	// (after Backfill → reembed → BackfillOCR), covering the face-detection
+	// backlog accumulated while ML was down. Injected as a function field
+	// rather than directly importing FaceService (same pattern as
+	// MountGuard's SetBackfill/SetBackfillOCR), avoiding a type coupling
+	// between Embedder and FaceService; service.go wires it to
+	// faces.RunPipeline. Safely skipped when nil (not wired up / tests).
 	onRecovered func(context.Context)
 }
 
@@ -95,7 +107,8 @@ func (e *Embedder) SetPollInterval(d time.Duration) { e.pollInterval = d }
 // face detection backlog accumulated while ML was down.
 func (e *Embedder) SetOnRecovered(fn func(context.Context)) { e.onRecovered = fn }
 
-// queryMissing 列出 status='indexed' 但 asset_clip_idx 缺行的 asset 路径。
+// queryMissing lists the file paths of assets that are status='indexed' but
+// have no row in asset_clip_idx.
 func (e *Embedder) queryMissing(ctx context.Context) ([]string, error) {
 	// a.offline=0: an asset on a currently-unplugged removable drive can't be
 	// read, so retrying it here would just burn CPU on a guaranteed failure
@@ -121,8 +134,9 @@ func (e *Embedder) queryMissing(ctx context.Context) ([]string, error) {
 	return paths, rows.Err()
 }
 
-// hasEmbeddingForPath 反查指定 path 是否已在 asset_clip_idx 有行。
-// 用 path 反查而非 asset_id，是因为 Backfill 主循环只持有 path 列表。
+// hasEmbeddingForPath looks up whether the given path already has a row in
+// asset_clip_idx. Looked up by path rather than asset_id because Backfill's
+// main loop only holds a list of paths.
 func (e *Embedder) hasEmbeddingForPath(path string) bool {
 	var n int
 	_ = e.db.QueryRow(`
@@ -132,13 +146,17 @@ func (e *Embedder) hasEmbeddingForPath(path string) bool {
 	return n == 1
 }
 
-// Backfill 对所有 status='indexed' 但缺 CLIP 向量的 asset 补跑 ML。
-// 并发调用安全：第二次调用立即返回 nil,但会置 rerunPending,由进行中的那轮
-// 结束后自动再跑一轮(重新查询目标),保证触发不被吞掉。
+// Backfill reruns ML for every asset that's status='indexed' but missing a
+// CLIP vector. Safe for concurrent calls: a second call returns nil
+// immediately but sets rerunPending, so the in-progress pass automatically
+// runs one more round (requerying targets) once it finishes, guaranteeing
+// the trigger isn't swallowed.
 //
-// 已知的微小窗口:若置位恰好发生在当前轮最后一次 pending 检查之后、running
-// 释放之前,这次触发要等到下一次 Backfill 调用(ML ready 跳变 / 挂载恢复 /
-// 手动触发)才被消费。窗口极窄且这些触发源都会周期性出现,不做双重检查。
+// Known narrow window: if the flag is set right after the current pass's
+// last pending check but before running is released, that trigger won't be
+// consumed until the next Backfill call (an ML-ready transition / mount
+// recovery / manual trigger). The window is extremely narrow and these
+// trigger sources all recur periodically, so no double-check is done.
 func (e *Embedder) Backfill(ctx context.Context) error {
 	if !e.running.CompareAndSwap(false, true) {
 		e.rerunPending.Store(true)
@@ -156,8 +174,8 @@ func (e *Embedder) Backfill(ctx context.Context) error {
 	}
 }
 
-// backfillOnce 是 Backfill 的单轮主体(查询目标 + 逐个补跑 + 任务上报),
-// 不含并发防重与 rerun 循环。
+// backfillOnce is Backfill's single-pass body (query targets + backfill each
+// one + report task progress), without the concurrency guard or rerun loop.
 func (e *Embedder) backfillOnce(ctx context.Context) error {
 	paths, err := e.queryMissing(ctx)
 	if err != nil {
@@ -174,7 +192,7 @@ func (e *Embedder) backfillOnce(ctx context.Context) error {
 		e.reg.Upsert(Task{
 			ID:        taskID,
 			Type:      "embedding",
-			Label:     "生成 AI 索引",
+			Label:     "Generating AI index",
 			Total:     total,
 			Current:   processed,
 			Progress:  float64(processed) / float64(total),
@@ -199,8 +217,10 @@ func (e *Embedder) backfillOnce(ctx context.Context) error {
 		pubRunning(processed)
 	}
 
-	// 若 ctx 已取消（用户主动取消或服务关闭），不发 final task——
-	// 部分完成不等于完成，registry 里残留的 running task 会随服务关闭自然消失。
+	// If ctx is already cancelled (user cancellation or service shutdown),
+	// don't publish the final task — partial completion isn't completion,
+	// and the leftover running task in the registry naturally disappears
+	// when the service shuts down.
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
@@ -208,7 +228,7 @@ func (e *Embedder) backfillOnce(ctx context.Context) error {
 	final := Task{
 		ID:        taskID,
 		Type:      "embedding",
-		Label:     "生成 AI 索引",
+		Label:     "Generating AI index",
 		Total:     total,
 		Current:   success,
 		StartedAt: started,
@@ -220,7 +240,7 @@ func (e *Embedder) backfillOnce(ctx context.Context) error {
 		final.Status = "done"
 		final.Progress = 1
 		if failed > 0 {
-			final.Label = fmt.Sprintf("生成 AI 索引（失败 %d 张）", failed)
+			final.Label = fmt.Sprintf("Generating AI index (%d failed)", failed)
 		}
 	}
 	e.reg.Upsert(final)
@@ -233,10 +253,13 @@ func (e *Embedder) backfillOnce(ctx context.Context) error {
 	return nil
 }
 
-// queryMissingOCR 列出 status='indexed' 但 OCR 数据不完整的 asset：
-// 要么 asset_ocr 缺行（从未跑过 OCR——即使没识别到文字也会写 text 为空字符串的行），
-// 要么 coverage 为 NULL（旧版跑的 OCR 没存文字框面积，需要重跑补齐），
-// 要么 boxes_ver=0（旧版没把逐行坐标存进 asset_ocr_lines，需重跑供搜索命中高亮）。
+// queryMissingOCR lists assets that are status='indexed' but have
+// incomplete OCR data: either asset_ocr has no row (OCR never ran — even
+// when no text is recognized a row with an empty text is written), or
+// coverage is NULL (an older OCR run didn't store the text-box area and
+// needs a rerun to fill it in), or boxes_ver=0 (an older run didn't store
+// per-line coordinates into asset_ocr_lines, needs a rerun for search-hit
+// highlighting).
 func (e *Embedder) queryMissingOCR(ctx context.Context) ([]ocrTarget, error) {
 	// a.offline=0: same reasoning as queryMissing above — skip assets whose
 	// source is unreachable because their removable drive is unplugged.
@@ -268,11 +291,13 @@ type ocrTarget struct {
 	isVideo bool
 }
 
-// BackfillOCR 对所有缺 OCR 文本的 asset 补跑 ML OCR。
-// 图片读原图（小票/文档的小字在缩略图分辨率下会丢失）；
-// 视频没有现成关键帧文件，退而用 large.jpg（1280px）缩略图。
-// 并发调用安全：第二次调用立即返回 nil,但会置 ocrRerunPending,由进行中的
-// 那轮结束后自动再跑一轮——理由与窗口说明同 Backfill。
+// BackfillOCR reruns ML OCR for every asset missing OCR text.
+// Images read the original (small text on receipts/documents is lost at
+// thumbnail resolution); videos have no ready-made keyframe file, so they
+// fall back to the large.jpg (1280px) thumbnail.
+// Safe for concurrent calls: a second call returns nil immediately but sets
+// ocrRerunPending, so the in-progress pass automatically runs one more round
+// once it finishes — same reasoning and window as Backfill.
 func (e *Embedder) BackfillOCR(ctx context.Context) error {
 	if !e.ocrRunning.CompareAndSwap(false, true) {
 		e.ocrRerunPending.Store(true)
@@ -290,7 +315,8 @@ func (e *Embedder) BackfillOCR(ctx context.Context) error {
 	}
 }
 
-// backfillOCROnce 是 BackfillOCR 的单轮主体,不含并发防重与 rerun 循环。
+// backfillOCROnce is BackfillOCR's single-pass body, without the concurrency
+// guard or rerun loop.
 func (e *Embedder) backfillOCROnce(ctx context.Context) error {
 	targets, err := e.queryMissingOCR(ctx)
 	if err != nil {
@@ -307,7 +333,7 @@ func (e *Embedder) backfillOCROnce(ctx context.Context) error {
 		e.reg.Upsert(Task{
 			ID:        taskID,
 			Type:      "ocr",
-			Label:     "识别图片文字",
+			Label:     "Recognizing text in images",
 			Total:     total,
 			Current:   processed,
 			Progress:  float64(processed) / float64(total),
@@ -317,7 +343,9 @@ func (e *Embedder) backfillOCROnce(ctx context.Context) error {
 	}
 	pubRunning(0)
 
-	// pass 跑一遍给定目标,返回处理/失败计数(readFail=源文件读不到,ocrFail=ML 调用失败)。
+	// pass runs through the given targets once, returning
+	// processed/failed counts (readFail = source file unreadable, ocrFail =
+	// ML call failed).
 	pass := func(ts []ocrTarget) (processed, failed, readFail, ocrFail int64) {
 		for _, t := range ts {
 			if ctx.Err() != nil {
@@ -329,20 +357,23 @@ func (e *Embedder) backfillOCROnce(ctx context.Context) error {
 			}
 			data, rerr := os.ReadFile(src)
 			if rerr != nil || len(data) == 0 {
-				// 源图/缩略图读不到(文件被删、缩略图缺失等),与 ML 无关。
+				// The original/thumbnail is unreadable (file deleted,
+				// thumbnail missing, etc.), unrelated to ML.
 				readFail++
 				failed++
 				processed++
 				pubRunning(processed)
 				continue
 			}
-			// 超大原图守卫(与 detectFaceScanTarget / 索引内联 OCR 同一套):
-			// 超过 PIL 上限的图片发原图必然 500 且每次恢复链都重试,降级用缩略图。
+			// Oversized-original guard (same one as
+			// detectFaceScanTarget / inline indexing OCR): an image over
+			// PIL's limit necessarily 500s on the original and would retry
+			// on every recovery chain pass, so fall back to the thumbnail.
 			if !t.isVideo && oversizedForML(data) {
 				if thumb := readLargeOrSmallThumb(e.indexer.thumbDir, t.id); len(thumb) > 0 {
 					data = thumb
 				} else {
-					zap.L().Warn("OCR 补跑:超大图且无缩略图可降级,跳过",
+					zap.L().Warn("OCR backfill: oversized image with no thumbnail fallback available, skipping",
 						zap.String("asset_id", t.id), zap.String("path", t.path))
 					readFail++
 					failed++
@@ -365,10 +396,13 @@ func (e *Embedder) backfillOCROnce(ctx context.Context) error {
 
 	processed, failed, readFail, ocrFail := pass(targets)
 
-	// 首遍因 ML 全失败(疑似重启瞬间 OCR 模型还没热好):等一会、对仍缺 OCR 的目标重试一次,
-	// 仍失败才报错。避免每次重部署都弹一个其实是「ML 未热好」的假失败。
+	// The first pass failed entirely due to ML (likely the OCR model
+	// hasn't warmed up right after a restart): wait a bit and retry the
+	// targets still missing OCR once, only reporting an error if that
+	// still fails too. Avoids surfacing a false failure on every
+	// redeployment that's really just "ML not warmed up yet".
 	if processed > 0 && failed == processed && ocrFail > 0 && ctx.Err() == nil {
-		zap.L().Info("OCR 补跑首遍全失败(疑似 ML 未就绪),稍后重试一次",
+		zap.L().Info("OCR backfill's first pass failed entirely (ML likely not ready), retrying once shortly",
 			zap.Int64("ml_fail", ocrFail))
 		select {
 		case <-ctx.Done():
@@ -389,13 +423,15 @@ func (e *Embedder) backfillOCROnce(ctx context.Context) error {
 	final := Task{
 		ID:        taskID,
 		Type:      "ocr",
-		Label:     "识别图片文字",
+		Label:     "Recognizing text in images",
 		Total:     total,
 		Current:   processed - failed,
 		StartedAt: started,
 	}
 	if processed > 0 && failed == processed {
-		// 全部失败才报 error，并按真实原因给出准确信息(此前一律写「ML 失联」是误报)。
+		// Only report error when everything failed, with the accurate
+		// reason given for the real cause (previously always writing
+		// "ML disconnected" was a misdiagnosis).
 		final.Status = "error"
 		switch {
 		case ocrFail == 0 && readFail > 0:
@@ -412,11 +448,11 @@ func (e *Embedder) backfillOCROnce(ctx context.Context) error {
 		final.Status = "done"
 		final.Progress = 1
 		if failed > 0 {
-			final.Label = fmt.Sprintf("识别图片文字（失败 %d 张）", failed)
+			final.Label = fmt.Sprintf("Recognizing text in images (%d failed)", failed)
 		}
 	}
 	if failed > 0 {
-		zap.L().Warn("OCR 补跑存在失败",
+		zap.L().Warn("OCR backfill had failures",
 			zap.Int64("total", total), zap.Int64("processed", processed),
 			zap.Int64("read_fail", readFail), zap.Int64("ml_fail", ocrFail),
 			zap.String("status", final.Status))
@@ -431,10 +467,14 @@ func (e *Embedder) backfillOCROnce(ctx context.Context) error {
 	return nil
 }
 
-// BackfillDocVerdicts 为「OCR 行坐标已存(boxes_ver=1)、doc 判定未算(doc_ver=0)、
-// 图向量已就绪」的资产补算 doc 分类混合判定。纯本地数学(提示词向量最多一次文本
-// 嵌入),毫秒级/张,因此不挂 TaskRegistry、不发任务事件(与跑推理的 BackfillOCR
-// 不同)。无向量的资产不入选,等 CLIP Backfill 补齐向量后的下一轮钩子再收敛。
+// BackfillDocVerdicts computes the doc-classification mixed-criteria verdict
+// for assets whose OCR line coordinates are already stored (boxes_ver=1), doc
+// verdict hasn't been computed yet (doc_ver=0), and image vector is ready.
+// Pure local math (at most one text embedding for the prompt vectors),
+// milliseconds per asset, so it isn't hooked up to TaskRegistry and doesn't
+// publish task events (unlike BackfillOCR, which runs inference). Assets
+// without a vector aren't selected; they converge on the next recovery-chain
+// hook after CLIP Backfill fills in their vector.
 func (e *Embedder) BackfillDocVerdicts(ctx context.Context) error {
 	rows, err := e.db.QueryContext(ctx, `
         SELECT o.asset_id
@@ -470,12 +510,14 @@ func (e *Embedder) BackfillDocVerdicts(ctx context.Context) error {
 	return nil
 }
 
-// SetAestheticHead 注入美学评分头;nil 时 BackfillAesthetic 是 no-op。
+// SetAestheticHead injects the aesthetic-scoring head; BackfillAesthetic is a no-op when nil.
 func (e *Embedder) SetAestheticHead(h *aesthetic.Head) { e.aestheticHead = h }
 
-// BackfillAesthetic 为「有 CLIP 向量但 aesthetic_score IS NULL」的资产补算美学分。
-// 纯本地矩阵乘,不依赖 ML 在线;不过滤 offline(打分只读库内向量,不碰文件)。
-// 并发防重与 rerun 语义同 BackfillOCR。
+// BackfillAesthetic computes the aesthetic score for assets that have a
+// CLIP vector but aesthetic_score IS NULL. Pure local matrix multiply,
+// doesn't depend on ML being online; doesn't filter out offline assets
+// (scoring only reads the in-DB vector, never touches the file). Concurrency
+// guard and rerun semantics match BackfillOCR.
 func (e *Embedder) BackfillAesthetic(ctx context.Context) error {
 	if e.aestheticHead == nil {
 		return nil
@@ -495,7 +537,8 @@ func (e *Embedder) BackfillAesthetic(ctx context.Context) error {
 	}
 }
 
-// backfillAestheticOnce 是 BackfillAesthetic 的单轮主体,不含并发防重与 rerun 循环。
+// backfillAestheticOnce is BackfillAesthetic's single-pass body, without the
+// concurrency guard or rerun loop.
 func (e *Embedder) backfillAestheticOnce(ctx context.Context) error {
 	rows, err := e.db.QueryContext(ctx, `
         SELECT a.id FROM assets a
@@ -526,7 +569,7 @@ func (e *Embedder) backfillAestheticOnce(ctx context.Context) error {
 	total := int64(len(ids))
 	pubRunning := func(processed int64) {
 		e.reg.Upsert(Task{
-			ID: taskID, Type: "aesthetic", Label: "评估照片美学分",
+			ID: taskID, Type: "aesthetic", Label: "Scoring photo aesthetics",
 			Total: total, Current: processed,
 			Progress: float64(processed) / float64(total),
 			Status:   "running", StartedAt: started,
@@ -541,7 +584,8 @@ func (e *Embedder) backfillAestheticOnce(ctx context.Context) error {
 		}
 		vec := readClipVector(e.db, id)
 		if vec == nil {
-			// 查询和读取之间向量被删(如 rebuild 竞态):跳过,留 NULL 下轮收敛。
+			// The vector was deleted between the query and the read (e.g. a
+			// rebuild race): skip it, leaving it NULL to converge next round.
 			processed++
 			failed++
 			pubRunning(processed)
@@ -555,7 +599,7 @@ func (e *Embedder) backfillAestheticOnce(ctx context.Context) error {
 			continue
 		}
 		if _, err := e.db.Exec(`UPDATE assets SET aesthetic_score=? WHERE id=?`, s, id); err != nil {
-			zap.L().Warn("aesthetic backfill: 写分失败", zap.String("asset_id", id), zap.Error(err))
+			zap.L().Warn("aesthetic backfill: failed to write score", zap.String("asset_id", id), zap.Error(err))
 			failed++
 		}
 		processed++
@@ -563,7 +607,7 @@ func (e *Embedder) backfillAestheticOnce(ctx context.Context) error {
 	}
 
 	final := Task{
-		ID: taskID, Type: "aesthetic", Label: "评估照片美学分",
+		ID: taskID, Type: "aesthetic", Label: "Scoring photo aesthetics",
 		Total: total, Current: processed - failed,
 		Status: "done", Progress: 1, StartedAt: started,
 	}
@@ -577,9 +621,11 @@ func (e *Embedder) backfillAestheticOnce(ctx context.Context) error {
 	return nil
 }
 
-// Run 主循环：每隔 pollInterval 检查 ML ready 状态，
-// 检测到 false→true 跳变时触发一次 Backfill（goroutine 异步执行）。
-// 服务启动时如果 ML 已经就绪，第一次 tick 的 prev=false 也会触发——符合 spec §5.2。
+// Run is the main loop: checks ML ready state every pollInterval,
+// triggering a Backfill (executed asynchronously in a goroutine) when it
+// detects a false→true transition.
+// If ML is already ready when the service starts, the first tick's
+// prev=false also triggers it — matching spec §5.2.
 func (e *Embedder) Run(ctx context.Context) {
 	interval := e.pollInterval
 	if interval <= 0 {
@@ -598,7 +644,7 @@ func (e *Embedder) Run(ctx context.Context) {
 	}
 }
 
-// tick 检测 ML ready 跳变，有跳变时异步触发 Backfill。
+// tick detects an ML-ready transition and, when one occurs, asynchronously triggers Backfill.
 func (e *Embedder) tick(ctx context.Context) {
 	ready := e.ml.IsReady()
 	prev := e.lastReady.Swap(ready)
@@ -609,9 +655,10 @@ func (e *Embedder) tick(ctx context.Context) {
 			// then OCR for assets indexed before OCR support existed, then doc
 			// verdicts for OCR'd assets missing the mixed-criteria judgment
 			// (BackfillDocVerdicts), then aesthetic scores for assets whose CLIP
-			// vector arrived while ML was down (BackfillAesthetic，纯本地计算，
-			// 不依赖 ML，但仍挂在同一条恢复链上顺带收敛)，最后 faces
-			// (RunPipeline，via onRecovered) — covers detection backlog
+			// vector arrived while ML was down (BackfillAesthetic, a pure local
+			// computation that doesn't depend on ML, but is still hung on this
+			// same recovery chain to converge along with it), and finally faces
+			// (RunPipeline, via onRecovered) — covers detection backlog
 			// accumulated while ML was down.
 			_ = e.Backfill(ctx)
 			e.reembedThumbnailsOnce()

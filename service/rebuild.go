@@ -93,7 +93,7 @@ func (r *Rebuilder) run(taskID string) {
 	// unplugged) would permanently lose its vector — ForceReprocess bails out
 	// of processFileInternal at the very first os.ReadFile and never gets a
 	// chance to re-embed it, so the asset would silently drop out of semantic
-	// search forever (only "失败 N 张" in the task label hinted at it, with
+	// search forever (only "N failed" in the task label hinted at it, with
 	// no way to recover). The old goals of that wipe are now handled without
 	// destroying data that can't be recomputed:
 	//   - orphan vectors (assets that no longer exist) are swept by
@@ -122,7 +122,7 @@ func (r *Rebuilder) run(taskID string) {
 			prog = float64(cur) / float64(total)
 		}
 		r.reg.Upsert(Task{
-			ID: taskID, Type: "rebuild", Label: "重建 AI 索引",
+			ID: taskID, Type: "rebuild", Label: "Rebuilding AI index",
 			Total: total, Current: cur, Progress: prog,
 			Status: status, StartedAt: started,
 		})
@@ -130,9 +130,9 @@ func (r *Rebuilder) run(taskID string) {
 
 	// finalPublish emits the terminal "done" task with optional failure count.
 	finalPublish := func() {
-		label := "重建 AI 索引"
+		label := "Rebuilding AI index"
 		if f := atomic.LoadInt64(&failed); f > 0 {
-			label = fmt.Sprintf("重建 AI 索引（失败 %d 张）", f)
+			label = fmt.Sprintf("Rebuilding AI index (%d failed)", f)
 		}
 		r.reg.Upsert(Task{
 			ID: taskID, Type: "rebuild", Label: label,
@@ -141,22 +141,29 @@ func (r *Rebuilder) run(taskID string) {
 		})
 	}
 
-	// 人脸重聚类 + meta 写入，由空库和正常路径共用。
+	// Face re-clustering + meta write, shared by both the empty-DB and normal paths.
 	finalize := func() {
 		if r.ctx.Err() != nil {
-			return // 服务关闭：不发 final，残留 running task 随服务消失
+			return // service shutting down: don't publish final, the leftover running task disappears with the service
 		}
-		// 清理孤儿 CLIP 向量（asset 已不存在的 asset_clip_idx/clip_embeddings
-		// 行）：承接以前全库清空里“清孤儿”的目的，见 run() 开头的说明。
+		// Clean up orphaned CLIP vectors (asset_clip_idx/clip_embeddings
+		// rows whose asset no longer exists): carries forward the "clean
+		// up orphans" purpose of the old full-DB wipe, see the note at the
+		// top of run().
 		pruneOrphanClipVectors(r.db)
-		// 人脸检测+重聚类（内部 CAS 防重入）。改调 RunPipeline 而非 RunClustering：
-		// 下方 worker 循环删旧 face_detections 时已把对应资产的 face_scanned 置回
-		// 0，必须靠 RunPipeline 的检测阶段重新扫一遍才能把脸补回来——RunClustering
-		// 只会在既有 face_detections 上重新分组，不会触发检测，重建后会永久无脸。
+		// Face detection + re-clustering (internally CAS-guarded against
+		// re-entrancy). Calls RunPipeline rather than RunClustering: the
+		// worker loop below has already reset face_scanned to 0 for assets
+		// whose old face_detections it deleted — only RunPipeline's
+		// detection stage rescanning them can bring the faces back;
+		// RunClustering only regroups existing face_detections without
+		// triggering detection, which would leave the rebuild's assets
+		// permanently faceless.
 		if err := r.faces.RunPipeline(r.ctx); err != nil {
 			zap.L().Warn("rebuild: face pipeline failed", zap.Error(err))
 		}
-		// 换模型重聚类后，旧的空 persons（含用户命名）已无意义，清掉。
+		// After re-clustering under a new model, old empty persons
+		// (including user-named ones) are meaningless — clean them up.
 		if _, err := r.db.Exec(`DELETE FROM persons WHERE id NOT IN
 			(SELECT person_id FROM face_person WHERE person_id IS NOT NULL)`); err != nil {
 			zap.L().Warn("rebuild: prune empty persons failed", zap.Error(err))
@@ -178,7 +185,7 @@ func (r *Rebuilder) run(taskID string) {
 		}
 	}
 
-	// total=0：空库直接完成，跳过 worker pool，仍走 finalize() 里的 RunPipeline + meta。
+	// total=0: an empty DB completes immediately, skipping the worker pool, but still goes through finalize()'s RunPipeline + meta.
 	if total == 0 {
 		finalize()
 		if r.ctx.Err() != nil {
@@ -194,7 +201,7 @@ func (r *Rebuilder) run(taskID string) {
 
 	publish("running")
 
-	// Worker pool sized by cfg.Workers — ML 调用是瓶颈，与索引器同档并发。
+	// Worker pool sized by cfg.Workers — ML calls are the bottleneck, matching the indexer's concurrency level.
 	queue := make(chan rebuildTarget)
 	var wg sync.WaitGroup
 	for i := 0; i < r.workers; i++ {
@@ -224,23 +231,28 @@ func (r *Rebuilder) run(taskID string) {
 					publish("running")
 					continue
 				}
-				// 旧人脸行先删（face_detections 是 INSERT 而非 upsert，
-				// 不删会翻倍；face_person 经 FK CASCADE 一并清理）。
-				// 人脸检测已移出 processFileInternal，ForceReprocess 不会再重新
-				// 检测——必须把 face_scanned 置回 0，交给 finalize() 里的
-				// RunPipeline 重新扫一遍，否则这批脸就永久空了。
+				// Delete old face rows first (face_detections is an
+				// INSERT, not an upsert — not deleting them first would
+				// double them up; face_person is cleaned up together via
+				// FK CASCADE). Face detection has been removed from
+				// processFileInternal, so ForceReprocess won't re-detect
+				// on its own — face_scanned must be reset to 0, handing it
+				// off to finalize()'s RunPipeline to rescan, or this batch
+				// of faces would be permanently empty.
 				if _, err := r.db.Exec(`DELETE FROM face_detections WHERE asset_id=?`, t.id); err != nil {
 					zap.L().Warn("rebuild: clear faces failed", zap.String("asset", t.id), zap.Error(err))
 				}
 				if _, err := r.db.Exec(`UPDATE assets SET face_scanned=0 WHERE id=?`, t.id); err != nil {
 					zap.L().Warn("rebuild: reset face_scanned failed", zap.String("asset", t.id), zap.Error(err))
 				}
-				// 旧美学分基于旧模型向量,一并清掉;ForceReprocess 重写向量时由
-				// 内联打分(writeClipEmbedding 出口)自动补回,无需单独任务。
+				// The old aesthetic score is based on the old model's
+				// vector, so clear it too; it's automatically restored by
+				// inline scoring (at writeClipEmbedding's exit point) when
+				// ForceReprocess rewrites the vector, no separate task needed.
 				if _, err := r.db.Exec(`UPDATE assets SET aesthetic_score=NULL WHERE id=?`, t.id); err != nil {
 					zap.L().Warn("rebuild: reset aesthetic_score failed", zap.String("asset", t.id), zap.Error(err))
 				}
-				// 旧 CLIP 向量先删：见上方“不再全库清空”的说明 a)。
+				// Delete the old CLIP vector first: see the "no longer wiping the whole DB" note above.
 				dropClipVector(r.db, t.id)
 				ok := r.indexer.ForceReprocess(t.path, processOpts{force: true, skipExif: true, skipThumb: true})
 				atomic.AddInt64(&processed, 1)
@@ -271,30 +283,36 @@ func (r *Rebuilder) run(taskID string) {
 
 const mlModelGenKey = "ml_model_gen"
 
-// modelGenStale 返回 photos_meta 里记录的模型代次是否落后于当前二进制。
-// 键不存在(老库 / 首次启动)视为落后。
+// modelGenStale returns whether the model generation recorded in
+// photos_meta is behind the current binary. A missing key (an old DB /
+// first startup) is treated as stale.
 func modelGenStale(db *sql.DB) bool {
 	var gen string
 	_ = db.QueryRow(`SELECT value FROM photos_meta WHERE key=?`, mlModelGenKey).Scan(&gen)
 	return gen != common.MLModelGen
 }
 
-// shouldStampModelGen 判断本轮 rebuild 是否可以盖章 ml_model_gen：
-// total==0(空库，盖章合法)或至少有一个目标成功(failed<total)时可以盖章；
-// total>0 且全部失败(典型场景是模型换代恰逢移动盘整体离线)时不能盖章，
-// 否则 modelGenStale 判定永远不再触发，MaybeAutoRebuild 失去自动重试机会。
+// shouldStampModelGen decides whether this rebuild pass may stamp
+// ml_model_gen: it's allowed when total==0 (an empty DB, stamping is
+// legitimate) or when at least one target succeeded (failed<total); it's
+// not allowed when total>0 and everything failed (the typical scenario is
+// a model upgrade coinciding with every removable drive being offline),
+// otherwise modelGenStale would never trigger again and MaybeAutoRebuild
+// would lose its chance to auto-retry.
 func shouldStampModelGen(total, failed int64) bool {
 	return total == 0 || failed < total
 }
 
-// MaybeAutoRebuild 在模型代次变化时自动触发一次全量重建：等 ML 后端就绪
-// (新模型缓存就位)后调 Start()。代次在 finalize() 成功后写入,所以重建
-// 中途失败/断电会在下次启动重试。由 main.go 以 goroutine 启动。
+// MaybeAutoRebuild automatically triggers one full rebuild when the model
+// generation changes: calls Start() once the ML backend is ready (the new
+// model cache is in place). The generation is written after finalize()
+// succeeds, so a rebuild that fails or loses power midway is retried on the
+// next startup. Launched by main.go as a goroutine.
 func (r *Rebuilder) MaybeAutoRebuild(ready func() bool) {
 	if !modelGenStale(r.db) {
 		return
 	}
-	zap.L().Info("ML 模型代次变化，等待 ML 就绪后自动全量重建",
+	zap.L().Info("ML model generation changed, waiting for ML to be ready before auto full rebuild",
 		zap.String("target_gen", common.MLModelGen))
 	for r.ctx.Err() == nil && !ready() {
 		select {
@@ -307,16 +325,16 @@ func (r *Rebuilder) MaybeAutoRebuild(ready func() bool) {
 		return
 	}
 	if _, err := r.Start(); err != nil && err != ErrRebuildRunning {
-		zap.L().Warn("自动重建启动失败", zap.Error(err))
+		zap.L().Warn("failed to start auto rebuild", zap.Error(err))
 	}
 }
 
 // failTask publishes a terminal error state for the rebuild task and
 // schedules its removal, mirroring the Embedder error convention.
-// errKey/errParams 是结构化 i18n 错误(见 Task.SetError);msg 仅用于日志。
+// errKey/errParams are the structured i18n error (see Task.SetError); msg is for logging only.
 func (r *Rebuilder) failTask(taskID string, started time.Time, errKey string, errParams map[string]string) {
 	t := Task{
-		ID: taskID, Type: "rebuild", Label: "重建 AI 索引",
+		ID: taskID, Type: "rebuild", Label: "Rebuilding AI index",
 		Status: "error", StartedAt: started,
 	}
 	t.SetError(errKey, errParams)

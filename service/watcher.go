@@ -17,15 +17,18 @@ import (
 	"go.uber.org/zap"
 )
 
-// overflowRescanCooldown 限制两次溢出补扫之间的最小间隔:写入风暴期间
-// inotify 队列会连环溢出,单飞(overflowRescanning)只防止并发,不防止
-// 补扫刚结束、下一次溢出又立刻触发——每次全树补扫都是一次 IO 开销,风暴期
-// 内的连环溢出应合并进冷却期内已完成/正在进行的这一轮,交给周期性
-// ScanDirectory 兜底覆盖剩余未扫到的变更。
+// overflowRescanCooldown caps the minimum interval between two overflow
+// rescans: during a write storm the inotify queue can overflow repeatedly,
+// and single-flighting (overflowRescanning) only prevents concurrent rescans,
+// not a rescan that just finished being immediately retriggered by the next
+// overflow — each full-tree rescan is an IO cost, so repeated overflows
+// within a storm should be folded into the rescan already done/in-flight
+// within the cooldown window, leaving the periodic ScanDirectory to catch up
+// on whatever remains unscanned.
 const overflowRescanCooldown = 5 * time.Minute
 
-// watchPollInterval 是自动模式下根集合轮询的默认间隔,与
-// mountguard.go 的 mountGuardPollInterval 同频。
+// watchPollInterval is the default root-set polling interval in auto mode,
+// kept in sync with mountguard.go's mountGuardPollInterval.
 const watchPollInterval = 30 * time.Second
 
 // Watcher monitors directories for new or modified media files and enqueues
@@ -55,8 +58,9 @@ type Watcher struct {
 	// to be in flight at a time (walkSupported + Indexer.Enqueue are
 	// idempotent, so a rescan already covers anything a second one would).
 	overflowRescanning atomic.Bool
-	// lastOverflowRescan 记录上一轮溢出补扫结束的 Unix 秒时间戳,配合
-	// overflowRescanCooldown 抑制写入风暴下的连环补扫。
+	// lastOverflowRescan records the Unix-seconds timestamp at which the
+	// previous overflow rescan finished, used together with
+	// overflowRescanCooldown to suppress repeated rescans during a write storm.
 	lastOverflowRescan atomic.Int64
 	// walkInFlight tracks directories (keyed by withSep) whose trackNewDir
 	// recursive walk is currently running. A dense mkdir burst (e.g. an
@@ -67,12 +71,14 @@ type Watcher struct {
 	// already covers everything beneath it.
 	walkInFlight sync.Map
 
-	// enumerateRoots 是自动模式(watchDirs 为空)下的根集合来源;nil 时用
-	// EnumerateScanRoots(生产路径),测试注入以避免依赖真实 /proc/mounts。
+	// enumerateRoots is the source of the root set in auto mode (watchDirs
+	// empty); nil falls back to EnumerateScanRoots (the production path).
+	// Tests inject their own to avoid depending on real /proc/mounts.
 	enumerateRoots func() []string
 
-	// pollInterval 是自动模式下根集合轮询间隔;0 ⇒ watchPollInterval(30s,
-	// 与 mountGuardPollInterval 同频)。测试注入短间隔。
+	// pollInterval is the root-set polling interval in auto mode; 0 ⇒
+	// watchPollInterval (30s, kept in sync with mountGuardPollInterval).
+	// Tests inject a shorter interval.
 	pollInterval time.Duration
 }
 
@@ -168,16 +174,18 @@ func (w *Watcher) Start(parentCtx context.Context) {
 	}
 }
 
-// handleWatchError:inotify 队列溢出意味着事件已经丢失,唯一可靠的恢复
-// 是对所有根做一次补扫(Enqueue 幂等,重复入队无害)。单飞防抖:溢出
-// 往往连环出现,补扫进行中忽略后续溢出。
+// handleWatchError: an inotify queue overflow means events have already been
+// lost, so the only reliable recovery is a rescan of every root (Enqueue is
+// idempotent, so re-enqueuing is harmless). Single-flighted to debounce:
+// overflows tend to arrive in bursts, and subsequent ones are ignored while a
+// rescan is already in flight.
 func (w *Watcher) handleWatchError(ctx context.Context, wg *sync.WaitGroup, err error) {
 	if !errors.Is(err, fsnotify.ErrEventOverflow) {
 		zap.L().Warn("watcher: fsnotify error", zap.Error(err))
 		return
 	}
 	if time.Now().Unix()-w.lastOverflowRescan.Load() < int64(overflowRescanCooldown/time.Second) {
-		return // 风暴期内的连环溢出合并进上一轮补扫,交给周期扫描兜底
+		return // repeated overflows within a storm fold into the last rescan; the periodic scan catches the rest
 	}
 	if !w.overflowRescanning.CompareAndSwap(false, true) {
 		return
@@ -313,8 +321,8 @@ func (w *Watcher) trackNewDir(ctx context.Context, fw *fsnotify.Watcher, dir str
 	// fw.Add is cheap and idempotent, so calling it unconditionally is safe.
 	added, enospc := addRecursiveWatch(ctx, fw, dir)
 	if skipCatchupScan(added, enospc) {
-		// 目录被排除(scanExcludeDirs/IsExcludedMount)或 walk 前已消失:
-		// 没有 watch 覆盖也没有内容需要索引。
+		// The directory is excluded (scanExcludeDirs/IsExcludedMount) or
+		// vanished before the walk ran: no watch coverage and nothing to index.
 		return
 	}
 	if enospc && added == 0 {
@@ -342,13 +350,15 @@ func (w *Watcher) trackNewDir(ctx context.Context, fw *fsnotify.Watcher, dir str
 	}
 }
 
-// withSep 规整目录键,保证前缀判断不会把 /a/bc 误判为 /a/b 的子目录
+// withSep normalizes a directory key so prefix matching never mistakes
+// /a/bc for a subdirectory of /a/b.
 func withSep(dir string) string {
 	return strings.TrimRight(dir, string(filepath.Separator)) + string(filepath.Separator)
 }
 
 // walkCovered reports whether dir itself or any ancestor already has a
-// recursive walk in flight(祖先的 WalkDir 必然覆盖 dir,重复走只是放大 IO)。
+// recursive walk in flight (an ancestor's WalkDir necessarily covers dir; a
+// redundant walk would only inflate IO).
 func (w *Watcher) walkCovered(dir string) bool {
 	key := withSep(dir)
 	covered := false
@@ -507,10 +517,13 @@ func (w *Watcher) Restart(parentCtx context.Context, dirs []string) {
 	go w.Start(parentCtx)
 }
 
-// followMounts 是自动模式的动态跟随:周期性比较根集合快照,发现挂载增减就
-// 触发 Restart 重建监听;新出现的根先补扫一遍(inotify 只看未来事件,存量
-// 文件靠补扫入库,ScanDirectoryOnce 与 MountGuard 恢复补扫天然去重)。
-// 触发重启后本轮询即退出——Restart 会启动新的 Start,新 Start 自带新轮询。
+// followMounts is auto mode's dynamic follow-up: it periodically compares
+// root-set snapshots, and triggers a Restart to rebuild watches when mounts
+// are added or removed; newly appeared roots get a one-time rescan first
+// (inotify only sees future events, so existing files rely on the rescan to
+// get indexed — ScanDirectoryOnce and MountGuard's recovery rescan naturally
+// dedup with each other). Once a restart is triggered this polling loop
+// exits — Restart starts a new Start, which brings its own new polling loop.
 func (w *Watcher) followMounts(ctx context.Context, parentCtx context.Context, current []string) {
 	interval := w.pollInterval
 	if interval <= 0 {
@@ -543,13 +556,14 @@ func (w *Watcher) followMounts(ctx context.Context, parentCtx context.Context, c
 					}
 				}(root)
 			}
-			w.Restart(parentCtx, nil) // nil 保持自动模式
+			w.Restart(parentCtx, nil) // nil keeps auto mode
 			return
 		}
 	}
 }
 
-// diffNewRoots returns the elements of next that are not in old(顺序无关)。
+// diffNewRoots returns the elements of next that are not in old (order does
+// not matter).
 func diffNewRoots(old, next []string) []string {
 	seen := make(map[string]bool, len(old))
 	for _, r := range old {

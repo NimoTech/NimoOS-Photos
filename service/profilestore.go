@@ -1,9 +1,13 @@
-// Moments M2 画像层数据层:user_profile_entities 单表的 repo。
+// Moments M2 profile-layer data layer: repo for the single
+// user_profile_entities table.
 //
-// 画像实体是"用户自己的宠物/家人"的挖掘结果(区别于 M1 概念版主题时刻的
-// "全库搜含宠物元素")——挖掘发生在对应 recipe(profile:pets/profile:family)
-// 的引擎构建内,与重算同事务节奏,产出按 kind 全量替换(delete kind 全部 +
-// insert),幂等,跨 kind 隔离(替换 pet 不影响 family,反之亦然)。
+// A profile entity is a mined result about "the user's own pets/family"
+// (as opposed to M1's concept-version theme moments, which do a "library-wide
+// search for pet-containing elements") — mining happens inside the engine
+// build for the corresponding recipe (profile:pets/profile:family), on the
+// same transaction cadence as recompute, and produces a full replace by kind
+// (delete all rows of that kind + insert), idempotent, isolated across kinds
+// (replacing pet never affects family, and vice versa).
 package service
 
 import (
@@ -12,13 +16,15 @@ import (
 	"time"
 )
 
-// ProfileEntity 对应 user_profile_entities 表一行。EvidenceJSON 是挖掘依据的
-// JSON 快照(photo_count/months/first/last 等),供排障与后续升级读取,不
-// 参与查询过滤。FirstSeen/LastSeen 为零值 time.Time 时表示该列在库中是 NULL。
+// ProfileEntity corresponds to one row of user_profile_entities. EvidenceJSON
+// is a JSON snapshot of the mining evidence (photo_count/months/first/last,
+// etc.), kept for troubleshooting and future upgrades to read — it is never
+// used for query filtering. FirstSeen/LastSeen being the zero time.Time means
+// that column is NULL in the DB.
 type ProfileEntity struct {
 	ID           string
-	Kind         string // "pet" | "person"(预留 place/activity)
-	Key          string // pet: 物种词 'beagle';person: person_id
+	Kind         string // "pet" | "person" (place/activity reserved)
+	Key          string // pet: species term e.g. 'beagle'; person: person_id
 	Label        string
 	EvidenceJSON string
 	PhotoCount   int
@@ -27,29 +33,34 @@ type ProfileEntity struct {
 	UpdatedAt    int64 // Unix ms
 }
 
-// ProfileEntityID 派生画像实体的稳定 id:hash(kind + "|" + key) 前 16 hex。
-// 与 TripMomentID/ThemeMomentID 同法(见 momentstore.go hashID16),同
-// kind+key 恒定映射到同一行,重算即原地刷新。
+// ProfileEntityID derives a stable id for a profile entity: the first 16 hex
+// chars of hash(kind + "|" + key). Same approach as TripMomentID/ThemeMomentID
+// (see momentstore.go's hashID16) — a given kind+key always maps to the same
+// row, so a recompute just refreshes it in place.
 func ProfileEntityID(kind, key string) string {
 	return hashID16(kind + "|" + key)
 }
 
-// ProfileStore 是 user_profile_entities 表的 repo 层,纯 SQL,无 ORM(照
-// MomentStore 的风格)。
+// ProfileStore is the repo layer for the user_profile_entities table, plain
+// SQL, no ORM (following MomentStore's style).
 type ProfileStore struct {
 	db *sql.DB
 }
 
-// NewProfileStore 构造 ProfileStore。
+// NewProfileStore constructs a ProfileStore.
 func NewProfileStore(db *sql.DB) *ProfileStore {
 	return &ProfileStore{db: db}
 }
 
-// ReplaceEntities 是某 kind 下画像实体的幂等全量替换入口:事务内先 delete
-// 该 kind 全部旧行,再 insert 本轮 entities。挖掘结果不是增量合并——每轮
-// 挖掘都是对该 kind 全库重新判定达标集合,全量替换避免"曾经达标、现在不再
-// 达标"的旧实体残留。entities 为空时等价于清空该 kind(如本轮全库无实体
-// 达标)。不影响其它 kind 下的行(WHERE kind=? 严格隔离)。
+// ReplaceEntities is the idempotent full-replace entry point for profile
+// entities of a given kind: within a transaction it first deletes all
+// existing rows of that kind, then inserts this round's entities. Mining
+// results are not merged incrementally — each mining pass re-evaluates the
+// qualifying set library-wide for that kind, and a full replace avoids
+// leaving behind stale entities that "used to qualify but no longer do".
+// Passing an empty entities slice is equivalent to clearing the kind (e.g.
+// when this pass found nothing qualifying library-wide). Rows of other kinds
+// are unaffected (WHERE kind=? strictly isolates them).
 func (s *ProfileStore) ReplaceEntities(kind string, entities []ProfileEntity) error {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -80,8 +91,9 @@ func (s *ProfileStore) ReplaceEntities(kind string, entities []ProfileEntity) er
 	return nil
 }
 
-// nonEmptyOr 在 s 为空字符串时回落到 fallback(evidence 列 NOT NULL DEFAULT
-// '{}',调用方不传 EvidenceJSON 时应落成 '{}' 而非空串)。
+// nonEmptyOr falls back to fallback when s is an empty string (the evidence
+// column is NOT NULL DEFAULT '{}', so a caller that omits EvidenceJSON should
+// land on '{}' rather than an empty string).
 func nonEmptyOr(s, fallback string) string {
 	if s == "" {
 		return fallback
@@ -89,8 +101,9 @@ func nonEmptyOr(s, fallback string) string {
 	return s
 }
 
-// ListEntities 列出某 kind 下全部画像实体,按 photo_count 倒序(最有存在感
-// 的实体排前面,如 UI 展示"你的宠物们"时的默认顺序)。
+// ListEntities lists every profile entity of a given kind, ordered by
+// photo_count descending (the entities with the strongest presence come
+// first, e.g. the default order when the UI shows "your pets").
 func (s *ProfileStore) ListEntities(kind string) ([]ProfileEntity, error) {
 	rows, err := s.db.Query(`
 		SELECT id, kind, key, label, evidence, photo_count, first_seen, last_seen, updated_at

@@ -63,7 +63,7 @@ func TestPreviewGeneratesAndServes(t *testing.T) {
 	}
 	h, db, cleanup := newPreviewHarness(t)
 	defer cleanup()
-	// 造源视频
+	// Build the source video
 	dir := t.TempDir()
 	src := filepath.Join(dir, "v1.mp4")
 	require.NoError(t, exec.Command("ffmpeg", "-hide_banner", "-loglevel", "error",
@@ -82,7 +82,7 @@ func TestPreviewGeneratesAndServes(t *testing.T) {
 	require.Equal(t, "max-age=604800", rec.Header().Get("Cache-Control"))
 	require.NotZero(t, rec.Body.Len(), "response body should carry the generated preview.mp4")
 
-	// 再次请求：preview.mp4 已存在 → ensure 核心秒退缓存命中，仍 200。
+	// Second request: preview.mp4 already exists → ensure's core logic short-circuits on the cache hit, still 200.
 	req2 := httptest.NewRequest(http.MethodGet, "/", nil)
 	rec2 := httptest.NewRecorder()
 	c2 := e.NewContext(req2, rec2)
@@ -107,7 +107,7 @@ func TestPreviewSupportsRange(t *testing.T) {
 
 	e := echo.New()
 
-	// 先请求一次落地 preview.mp4，避免 Range 请求撞上首次生成路径。
+	// Request once first to land preview.mp4, so the Range request doesn't hit the first-generation path.
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	rec := httptest.NewRecorder()
 	c := e.NewContext(req, rec)
@@ -116,7 +116,7 @@ func TestPreviewSupportsRange(t *testing.T) {
 	require.NoError(t, h.Preview(c))
 	require.Equal(t, http.StatusOK, rec.Code)
 
-	// <video> 标签的 Range 请求应得到 206 + 部分内容（c.File 底层 http.ServeContent 自带）。
+	// A <video> tag's Range request should get 206 + partial content (built into c.File's underlying http.ServeContent).
 	rangeReq := httptest.NewRequest(http.MethodGet, "/", nil)
 	rangeReq.Header.Set("Range", "bytes=0-99")
 	rangeRec := httptest.NewRecorder()

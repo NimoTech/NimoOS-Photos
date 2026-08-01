@@ -18,8 +18,9 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// mockSearchTextML 与 service 包测试里的 mockTextML 等价：把任意查询词映射到固定
-// 方向 e0=[1,0,...] 的向量，让 KNN 排序完全由资产向量的 x 分量决定，测试可控。
+// mockSearchTextML is equivalent to mockTextML in the service package's tests:
+// it maps any query term to a fixed-direction vector e0=[1,0,...], so KNN
+// ordering is fully determined by the assets' vector x component, keeping the test deterministic.
 type mockSearchTextML struct{}
 
 func (m *mockSearchTextML) CLIPTextEmbed(_ string) ([]float32, error) {
@@ -28,8 +29,9 @@ func (m *mockSearchTextML) CLIPTextEmbed(_ string) ([]float32, error) {
 	return v, nil
 }
 
-// searchFakeServices 只实现 SearchHandler 依赖的 Search()，其余方法由内嵌的
-// service.Services 接口零值满足（未调用到，panic 即视为测试写错）。
+// searchFakeServices only implements the Search() method that SearchHandler
+// depends on; other methods are satisfied by the embedded service.Services
+// interface's zero value (never called — a panic there means the test itself is wrong).
 type searchFakeServices struct {
 	service.Services
 	search *service.SearchService
@@ -37,8 +39,9 @@ type searchFakeServices struct {
 
 func (f *searchFakeServices) Search() *service.SearchService { return f.search }
 
-// newSearchHarness 打开一个临时库，插入 n 条严格递减分数的语义资产（id0 分最高排
-// 最前），返回可直接调用 Smart 的 handler。
+// newSearchHarness opens a temp database and inserts n semantic assets with
+// strictly decreasing scores (id0 scores highest and sorts first), returning
+// a handler ready to call Smart directly.
 func newSearchHarness(t *testing.T, n int) *v1.SearchHandler {
 	t.Helper()
 	db, err := sqlite.Open(filepath.Join(t.TempDir(), "search_route.db"))
@@ -47,7 +50,7 @@ func newSearchHarness(t *testing.T, n int) *v1.SearchHandler {
 
 	for i := 0; i < n; i++ {
 		id := fmt.Sprintf("id%d", i)
-		ds := 0.95 - float64(i)*0.005 // 分差够小，保证 n 较大时仍严格递减且不触发极端断层
+		ds := 0.95 - float64(i)*0.005 // score gap small enough to stay strictly decreasing for large n without triggering extreme cliffs
 		x := 0.03 + ds*0.10
 		_, err := db.Exec(`INSERT INTO assets(id,file_path,status,is_live_photo_video) VALUES(?,?,'indexed',0)`, id, "/p/"+id+".jpg")
 		require.NoError(t, err)
@@ -78,8 +81,9 @@ func doSmart(t *testing.T, h *v1.SearchHandler, body string) (*httptest.Response
 	return rec, results
 }
 
-// TestSmartHandlerDefaultLimitIs50 验证默认 limit 从旧值 20 升到 50：库里有 60 条
-// 候选资产、请求不带 limit 时应恰好拿到 50 条。
+// TestSmartHandlerDefaultLimitIs50 verifies the default limit was raised from
+// 20 to 50: with 60 candidate assets in the library, a request without limit
+// should get exactly 50.
 func TestSmartHandlerDefaultLimitIs50(t *testing.T) {
 	h := newSearchHarness(t, 60)
 	rec, results := doSmart(t, h, `{"query":"fish"}`)
@@ -87,8 +91,10 @@ func TestSmartHandlerDefaultLimitIs50(t *testing.T) {
 	require.Len(t, results, 50)
 }
 
-// TestSmartHandlerLimitClampedToDefaultWhenOutOfRange 验证 limit 钳制区间变为
-// (0,500]：<=0 或 >500 都归默认 50（沿用「越界即归默认」而非夹到边界的既有模式）。
+// TestSmartHandlerLimitClampedToDefaultWhenOutOfRange verifies the limit
+// clamp range is now (0,500]: <=0 or >500 both fall back to the default 50
+// (keeping the existing "out-of-range falls back to default" pattern rather
+// than clamping to the boundary).
 func TestSmartHandlerLimitClampedToDefaultWhenOutOfRange(t *testing.T) {
 	h := newSearchHarness(t, 60)
 
@@ -102,8 +108,9 @@ func TestSmartHandlerLimitClampedToDefaultWhenOutOfRange(t *testing.T) {
 	require.Len(t, tooBig, 50)
 }
 
-// TestSmartHandlerLimitWithinRangeIsHonored 验证 (0,500] 区间内的 limit 原样生效，
-// 包括新上限 500 附近的值（用小一点的库规模验证 500 本身不会被误判越界）。
+// TestSmartHandlerLimitWithinRangeIsHonored verifies that a limit within
+// (0,500] is honored as-is, including values near the new upper bound of 500
+// (using a smaller library size to verify 500 itself isn't wrongly treated as out of range).
 func TestSmartHandlerLimitWithinRangeIsHonored(t *testing.T) {
 	h := newSearchHarness(t, 10)
 	_, results := doSmart(t, h, `{"query":"fish","limit":7}`)
@@ -111,11 +118,12 @@ func TestSmartHandlerLimitWithinRangeIsHonored(t *testing.T) {
 
 	h2 := newSearchHarness(t, 3)
 	_, results2 := doSmart(t, h2, `{"query":"fish","limit":500}`)
-	require.Len(t, results2, 3, "limit=500 在钳制区间内应原样生效，库不足时返回实际数")
+	require.Len(t, results2, 3, "limit=500 is within the clamp range and should be honored as-is; when the library has fewer, return the actual count")
 }
 
-// TestSmartHandlerNegativeOffsetClampsToZero 验证请求体里的负数 offset 被路由层
-// 归零：offset=-1 的结果应与不传 offset（等价于 offset=0）完全一致（含顺序）。
+// TestSmartHandlerNegativeOffsetClampsToZero verifies that a negative offset
+// in the request body is clamped to zero by the route layer: results for
+// offset=-1 should be identical (including order) to not sending offset at all (equivalent to offset=0).
 func TestSmartHandlerNegativeOffsetClampsToZero(t *testing.T) {
 	h := newSearchHarness(t, 20)
 
@@ -128,8 +136,9 @@ func TestSmartHandlerNegativeOffsetClampsToZero(t *testing.T) {
 	}
 }
 
-// TestSmartHandlerOffsetPagesDeeper 验证 offset>0 时拿到的是排序更靠后的资产
-// （分页真的往后翻，而不是重复返回首页),且深页结果全部 belowCut=true。
+// TestSmartHandlerOffsetPagesDeeper verifies that offset>0 returns assets
+// further down the ranking (pagination actually advances rather than
+// repeating the first page), and that deep-page results all have belowCut=true.
 func TestSmartHandlerOffsetPagesDeeper(t *testing.T) {
 	h := newSearchHarness(t, 20)
 
@@ -143,8 +152,8 @@ func TestSmartHandlerOffsetPagesDeeper(t *testing.T) {
 		firstIDs[a["id"].(string)] = true
 	}
 	for _, a := range second {
-		require.False(t, firstIDs[a["id"].(string)], "第二页不应与首页重复")
+		require.False(t, firstIDs[a["id"].(string)], "the second page should not overlap with the first page")
 		belowCut, _ := a["belowCut"].(bool)
-		require.True(t, belowCut, "offset>0 的结果应全部 belowCut=true")
+		require.True(t, belowCut, "offset>0 results should all have belowCut=true")
 	}
 }

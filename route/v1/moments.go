@@ -1,6 +1,8 @@
-// Smart Moments 的 HTTP 路由层:列表/成员/固化相册/触发重算/recipe 热更新
-// 推送入口。数据层(MomentStore)与调度层(MomentsService)见 service 包的
-// Task 1-4;本文件只做参数绑定、错误映射、DTO 转换,不含业务逻辑。
+// HTTP route layer for Smart Moments: list/members/pin-to-album/trigger
+// recompute/recipe hot-update push endpoint. The data layer (MomentStore)
+// and scheduling layer (MomentsService) are in the service package's
+// Task 1-4; this file only does param binding, error mapping, and DTO
+// conversion — no business logic.
 package v1
 
 import (
@@ -18,10 +20,11 @@ import (
 // MomentsHandler handles the Smart Moments API.
 type MomentsHandler struct {
 	svc service.Services
-	ctx context.Context // 应用生命周期 ctx,喂给后台 Recompute goroutine——绝不能
-	// 用请求的 c.Request().Context(),那个 ctx 在 handler 返回、响应写完后就会
-	// 被 net/http 取消,会连带杀死刚 go 出去的重算(照 PersonsHandler.Recluster
-	// 同款教训)。
+	ctx context.Context // app-lifetime ctx, fed to the background Recompute goroutine — must
+	// never use the request's c.Request().Context(), since that ctx gets
+	// canceled by net/http once the handler returns and the response is
+	// written, which would kill the recompute that was just kicked off
+	// (same lesson as PersonsHandler.Recluster).
 }
 
 // NewMomentsHandler constructs a MomentsHandler.
@@ -29,8 +32,10 @@ func NewMomentsHandler(svc service.Services, ctx context.Context) *MomentsHandle
 	return &MomentsHandler{svc: svc, ctx: ctx}
 }
 
-// momentResponse 是 GET /v1/photos/moments 单条时刻的对外字段——蛇形命名照
-// 简报权威契约逐字对齐(不同于本文件其余接口沿用的 camelCase 惯例)。
+// momentResponse is the external field shape of a single moment for
+// GET /v1/photos/moments — snake_case, matching the brief's authoritative
+// contract verbatim (unlike the camelCase convention this file otherwise
+// follows for its other endpoints).
 type momentResponse struct {
 	ID           string  `json:"id"`
 	Title        string  `json:"title"`
@@ -42,35 +47,45 @@ type momentResponse struct {
 	Place        string  `json:"place,omitempty"`
 	RecipeKey    string  `json:"recipe_key"`
 	NamedByLLM   bool    `json:"named_by_llm"`
-	// SortOrder 是拖拽手排序的序号(nil=未手排),供前端调试用,不强依赖。
+	// SortOrder is the drag-reorder index (nil = not manually ordered); for
+	// frontend debugging only, not a hard dependency.
 	SortOrder *int `json:"sort_order,omitempty"`
-	// FeaturedAssetIDs 是该时刻的精选成员 id(不含封面,已按 score 降序截取
-	// 前 maxFeaturedAssetIDsPerMoment 个),供列表页直接渲染小图带而不必逐条
-	// 请求 /assets?featured=1。恒为数组(可能为空 []),不用 omitempty——前端
-	// 不必对该字段做 null 判断。
+	// FeaturedAssetIDs are the moment's featured member ids (excluding the
+	// cover, already truncated to the top maxFeaturedAssetIDsPerMoment by
+	// score DESC), letting list pages render a thumbnail strip directly
+	// without a per-moment /assets?featured=1 request. Always an array
+	// (may be empty []), no omitempty — the frontend doesn't need to
+	// null-check this field.
 	FeaturedAssetIDs []string `json:"featured_asset_ids"`
-	// AddedThisWeek 是该时刻本周(7 天窗)新增的成员数(added_at 非 NULL 且
-	// 落在窗口内才计入,见 MomentStore.AddedThisWeekByMoment)。恒输出(0 也
-	// 带),前端判 >0 才显示绿色 "+N this week" 标记。
+	// AddedThisWeek is the count of members added within the current
+	// 7-day window (only counted when added_at is non-NULL and falls
+	// inside the window; see MomentStore.AddedThisWeekByMoment). Always
+	// output (0 included); the frontend only shows the green "+N this
+	// week" badge when it's >0.
 	AddedThisWeek int `json:"added_this_week"`
-	// CoverRatio 是封面宽高比(w/h,见 MomentStore.CoverRatioByMoment),供
-	// 前端马赛克布局判定横竖版卡片档位。任一维度缺失或为 0(封面尚未 EXIF
-	// 索引/无该字段)时输出 0=未知;恒输出,不用 omitempty——前端不必对该
-	// 字段做 null 判断。
+	// CoverRatio is the cover's aspect ratio (w/h, see
+	// MomentStore.CoverRatioByMoment), used by the frontend to decide
+	// landscape/portrait card slots in the mosaic layout. Outputs 0
+	// (= unknown) when either dimension is missing or 0 (cover not yet
+	// EXIF-indexed, or the field is absent); always output, no
+	// omitempty — the frontend doesn't need to null-check this field.
 	CoverRatio float64 `json:"cover_ratio"`
 }
 
-// maxFeaturedAssetIDsPerMoment 是 List() 合成 featured_asset_ids 时每个时刻
-// 截取的精选数量上限,喂给 MomentStore.TopFeaturedByMoment 的 perMoment 参数。
-// 马赛克布局的三联模板(T4)最多消费 2 张精选 + 兜底链需要,上限从 2 提到 3
-// (见 2026-07-29 moments-mosaic 设计 spec 第一节)。
+// maxFeaturedAssetIDsPerMoment is the per-moment cap on featured items when
+// List() assembles featured_asset_ids, fed into MomentStore.TopFeaturedByMoment's
+// perMoment param. The mosaic layout's three-tile template (T4) consumes up
+// to 2 featured items plus a fallback chain, so the cap was raised from 2 to
+// 3 (see the 2026-07-29 moments-mosaic design spec, section 1).
 const maxFeaturedAssetIDsPerMoment = 3
 
-// toMomentResponse 转换 service.Moment → momentResponse。TimeFrom/TimeTo 为零值
-// time.Time 时(主题类时刻没有固定时间窗)对应字段留空(nil,JSON 里省略),
-// 非零值格式化为 RFC3339。featuredAssetIDs/addedThisWeek/coverRatio 均由调用
-// 方一次性算好传入(List() 对全部时刻各只查一次 TopFeaturedByMoment/
-// AddedThisWeekByMoment/CoverRatioByMoment,避免逐条时刻查询的 N+1)。
+// toMomentResponse converts service.Moment → momentResponse. When
+// TimeFrom/TimeTo are zero-value time.Time (theme moments have no fixed
+// time window), the corresponding fields are left empty (nil, omitted from
+// JSON); non-zero values are formatted as RFC3339. featuredAssetIDs/
+// addedThisWeek/coverRatio are all precomputed by the caller and passed in
+// (List() queries TopFeaturedByMoment/AddedThisWeekByMoment/CoverRatioByMoment
+// once each for all moments, avoiding per-moment N+1 queries).
 func toMomentResponse(m service.Moment, featuredAssetIDs []string, addedThisWeek int, coverRatio float64) momentResponse {
 	r := momentResponse{
 		ID:               m.ID,
@@ -108,19 +123,24 @@ func (h *MomentsHandler) List(c echo.Context) error {
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
 	}
-	// 一次查询取全库 featured_asset_ids(排除各自封面),按 moment id 分发——
-	// 不对每条时刻单独查询,避免 N+1(TopFeaturedByMoment 本身就是一条 SQL)。
+	// Single query fetches featured_asset_ids for the whole DB (cover
+	// excluded from each), dispatched by moment id — never queried
+	// per-moment, avoiding N+1 (TopFeaturedByMoment is itself one SQL
+	// statement).
 	featured, err := h.svc.Moments().Store().TopFeaturedByMoment(maxFeaturedAssetIDsPerMoment)
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
 	}
-	// 同法:一次查询取全库 added_this_week,按 moment id 分发,无 N+1。
+	// Same approach: one query fetches added_this_week for the whole DB,
+	// dispatched by moment id, no N+1.
 	addedThisWeek, err := h.svc.Moments().Store().AddedThisWeekByMoment(time.Now().UnixMilli())
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
 	}
-	// 同法:一次查询取全库封面宽高比,按 moment id 分发,无 N+1;map 里没有的
-	// id(缺 exif 行或尺寸为 0)取零值 float64(0),即"未知"。
+	// Same approach: one query fetches cover aspect ratio for the whole
+	// DB, dispatched by moment id, no N+1; ids missing from the map
+	// (no exif row, or zero dimensions) get the zero value float64(0),
+	// i.e. "unknown".
 	coverRatio, err := h.svc.Moments().Store().CoverRatioByMoment()
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
@@ -149,36 +169,41 @@ func (h *MomentsHandler) findMoment(id string) (service.Moment, error) {
 	return service.Moment{}, service.ErrNotFound
 }
 
-// momentAssetMemberDTO 是 with_members=1 附带的成员元数据,供编辑 UI 区分
-// "引擎本轮产出"与"用户手动 pin"的成员、以及是否属于精选。
+// momentAssetMemberDTO is the member metadata attached when with_members=1,
+// letting the edit UI distinguish members "produced by this engine run"
+// from those "manually pinned by the user", and whether each is featured.
 type momentAssetMemberDTO struct {
 	AssetID  string `json:"asset_id"`
 	Manual   bool   `json:"manual"`
 	Featured bool   `json:"featured"`
 }
 
-// momentPlaceDTO 是 with_members=1 附带的 About 多地点聚合数据(见设计 spec
-// 第三节),转自 service.MomentPlace。
+// momentPlaceDTO is the About-section multi-place aggregate data attached
+// when with_members=1 (see design spec section 3), converted from
+// service.MomentPlace.
 type momentPlaceDTO struct {
 	Name  string `json:"name"`
 	Count int    `json:"count"`
 }
 
-// maxPlacesPerMoment 是 Assets(with_members=1) places 字段的城市数量上限,
-// 防止极端多地点的时刻把响应撑得过长(见设计 spec 第三节)。
+// maxPlacesPerMoment caps the number of cities in Assets(with_members=1)'s
+// places field, preventing moments with an extreme number of places from
+// bloating the response (see design spec section 3).
 const maxPlacesPerMoment = 8
 
 // Assets returns a moment's member assets, serialized via the same asset
 // shape as GET /v1/photos/assets. Query param featured=1 restricts to the
-// featured (精选) subset; members are already ordered by score DESC by
+// featured subset; members are already ordered by score DESC by
 // MomentStore.GetMomentAssets, and that order is preserved end-to-end because
 // Search().ListAssets short-circuits on a non-nil AssetIDs filter without
 // re-sorting.
 //
-// with_members=1 时响应形状变为 {"assets":[...], "members":[{"asset_id",
-// "manual","featured"}]},供编辑 UI 同时拿到成员的来源/精选标记;不带该
-// 参数时保持既有裸数组完全不变(部署窗口内旧前端仍按裸数组解析,见简报
-// 歧义裁决)。
+// With with_members=1, the response shape becomes {"assets":[...], "members":
+// [{"asset_id","manual","featured"}]}, letting the edit UI get each member's
+// origin/featured flag in the same call; without that param, the response
+// stays the existing bare array unchanged (during the deploy window, old
+// frontends still parse it as a bare array — see the brief's ambiguity
+// ruling).
 //
 // GET /v1/photos/moments/:id/assets?featured=1&with_members=1
 func (h *MomentsHandler) Assets(c echo.Context) error {
@@ -227,18 +252,21 @@ func (h *MomentsHandler) Assets(c echo.Context) error {
 	return c.JSON(http.StatusOK, map[string]any{"assets": assets, "members": memberDTOs, "places": placeDTOs})
 }
 
-// momentAssetsIDsRequest 是 Pin/ExcludeAssets 共用的请求体形状:一批待操作
-// 的 asset id。
+// momentAssetsIDsRequest is the request body shape shared by
+// Pin/ExcludeAssets: a batch of asset ids to operate on.
 type momentAssetsIDsRequest struct {
 	IDs []string `json:"ids"`
 }
 
-// PinAssets 把若干 asset 强制并入某时刻:落一条编辑记录并立即改成员(见
-// MomentStore.PinMomentAssets),对下一轮引擎重算也生效(回放钩子见
-// momentstore.go applyMomentEdits)。空 ids 视为无效请求 → 400;moment 不
-// 存在或已隐藏 → 404(findMoment 统一拦,ListMoments 已过滤 hidden,故此处
-// 不会触达 store 对未知 momentID 的 error 路径)。assets 表里不存在的 id
-// 由 store 层静默忽略,不影响本次请求成功。
+// PinAssets forcibly merges some assets into a moment: records one edit and
+// updates membership immediately (see MomentStore.PinMomentAssets), which
+// also takes effect on the next engine recompute (replay hook in
+// momentstore.go applyMomentEdits). Empty ids is treated as an invalid
+// request → 400; a moment that doesn't exist or is hidden → 404 (findMoment
+// catches this uniformly; ListMoments already filters out hidden, so this
+// path never reaches the store's error path for an unknown momentID). Ids
+// not present in the assets table are silently ignored by the store layer
+// and don't affect the success of this request.
 //
 // POST /v1/photos/moments/:id/assets
 //
@@ -259,9 +287,10 @@ func (h *MomentsHandler) PinAssets(c echo.Context) error {
 	return c.JSON(http.StatusOK, map[string]any{"ok": true, "asset_count": count})
 }
 
-// ExcludeAssets 把若干 asset 强制剔除出某时刻(见
-// MomentStore.ExcludeMomentAssets),封面重挑已在 store 层完成。空
-// ids/moment 不存在或已隐藏的口径与 PinAssets 完全同形。
+// ExcludeAssets forcibly removes some assets from a moment (see
+// MomentStore.ExcludeMomentAssets); cover reselection is already done at
+// the store layer. Empty ids / moment not found or hidden are handled
+// identically to PinAssets.
 //
 // DELETE /v1/photos/moments/:id/assets
 //
@@ -282,10 +311,12 @@ func (h *MomentsHandler) ExcludeAssets(c echo.Context) error {
 	return c.JSON(http.StatusOK, map[string]any{"ok": true, "asset_count": count})
 }
 
-// Delete 隐藏某时刻(tombstone,行本身保留,见 MomentStore.HideMoment)。
-// moment 不存在或已隐藏 → 404(findMoment 基于 ListMoments,已过滤
-// hidden=0,故重复 DELETE 同一个 id 第二次起也是 404,是预期的幂等表现)。
-// 隐藏生效后 List/Assets/CreateAlbum(export)一律 404/不再列出。
+// Delete hides a moment (tombstone; the row itself is kept, see
+// MomentStore.HideMoment). Moment not found or already hidden → 404
+// (findMoment is based on ListMoments, which already filters hidden=0, so
+// repeated DELETEs of the same id are also 404 from the second call on —
+// this is the expected idempotent behavior). Once hidden takes effect,
+// List/Assets/CreateAlbum (export) all return 404 / stop listing it.
 //
 // DELETE /v1/photos/moments/:id
 func (h *MomentsHandler) Delete(c echo.Context) error {
@@ -299,10 +330,11 @@ func (h *MomentsHandler) Delete(c echo.Context) error {
 	return c.JSON(http.StatusOK, map[string]any{"ok": true})
 }
 
-// CreateAlbum 把一个时刻固化为普通相册(全量成员,不限精选),名字用
-// moment 的 title——转调既有 AlbumService.Create + BatchAddAssets(照
-// smartview.go ExportAsAlbum 同款薄封装,但直接在 handler 里写,不改
-// smartview.go)。
+// CreateAlbum pins a moment into a regular album (all members, not just
+// featured), using the moment's title as the album name — delegating to
+// the existing AlbumService.Create + BatchAddAssets (the same thin
+// wrapper pattern as smartview.go's ExportAsAlbum, but written directly in
+// the handler here without touching smartview.go).
 //
 // POST /v1/photos/moments/:id/album
 func (h *MomentsHandler) CreateAlbum(c echo.Context) error {
@@ -337,23 +369,26 @@ func (h *MomentsHandler) CreateAlbum(c echo.Context) error {
 	})
 }
 
-// Recompute 异步触发全量重算(RecomputeAll 自身 CAS 防重入,重入直接返回
-// nil),不阻塞请求;进度走既有 TaskRegistry(Type:"moments"),这里只回一个
-// 202 + task_type 让前端知道去哪张 task 轮询。
+// Recompute asynchronously triggers a full recompute (RecomputeAll has its
+// own CAS reentrancy guard and just returns nil on reentry); it doesn't
+// block the request. Progress goes through the existing TaskRegistry
+// (Type: "moments"); this just replies with a 202 + task_type so the
+// frontend knows which task to poll.
 //
 // POST /v1/photos/moments/recompute
 func (h *MomentsHandler) Recompute(c echo.Context) error {
 	go func() {
 		if err := h.svc.Moments().RecomputeAll(h.ctx); err != nil {
-			zap.L().Warn("moments: 手动触发重算失败", zap.Error(err))
+			zap.L().Warn("moments: manually triggered recompute failed", zap.Error(err))
 		}
 	}()
 	return c.JSON(http.StatusAccepted, map[string]string{"task_type": "moments"})
 }
 
-// recipeDTO 是 recipe 热更新接口的对外形状:Params 展开为解析后的
-// RecipeParams(而非内部存储的原始 JSON 字符串),GET 侧经 ParseParams 补齐
-// 默认值,PUT 侧序列化回 ParamsJSON 落库。
+// recipeDTO is the external shape of the recipe hot-update endpoint: Params
+// is expanded into the parsed RecipeParams (rather than the raw JSON string
+// stored internally); the GET side fills in defaults via ParseParams, and
+// the PUT side serializes it back into ParamsJSON for storage.
 type recipeDTO struct {
 	Key       string               `json:"key"`
 	Kind      string               `json:"kind"`
@@ -363,7 +398,8 @@ type recipeDTO struct {
 	UpdatedAt int64                `json:"updated_at,omitempty"`
 }
 
-// ListRecipes 列出全部 recipe(含禁用),供 recipe 管理界面展示/编辑。
+// ListRecipes lists all recipes (including disabled ones), for the recipe
+// management UI to display/edit.
 //
 // GET /v1/photos/moments/recipes
 func (h *MomentsHandler) ListRecipes(c echo.Context) error {
@@ -385,8 +421,9 @@ func (h *MomentsHandler) ListRecipes(c echo.Context) error {
 	return c.JSON(http.StatusOK, map[string]any{"recipes": out})
 }
 
-// UpdateRecipes 是 recipe 的热更新推送入口:整批 upsert(按 key),下一轮
-// RecomputeAll 即生效,无需改代码/重启服务。
+// UpdateRecipes is the recipe hot-update push endpoint: a batch upsert
+// (keyed by key) that takes effect on the next RecomputeAll, no code
+// changes or service restart needed.
 //
 // PUT /v1/photos/moments/recipes
 //
@@ -405,11 +442,13 @@ func (h *MomentsHandler) UpdateRecipes(c echo.Context) error {
 			return echo.NewHTTPError(http.StatusBadRequest, "recipe key/kind is required")
 		}
 		if dto.Kind != "trip" && dto.Kind != "theme" {
-			// kind 白名单:引擎(service/moments.go recomputeRecipe)只认
-			// "trip"/"theme" 两种,其它 kind 会被静默 Warn 跳过(不报错)—
-			// 这在推送入口这层拦掉更好:防止运维/脚本 typo(如
-			// "thmee"/"Trip")悄悄把无效 recipe 写进库,重算永远不会产出、
-			// 也没有任何报错提示。
+			// kind whitelist: the engine (service/moments.go recomputeRecipe)
+			// only recognizes "trip"/"theme"; any other kind is silently
+			// skipped with a Warn (no error) — better to catch it at this
+			// push endpoint layer instead: it prevents an ops/script typo
+			// (e.g. "thmee"/"Trip") from quietly writing an invalid recipe
+			// into the DB, where recompute would never produce anything and
+			// there'd be no error to notice.
 			return echo.NewHTTPError(http.StatusBadRequest, "kind must be one of: trip, theme")
 		}
 		paramsJSON, err := json.Marshal(dto.Params)
@@ -431,10 +470,13 @@ func (h *MomentsHandler) UpdateRecipes(c echo.Context) error {
 	return c.JSON(http.StatusOK, map[string]any{"updated": len(recipes)})
 }
 
-// ReorderMoments 是拖拽排序的落库入口:body 里的 ids 顺序即用户拖拽后的
-// 展示顺序,事务内按序赋 sort_order(见 MomentStore.ReorderMoments)。空
-// ids 视为无效请求(拖拽必然携带至少一个 id)→ 400;body 里未知的 id
-// (前端列表可能略旧)在 store 层被忽略,不影响本次请求成功。
+// ReorderMoments is the persistence endpoint for drag reordering: the ids
+// order in the body is the user's post-drag display order, and sort_order
+// is assigned accordingly within a transaction (see
+// MomentStore.ReorderMoments). Empty ids is treated as an invalid request
+// (a drag always carries at least one id) → 400; unknown ids in the body
+// (the frontend's list may be slightly stale) are ignored at the store
+// layer and don't affect the success of this request.
 //
 // PUT /v1/photos/moments/order
 //

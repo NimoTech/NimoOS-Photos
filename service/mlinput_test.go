@@ -10,11 +10,12 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// fakeJPEGHeader 手工构造一段最小的 JPEG 字节序列：SOI + APP0(JFIF) +
-// SOF0(baseline，单分量)。JPEG 解码器在 configOnly 模式下读完 SOF0 就返回，
-// 不需要真正的熵编码扫描数据，所以可以在不分配任何像素内存的情况下声明任意
-// (合法 16 位范围内的)宽高——用来测试"读头部判断是否超限"而不必真的构造一张
-// 199.8MP 的图片。
+// fakeJPEGHeader hand-builds a minimal JPEG byte sequence: SOI + APP0(JFIF) +
+// SOF0 (baseline, single component). In configOnly mode the JPEG decoder
+// returns as soon as it's read SOF0, without needing real entropy-coded scan
+// data, so any (legal 16-bit range) width/height can be declared without
+// allocating any pixel memory — used to test "read the header to determine
+// whether it exceeds the limit" without actually constructing a 199.8MP image.
 func fakeJPEGHeader(width, height int) []byte {
 	buf := []byte{0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x07, 'J', 'F', 'I', 'F', 0x00}
 	buf = append(buf, 0xFF, 0xC0, 0x00, 0x0B,
@@ -35,10 +36,10 @@ func TestPixelsExceedMLLimit(t *testing.T) {
 		width, height int
 		want          bool
 	}{
-		{"低于阈值(169.9M)", 1, 169_900_000, false},
-		{"恰好等于阈值(170M)不算超限", 1, 170_000_000, false},
-		{"刚超过阈值", 1, 170_000_001, true},
-		{"真实案例 16320x12240=199.8MP", 16320, 12240, true},
+		{"below the threshold (169.9M)", 1, 169_900_000, false},
+		{"exactly at the threshold (170M), not exceeding", 1, 170_000_000, false},
+		{"just over the threshold", 1, 170_000_001, true},
+		{"real case 16320x12240=199.8MP", 16320, 12240, true},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -48,12 +49,12 @@ func TestPixelsExceedMLLimit(t *testing.T) {
 }
 
 func TestOversizedForML(t *testing.T) {
-	t.Run("手工构造的超大 JPEG 头判定为超限", func(t *testing.T) {
+	t.Run("a hand-built oversized JPEG header is judged as exceeding the limit", func(t *testing.T) {
 		data := fakeJPEGHeader(16320, 12240)
-		require.True(t, oversizedForML(data), "16320x12240=199.8MP 应超过 170M 阈值")
+		require.True(t, oversizedForML(data), "16320x12240=199.8MP should exceed the 170M threshold")
 	})
 
-	t.Run("正常小图不超限", func(t *testing.T) {
+	t.Run("a normal small image does not exceed the limit", func(t *testing.T) {
 		img := image.NewRGBA(image.Rect(0, 0, 20, 10))
 		for y := 0; y < 10; y++ {
 			for x := 0; x < 20; x++ {
@@ -62,10 +63,10 @@ func TestOversizedForML(t *testing.T) {
 		}
 		var buf bytes.Buffer
 		require.NoError(t, png.Encode(&buf, img))
-		require.False(t, oversizedForML(buf.Bytes()), "20x10 的小图不应判定为超限")
+		require.False(t, oversizedForML(buf.Bytes()), "a 20x10 small image should not be judged as exceeding the limit")
 	})
 
-	t.Run("无法识别的格式按不超限处理", func(t *testing.T) {
+	t.Run("an unrecognizable format is treated as not exceeding the limit", func(t *testing.T) {
 		require.False(t, oversizedForML([]byte("not an image")))
 	})
 }

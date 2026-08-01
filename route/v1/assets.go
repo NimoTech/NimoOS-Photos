@@ -81,7 +81,7 @@ func (h *AssetsHandler) Sprite(c echo.Context) error {
 	hdr := c.Response().Header()
 	hdr.Set("X-Sprite-Frames", strconv.Itoa(frames))
 	hdr.Set("X-Sprite-Frame-W", strconv.Itoa(service.SpriteFrameW))
-	hdr.Set("X-Sprite-Frame-H", strconv.Itoa(frameH)) // 实际帧高（按原始比例，从文件读）
+	hdr.Set("X-Sprite-Frame-H", strconv.Itoa(frameH)) // actual frame height (per original aspect ratio, read from file)
 	hdr.Set("X-Sprite-Duration-Ms", strconv.FormatInt(durationMs, 10))
 	hdr.Set("Cache-Control", "max-age=604800")
 	return c.File(spritePath)

@@ -128,12 +128,12 @@ func TestEvaluateAndPreviewExcludeOfflineAssets(t *testing.T) {
 		ids = append(ids, id)
 	}
 	rows.Close()
-	require.Equal(t, []string{"online"}, ids, "offline 资产不应进入 smart_view_matches")
+	require.Equal(t, []string{"online"}, ids, "offline assets must not enter smart_view_matches")
 
 	// Preview path: same condition, unpersisted — must also exclude offline.
 	total, seeds, _, err := s.Preview([]string{"Sara"}, "", 50, true)
 	require.NoError(t, err)
-	require.Equal(t, 1, total, "Preview 计数不应包含 offline 资产")
+	require.Equal(t, 1, total, "the Preview count must not include offline assets")
 	require.Equal(t, []string{"online"}, seeds)
 }
 
@@ -163,7 +163,7 @@ func TestEvaluateOCRCondition(t *testing.T) {
 	_, _ = db.Exec(`INSERT INTO asset_ocr(asset_id,text) VALUES('a2','Invoice #2024-001')`)
 	_, _ = db.Exec(`INSERT INTO asset_ocr(asset_id,text) VALUES('a3','')`)
 
-	// OR 语法：receipt 或 invoice 命中即匹配；大小写不敏感
+	// OR syntax: matches if either receipt or invoice hits; case-insensitive
 	_, err := s.Create(SmartViewInput{ID: "sv-ocr", Name: "Receipts",
 		CondsRaw: []string{"ocr: receipt | invoice"}, Threshold: 80, Live: true})
 	require.NoError(t, err)
@@ -178,7 +178,7 @@ func TestEvaluateOCRCondition(t *testing.T) {
 	rows.Close()
 	require.Equal(t, []string{"a1", "a2"}, ids)
 
-	// 结构化条件：分数为 1.0，不受阈值影响
+	// Structural condition: score is 1.0, unaffected by the threshold
 	var score float64
 	require.NoError(t, db.QueryRow(`SELECT match_score FROM smart_view_matches
 		WHERE smart_view_id='sv-ocr' AND asset_id='a1'`).Scan(&score))
@@ -203,8 +203,9 @@ func seedClipAsset(t *testing.T, s *SmartViewService, id string) {
 	require.NoError(t, err)
 }
 
-// seedClipAssetWithSim 插入一个 indexed asset，其 CLIP 向量与 mock 文本向量
-// （[1,0,...]）的余弦相似度恰为 sim——用于测试分数标定。
+// seedClipAssetWithSim inserts an indexed asset whose CLIP vector has cosine
+// similarity exactly sim against the mock text vector ([1,0,...]) — used for
+// testing score calibration.
 func seedClipAssetWithSim(t *testing.T, s *SmartViewService, id string, sim float64, takenAt string) {
 	t.Helper()
 	db := s.db
@@ -222,15 +223,19 @@ func seedClipAssetWithSim(t *testing.T, s *SmartViewService, id string, sim floa
 	require.NoError(t, err)
 }
 
-// 语义条件的阈值滑块（50-99%）比较的是 SmartSearch 已重标定的展示分
-// （scan.go displayScore：[simDisplayFloor,simDisplayCeil]→0-100%，唯一标定层），
-// evalParsed 不得再做第二次映射——否则滑块语义与搜索页百分比脱钩。
+// The semantic condition's threshold slider (50-99%) compares against
+// SmartSearch's already-recalibrated display score (scan.go's displayScore:
+// [simDisplayFloor,simDisplayCeil]→0-100%, the single calibration layer);
+// evalParsed must not apply a second mapping on top of it — otherwise the
+// slider's semantics would decouple from the search page's percentage.
 func TestSemanticScoreCalibration(t *testing.T) {
 	s := svTestService(t)
-	// 种子裸分相对标定端点取值,期望值由 displayScore 现算,换模型重标端点时
-	// 本测试自动跟随,不再硬编码百分比。
-	goodRaw := simDisplayFloor() + (simDisplayCeil()-simDisplayFloor())*0.9 // 展示分 90%
-	badRaw := simDisplayFloor() + (simDisplayCeil()-simDisplayFloor())*0.2 // 展示分 20%
+	// Seed raw scores relative to the calibration endpoints; the expected value
+	// is computed live via displayScore, so this test automatically follows
+	// along when the endpoints get recalibrated for a new model, instead of
+	// hardcoding a percentage.
+	goodRaw := simDisplayFloor() + (simDisplayCeil()-simDisplayFloor())*0.9 // display score 90%
+	badRaw := simDisplayFloor() + (simDisplayCeil()-simDisplayFloor())*0.2  // display score 20%
 	seedClipAssetWithSim(t, s, "good", goodRaw, "2024-06-01T00:00:00Z")
 	seedClipAssetWithSim(t, s, "bad", badRaw, "2024-06-01T00:00:00Z")
 
@@ -247,11 +252,12 @@ func TestSemanticScoreCalibration(t *testing.T) {
 	require.Equal(t, 0, count, "90% must fail a 95% threshold")
 }
 
-// 用户场景还原：chips ["2024","bike"]——裸年份按日期过滤、bike 走 CLIP，
-// 2024 年的高分照片必须匹配，2023 年的不匹配。
+// Reproduces a real user scenario: chips ["2024","bike"] — a bare year
+// filters by date, bike goes through CLIP; a high-scoring 2024 photo must
+// match, a 2023 one must not.
 func TestBareYearPlusSemantic(t *testing.T) {
 	s := svTestService(t)
-	highRaw := simDisplayFloor() + (simDisplayCeil()-simDisplayFloor())*0.9 // 展示分 90%
+	highRaw := simDisplayFloor() + (simDisplayCeil()-simDisplayFloor())*0.9 // display score 90%
 	seedClipAssetWithSim(t, s, "a24", highRaw, "2024-06-01T00:00:00Z")
 	seedClipAssetWithSim(t, s, "a23", highRaw, "2023-06-01T00:00:00Z")
 
@@ -269,20 +275,24 @@ func TestBareYearPlusSemantic(t *testing.T) {
 	rows.Close()
 	require.Equal(t, []string{"a24"}, ids)
 
-	// 存库分数就是 SmartSearch 的展示分（与滑块/搜索页百分比同量纲），
-	// 不允许再有第二层映射改写它
+	// The persisted score is exactly SmartSearch's display score (same scale as
+	// the slider/search page percentage) — no second mapping layer is allowed
+	// to rewrite it.
 	var score float64
 	require.NoError(t, s.db.QueryRow(`SELECT match_score FROM smart_view_matches WHERE smart_view_id='sv-bike'`).Scan(&score))
-	require.InDelta(t, displayScore(highRaw), score, 0.01) // 落库分 = 唯一标定层 displayScore 的输出
+	require.InDelta(t, displayScore(highRaw), score, 0.01) // persisted score = the output of the single calibration layer, displayScore
 }
 
-// Evaluate 必须从 conds_raw 现解析，而不是用建库时固化的 conds_parsed 快照：
-// 否则解析器升级后旧视图不会自愈，"last 30 days" 这类相对日期窗也会被冻结。
+// Evaluate must re-parse from conds_raw rather than using the conds_parsed
+// snapshot frozen at creation time: otherwise old views wouldn't self-heal
+// after a parser upgrade, and relative date windows like "last 30 days"
+// would also be frozen.
 func TestEvaluateReparsesFromRaw(t *testing.T) {
 	s := svTestService(t)
 	seedClipAssetWithSim(t, s, "a24", 0.30, "2024-06-01T00:00:00Z")
 
-	// 模拟旧版本创建的视图：conds_parsed 里 "2024" 被错误地存成了 semantic
+	// Simulates a view created by an old version: "2024" in conds_parsed was
+	// incorrectly stored as semantic
 	staleParsed := `[{"raw":"2024","kind":"semantic","value":"2024"},{"raw":"bike","kind":"semantic","value":"bike"}]`
 	_, err := s.db.Exec(`INSERT INTO smart_views(id,name,conds_raw,conds_parsed,threshold,live)
 		VALUES('sv-old','Old','["2024","bike"]',?,50,1)`, staleParsed)
@@ -295,16 +305,19 @@ func TestEvaluateReparsesFromRaw(t *testing.T) {
 	require.Equal(t, 1, n, "Evaluate should re-parse raw conds so the upgraded parser takes effect")
 }
 
-// Evaluate 的调和循环不得触碰手动行（origin!=0）：钉住行（不匹配当前条件）
-// 存活且分数保持 1.0 不被刷新；排除行同样存活（保留"记忆"，供读路径过滤）；
-// 自动行（origin=0）该增该删照旧——不匹配的自动行被删,新匹配的资产以
-// origin=0 被 INSERT。
+// Evaluate's reconciliation loop must never touch a manual row (origin!=0):
+// a pinned row (not matching the current condition) survives and keeps a
+// score of 1.0, not refreshed; an excluded row likewise survives (keeping
+// its "memory" for the read path to filter); auto rows (origin=0) are added
+// and removed as before — a non-matching auto row is deleted, and a newly
+// matching asset is INSERTed with origin=0.
 func TestEvaluatePreservesManualRows(t *testing.T) {
 	s := svTestService(t)
 	db := s.db
 
-	// aPin/aExcl/aGone 均无 CLIP 向量,天然不满足 "scene: sunset" 语义条件；
-	// aMatch 有对齐的 CLIP 向量,天然满足条件（展示分 1.0）。
+	// aPin/aExcl/aGone all have no CLIP vector, so they naturally don't satisfy
+	// the "scene: sunset" semantic condition; aMatch has an aligned CLIP vector,
+	// so it naturally satisfies it (display score 1.0).
 	for _, id := range []string{"aPin", "aExcl", "aGone"} {
 		_, err := db.Exec(`INSERT INTO assets(id,file_path,status,is_live_photo_video) VALUES(?,?,'indexed',0)`,
 			id, "/p/"+id+".jpg")
@@ -316,7 +329,7 @@ func TestEvaluatePreservesManualRows(t *testing.T) {
 		VALUES('sv-manual','Manual','["scene: sunset"]','[]',50,0)`)
 	require.NoError(t, err)
 
-	// 预置表内手动/陈旧行。
+	// Pre-seed manual/stale rows in the table.
 	_, err = db.Exec(`INSERT INTO smart_view_matches(smart_view_id,asset_id,match_score,origin) VALUES('sv-manual','aPin',1.0,1)`)
 	require.NoError(t, err)
 	_, err = db.Exec(`INSERT INTO smart_view_matches(smart_view_id,asset_id,match_score,origin) VALUES('sv-manual','aExcl',0.7,2)`)
@@ -329,28 +342,30 @@ func TestEvaluatePreservesManualRows(t *testing.T) {
 	var org int
 	var score float64
 	require.NoError(t, db.QueryRow(`SELECT origin,match_score FROM smart_view_matches WHERE smart_view_id='sv-manual' AND asset_id='aPin'`).Scan(&org, &score))
-	require.Equal(t, 1, org, "钉住行 origin 不应被改动")
-	require.Equal(t, 1.0, score, "钉住行分数应恒为 1.0,不被重估刷新")
+	require.Equal(t, 1, org, "a pinned row's origin must not be changed")
+	require.Equal(t, 1.0, score, "a pinned row's score must always stay 1.0, not refreshed by a recompute")
 
 	require.NoError(t, db.QueryRow(`SELECT origin,match_score FROM smart_view_matches WHERE smart_view_id='sv-manual' AND asset_id='aExcl'`).Scan(&org, &score))
-	require.Equal(t, 2, org, "排除行应存活,保留记忆")
-	require.Equal(t, 0.7, score, "排除行分数不应被重估改动")
+	require.Equal(t, 2, org, "an excluded row should survive, keeping its memory")
+	require.Equal(t, 0.7, score, "an excluded row's score must not be changed by a recompute")
 
 	err = db.QueryRow(`SELECT origin FROM smart_view_matches WHERE smart_view_id='sv-manual' AND asset_id='aGone'`).Scan(&org)
-	require.ErrorIs(t, err, sql.ErrNoRows, "不匹配条件的自动行应被重估删除")
+	require.ErrorIs(t, err, sql.ErrNoRows, "an auto row not matching the condition should be deleted by a recompute")
 
 	require.NoError(t, db.QueryRow(`SELECT origin,match_score FROM smart_view_matches WHERE smart_view_id='sv-manual' AND asset_id='aMatch'`).Scan(&org, &score))
-	require.Equal(t, 0, org, "新匹配的资产应以 origin=0 自动插入")
+	require.Equal(t, 0, org, "a newly matching asset should be auto-inserted with origin=0")
 	require.Equal(t, 1.0, score)
 }
 
-// 钉住行若同时天然满足条件（evalParsed 会为它算出 <1 的展示分）,重估也不得
-// 刷新其分数,也不得因为它已在表中而触发 INSERT 主键冲突。
+// If a pinned row also naturally satisfies the condition (evalParsed would
+// compute a display score <1 for it), a recompute must not refresh its
+// score, and must not trigger an INSERT primary-key conflict just because
+// it's already in the table.
 func TestEvaluatePinnedAlsoMatching(t *testing.T) {
 	s := svTestService(t)
 	db := s.db
 
-	// 展示分 50%——明显低于钉住行记忆中的 1.0,用于验证"不刷分"。
+	// Display score 50% — clearly below the pinned row's remembered 1.0, used to verify "score isn't refreshed".
 	raw := simDisplayFloor() + (simDisplayCeil()-simDisplayFloor())*0.5
 	seedClipAssetWithSim(t, s, "aPin", raw, "2024-06-01T00:00:00Z")
 
@@ -364,17 +379,18 @@ func TestEvaluatePinnedAlsoMatching(t *testing.T) {
 
 	var cnt int
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM smart_view_matches WHERE smart_view_id='sv-pinmatch'`).Scan(&cnt))
-	require.Equal(t, 1, cnt, "不应出现重复行/主键冲突")
+	require.Equal(t, 1, cnt, "there should be no duplicate row/primary-key conflict")
 
 	var org int
 	var score float64
 	require.NoError(t, db.QueryRow(`SELECT origin,match_score FROM smart_view_matches WHERE smart_view_id='sv-pinmatch' AND asset_id='aPin'`).Scan(&org, &score))
 	require.Equal(t, 1, org)
-	require.Equal(t, 1.0, score, "钉住行即便天然匹配,分数也不应被重估刷新为 evalParsed 算出的 <1 值")
+	require.Equal(t, 1.0, score, "even if a pinned row also naturally matches, its score must not be refreshed to evalParsed's computed <1 value by a recompute")
 }
 
-// 条件为空（或全部不可执行）但填了 description 时，描述本身应作为
-// semantic 条件参与匹配——"What should Nimo match?" 不再是摆设。
+// When conditions are empty (or all unactionable) but description is filled
+// in, the description itself should participate in matching as a semantic
+// condition — "What should Nimo match?" is no longer just decoration.
 func TestCreateDescriptionFallbackSemantic(t *testing.T) {
 	s := svTestService(t)
 	seedClipAsset(t, s, "a1")
@@ -388,14 +404,16 @@ func TestCreateDescriptionFallbackSemantic(t *testing.T) {
 	require.Equal(t, 1, n, "description should drive semantic matching when no executable conditions exist")
 }
 
-// 已有可执行条件时 description 不参与匹配（保持原语义，不额外收紧交集）。
+// When an executable condition already exists, description doesn't
+// participate in matching (preserves original semantics, doesn't further
+// tighten the intersection).
 func TestCreateDescriptionIgnoredWhenExecutableConds(t *testing.T) {
 	s := svTestService(t)
 	db := s.db
 	_, _ = db.Exec(`INSERT INTO assets(id,file_path,status,is_live_photo_video) VALUES('a1','/p/a1.jpg','indexed',0)`)
 	_, _ = db.Exec(`INSERT INTO asset_ocr(asset_id,text) VALUES('a1','SUPERMART Receipt')`)
 
-	// a1 没有 CLIP 向量——若 description 被错误地附加为 semantic 条件，交集将为空
+	// a1 has no CLIP vector — if description were incorrectly appended as a semantic condition, the intersection would be empty
 	_, err := s.Create(SmartViewInput{ID: "sv-e", Name: "Receipts",
 		Description: "receipts and invoices", CondsRaw: []string{"ocr: receipt"}, Threshold: 50, Live: true})
 	require.NoError(t, err)
@@ -405,7 +423,7 @@ func TestCreateDescriptionIgnoredWhenExecutableConds(t *testing.T) {
 	require.Equal(t, 1, n)
 }
 
-// Update 改 description 后应重算 conds_parsed（兜底语义条件跟着变）。
+// After Update changes description, conds_parsed should be recomputed (the fallback semantic condition follows along).
 func TestUpdateDescriptionReparses(t *testing.T) {
 	s := svTestService(t)
 	_, err := s.Create(SmartViewInput{ID: "sv-u", Name: "U",
@@ -421,7 +439,7 @@ func TestUpdateDescriptionReparses(t *testing.T) {
 	require.NotContains(t, parsedJSON, "old query")
 }
 
-// Preview：description 兜底 + thresholdActive 标志。
+// Preview: description fallback + the thresholdActive flag.
 func TestPreviewDescriptionFallbackAndThresholdActive(t *testing.T) {
 	s := svTestService(t)
 	seedClipAsset(t, s, "a1")
@@ -432,7 +450,7 @@ func TestPreviewDescriptionFallbackAndThresholdActive(t *testing.T) {
 	require.True(t, thresholdActive, "semantic fallback condition should activate the threshold slider")
 }
 
-// Preview：纯结构化条件（OCR/人物/日期）时 thresholdActive=false——滑块不生效。
+// Preview: with a purely structural condition (OCR/person/date), thresholdActive=false — the slider has no effect.
 func TestPreviewThresholdInactiveForStructuralConds(t *testing.T) {
 	s := svTestService(t)
 	db := s.db
@@ -445,7 +463,7 @@ func TestPreviewThresholdInactiveForStructuralConds(t *testing.T) {
 	require.False(t, thresholdActive)
 }
 
-// Preview 应尊重 includeVideos 开关，而不是硬编码排除视频。
+// Preview should respect the includeVideos toggle, rather than hardcoding video exclusion.
 func TestPreviewRespectsIncludeVideos(t *testing.T) {
 	s := svTestService(t)
 	db := s.db
@@ -462,13 +480,15 @@ func TestPreviewRespectsIncludeVideos(t *testing.T) {
 	require.Equal(t, 1, count, "videos must be included when includeVideos=true")
 }
 
-// MatchedAssets 必须容忍 NULL 列（duration_ms / taken_at / file_size 等）：
-// 生产库的图片资产 duration_ms 为 NULL，手写 scan 直接转 int64 会整个查询报错，
-// detail 页三个区块（matches/recent/activity）随之全空。
+// MatchedAssets must tolerate NULL columns (duration_ms / taken_at /
+// file_size etc.): in production, an image asset's duration_ms is NULL, and
+// a hand-written scan straight into int64 would error out the whole query,
+// leaving all three sections of the detail page (matches/recent/activity)
+// empty.
 func TestMatchedAssetsTolerateNullColumns(t *testing.T) {
 	s := svTestService(t)
 	db := s.db
-	// 最小列集插入——duration_ms、taken_at、file_size、mime_type 全部 NULL
+	// Insert with the minimal column set — duration_ms, taken_at, file_size, mime_type all NULL
 	_, err := db.Exec(`INSERT INTO assets(id,file_path,status,is_live_photo_video) VALUES('a1','/p/a1.jpg','indexed',0)`)
 	require.NoError(t, err)
 	_, _ = db.Exec(`INSERT INTO smart_views(id,name,conds_raw,conds_parsed,threshold) VALUES('sv-n','N','[]','[]',50)`)
@@ -482,8 +502,9 @@ func TestMatchedAssetsTolerateNullColumns(t *testing.T) {
 	require.InDelta(t, 0.8, *assets[0].MatchScore, 1e-9)
 }
 
-// "New" 标签语义：匹配进 Smart View 后、该用户从未打开过的资产 isNew=true；
-// 打开过一次（asset_views 记录在 matched_at 之后）就永久 false。
+// "New" tag semantics: once matched into a Smart View, an asset this user has
+// never opened has isNew=true; once opened (an asset_views record at/after
+// matched_at), it's permanently false.
 func TestMatchedAssetsIsNewFlag(t *testing.T) {
 	s := svTestService(t)
 	db := s.db
@@ -494,14 +515,14 @@ func TestMatchedAssetsIsNewFlag(t *testing.T) {
 		require.NoError(t, err)
 	}
 	_, _ = db.Exec(`INSERT INTO smart_views(id,name,conds_raw,conds_parsed,threshold) VALUES('sv-v','V','[]','[]',50)`)
-	// fresh: 从未浏览
+	// fresh: never viewed
 	_, _ = db.Exec(`INSERT INTO smart_view_matches(smart_view_id,asset_id,match_score,matched_at)
 		VALUES('sv-v','fresh',0.9,'2026-01-01T00:00:00Z')`)
-	// seen: matched 之后浏览过 → 不再 New
+	// seen: viewed after being matched → no longer New
 	_, _ = db.Exec(`INSERT INTO smart_view_matches(smart_view_id,asset_id,match_score,matched_at)
 		VALUES('sv-v','seen',0.8,'2026-01-01T00:00:00Z')`)
 	require.NoError(t, views.Record("1", "seen"))
-	// rematched: 浏览发生在 matched_at 之前（之后才重新匹配进来）→ 仍是 New
+	// rematched: the view happened before matched_at (it was re-matched in afterward) → still New
 	require.NoError(t, views.Record("1", "rematched"))
 	_, _ = db.Exec(`INSERT INTO smart_view_matches(smart_view_id,asset_id,match_score,matched_at)
 		VALUES('sv-v','rematched',0.7,'2030-01-01T00:00:00Z')`)
@@ -517,7 +538,7 @@ func TestMatchedAssetsIsNewFlag(t *testing.T) {
 	require.False(t, byID["seen"], "viewed-after-match asset should not be new")
 	require.True(t, byID["rematched"], "re-matched-after-view asset should be new again")
 
-	// 浏览记录按用户隔离：另一个用户看 seen 依然是 New
+	// View records are per-user isolated: another user still sees "seen" as New
 	assets, err = s.MatchedAssets("sv-v", 60, 0, false, "2")
 	require.NoError(t, err)
 	for _, a := range assets {
@@ -548,16 +569,17 @@ func TestSmartViewStats(t *testing.T) {
 	require.Len(t, sv.Seeds, 5)
 }
 
-// TestFillStatsSeedsPreferAestheticScore 验证:fillStats 生成的 Seeds 优先按
-// 美学分排序(NULL 排在最后),同美学分档次内再按 match_score 排序。
+// TestFillStatsSeedsPreferAestheticScore verifies that fillStats's generated
+// Seeds sort by aesthetic score first (NULL sorts last), with match_score as
+// the tiebreaker within the same aesthetic tier.
 func TestFillStatsSeedsPreferAestheticScore(t *testing.T) {
 	s := svTestService(t)
 	db := s.db
 	_, _ = db.Exec(`INSERT INTO smart_views(id,name,conds_raw,conds_parsed,threshold) VALUES('sv-aes','A','[]','[]',50)`)
 
-	// a-null: match_score 最高(0.9)但美学分为 NULL —— 应排最后
-	// a-high: match_score 0.8,美学分 9 —— 应排第一
-	// a-mid:  match_score 0.7,美学分 5 —— 应排第二
+	// a-null: highest match_score (0.9) but a NULL aesthetic score — should sort last
+	// a-high: match_score 0.8, aesthetic score 9 — should sort first
+	// a-mid:  match_score 0.7, aesthetic score 5 — should sort second
 	rows := []struct {
 		id    string
 		score float64
@@ -636,8 +658,9 @@ func TestIncrementalEvaluateRespectsPaused(t *testing.T) {
 	require.Equal(t, 0, pausedN)
 }
 
-// TestMatchedAssetsFilterAndPinned 验证读路径过滤:排除行(origin=2)对
-// MatchedAssets 不可见;钉住行(origin=1)可见、Pinned=true 且以 1.0 排最前。
+// TestMatchedAssetsFilterAndPinned verifies read-path filtering: an excluded
+// row (origin=2) is invisible to MatchedAssets; a pinned row (origin=1) is
+// visible, has Pinned=true, and sorts first with its 1.0 score.
 func TestMatchedAssetsFilterAndPinned(t *testing.T) {
 	s := svTestService(t)
 	db := s.db
@@ -653,55 +676,55 @@ func TestMatchedAssetsFilterAndPinned(t *testing.T) {
 
 	assets, err := s.MatchedAssets("sv-p", 60, 0, false, "")
 	require.NoError(t, err)
-	require.Len(t, assets, 2, "排除行不可见")
+	require.Len(t, assets, 2, "excluded row should be invisible")
 
 	byID := map[string]Asset{}
 	for _, a := range assets {
 		byID[a.ID] = a
 	}
 	_, excludedPresent := byID["a-excluded"]
-	require.False(t, excludedPresent, "排除行不应出现在结果中")
+	require.False(t, excludedPresent, "excluded row should not appear in the result")
 
-	require.Equal(t, "a-pinned", assets[0].ID, "钉住行分数恒 1.0,应排最前")
-	require.True(t, assets[0].Pinned, "钉住行 Pinned 应为 true")
-	require.False(t, byID["a-auto"].Pinned, "自动行 Pinned 应为 false")
+	require.Equal(t, "a-pinned", assets[0].ID, "a pinned row's score is always 1.0, should sort first")
+	require.True(t, assets[0].Pinned, "a pinned row's Pinned should be true")
+	require.False(t, byID["a-auto"].Pinned, "an auto row's Pinned should be false")
 }
 
-// TestFillStatsExcludesExcluded 验证 fillStats 五处统计查询(Count/
-// AddedThisWeek/StorageBytes/Distribution+Median/Seeds)均不含排除行、
-// 且包含钉住行。
+// TestFillStatsExcludesExcluded verifies fillStats's five stat queries
+// (Count/AddedThisWeek/StorageBytes/Distribution+Median/Seeds) all exclude
+// excluded rows and include pinned rows.
 func TestFillStatsExcludesExcluded(t *testing.T) {
 	s := svTestService(t)
 	db := s.db
 	_, _ = db.Exec(`INSERT INTO smart_views(id,name,conds_raw,conds_parsed,threshold) VALUES('sv-fs','FS','[]','[]',50)`)
 
-	// a-auto: 自动匹配,本周内
+	// a-auto: auto-matched, within this week
 	_, _ = db.Exec(`INSERT INTO assets(id,file_path,status,file_size,aesthetic_score) VALUES('a-auto','/p/a-auto','indexed',100,8.0)`)
 	_, _ = db.Exec(`INSERT INTO smart_view_matches(smart_view_id,asset_id,match_score,origin,matched_at)
 		VALUES('sv-fs','a-auto',0.6,0,?)`, time.Now().UTC().Format("2006-01-02T15:04:05Z"))
 
-	// a-pinned: 手动钉住,应计入所有统计
+	// a-pinned: manually pinned, should count toward every stat
 	_, _ = db.Exec(`INSERT INTO assets(id,file_path,status,file_size,aesthetic_score) VALUES('a-pinned','/p/a-pinned','indexed',200,9.0)`)
 	_, _ = db.Exec(`INSERT INTO smart_view_matches(smart_view_id,asset_id,match_score,origin,matched_at)
 		VALUES('sv-fs','a-pinned',1.0,1,?)`, time.Now().UTC().Format("2006-01-02T15:04:05Z"))
 
-	// a-excluded: 手动排除,不应计入任何统计
+	// a-excluded: manually excluded, should not count toward any stat
 	_, _ = db.Exec(`INSERT INTO assets(id,file_path,status,file_size,aesthetic_score) VALUES('a-excluded','/p/a-excluded','indexed',999999,10.0)`)
 	_, _ = db.Exec(`INSERT INTO smart_view_matches(smart_view_id,asset_id,match_score,origin,matched_at)
 		VALUES('sv-fs','a-excluded',0.99,2,?)`, time.Now().UTC().Format("2006-01-02T15:04:05Z"))
 
 	sv, err := s.Get("sv-fs")
 	require.NoError(t, err)
-	require.Equal(t, 2, sv.Count, "Count 不应包含排除行")
-	require.Equal(t, 2, sv.AddedThisWeek, "AddedThisWeek 不应包含排除行")
-	require.Equal(t, int64(300), sv.StorageBytes, "StorageBytes 不应包含排除行的巨量字节数")
-	require.Equal(t, 2, sumInts(sv.Distribution), "Distribution 不应包含排除行")
-	require.NotContains(t, sv.Seeds, "a-excluded", "Seeds 不应包含排除行")
-	require.Contains(t, sv.Seeds, "a-pinned", "Seeds 应包含钉住行")
+	require.Equal(t, 2, sv.Count, "Count should not include the excluded row")
+	require.Equal(t, 2, sv.AddedThisWeek, "AddedThisWeek should not include the excluded row")
+	require.Equal(t, int64(300), sv.StorageBytes, "StorageBytes should not include the excluded row's massive byte count")
+	require.Equal(t, 2, sumInts(sv.Distribution), "Distribution should not include the excluded row")
+	require.NotContains(t, sv.Seeds, "a-excluded", "Seeds should not include the excluded row")
+	require.Contains(t, sv.Seeds, "a-pinned", "Seeds should include the pinned row")
 }
 
-// TestExportRespectsOrigin 验证 ExportAsAlbum 经 MatchedAssets 复用同一份读路径
-// 过滤:钉住行导出、排除行不导出。
+// TestExportRespectsOrigin verifies ExportAsAlbum reuses the same read-path
+// filtering via MatchedAssets: a pinned row exports, an excluded row doesn't.
 func TestExportRespectsOrigin(t *testing.T) {
 	s := svTestService(t)
 	db := s.db
@@ -726,15 +749,17 @@ func TestExportRespectsOrigin(t *testing.T) {
 	for _, a := range assets {
 		ids[a.ID] = true
 	}
-	require.True(t, ids["a-pinned"], "钉住行应导出")
-	require.True(t, ids["a-auto"], "自动匹配行应导出")
-	require.False(t, ids["a-excluded"], "排除行不应导出")
+	require.True(t, ids["a-pinned"], "pinned row should export")
+	require.True(t, ids["a-auto"], "auto-matched row should export")
+	require.False(t, ids["a-excluded"], "excluded row should not export")
 }
 
-// TestUpdateResumeLiveTriggersEvaluate: 暂停期间 displayScore 标定端点
-// (simDisplayFloor/Ceil) 可能随模型换代调整，导致 match_score 停留在旧标度。
-// 恢复 live（Live: true）必须触发一次重算，把陈旧分数刷新；仅改 name 之类
-// 不影响匹配的 patch 不应触发重算。
+// TestUpdateResumeLiveTriggersEvaluate: while paused, the displayScore
+// calibration endpoints (simDisplayFloor/Ceil) may have shifted with a model
+// changeover, leaving match_score on the old scale. Resuming live (Live:
+// true) must trigger a recompute to refresh the stale score; a patch that
+// doesn't affect matching (like changing just name) should not trigger a
+// recompute.
 func TestUpdateResumeLiveTriggersEvaluate(t *testing.T) {
 	s := svTestService(t)
 	db := s.db
@@ -747,30 +772,33 @@ func TestUpdateResumeLiveTriggersEvaluate(t *testing.T) {
 		CondsRaw: []string{"Sara"}, Threshold: 50, Live: false})
 	require.NoError(t, err)
 
-	// Create() 的首次 Evaluate 已经插入真实匹配（纯结构条件，score=1.0）。
-	// 这里把它改成一个陈旧的旧标度分数，模拟暂停期间标定端点变化后残留的
-	// 旧 match_score。
+	// Create()'s first Evaluate has already inserted a real match (a pure
+	// structural condition, score=1.0). Here we change it to a stale old-scale
+	// score, simulating a leftover old match_score after the calibration
+	// endpoints changed while paused.
 	_, err = db.Exec(`UPDATE smart_view_matches SET match_score=0.05 WHERE smart_view_id='sv-resume' AND asset_id='a1'`)
 	require.NoError(t, err)
 
-	// 不影响匹配结果的 patch（仅改 name，Live 为 nil）不应触发重算。
+	// A patch that doesn't affect the matching result (only changes name, Live is nil) should not trigger a recompute.
 	_, err = s.Update("sv-resume", SmartViewPatch{Name: ptr("Renamed")})
 	require.NoError(t, err)
 	var score float64
 	require.NoError(t, db.QueryRow(`SELECT match_score FROM smart_view_matches WHERE smart_view_id='sv-resume' AND asset_id='a1'`).Scan(&score))
-	require.InDelta(t, 0.05, score, 1e-9, "仅改 name 不应触发重算")
+	require.InDelta(t, 0.05, score, 1e-9, "changing only name should not trigger a recompute")
 
-	// 恢复 live（Live: true）必须重算，把陈旧分数刷新回真实值。
+	// Resuming live (Live: true) must recompute, refreshing the stale score back to the true value.
 	_, err = s.Update("sv-resume", SmartViewPatch{Live: ptr(true)})
 	require.NoError(t, err)
 	require.NoError(t, db.QueryRow(`SELECT match_score FROM smart_view_matches WHERE smart_view_id='sv-resume' AND asset_id='a1'`).Scan(&score))
-	require.InDelta(t, 1.0, score, 1e-9, "恢复 live 应重算并刷新陈旧的 match_score")
+	require.InDelta(t, 1.0, score, 1e-9, "resuming live should recompute and refresh the stale match_score")
 }
 
-// TestPinAssets 覆盖 PinAssets 的四类落库路径 + 两类无效资产静默跳过：
-// 新行 INSERT(origin=1,score=1.0)；自动行(origin=0)升级钉住并改分 1.0；
-// 排除行(origin=2)翻转为钉住；已钉住行重复钉住幂等不计数；
-// 不存在的资产 / 软删资产静默跳过；视图不存在返回 ErrNotFound。
+// TestPinAssets covers PinAssets's four persistence paths + two silently-
+// skipped invalid-asset cases: a new row INSERT (origin=1, score=1.0); an
+// auto row (origin=0) upgraded to pinned with score changed to 1.0; an
+// excluded row (origin=2) flipped to pinned; re-pinning an already-pinned row
+// is idempotent and doesn't count again; a nonexistent asset / soft-deleted
+// asset is silently skipped; a nonexistent view returns ErrNotFound.
 func TestPinAssets(t *testing.T) {
 	s := svTestService(t)
 	db := s.db
@@ -795,35 +823,38 @@ func TestPinAssets(t *testing.T) {
 
 	added, err := s.PinAssets("sv-pin", []string{"aNew", "aAuto", "aExcl", "aPinned", "aDeleted", "aMissing"})
 	require.NoError(t, err)
-	require.Equal(t, 3, added, "只有 aNew/aAuto/aExcl 三个真正发生了钉住状态变化,aPinned 已是钉住不重复计数,aDeleted/aMissing 静默跳过")
+	require.Equal(t, 3, added, "only aNew/aAuto/aExcl actually underwent a pinned-state change; aPinned is already pinned and doesn't count again; aDeleted/aMissing are silently skipped")
 
 	for _, id := range []string{"aNew", "aAuto", "aExcl", "aPinned"} {
 		var org int
 		var score float64
 		require.NoError(t, db.QueryRow(`SELECT origin,match_score FROM smart_view_matches WHERE smart_view_id='sv-pin' AND asset_id=?`, id).
-			Scan(&org, &score), "asset %s 应有钉住行", id)
-		require.Equal(t, 1, org, "asset %s 应为钉住 origin", id)
-		require.Equal(t, 1.0, score, "asset %s 分数应恒为 1.0", id)
+			Scan(&org, &score), "asset %s should have a pinned row", id)
+		require.Equal(t, 1, org, "asset %s should have pinned origin", id)
+		require.Equal(t, 1.0, score, "asset %s's score should always be 1.0", id)
 	}
 	for _, id := range []string{"aDeleted", "aMissing"} {
 		var n int
 		require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM smart_view_matches WHERE smart_view_id='sv-pin' AND asset_id=?`, id).Scan(&n))
-		require.Equal(t, 0, n, "无效资产 %s 不应产生任何行", id)
+		require.Equal(t, 0, n, "invalid asset %s should produce no row", id)
 	}
 
 	_, err = s.PinAssets("sv-missing", []string{"aNew"})
 	require.ErrorIs(t, err, ErrNotFound)
 }
 
-// TestRemoveAssetsTiered 覆盖 RemoveAssets 的分层移除：钉住行→删行计 unpinned；
-// 自动行→origin=2 计 excluded；排除行/表外 id no-op；live=1 的视图在取消钉住后
-// 触发重估,若被取消钉住的资产天然匹配条件,会以 origin=0 回归；live=0 的视图
-// 不触发重估,删掉的钉住行就此消失,不会自动回归。
+// TestRemoveAssetsTiered covers RemoveAssets's tiered removal: a pinned
+// row → delete the row, counts as unpinned; an auto row → origin=2, counts
+// as excluded; an already-excluded row/an id not in the table is a no-op; a
+// live=1 view triggers a recompute after unpinning, and if the unpinned
+// asset naturally matches the condition it comes back as origin=0; a live=0
+// view doesn't trigger a recompute, so the deleted pinned row simply stays
+// gone, never automatically coming back.
 func TestRemoveAssetsTiered(t *testing.T) {
 	s := svTestService(t)
 	db := s.db
 
-	// aPinLive 有对齐的 CLIP 向量,天然满足 "scene: sunset" 语义条件。
+	// aPinLive has an aligned CLIP vector, so it naturally satisfies the "scene: sunset" semantic condition.
 	seedClipAsset(t, s, "aPinLive")
 	_, err := db.Exec(`INSERT INTO assets(id,file_path,status,is_live_photo_video) VALUES('aAuto','/p/aAuto.jpg','indexed',0)`)
 	require.NoError(t, err)
@@ -842,18 +873,18 @@ func TestRemoveAssetsTiered(t *testing.T) {
 
 	unpinned, excluded, err := s.RemoveAssets("sv-rm-live", []string{"aPinLive", "aAuto", "aExcl", "aOutside"})
 	require.NoError(t, err)
-	require.Equal(t, 1, unpinned, "aPinLive 是唯一的钉住行")
-	require.Equal(t, 1, excluded, "aAuto 是唯一的自动行")
+	require.Equal(t, 1, unpinned, "aPinLive is the only pinned row")
+	require.Equal(t, 1, excluded, "aAuto is the only auto row")
 
 	var org int
 	require.NoError(t, db.QueryRow(`SELECT origin FROM smart_view_matches WHERE smart_view_id='sv-rm-live' AND asset_id='aExcl'`).Scan(&org))
-	require.Equal(t, 2, org, "已排除行 no-op,origin 不变")
+	require.Equal(t, 2, org, "an already-excluded row is a no-op, origin unchanged")
 
-	// live=1:取消钉住后触发重估,aPinLive 天然匹配条件,应以 origin=0 回归。
+	// live=1: unpinning triggers a recompute; aPinLive naturally matches the condition, so it should come back as origin=0.
 	require.NoError(t, db.QueryRow(`SELECT origin FROM smart_view_matches WHERE smart_view_id='sv-rm-live' AND asset_id='aPinLive'`).Scan(&org))
-	require.Equal(t, 0, org, "取消钉住且天然匹配的资产,重估后应以 origin=0 回归")
+	require.Equal(t, 0, org, "an asset that's unpinned and naturally matches should come back as origin=0 after a recompute")
 
-	// live=0(暂停):取消钉住不触发重估,删掉的行不会自动回归。
+	// live=0 (paused): unpinning doesn't trigger a recompute, so the deleted row doesn't automatically come back.
 	seedClipAsset(t, s, "aPinPaused")
 	_, err = db.Exec(`INSERT INTO smart_views(id,name,conds_raw,conds_parsed,threshold,live)
 		VALUES('sv-rm-paused','RmPaused','["scene: sunset"]','[]',50,0)`)
@@ -866,14 +897,16 @@ func TestRemoveAssetsTiered(t *testing.T) {
 	require.Equal(t, 1, unpinned)
 	var n int
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM smart_view_matches WHERE smart_view_id='sv-rm-paused' AND asset_id='aPinPaused'`).Scan(&n))
-	require.Equal(t, 0, n, "暂停视图不触发重估,行删除后不会自动回归")
+	require.Equal(t, 0, n, "a paused view doesn't trigger a recompute, so the deleted row doesn't automatically come back")
 
 	_, _, err = s.RemoveAssets("sv-missing", []string{"aAuto"})
 	require.ErrorIs(t, err, ErrNotFound)
 }
 
-// TestRestoreAssets 覆盖 RestoreAssets：删除排除行计 restored,live=1 触发重估
-// 使天然匹配的资产以 origin=0 回归；非排除行(自动/钉住)no-op 不计数、不改动。
+// TestRestoreAssets covers RestoreAssets: deleting an excluded row counts as
+// restored, a live=1 view triggers a recompute so a naturally matching asset
+// comes back as origin=0; a non-excluded row (auto/pinned) is a no-op — not
+// counted, not changed.
 func TestRestoreAssets(t *testing.T) {
 	s := svTestService(t)
 	db := s.db
@@ -892,21 +925,22 @@ func TestRestoreAssets(t *testing.T) {
 
 	restored, err := s.RestoreAssets("sv-restore", []string{"aExclLive", "aPin", "aOutside"})
 	require.NoError(t, err)
-	require.Equal(t, 1, restored, "只有 aExclLive 是排除行")
+	require.Equal(t, 1, restored, "only aExclLive is an excluded row")
 
 	var org int
 	require.NoError(t, db.QueryRow(`SELECT origin FROM smart_view_matches WHERE smart_view_id='sv-restore' AND asset_id='aExclLive'`).Scan(&org))
-	require.Equal(t, 0, org, "恢复后天然匹配的资产重估应以 origin=0 回归")
+	require.Equal(t, 0, org, "after restoring, a naturally matching asset should come back as origin=0 after a recompute")
 
 	require.NoError(t, db.QueryRow(`SELECT origin FROM smart_view_matches WHERE smart_view_id='sv-restore' AND asset_id='aPin'`).Scan(&org))
-	require.Equal(t, 1, org, "钉住行不受 RestoreAssets 影响")
+	require.Equal(t, 1, org, "a pinned row is unaffected by RestoreAssets")
 
 	_, err = s.RestoreAssets("sv-missing", []string{"aExclLive"})
 	require.ErrorIs(t, err, ErrNotFound)
 }
 
-// TestExcludedAssets 只返回 origin=2 且可见(未软删、未离线)的资产;origin=0/1
-// 行以及软删/离线的排除行都不应出现。
+// TestExcludedAssets only returns assets with origin=2 that are visible (not
+// soft-deleted, not offline); origin=0/1 rows and soft-deleted/offline
+// excluded rows should never appear.
 func TestExcludedAssets(t *testing.T) {
 	s := svTestService(t)
 	db := s.db
@@ -942,10 +976,13 @@ func TestExcludedAssets(t *testing.T) {
 	require.Equal(t, "aExclVisible", out[0].ID)
 }
 
-// TestDuplicateDoesNotCopyManualRows: spec 明确 Duplicate 只复制查询定义(条件/
-// 阈值等),不复制手动行(钉住/排除)。副本是全新的 smart_view_id,
-// smart_view_matches 按 smart_view_id 分区,原视图的手动行天然不会跟着复制；
-// 本测试锁定这一行为，防止未来改动（例如"完整克隆"需求）无意间引入复制。
+// TestDuplicateDoesNotCopyManualRows: the spec makes clear Duplicate only
+// copies the query definition (conditions/threshold etc.), not manual rows
+// (pinned/excluded). The copy gets a brand-new smart_view_id, and since
+// smart_view_matches is partitioned by smart_view_id, the original view's
+// manual rows naturally don't get copied along with it; this test pins down
+// that behavior, guarding against a future change (e.g. a "full clone"
+// requirement) accidentally introducing copying.
 func TestDuplicateDoesNotCopyManualRows(t *testing.T) {
 	s := svTestService(t)
 	db := s.db
@@ -963,7 +1000,7 @@ func TestDuplicateDoesNotCopyManualRows(t *testing.T) {
 	require.Equal(t, 1, added)
 	_, excluded, err := s.RemoveAssets(orig.ID, []string{"aPin"})
 	require.NoError(t, err)
-	require.Equal(t, 0, excluded, "aPin 是钉住行,RemoveAssets 会把它变回取消钉住而非排除")
+	require.Equal(t, 0, excluded, "aPin is a pinned row; RemoveAssets turns it back to unpinned rather than excluded")
 	_, err = db.Exec(`INSERT INTO smart_view_matches(smart_view_id,asset_id,match_score,origin) VALUES(?,?,0.6,2)`,
 		orig.ID, "aExcl")
 	require.NoError(t, err)
@@ -974,13 +1011,15 @@ func TestDuplicateDoesNotCopyManualRows(t *testing.T) {
 
 	var n int
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM smart_view_matches WHERE smart_view_id=?`, dup.ID).Scan(&n))
-	require.Equal(t, 0, n, "副本不应复制原视图的任何 matches 行(手动或自动)")
+	require.Equal(t, 0, n, "the copy should not copy any matches row from the original view (manual or auto)")
 }
 
-// ====================== 手动↔智能相册原地互转 ======================
+// ====================== Manual ↔ Smart Album in-place conversion ======================
 
-// TestConvertFromAlbumSuccess 覆盖:原相册成员全量锁定为 pin、Evaluate 同步
-// 触发吸入新的主题命中、原相册被删除、返回对象 live=true。
+// TestConvertFromAlbumSuccess covers: the original album's members are fully
+// locked as pinned, Evaluate synchronously triggers and pulls in new theme
+// matches, the original album is deleted, and the returned object has
+// live=true.
 func TestConvertFromAlbumSuccess(t *testing.T) {
 	s := svTestService(t)
 	db := s.db
@@ -992,7 +1031,7 @@ func TestConvertFromAlbumSuccess(t *testing.T) {
 			id, "/p/"+id+".jpg")
 		require.NoError(t, err)
 	}
-	// a-new 通过人脸条件命中,不在原相册里 —— 验证转换后的 Evaluate 会把它吸进来。
+	// a-new matches via the face condition and isn't in the original album — verifies that the post-conversion Evaluate pulls it in.
 	_, _ = db.Exec(`INSERT INTO face_detections(id,asset_id,bbox,embedding) VALUES('fn','a-new','{}',X'00')`)
 	_, _ = db.Exec(`INSERT INTO face_person(face_id,person_id) VALUES('fn','p-x')`)
 
@@ -1009,24 +1048,25 @@ func TestConvertFromAlbumSuccess(t *testing.T) {
 	require.True(t, sv.Live)
 	require.Equal(t, "Trip", sv.Name)
 
-	// 原相册应已消失。
+	// The original album should be gone.
 	_, err = albumSvc.Get(album.ID)
 	require.ErrorIs(t, err, ErrNotFound)
 
-	// 原成员全部锁定为 pin(origin=1)。
+	// The original members are all locked as pinned (origin=1).
 	for _, aid := range []string{"a-old1", "a-old2"} {
 		var org int
 		require.NoError(t, db.QueryRow(`SELECT origin FROM smart_view_matches WHERE smart_view_id=? AND asset_id=?`, sv.ID, aid).Scan(&org))
-		require.Equal(t, 1, org, aid+" 应被锁定为 pin")
+		require.Equal(t, 1, org, aid+" should be locked as pinned")
 	}
-	// Evaluate 应同步触发,吸入主题命中的新照片(origin=0 自动匹配)。
+	// Evaluate should trigger synchronously, pulling in the newly matched photo (origin=0, auto match).
 	var newOrg int
 	require.NoError(t, db.QueryRow(`SELECT origin FROM smart_view_matches WHERE smart_view_id=? AND asset_id='a-new'`, sv.ID).Scan(&newOrg))
 	require.Equal(t, 0, newOrg)
 }
 
-// TestConvertFromAlbumNotFound album 不存在应返回 ErrNotFound,且不留下半成品
-// smart_views 行(事务性——存在性断言)。
+// TestConvertFromAlbumNotFound: a nonexistent album should return
+// ErrNotFound, and leave no half-finished smart_views row (transactional —
+// an existence assertion).
 func TestConvertFromAlbumNotFound(t *testing.T) {
 	s := svTestService(t)
 	var before int
@@ -1037,10 +1077,10 @@ func TestConvertFromAlbumNotFound(t *testing.T) {
 
 	var after int
 	require.NoError(t, s.db.QueryRow(`SELECT COUNT(*) FROM smart_views`).Scan(&after))
-	require.Equal(t, before, after, "album 不存在时不应留下半成品 smart_views 行")
+	require.Equal(t, before, after, "when the album doesn't exist, no half-finished smart_views row should be left")
 }
 
-// TestConvertFromAlbumDefaultsNameFromAlbum name 缺省应回退用相册名。
+// TestConvertFromAlbumDefaultsNameFromAlbum: when name is unset, it should fall back to the album's name.
 func TestConvertFromAlbumDefaultsNameFromAlbum(t *testing.T) {
 	s := svTestService(t)
 	albumSvc := NewAlbumService(s.db)
@@ -1052,9 +1092,11 @@ func TestConvertFromAlbumDefaultsNameFromAlbum(t *testing.T) {
 	require.Equal(t, "My Album", sv.Name)
 }
 
-// TestConvertToAlbumSuccess 覆盖:pinned+自动匹配成员按 score DESC 写入相册、
-// excluded 不带过去、原智能相册被删除(级联 matches)、写入顺序即 score DESC
-// (album_assets.position 按插入顺序递增,ListAssets 按 position ASC 返回)。
+// TestConvertToAlbumSuccess covers: pinned+auto-matched members are written
+// into the album sorted by score DESC, excluded members aren't carried over,
+// the original smart view is deleted (cascading matches), and the write
+// order is exactly score DESC (album_assets.position increments in insertion
+// order, and ListAssets returns sorted by position ASC).
 func TestConvertToAlbumSuccess(t *testing.T) {
 	s := svTestService(t)
 	db := s.db
@@ -1080,34 +1122,42 @@ func TestConvertToAlbumSuccess(t *testing.T) {
 	for _, a := range assets {
 		ids[a.ID] = true
 	}
-	require.True(t, ids["a-pin"], "钉住成员应固化进相册")
-	require.True(t, ids["a-auto"], "自动匹配成员应固化进相册")
-	require.False(t, ids["a-excl"], "排除成员不应带过去")
+	require.True(t, ids["a-pin"], "pinned member should be solidified into the album")
+	require.True(t, ids["a-auto"], "auto-matched member should be solidified into the album")
+	require.False(t, ids["a-excl"], "excluded member should not be carried over")
 
-	// 顺序断言:ListAssets 按 position ASC 返回,写入时按 score DESC 递增
-	// position,故序列应恰为 [a-pin(1.0), a-auto(0.6)]。
-	require.Len(t, assets, 2, "排除成员不应计入序列")
+	// Order assertion: ListAssets returns sorted by position ASC, and writes
+	// increment position in score DESC order, so the sequence should be exactly
+	// [a-pin(1.0), a-auto(0.6)].
+	require.Len(t, assets, 2, "excluded member should not count toward the sequence")
 	require.Equal(t, []string{"a-pin", "a-auto"}, []string{assets[0].ID, assets[1].ID},
-		"相册内顺序应为 score DESC")
+		"order within the album should be score DESC")
 
-	// 原智能相册应已删除(级联 matches)。
+	// The original smart view should be deleted (cascading matches).
 	_, err = s.Get("sv-conv")
 	require.ErrorIs(t, err, ErrNotFound)
 	var n int
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM smart_view_matches WHERE smart_view_id='sv-conv'`).Scan(&n))
-	require.Equal(t, 0, n, "matches 应随 smart_views 级联删除")
+	require.Equal(t, 0, n, "matches should cascade-delete along with smart_views")
 }
 
-// TestConvertToAlbumRetainsOfflineMembers 验证离线成员(offline=1,如外置盘
-// 拔出期间)在转换固化时不会丢失:ConvertToAlbum 直接查 smart_view_matches,
-// 不像 MatchedAssets 那样过滤 a.offline=0——因为转换会删除源 smart_view,若
-// 沿用读路径的 offline 过滤,离线成员将永久无法找回。
+// TestConvertToAlbumRetainsOfflineMembers verifies an offline member
+// (offline=1, e.g. while an external drive is unplugged) isn't lost when
+// solidified by conversion: ConvertToAlbum queries smart_view_matches
+// directly, unlike MatchedAssets which filters a.offline=0 — because
+// conversion deletes the source smart_view, and if it reused the read
+// path's offline filter, the offline members would be permanently
+// unrecoverable.
 //
-// 断言直接查 album_assets 表而非经 AlbumService.ListAssets:ListAssets 本身
-// 也是读路径,同样过滤 a.offline=0(离线期间相册详情不展示该资产,属预期
-// UX),这里要验证的是"落库是否发生"而非"当前是否可见"——只要行已写入
-// album_assets,资产所在盘重新挂载(offline 复位为 0)后自然重新可见,不算
-// 丢失;此前的 bug 是这行压根没写进去,永久找不回。
+// The assertion queries the album_assets table directly rather than via
+// AlbumService.ListAssets: ListAssets itself is a read path and likewise
+// filters a.offline=0 (not showing that asset in the album detail while
+// offline is expected UX) — what's being verified here is "did the write
+// happen", not "is it currently visible" — as long as the row has been
+// written into album_assets, once the asset's drive is remounted (offline
+// reset to 0) it naturally becomes visible again, which doesn't count as
+// lost; the previous bug was that this row was never written at all,
+// permanently unrecoverable.
 func TestConvertToAlbumRetainsOfflineMembers(t *testing.T) {
 	s := svTestService(t)
 	db := s.db
@@ -1133,20 +1183,21 @@ func TestConvertToAlbumRetainsOfflineMembers(t *testing.T) {
 		require.NoError(t, rows.Scan(&aid))
 		ids[aid] = true
 	}
-	require.True(t, ids["a-offline"], "离线成员应随转换固化落库进 album_assets,不应永久丢失")
-	require.True(t, ids["a-online"], "在线成员应固化落库进 album_assets")
+	require.True(t, ids["a-offline"], "an offline member should be solidified into album_assets by the conversion, not permanently lost")
+	require.True(t, ids["a-online"], "an online member should be solidified into album_assets")
 }
 
-// TestConvertToAlbumNotFound smartview 不存在应返回 ErrNotFound。
+// TestConvertToAlbumNotFound: a nonexistent smart view should return ErrNotFound.
 func TestConvertToAlbumNotFound(t *testing.T) {
 	s := svTestService(t)
 	_, err := s.ConvertToAlbum("missing")
 	require.ErrorIs(t, err, ErrNotFound)
 }
 
-// TestConvertToAlbumNameConflict 同名冲突照 Export 现有 409 语义
-// (ErrAlbumNameExists);失败时原智能相册应保留、不留半成品(事务性——存在
-// 性断言)。
+// TestConvertToAlbumNameConflict: a name collision follows Export's existing
+// 409 semantics (ErrAlbumNameExists); on failure the original smart view
+// should be preserved, leaving nothing half-finished (transactional — an
+// existence assertion).
 func TestConvertToAlbumNameConflict(t *testing.T) {
 	s := svTestService(t)
 	albumSvc := NewAlbumService(s.db)
@@ -1158,24 +1209,24 @@ func TestConvertToAlbumNameConflict(t *testing.T) {
 	_, err = s.ConvertToAlbum("sv-dup")
 	require.ErrorIs(t, err, ErrAlbumNameExists)
 
-	// 原智能相册仍应存在(未被半途删除)。
+	// The original smart view should still exist (not deleted partway through).
 	_, err = s.Get("sv-dup")
 	require.NoError(t, err)
 }
 
-// TestSmartViewCreatedAtShape SV 的 List/Get/Create 响应都应携带 createdAt。
+// TestSmartViewCreatedAtShape: a smart view's List/Get/Create responses should all carry createdAt.
 func TestSmartViewCreatedAtShape(t *testing.T) {
 	s := svTestService(t)
 	sv, err := s.Create(SmartViewInput{ID: "sv-time", Name: "T", CondsRaw: []string{}, Threshold: 70, Live: true})
 	require.NoError(t, err)
-	require.False(t, sv.CreatedAt.IsZero(), "Create 响应应带 createdAt")
+	require.False(t, sv.CreatedAt.IsZero(), "Create response should carry createdAt")
 
 	got, err := s.Get("sv-time")
 	require.NoError(t, err)
-	require.False(t, got.CreatedAt.IsZero(), "Get 响应应带 createdAt")
+	require.False(t, got.CreatedAt.IsZero(), "Get response should carry createdAt")
 
 	list, err := s.List()
 	require.NoError(t, err)
 	require.Len(t, list, 1)
-	require.False(t, list[0].CreatedAt.IsZero(), "List 响应应带 createdAt")
+	require.False(t, list[0].CreatedAt.IsZero(), "List response should carry createdAt")
 }

@@ -132,7 +132,8 @@ func (s *StorageService) compute() (*StorageStats, error) {
 	}
 	// Face thumbnails count as cache but are keyed by person, not asset —
 	// orphan detection for this bucket lives in Prune()'s face_detections
-	// diff instead (删人/删照片留下的孤儿 jpg 由 Prune 统一回收).
+	// diff instead (orphan jpgs left by deleting a person/photo are reclaimed
+	// by Prune uniformly).
 	st.CacheBytes += dirSize(s.faceDir)
 
 	// 4. AI bucket = SQLite database files.
@@ -187,8 +188,9 @@ func (s *StorageService) Prune(stagingDir string, stagingMaxAge time.Duration) (
 		}
 	}
 
-	// face-thumbs 孤儿：按 face_detections 差集清理（删人/删照片不会清这里，
-	// 见 Stats 中的注释；此处是唯一的回收路径）。
+	// face-thumbs orphans: cleaned up by diffing against face_detections
+	// (deleting a person/photo doesn't clean this up; see the comment in
+	// Stats — this is the only reclamation path).
 	faceIDs := map[string]bool{}
 	frows, err := s.db.Query(`SELECT id FROM face_detections`)
 	if err != nil {
@@ -231,7 +233,8 @@ func (s *StorageService) Prune(stagingDir string, stagingMaxAge time.Duration) (
 		before := dirSize(stagingDir)
 		if n, err := PruneStaging(stagingDir, stagingMaxAge); err == nil && n > 0 {
 			res.RemovedCount += n
-			// 清理期间可能有新上传写入 staging，差值取非负，宁可少报不报负。
+			// New uploads may write to staging during cleanup; clamp the diff to
+			// non-negative — better to under-report than report negative.
 			if freed := before - dirSize(stagingDir); freed > 0 {
 				res.FreedBytes += freed
 			}

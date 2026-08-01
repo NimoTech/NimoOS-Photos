@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""美学分探针验收报告:取全库最高/最低各 N 张,生成本地 HTML 对比页。
-用法: python3 report.py --db /DATA/.system_data/photos/photos.db \
+"""Aesthetic score probe acceptance report: pull the top/bottom N scored
+photos from the whole library and generate a local HTML comparison page.
+Usage: python3 report.py --db /DATA/.system_data/photos/photos.db \
                         --thumbs /DATA/.system_data/photos/thumbs \
                         --out /tmp/aesthetic-report.html --n 30
 """
@@ -31,11 +32,11 @@ def main():
     db = sqlite3.connect(f"file:{a.db}?mode=ro", uri=True)
     top, bottom = rows(db, "DESC", a.n), rows(db, "ASC", a.n)
     total = db.execute("SELECT COUNT(*) FROM assets WHERE aesthetic_score IS NOT NULL").fetchone()[0]
-    page = ("<meta charset='utf-8'><title>美学分探针验收</title>"
+    page = ("<meta charset='utf-8'><title>Aesthetic score probe acceptance</title>"
             "<style>.grid{display:grid;grid-template-columns:repeat(6,1fr);gap:8px}"
             "img{width:100%;aspect-ratio:1;object-fit:cover}figure{margin:0;font:12px sans-serif}</style>"
-            f"<h1>美学分探针验收(已打分 {total} 张)</h1>"
-            + section("最高分", top, a.thumbs) + section("最低分", bottom, a.thumbs))
+            f"<h1>Aesthetic score probe acceptance ({total} photos scored)</h1>"
+            + section("Highest scores", top, a.thumbs) + section("Lowest scores", bottom, a.thumbs))
     with open(a.out, "w") as f:
         f.write(page)
     print(f"OK -> {a.out}")

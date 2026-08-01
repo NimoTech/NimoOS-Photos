@@ -10,12 +10,15 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// ── P1：流式哈希 ──────────────────────────────────────────────────────────
+// ── P1: streaming hash ────────────────────────────────────────────────────
 
-// TestSha256FileStream_MatchesFullReadHash 断言流式哈希（os.Open + io.Copy）
-// 与原来"整读进内存再算"（sha256File(os.ReadFile 的结果)）对同一份内容算出
-// 完全相同的摘要——这是把 processFileInternal 从整读切到流式读取的安全前提。
-// 内容特意跨过典型的 io.Copy 内部缓冲区大小（32KB），覆盖多次 Write 调用。
+// TestSha256FileStream_MatchesFullReadHash asserts the streaming hash
+// (os.Open + io.Copy) computes exactly the same digest for the same content
+// as the old "read fully into memory, then hash" approach
+// (sha256File(os.ReadFile's result)) — this is the safety precondition for
+// switching processFileInternal from full reads to streaming reads. The
+// content deliberately crosses io.Copy's typical internal buffer size
+// (32KB), covering multiple Write calls.
 func TestSha256FileStream_MatchesFullReadHash(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "blob.bin")
@@ -28,62 +31,73 @@ func TestSha256FileStream_MatchesFullReadHash(t *testing.T) {
 	want := sha256File(content)
 	got, err := sha256FileStream(path)
 	require.NoError(t, err)
-	require.Equal(t, want, got, "流式哈希结果必须与整读哈希一致")
+	require.Equal(t, want, got, "the streaming hash result must match the full-read hash")
 }
 
-// TestSha256FileStream_MissingFileReturnsError 断言文件不存在时流式哈希返回
-// 错误而不是 panic，与原 os.ReadFile 失败时的行为一致。
+// TestSha256FileStream_MissingFileReturnsError asserts that the streaming
+// hash returns an error rather than panicking when the file doesn't exist,
+// consistent with the original os.ReadFile failure behavior.
 func TestSha256FileStream_MissingFileReturnsError(t *testing.T) {
 	_, err := sha256FileStream(filepath.Join(t.TempDir(), "missing.bin"))
 	require.Error(t, err)
 }
 
-// ── P1：MIME 只读头部 ─────────────────────────────────────────────────────
+// ── P1: MIME header-only reads ────────────────────────────────────────────
 
-// TestDetectMimeType_KnownExtensionNeverReadsFile 断言已知扩展名（命中
-// canonicalMime 表）直接返回权威类型，完全不尝试打开文件——用一个根本不存在
-// 的路径来证明：如果实现读了文件，os.Open 会失败，函数就不可能返回正确结果。
+// TestDetectMimeType_KnownExtensionNeverReadsFile asserts a known extension
+// (a canonicalMime table hit) returns the authoritative type directly,
+// without ever attempting to open the file — using a path that flatly
+// doesn't exist to prove it: if the implementation read the file, os.Open
+// would fail and the function couldn't possibly return the correct result.
 func TestDetectMimeType_KnownExtensionNeverReadsFile(t *testing.T) {
 	got := detectMimeType("/nonexistent/does-not-exist.jpg", ".jpg")
-	require.Equal(t, "image/jpeg", got, "已知扩展名不应尝试读取文件")
+	require.Equal(t, "image/jpeg", got, "a known extension should not attempt to read the file")
 }
 
-// TestDetectMimeType_UnknownExtensionSniffsHeader 断言未知扩展名回退到内容
-// 嗅探时只需要文件头部就能识别类型（http.DetectContentType 本身只看前
-// 512B），验证 detectMimeType 没有退化成整文件读入。
+// TestDetectMimeType_UnknownExtensionSniffsHeader asserts that when an
+// unknown extension falls back to content sniffing, only the file header is
+// needed to identify the type (http.DetectContentType itself only looks at
+// the first 512B), verifying detectMimeType hasn't regressed into reading
+// the whole file.
 func TestDetectMimeType_UnknownExtensionSniffsHeader(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "blob.bin")
 	pngHeader := []byte{0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A}
 	require.NoError(t, os.WriteFile(path, pngHeader, 0o644))
-	require.Equal(t, "image/png", detectMimeType(path, ".bin"), "未知扩展名应回退到内容嗅探")
+	require.Equal(t, "image/png", detectMimeType(path, ".bin"), "an unknown extension should fall back to content sniffing")
 }
 
-// ── P1：图片 100MB 上限降级 ───────────────────────────────────────────────
+// ── P1: image 100MB cap fallback ──────────────────────────────────────────
 
-// TestImageExceedsReadLimit 是 imageExceedsReadLimit 判定函数的边界值单测
-// （对齐 mlinput_test.go 里 TestPixelsExceedMLLimit 的写法）：等于上限不算
-// 超限，超过一个字节才算超限。用注入的小阈值验证边界，不依赖 maxImageReadBytes
-// 的真实取值（生产环境仍是 100MB 常量，见 indexer.go 的注释）。
+// TestImageExceedsReadLimit is a boundary-value unit test for the
+// imageExceedsReadLimit predicate (matching the style of
+// TestPixelsExceedMLLimit in mlinput_test.go): equal to the limit doesn't
+// count as exceeding it, one byte over does. Uses an injected small
+// threshold to test the boundary without depending on maxImageReadBytes'
+// real value (production is still the 100MB constant, see the comment in
+// indexer.go).
 func TestImageExceedsReadLimit(t *testing.T) {
 	prev := maxImageReadBytes
 	t.Cleanup(func() { maxImageReadBytes = prev })
 	maxImageReadBytes = 100
 
-	require.False(t, imageExceedsReadLimit(100), "等于上限不应判定超限")
+	require.False(t, imageExceedsReadLimit(100), "equal to the limit should not be judged as exceeding it")
 	require.False(t, imageExceedsReadLimit(99))
-	require.True(t, imageExceedsReadLimit(101), "超过上限应判定超限")
+	require.True(t, imageExceedsReadLimit(101), "over the limit should be judged as exceeding it")
 }
 
-// TestProcessFileInternal_OversizedImage_SkipsMLButIndexes 覆盖"超大图跳过
-// ML 仍完成基础索引"：注入一个极小的阈值（避免真的构造 100MB+ 文件），并用
-// skipThumb 关掉缩略图生成，这样 embedClip 找不到 small.jpg 兜底，唯一能喂给
-// ML 的就是 faceData——如果 faceData 真的因为超限被置空，CLIP/OCR 必然一次
-// 都不会被调用，但资产仍应正常走到 status='indexed'。
+// TestProcessFileInternal_OversizedImage_SkipsMLButIndexes covers "an
+// oversized image skips ML but still completes basic indexing": injects a
+// tiny threshold (to avoid actually constructing a 100MB+ file) and uses
+// skipThumb to disable thumbnail generation, so embedClip can't fall back
+// to small.jpg — the only thing that could be fed to ML is faceData. If
+// faceData is genuinely emptied out due to exceeding the limit, CLIP/OCR
+// must never be called even once, but the asset should still reach
+// status='indexed' normally.
 func TestProcessFileInternal_OversizedImage_SkipsMLButIndexes(t *testing.T) {
 	prev := maxImageReadBytes
 	t.Cleanup(func() { maxImageReadBytes = prev })
-	maxImageReadBytes = 8 // 真实测试 JPEG 显然超过这个阈值
+	maxImageReadBytes = 8 // the real test JPEG clearly exceeds this threshold
 
 	db := makeTestDB(t)
 	thumbDir := t.TempDir()
@@ -94,17 +108,18 @@ func TestProcessFileInternal_OversizedImage_SkipsMLButIndexes(t *testing.T) {
 	ix := NewIndexer(db, ml, thumbDir, 1)
 	require.True(t, ix.processFileInternal(path, processOpts{skipThumb: true}))
 
-	require.Zero(t, ml.clipCalls, "faceData 置空且无缩略图兜底时不应调用 CLIP")
-	require.Zero(t, ml.ocrCalls, "faceData 置空时应跳过 OCR")
+	require.Zero(t, ml.clipCalls, "CLIP should not be called when faceData is emptied and there's no thumbnail fallback")
+	require.Zero(t, ml.ocrCalls, "OCR should be skipped when faceData is emptied")
 
 	var status string
 	require.NoError(t, db.QueryRow(`SELECT status FROM assets WHERE file_path=?`, path).Scan(&status))
-	require.Equal(t, "indexed", status, "超大图仍应完成基础索引（EXIF+入库)")
+	require.Equal(t, "indexed", status, "an oversized image should still complete basic indexing (EXIF + DB write)")
 }
 
-// TestProcessFileInternal_NormalImage_StillRunsML 是上一测试的对照组：同一份
-// 文件、同一份 opts，只是没有调低阈值，ML 必须照常跑——确保新增的降级分支
-// 没有误伤正常大小的图片。
+// TestProcessFileInternal_NormalImage_StillRunsML is the control for the
+// previous test: the same file, the same opts, just without lowering the
+// threshold — ML must run as usual, confirming the new fallback branch
+// hasn't accidentally affected normal-sized images.
 func TestProcessFileInternal_NormalImage_StillRunsML(t *testing.T) {
 	db := makeTestDB(t)
 	thumbDir := t.TempDir()
@@ -115,14 +130,15 @@ func TestProcessFileInternal_NormalImage_StillRunsML(t *testing.T) {
 	ix := NewIndexer(db, ml, thumbDir, 1)
 	require.True(t, ix.processFileInternal(path, processOpts{skipThumb: true}))
 
-	require.Equal(t, 1, ml.clipCalls, "正常大小的图片应照常跑 CLIP")
+	require.Equal(t, 1, ml.clipCalls, "a normal-sized image should run CLIP as usual")
 }
 
-// ── P1：视频路径完全不碰 data ─────────────────────────────────────────────
+// ── P1: the video path never touches data ─────────────────────────────────
 
-// TestProcessFileInternal_Video_StillIndexesAndEmbeds 是移除顶层整读之后的
-// 回归测试：视频的关键帧提取、ffprobe 探测、CLIP 嵌入（走关键帧文件，不走
-// 整段视频字节）都必须与改动前行为一致。
+// TestProcessFileInternal_Video_StillIndexesAndEmbeds is a regression test
+// after removing the top-level full read: video keyframe extraction,
+// ffprobe probing, and CLIP embedding (via the keyframe file, not the whole
+// video's bytes) must all behave the same as before the change.
 func TestProcessFileInternal_Video_StillIndexesAndEmbeds(t *testing.T) {
 	if _, err := exec.LookPath("ffmpeg"); err != nil {
 		t.Skip("ffmpeg not found")
@@ -143,17 +159,18 @@ func TestProcessFileInternal_Video_StillIndexesAndEmbeds(t *testing.T) {
 	).Scan(&status, &mime, &durationMs))
 	require.Equal(t, "indexed", status)
 	require.Equal(t, "video/mp4", mime)
-	require.Greater(t, durationMs, int64(0), "视频时长应通过 ffprobe（按路径）取得")
-	require.Equal(t, 1, ml.clipCalls, "视频应通过关键帧文件走一次 CLIP 嵌入")
+	require.Greater(t, durationMs, int64(0), "video duration should be obtained via ffprobe (by path)")
+	require.Equal(t, 1, ml.clipCalls, "video should go through CLIP embedding once via the keyframe file")
 }
 
-// ── P2：stat 快速跳过 ─────────────────────────────────────────────────────
+// ── P2: stat fast-skip ─────────────────────────────────────────────────────
 
-// TestProcessFileInternal_StatFastPath_SkipsReprocessWhenUnchanged 断言：
-// 已经 status='indexed' 且 file_size+mtime 都没变的资产，再次
-// processFileInternal 必须在 stat 阶段就短路——不重复调用 ML（也就是不重复
-// embedClip），这正是打破重启死循环的关键：不用读一个字节就知道"这份内容
-// 早就处理过"。
+// TestProcessFileInternal_StatFastPath_SkipsReprocessWhenUnchanged asserts:
+// an asset that's already status='indexed' with unchanged file_size+mtime
+// must short-circuit at the stat stage on a second processFileInternal call
+// — no repeated ML call (i.e. no repeated embedClip) — this is exactly the
+// key to breaking the restart death loop: knowing "this content has already
+// been processed" without reading a single byte.
 func TestProcessFileInternal_StatFastPath_SkipsReprocessWhenUnchanged(t *testing.T) {
 	db := makeTestDB(t)
 	thumbDir := t.TempDir()
@@ -163,20 +180,23 @@ func TestProcessFileInternal_StatFastPath_SkipsReprocessWhenUnchanged(t *testing
 	ml := &recordingML{}
 	ix := NewIndexer(db, ml, thumbDir, 1)
 	require.True(t, ix.processFileInternal(path, processOpts{}))
-	require.Equal(t, 1, ml.clipCalls, "首次索引应跑一次 CLIP")
+	require.Equal(t, 1, ml.clipCalls, "the first indexing pass should run CLIP once")
 
 	var mtimeBefore int64
 	require.NoError(t, db.QueryRow(`SELECT mtime FROM assets WHERE file_path=?`, path).Scan(&mtimeBefore))
-	require.NotZero(t, mtimeBefore, "首次索引应把 mtime 回填入库")
+	require.NotZero(t, mtimeBefore, "the first indexing pass should write mtime back to the DB")
 
-	// 文件内容、mtime 都没变：第二次处理应该被 stat 快速路径短路。
+	// File content and mtime are both unchanged: the second processing
+	// pass should be short-circuited by the stat fast path.
 	require.True(t, ix.processFileInternal(path, processOpts{}))
-	require.Equal(t, 1, ml.clipCalls, "size+mtime 命中应短路，不重复 CLIP")
+	require.Equal(t, 1, ml.clipCalls, "a size+mtime hit should short-circuit and not repeat CLIP")
 }
 
-// TestProcessFileInternal_StatFastPath_ReprocessesWhenContentChanges 断言：
-// 同一路径的内容真的变了（size/mtime/checksum 都会变化）时，stat 快速路径和
-// checksum 短路都应该 miss，重新走一遍完整流水线（重新跑 ML）。
+// TestProcessFileInternal_StatFastPath_ReprocessesWhenContentChanges
+// asserts: when the same path's content actually changes (size/mtime/
+// checksum all change), both the stat fast path and the checksum
+// short-circuit should miss, and the full pipeline should rerun (ML runs
+// again).
 func TestProcessFileInternal_StatFastPath_ReprocessesWhenContentChanges(t *testing.T) {
 	db := makeTestDB(t)
 	thumbDir := t.TempDir()
@@ -189,21 +209,25 @@ func TestProcessFileInternal_StatFastPath_ReprocessesWhenContentChanges(t *testi
 	require.True(t, ix.processFileInternal(path, processOpts{}))
 	require.Equal(t, 1, ml.clipCalls)
 
-	writeJPEGAt(t, path, 2) // 换一张不同内容的图片写到同一路径
+	writeJPEGAt(t, path, 2) // write a different image to the same path
 	require.True(t, ix.processFileInternal(path, processOpts{}))
-	require.Equal(t, 2, ml.clipCalls, "内容变化应重新处理，不能被 stat 快速路径挡住")
+	require.Equal(t, 2, ml.clipCalls, "a content change should trigger reprocessing, not be blocked by the stat fast path")
 
 	var checksum string
 	require.NoError(t, db.QueryRow(`SELECT checksum FROM assets WHERE file_path=?`, path).Scan(&checksum))
 	require.NotEmpty(t, checksum)
 }
 
-// TestProcessFileInternal_LegacyNullMtime_BackfilledViaChecksumShortcut 覆盖
-// 升级前入库的存量行(mtime 为 NULL)的回填闭环:stat 快速路径必然 miss →
-// 流式哈希 → 命中 checksum 短路。修复前 checksum 短路在 INSERT 之前 return、
-// 永远回填不到 mtime,存量行每次续扫都要被整文件重读;修复后 checksum 短路里
-// 就地把 size+mtime 写回本 file_path,于是:①该行 mtime 立即变为非空;②再处理
-// 一次时被第 2 步 stat 快速路径零读取命中(不再重复跑 ML)。
+// TestProcessFileInternal_LegacyNullMtime_BackfilledViaChecksumShortcut
+// covers the backfill closed loop for legacy rows written before this
+// upgrade (mtime is NULL): the stat fast path necessarily misses →
+// streaming hash → hits the checksum short-circuit. Before the fix, the
+// checksum short-circuit returned before the INSERT and never backfilled
+// mtime, so legacy rows had to be fully re-read on every rescan; after the
+// fix, the checksum short-circuit writes size+mtime back onto this
+// file_path in place, so: (1) that row's mtime immediately becomes
+// non-null; (2) the next processing pass hits step 2's stat fast path with
+// zero reads (ML doesn't run again).
 func TestProcessFileInternal_LegacyNullMtime_BackfilledViaChecksumShortcut(t *testing.T) {
 	db := makeTestDB(t)
 	thumbDir := t.TempDir()
@@ -215,27 +239,31 @@ func TestProcessFileInternal_LegacyNullMtime_BackfilledViaChecksumShortcut(t *te
 	require.True(t, ix.processFileInternal(path, processOpts{}))
 	require.Equal(t, 1, ml.clipCalls)
 
-	// 模拟"升级前入库"的存量行:把 mtime 抹成 NULL。
+	// Simulate a legacy row "written before this upgrade": wipe mtime to NULL.
 	_, err := db.Exec(`UPDATE assets SET mtime=NULL WHERE file_path=?`, path)
 	require.NoError(t, err)
 
-	// 再处理一次:stat 快速路径 miss(mtime 为 NULL)→ 走到 checksum 短路,
-	// 内容没变命中 indexed → 应就地回填 mtime,且不重复跑 ML。
+	// Process once more: the stat fast path misses (mtime is NULL) → falls
+	// through to the checksum short-circuit, content unchanged hits
+	// indexed → should backfill mtime in place, without rerunning ML.
 	require.True(t, ix.processFileInternal(path, processOpts{}))
-	require.Equal(t, 1, ml.clipCalls, "内容没变时 checksum 短路不应重复跑 ML")
+	require.Equal(t, 1, ml.clipCalls, "the checksum short-circuit should not rerun ML when content is unchanged")
 
 	var mtime sql.NullInt64
 	require.NoError(t, db.QueryRow(`SELECT mtime FROM assets WHERE file_path=?`, path).Scan(&mtime))
-	require.True(t, mtime.Valid && mtime.Int64 != 0, "checksum 短路应把存量行的 mtime 回填为非空")
+	require.True(t, mtime.Valid && mtime.Int64 != 0, "the checksum short-circuit should backfill the legacy row's mtime to non-null")
 
-	// 回填之后,第三次处理应被 stat 快速路径零读取命中(仍不跑 ML)。
+	// After the backfill, a third processing pass should be a zero-read hit
+	// via the stat fast path (still no ML run).
 	require.True(t, ix.processFileInternal(path, processOpts{}))
-	require.Equal(t, 1, ml.clipCalls, "回填后应由 stat 快速路径命中,不再触达 checksum 路径")
+	require.Equal(t, 1, ml.clipCalls, "after the backfill, the stat fast path should hit and the checksum path should no longer be reached")
 }
 
-// TestProcessFileInternal_StatFastPath_IgnoredWhenForced 断言 opts.force=true
-// 时即便 size+mtime 都没变也必须绕过 stat 快速路径重新跑一遍——与既有的
-// checksum 短路 force 语义保持一致（Embedder 的 CLIP 补跑场景）。
+// TestProcessFileInternal_StatFastPath_IgnoredWhenForced asserts that when
+// opts.force=true, the stat fast path must be bypassed and reprocessing
+// forced even when size+mtime are both unchanged — consistent with the
+// existing checksum short-circuit's force semantics (Embedder's CLIP
+// backfill scenario).
 func TestProcessFileInternal_StatFastPath_IgnoredWhenForced(t *testing.T) {
 	db := makeTestDB(t)
 	thumbDir := t.TempDir()
@@ -249,5 +277,5 @@ func TestProcessFileInternal_StatFastPath_IgnoredWhenForced(t *testing.T) {
 
 	ok := ix.ForceReprocess(path, processOpts{force: true, skipExif: true, skipThumb: true})
 	require.True(t, ok)
-	require.Equal(t, 2, ml.clipCalls, "force 应绕过 stat 快速路径重新跑 ML")
+	require.Equal(t, 2, ml.clipCalls, "force should bypass the stat fast path and rerun ML")
 }

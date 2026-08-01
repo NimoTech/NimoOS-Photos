@@ -57,9 +57,10 @@ install_photos_ml() {
         return 0
     fi
     if tar -xzf "${tmp}/${BUNDLE}" -C "${tmp}"; then
-        # timeout 硬包住:bundle 内的 /ping 等待若挂死也不会阻塞整个安装(非致命)
+        # Hard timeout wrapper: if the bundle's own /ping wait hangs, it won't
+        # block the whole install (non-fatal either way).
         timeout 300 bash "${tmp}/install.sh" \
-            || echo "🟨 Photos AI ML installer timed out/errored (non-fatal); 可稍后手动重试。"
+            || echo "🟨 Photos AI ML installer timed out/errored (non-fatal); retry manually later."
     else
         echo "🟨 Failed to extract ${BUNDLE} (non-fatal)."
     fi

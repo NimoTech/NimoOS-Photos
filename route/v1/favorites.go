@@ -80,18 +80,19 @@ func (h *FavoritesHandler) List(c echo.Context) error {
 }
 
 // Export — GET /v1/photos/favorites/export
-// 流式 ZIP 下载。单文件失败跳过、写日志。无收藏返回 400。
+// Streaming ZIP download. Skips (and logs) any file that fails; returns 400 if there are no favorites.
 func (h *FavoritesHandler) Export(c echo.Context) error {
-	// 走 query token，绕过了 JWT middleware（router Skipper），所以这里得自己
-	// 解析 JWT 拿 user_id；不然 fallback 到 "default"，和 Favorite 写入的真实
-	// user_id 不一致就会读空、返回 "no favorites"。
+	// Uses a query token, which bypasses the JWT middleware (router Skipper), so we
+	// have to parse the JWT ourselves to get user_id; otherwise it falls back to
+	// "default", which won't match the real user_id used when the favorite was
+	// written, and we'd read nothing and return "no favorites".
 	token := c.QueryParam("token")
 	if token == "" {
 		return echo.NewHTTPError(http.StatusUnauthorized, "token required")
 	}
 	var userID string
 	if h.runtimePath == "" {
-		// 测试 / 单机直连场景：runtimePath 没配，跳过 JWT 校验，回退 "default"。
+		// Test / single-node direct-connect scenario: runtimePath isn't configured, skip JWT validation, fall back to "default".
 		userID = JWTUserID(c)
 	} else {
 		valid, claims, err := jwt.Validate(token, func() (*ecdsa.PublicKey, error) {
@@ -164,8 +165,8 @@ func (h *FavoritesHandler) Top(c echo.Context) error {
 	return c.JSON(http.StatusOK, assets)
 }
 
-// dedupZipEntryName 返回不与 used 中已有名字冲突的文件名。
-// "photo.jpg" 第二次出现变成 "photo-2.jpg"。
+// dedupZipEntryName returns a filename that doesn't collide with any name already in used.
+// A second occurrence of "photo.jpg" becomes "photo-2.jpg".
 func dedupZipEntryName(name string, used map[string]int) string {
 	if name == "" {
 		return ""

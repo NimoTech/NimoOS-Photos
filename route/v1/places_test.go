@@ -38,7 +38,7 @@ func newPlacesHarness(t *testing.T) (*PlacesHandler, func()) {
 	return h, func() { db.Close() }
 }
 
-// TestPlacesListEmpty 验证空库时 List 返回 200 且 JSON 含 stats 字段。
+// TestPlacesListEmpty verifies that List returns 200 with a JSON stats field when the library is empty.
 func TestPlacesListEmpty(t *testing.T) {
 	h, cleanup := newPlacesHarness(t)
 	defer cleanup()
@@ -58,13 +58,13 @@ func TestPlacesListEmpty(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("response is not valid JSON: %v — body: %s", err, rec.Body.String())
 	}
-	// 空库 stats 全为 0，places/regions 为 nil 或空切片均可。
+	// With an empty library, stats are all 0; places/regions may be nil or an empty slice.
 	if resp.Stats.Cities < 0 {
 		t.Errorf("unexpected negative cities: %d", resp.Stats.Cities)
 	}
 }
 
-// TestPlacesGetNotFound 验证不存在的 key 返回 404。
+// TestPlacesGetNotFound verifies that a nonexistent key returns 404.
 func TestPlacesGetNotFound(t *testing.T) {
 	h, cleanup := newPlacesHarness(t)
 	defer cleanup()
@@ -88,7 +88,7 @@ func TestPlacesGetNotFound(t *testing.T) {
 	}
 }
 
-// TestPlacesGetBadKey 验证非整数 key 返回 400。
+// TestPlacesGetBadKey verifies that a non-integer key returns 400.
 func TestPlacesGetBadKey(t *testing.T) {
 	h, cleanup := newPlacesHarness(t)
 	defer cleanup()

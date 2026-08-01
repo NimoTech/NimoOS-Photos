@@ -1,6 +1,8 @@
-// Package uploadstore 提供 NimoOS-Photos 的原生 database/sql 版本 upload.Store 实现。
-// 列名与 pkg/sqlite/db.go 中 o_upload_tasks 表严格对应;时间戳(created_at/updated_at)
-// 由代码显式写入,无 GORM autoCreateTime/autoUpdateTime 支持。
+// Package uploadstore provides NimoOS-Photos's native database/sql-based
+// upload.Store implementation. Column names correspond exactly to the
+// o_upload_tasks table in pkg/sqlite/db.go; timestamps (created_at/updated_at)
+// are written explicitly by the code — there is no GORM
+// autoCreateTime/autoUpdateTime support.
 package uploadstore
 
 import (
@@ -11,18 +13,18 @@ import (
 	upload "github.com/NimoTech/NimoOS-Common/upload"
 )
 
-// Store 是基于原生 database/sql 的 upload.Store 实现。
+// Store is the native database/sql-based upload.Store implementation.
 type Store struct {
 	db *sql.DB
 }
 
-// NewStore 返回一个 *Store,关联给定的 *sql.DB(应已 migrate)。
+// NewStore returns a *Store bound to the given *sql.DB (which should already be migrated).
 func NewStore(db *sql.DB) *Store {
 	return &Store{db: db}
 }
 
-// 列顺序:与 o_upload_tasks 表列定义保持一致。
-// 表定义顺序:
+// Column order: matches the o_upload_tasks table's column definitions.
+// Table definition order:
 //   id, owner_user_id, filename, target_path, relative_path,
 //   size, mime, fingerprint, content_hash, upload_url,
 //   uploaded_offset, status, retry_count, error, last_error_at,
@@ -33,7 +35,8 @@ const selectAllCols = `id,owner_user_id,filename,target_path,relative_path,` +
 	`uploaded_offset,status,retry_count,error,last_error_at,` +
 	`batch_id,client_id,client_meta,created_at,updated_at,expires_at`
 
-// scanTask 按固定列顺序扫描一行到 UploadTask。列序须与 selectAllCols 完全一致。
+// scanTask scans a row into an UploadTask using a fixed column order. The
+// column order here must match selectAllCols exactly.
 func scanTask(row interface {
 	Scan(dest ...interface{}) error
 }) (*upload.UploadTask, error) {
@@ -50,10 +53,10 @@ func scanTask(row interface {
 	return &t, nil
 }
 
-// Create 写入全列(包含 created_at/updated_at=now)。
+// Create writes every column (including created_at/updated_at=now).
 func (s *Store) Create(t *upload.UploadTask) error {
 	now := time.Now().Unix()
-	// 若调用方已设置时间戳则沿用,否则用 now
+	// Keep the caller's timestamp if already set, otherwise use now.
 	createdAt := t.CreatedAt
 	if createdAt == 0 {
 		createdAt = now
@@ -78,7 +81,7 @@ func (s *Store) Create(t *upload.UploadTask) error {
 	return err
 }
 
-// Get 按 id 查询任务;缺失时返回 upload.ErrNotFound。
+// Get looks up a task by id; returns upload.ErrNotFound when missing.
 func (s *Store) Get(id string) (*upload.UploadTask, error) {
 	row := s.db.QueryRow(
 		`SELECT `+selectAllCols+` FROM o_upload_tasks WHERE id=?`, id,
@@ -93,8 +96,8 @@ func (s *Store) Get(id string) (*upload.UploadTask, error) {
 	return t, nil
 }
 
-// ListActiveByOwner 返回指定 owner 的活跃任务(uploading/paused/failed),
-// 按 created_at DESC 排序。
+// ListActiveByOwner returns the given owner's active tasks
+// (uploading/paused/failed), ordered by created_at DESC.
 func (s *Store) ListActiveByOwner(owner string) ([]upload.UploadTask, error) {
 	rows, err := s.db.Query(
 		`SELECT `+selectAllCols+` FROM o_upload_tasks
@@ -118,7 +121,7 @@ func (s *Store) ListActiveByOwner(owner string) ([]upload.UploadTask, error) {
 	return result, rows.Err()
 }
 
-// ListDueForGC 返回 expires_at > 0 且 <= now 的任务。
+// ListDueForGC returns tasks with expires_at > 0 and <= now.
 func (s *Store) ListDueForGC(now int64) ([]upload.UploadTask, error) {
 	rows, err := s.db.Query(
 		`SELECT `+selectAllCols+` FROM o_upload_tasks
@@ -141,7 +144,7 @@ func (s *Store) ListDueForGC(now int64) ([]upload.UploadTask, error) {
 	return result, rows.Err()
 }
 
-// UpdateOffset 更新已上传字节数及续期过期时间,同时维护 updated_at。
+// UpdateOffset updates the uploaded byte count and renewed expiry time, and also maintains updated_at.
 func (s *Store) UpdateOffset(id string, offset, expiresAt int64) error {
 	_, err := s.db.Exec(
 		`UPDATE o_upload_tasks SET uploaded_offset=?, expires_at=?, updated_at=? WHERE id=?`,
@@ -150,7 +153,7 @@ func (s *Store) UpdateOffset(id string, offset, expiresAt int64) error {
 	return err
 }
 
-// SetStatus 更新任务状态及过期时间,同时维护 updated_at。
+// SetStatus updates the task's status and expiry time, and also maintains updated_at.
 func (s *Store) SetStatus(id, status string, expiresAt int64) error {
 	_, err := s.db.Exec(
 		`UPDATE o_upload_tasks SET status=?, expires_at=?, updated_at=? WHERE id=?`,
@@ -159,7 +162,7 @@ func (s *Store) SetStatus(id, status string, expiresAt int64) error {
 	return err
 }
 
-// SetFailed 将任务标记为失败并记录错误信息,同时维护 updated_at。
+// SetFailed marks the task as failed and records the error message, and also maintains updated_at.
 func (s *Store) SetFailed(id, errMsg string, lastErrorAt, expiresAt int64) error {
 	_, err := s.db.Exec(
 		`UPDATE o_upload_tasks SET status=?, error=?, last_error_at=?, expires_at=?, updated_at=? WHERE id=?`,
@@ -168,11 +171,12 @@ func (s *Store) SetFailed(id, errMsg string, lastErrorAt, expiresAt int64) error
 	return err
 }
 
-// Delete 物理删除任务记录。对不存在的 id 静默成功(不返回 ErrNotFound)。
+// Delete physically deletes the task record. Silently succeeds for a
+// nonexistent id (does not return ErrNotFound).
 func (s *Store) Delete(id string) error {
 	_, err := s.db.Exec(`DELETE FROM o_upload_tasks WHERE id=?`, id)
 	return err
 }
 
-// 编译期接口合规性检查:确保 *Store 实现 upload.Store。
+// Compile-time interface compliance check: ensures *Store implements upload.Store.
 var _ upload.Store = (*Store)(nil)

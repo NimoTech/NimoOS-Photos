@@ -1,6 +1,8 @@
-// 共用选优:trip/theme 两个引擎产出的候选成员集,靠这里统一的连拍去重 +
-// 精选/封面挑选逻辑决定"哪些照片值得展示"——引擎本身只管"该不该属于这个
-// 时刻",不管"该不该被推到前排"。
+// Shared curation: the candidate member sets produced by the trip/theme
+// engines rely on the unified burst dedup + featured/cover selection logic
+// here to decide "which photos are worth showing" — the engines themselves
+// only care about "does this belong to this moment", not "should it be
+// pushed to the front".
 package service
 
 import (
@@ -18,14 +20,16 @@ import (
 	"time"
 )
 
-// clipVecLoader 按 asset_id 返回 CLIP 图向量;ok=false 表示无向量(未嵌入,或
-// ScenesEnabled 关闭)。PickFeaturedAndCover 对这类资产跳过连拍去重、直接放
-// 入精选候选池(没有向量就无法判断"是不是同一张连拍",宁可不去重也不要
-// 误删)。
+// clipVecLoader returns the CLIP image vector for an asset_id; ok=false means
+// no vector (not embedded, or ScenesEnabled off). PickFeaturedAndCover skips
+// burst dedup for such assets and puts them straight into the featured
+// candidate pool (with no vector there's no way to tell "is this the same
+// burst shot", so it's better to skip dedup than risk wrongly dropping one).
 type clipVecLoader func(assetID string) ([]float32, bool)
 
-// RealClipVecLoader 是 clipVecLoader 的生产实现,包一层 readClipVector(见
-// docverdict.go:14-24)。测试用 fake 注入,不走这个。
+// RealClipVecLoader is the production implementation of clipVecLoader,
+// wrapping readClipVector (see docverdict.go:14-24). Tests inject a fake
+// instead of using this.
 func RealClipVecLoader(db *sql.DB) clipVecLoader {
 	return func(assetID string) ([]float32, bool) {
 		v := readClipVector(db, assetID)
@@ -33,15 +37,18 @@ func RealClipVecLoader(db *sql.DB) clipVecLoader {
 	}
 }
 
-// coverImageLoader 按 asset_id 返回封面亮度闸要检查的缩略图;ok=false 表示读
-// 不到(缩略图缺失/解码失败)——pickCover 对这种候选跳过亮度闸、直接采用
-// (宁可放行一张没法验证的图,也不要因为读不到缩略图就让整个 recipe 没有
-// 封面)。
+// coverImageLoader returns the thumbnail the cover brightness gate should
+// check for an asset_id; ok=false means it couldn't be read (thumbnail
+// missing/decode failure) — pickCover skips the brightness gate for such a
+// candidate and accepts it outright (better to let through an image that
+// can't be verified than to leave a whole recipe without a cover just
+// because a thumbnail couldn't be read).
 type coverImageLoader func(assetID string) (image.Image, bool)
 
-// RealCoverImageLoader 是 coverImageLoader 的生产实现,读
-// <thumbDir>/<assetID>/small.jpg(与 pkg/thumb.Generate 落盘路径同款惯例)并
-// 解码为 image.Image。文件不存在/解码失败按 ok=false 处理。
+// RealCoverImageLoader is the production implementation of coverImageLoader:
+// reads <thumbDir>/<assetID>/small.jpg (the same on-disk path convention as
+// pkg/thumb.Generate) and decodes it to an image.Image. A missing
+// file/decode failure is treated as ok=false.
 func RealCoverImageLoader(thumbDir string) coverImageLoader {
 	return func(assetID string) (image.Image, bool) {
 		f, err := os.Open(filepath.Join(thumbDir, assetID, "small.jpg"))
@@ -57,17 +64,21 @@ func RealCoverImageLoader(thumbDir string) coverImageLoader {
 	}
 }
 
-// 封面亮度/对比硬闸阈值——探针美学头选出的封面偶发过暗/过曝/灰雾低对比
-// (真机截图实证),这是等 AVA 对齐头上线前的过渡补丁,阈值不进 recipe。
-// 换 AVA 头后,pickCover 及以下几个亮度闸相关函数可整段退役。
+// Cover brightness/contrast hard-gate thresholds — the probe aesthetic
+// head's chosen covers are occasionally too dark/overexposed/hazy-low-
+// contrast (confirmed by real-device screenshots); this is a transitional
+// patch until the AVA alignment head ships, and the thresholds don't go into
+// the recipe. Once the AVA head replaces it, pickCover and the brightness-
+// gate helper functions below it can be retired wholesale.
 const (
-	coverMinMeanLuma = 0.12 // 灰度均值低于此值判过暗
-	coverMaxMeanLuma = 0.92 // 灰度均值高于此值判过曝
-	coverMinStdDev   = 0.05 // 灰度标准差低于此值判灰雾/低对比
+	coverMinMeanLuma = 0.12 // grayscale mean below this is judged too dark
+	coverMaxMeanLuma = 0.92 // grayscale mean above this is judged overexposed
+	coverMinStdDev   = 0.05 // grayscale std dev below this is judged hazy/low-contrast
 )
 
-// passesCoverBrightnessGate 计算 img 的灰度均值/标准差(取值域 [0,1]),判断是
-// 否适合当封面:过暗、过曝、或灰雾低对比都不通过。
+// passesCoverBrightnessGate computes img's grayscale mean/std dev (range
+// [0,1]) to decide whether it's fit to be a cover: too dark, overexposed, or
+// hazy low-contrast all fail.
 func passesCoverBrightnessGate(img image.Image) bool {
 	mean, stddev := grayscaleMeanStdDev(img)
 	if mean < coverMinMeanLuma || mean > coverMaxMeanLuma {
@@ -79,8 +90,10 @@ func passesCoverBrightnessGate(img image.Image) bool {
 	return true
 }
 
-// grayscaleMeanStdDev 遍历 img 全部像素转灰度,返回均值与标准差(都归一化到
-// [0,1])。缩略图是 small.jpg(250px 宽),像素量小,不需要额外降采样。
+// grayscaleMeanStdDev iterates all of img's pixels converted to grayscale,
+// returning the mean and std dev (both normalized to [0,1]). The thumbnail is
+// small.jpg (250px wide), a small pixel count, so no extra downsampling is
+// needed.
 func grayscaleMeanStdDev(img image.Image) (mean, stddev float64) {
 	bounds := img.Bounds()
 	var sum, sumSq, n float64
@@ -99,18 +112,23 @@ func grayscaleMeanStdDev(img image.Image) (mean, stddev float64) {
 	mean = sum / n
 	variance := sumSq/n - mean*mean
 	if variance < 0 {
-		variance = 0 // 浮点误差兜底
+		variance = 0 // guard against floating-point error
 	}
 	return mean, math.Sqrt(variance)
 }
 
-// pickCover 从 featured(已按 aesthetic_score 排好、且已按 maxFeatured 截断的
-// 精选成员)中挑封面:按 MomentAsset.Score 降序、同分再按 aesthetic_score 降
-// 序重排候选顺序(score 对 theme/pet 时刻是 CLIP 主题相似分,让 Your Beagle
-// 的封面挑到"最像狗"的那张;trip 时刻 score 恒为 0,自然退化为纯美学序,即
-// 现状行为)。逐候选过亮度/对比闸,第一个通过者当封面;loadCover 读不到
-// (ok=false)的候选直接采用,不受闸约束;全部被拒(或没有可用 loader)则回退
-// 到 featured[0](aesthetic 序下的最高分),不因闸失败导致"没有封面"。
+// pickCover picks a cover from featured (the featured members, already sorted
+// by aesthetic_score and truncated to maxFeatured): re-sorts the candidate
+// order by MomentAsset.Score descending, then aesthetic_score descending on
+// ties (Score is the CLIP topic-similarity score for theme/pet moments, so
+// Your Beagle's cover ends up picking the photo "most like a dog"; for trip
+// moments Score is always 0, which naturally degrades to pure aesthetic
+// order, i.e. the existing behavior). Runs each candidate through the
+// brightness/contrast gate in order, using the first one that passes as the
+// cover; a candidate loadCover can't read (ok=false) is accepted outright,
+// unconstrained by the gate; if all are rejected (or there's no usable
+// loader), falls back to featured[0] (the highest score under aesthetic
+// order), so a gate failure never results in "no cover".
 func pickCover(featured []string, assets []MomentAsset, info map[string]pickAssetInfo, loadCover coverImageLoader) string {
 	if len(featured) == 0 {
 		return ""
@@ -149,33 +167,45 @@ func pickCover(featured []string, assets []MomentAsset, info map[string]pickAsse
 	return featured[0]
 }
 
-// burstWindowSeconds 是连拍分簇的时间窗:相邻两张照片拍摄时间间隔 <=
-// 此值才可能属于同一连拍簇(簇内再用向量相似度判定是否真的是连拍)。
+// burstWindowSeconds is the time window for burst clustering: two adjacent
+// photos can only possibly belong to the same burst cluster if their taken
+// time gap is <= this value (vector similarity within the cluster then
+// decides whether it's really a burst).
 const burstWindowSeconds = 60
 
-// burstCosineThreshold 是连拍去重的余弦相似度门槛:同一时间簇内两张照片的
-// CLIP 向量余弦相似度 > 此值即判定为连拍(同一场景的连续快门),簇内只留
-// 美学分最高者进入精选候选池。
+// burstCosineThreshold is the cosine similarity threshold for burst dedup:
+// two photos in the same time cluster are judged a burst (consecutive
+// shutter presses of the same scene) once their CLIP vector cosine
+// similarity > this value; only the highest-aesthetic-score photo within the
+// cluster enters the featured candidate pool.
 const burstCosineThreshold = 0.95
 
-// pickAssetInfo 是 PickFeaturedAndCover 计算过程中每个资产需要的最小信息。
+// pickAssetInfo is the minimal per-asset information PickFeaturedAndCover
+// needs during its computation.
 type pickAssetInfo struct {
 	takenAt      time.Time
 	aesthetic    float64
 	hasAesthetic bool
 }
 
-// PickFeaturedAndCover 是 trip/theme 引擎共用的选优:按拍摄时间 60s 相邻窗把
-// assets 分簇 → 簇内按 CLIP 向量两两余弦相似度 > 0.95 判连拍(同一连拍组只
-// 保留 aesthetic_score 最高者进精选候选池,其余仍是该时刻成员,只是不参与
-// 精选/不作为封面候选)→ 候选池按 aesthetic_score 降序取前 maxFeatured 张为
-// 精选。封面则从精选候选中另按 MomentAsset.Score(CLIP 主题相似分,trip 时刻
-// 恒为 0)降序 + aesthetic_score 降序重排后,过 pickCover 的亮度/对比闸挑选
-// (过渡补丁,见 pickCover 注释)。向量缺失的资产跳过去重步骤,直接进候选池。
+// PickFeaturedAndCover is the curation shared by the trip/theme engines:
+// clusters assets by a 60s adjacent taken-time window → within a cluster,
+// pairwise CLIP vector cosine similarity > 0.95 judges a burst (only the
+// highest aesthetic_score in a burst group enters the featured candidate
+// pool; the rest remain members of the moment, just not part of featured/not
+// a cover candidate) → the candidate pool is sorted by aesthetic_score
+// descending and the top maxFeatured become featured. The cover is then
+// picked from the featured candidates by re-sorting on MomentAsset.Score
+// (the CLIP topic-similarity score, always 0 for trip moments) descending +
+// aesthetic_score descending, passed through pickCover's brightness/contrast
+// gate (a transitional patch, see the pickCover comment). Assets with no
+// vector skip the dedup step and go straight into the candidate pool.
 //
-// 注意:aesthetic_score 是探针头模型的输出,只在同一批候选内做相对排序
-// (谁比谁"更值得展示"),不是绝对质量分——禁止拿它做跨批次/跨时刻的绝对
-// 阈值判断(比如"低于 0.4 就不能当封面"这种规则是错的)。
+// Note: aesthetic_score is the probe head model's output, used only for
+// relative ranking within the same batch of candidates (who is "more worth
+// showing" than whom), not an absolute quality score — never use it for an
+// absolute threshold judgment across batches/moments (a rule like "below 0.4
+// can't be a cover" would be wrong).
 func PickFeaturedAndCover(ctx context.Context, db *sql.DB, assets []MomentAsset, maxFeatured int, loadVec clipVecLoader, loadCover coverImageLoader) ([]string, string, error) {
 	if len(assets) == 0 {
 		return nil, "", nil
@@ -190,9 +220,10 @@ func PickFeaturedAndCover(ctx context.Context, db *sql.DB, assets []MomentAsset,
 	for i, a := range assets {
 		ordered[i] = a.AssetID
 	}
-	// 按 taken_at 升序排列;没有 taken_at 的排到最后(SliceStable 维持它们
-	// 相对原始顺序不变)——没有时间锚点就无法判断"是否相邻",在
-	// clusterByTimeWindow 里各自单独成簇。
+	// Sort by taken_at ascending; assets with no taken_at go last (SliceStable
+	// keeps their relative original order) — with no time anchor there's no
+	// way to tell "is this adjacent", so in clusterByTimeWindow each becomes its
+	// own cluster.
 	sort.SliceStable(ordered, func(i, j int) bool {
 		hi, hj := !info[ordered[i]].takenAt.IsZero(), !info[ordered[j]].takenAt.IsZero()
 		if hi != hj {
@@ -214,7 +245,8 @@ func PickFeaturedAndCover(ctx context.Context, db *sql.DB, assets []MomentAsset,
 		return nil, "", nil
 	}
 
-	// 候选池按 aesthetic_score 降序;同分按 id 排序保证结果确定、可复现。
+	// Candidate pool sorted by aesthetic_score descending; ties broken by id to
+	// guarantee a deterministic, reproducible result.
 	sort.SliceStable(poolIDs, func(i, j int) bool {
 		si, sj := aestheticOf(info, poolIDs[i]), aestheticOf(info, poolIDs[j])
 		if si != sj {
@@ -231,11 +263,14 @@ func PickFeaturedAndCover(ctx context.Context, db *sql.DB, assets []MomentAsset,
 	return featured, cover, nil
 }
 
-// clusterByTimeWindow 把已按 taken_at 升序排好(无 taken_at 的排最后)的
-// ordered 序列,按相邻两点间隔 <= burstWindowSeconds 链式分簇:算法与
-// moments_trip.go 的 splitByGap 同构,只是这里的窗口单位是秒、判据是"够近就
-// 并入同簇"而不是"够远就切段"。没有 taken_at 的资产各自单独成簇——没有时间
-// 锚点,无法判断它与任何人相邻。
+// clusterByTimeWindow takes the ordered sequence (already sorted by taken_at
+// ascending, with no-taken_at assets last) and chain-clusters it wherever
+// adjacent points are <= burstWindowSeconds apart: the algorithm mirrors
+// moments_trip.go's splitByGap, except the window unit here is seconds and
+// the criterion is "close enough → merge into the same cluster" rather than
+// "far enough → cut a new segment". Assets with no taken_at each become their
+// own cluster — with no time anchor, there's no way to tell it's adjacent to
+// anything.
 func clusterByTimeWindow(ordered []string, info map[string]pickAssetInfo) [][]string {
 	var clusters [][]string
 	var cur []string
@@ -268,10 +303,13 @@ func clusterByTimeWindow(ordered []string, info map[string]pickAssetInfo) [][]st
 	return clusters
 }
 
-// groupByCosine 在一个时间簇内,用并查集把"两两余弦相似度 > 阈值"的资产合并
-// 成连拍组(允许链式传递:A~B、B~C 都命中即使 A~C 未命中,A/B/C 仍归一组—
-// —这与"连拍"的直觉一致:一串连续快门里首尾两张构图可能已经有明显差异)。
-// 没有向量的资产各自单独成组(跳过去重,直接进池)。
+// groupByCosine, within a single time cluster, uses a union-find to merge
+// assets whose pairwise cosine similarity > the threshold into a burst group
+// (allowing chained transitivity: if A~B and B~C both match even though A~C
+// doesn't, A/B/C are still one group — consistent with the intuition of a
+// "burst": across a run of consecutive shutter presses, the first and last
+// frame's composition may already differ noticeably). Assets with no vector
+// each become their own group (skipping dedup, going straight into the pool).
 func groupByCosine(cluster []string, loadVec clipVecLoader) [][]string {
 	if len(cluster) <= 1 {
 		groups := make([][]string, len(cluster))
@@ -340,8 +378,9 @@ func groupByCosine(cluster []string, loadVec clipVecLoader) [][]string {
 	return groups
 }
 
-// bestByAestheticInGroup 返回组内 aesthetic_score 最高者;没有美学分的资产
-// 视为最低(-1),分数并列按 id 排序保证确定性。
+// bestByAestheticInGroup returns the highest aesthetic_score in the group;
+// an asset with no aesthetic score is treated as the lowest (-1), and ties
+// are broken by id to guarantee determinism.
 func bestByAestheticInGroup(group []string, info map[string]pickAssetInfo) string {
 	best := group[0]
 	bestScore := aestheticOf(info, best)
@@ -354,8 +393,8 @@ func bestByAestheticInGroup(group []string, info map[string]pickAssetInfo) strin
 	return best
 }
 
-// aestheticOf 返回资产的 aesthetic_score;没打过分(NULL)的视为 -1,天然排
-// 在任何已打分资产之后。
+// aestheticOf returns an asset's aesthetic_score; an asset never scored
+// (NULL) is treated as -1, naturally sorting after any scored asset.
 func aestheticOf(info map[string]pickAssetInfo, id string) float64 {
 	v := info[id]
 	if !v.hasAesthetic {
@@ -364,8 +403,9 @@ func aestheticOf(info map[string]pickAssetInfo, id string) float64 {
 	return v.aesthetic
 }
 
-// loadPickAssetInfo 批量查询 assets.taken_at/aesthetic_score(chunk 到 500 一
-// 批,避免 SQLite 变量上限,与 places.go bestByAesthetic 同款写法)。
+// loadPickAssetInfo batch-queries assets.taken_at/aesthetic_score (chunked
+// to 500 per batch to stay under the SQLite variable limit, same approach as
+// places.go's bestByAesthetic).
 func loadPickAssetInfo(ctx context.Context, db *sql.DB, assets []MomentAsset) (map[string]pickAssetInfo, error) {
 	out := make(map[string]pickAssetInfo, len(assets))
 	ids := make([]string, len(assets))

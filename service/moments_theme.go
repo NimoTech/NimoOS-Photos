@@ -1,7 +1,9 @@
-// theme 引擎:把 recipe 的 clip_prompts(CLIP 语义检索)与 caption_keywords
-// (caption 文本关键词)两路命中取并集,再与候选池(排除回收站/离线/文档/
-// live photo 视频侧)取交集,达到 MinAssets 的产出一个"滚动更新"的主题时刻
-// 草稿(见 ThemeMomentID 的设计:同一 recipe 永远映射同一个 moment id)。
+// The theme engine: takes the union of two paths' hits — the recipe's
+// clip_prompts (CLIP semantic search) and caption_keywords (caption text
+// keywords) — then intersects with the candidate pool (excluding trash/
+// offline/documents/live photo companion videos), producing a single
+// "rolling" theme moment draft once it reaches MinAssets (see ThemeMomentID's
+// design: the same recipe always maps to the same moment id).
 package service
 
 import (
@@ -14,34 +16,40 @@ import (
 	"time"
 )
 
-// AssetScore 是 clipTextSearcher 一次文本检索命中的最小结果:资产 id + 相似度
-// 分数(约定 [0,1],与 Asset.MatchScore 同一量纲)。
+// AssetScore is the minimal result of one clipTextSearcher text-search hit:
+// asset id + similarity score (convention [0,1], same scale as
+// Asset.MatchScore).
 type AssetScore struct {
 	AssetID string
 	Score   float64
 }
 
-// clipTextSearcher 是 theme 引擎需要的 CLIP 文本检索能力,真实现见
-// SearchService.SearchAssetsByText(search.go);测试注入 fake,避免 theme 引擎
-// 直接依赖 ML 层。
+// clipTextSearcher is the CLIP text-search capability the theme engine
+// needs; the real implementation is SearchService.SearchAssetsByText
+// (search.go). Tests inject a fake, so the theme engine doesn't directly
+// depend on the ML layer.
 type clipTextSearcher interface {
 	SearchAssetsByText(ctx context.Context, prompt string, topK int) ([]AssetScore, error)
 }
 
-// BuildThemeMoments 是 theme 引擎的入口:每条 ClipPrompts 走 searcher 取
-// TopK、按 MinScore 过滤;CaptionKeywords 对 asset_caption 做词边界匹配(见
-// matchCaptionKeywords,命中记 MinScore 保底分);两路取并集(同一
-// 资产被两路都命中时分数取 max)。并集再与候选池取交集(候选池判据与 trip
-// 引擎一致,见 loadThemeCandidatePool),成员数达 MinAssets 才产出单个
-// MomentDraft;不足则返回空切片(该 recipe 本轮没有可展示的主题时刻,不是
-// 错误)。
+// BuildThemeMoments is the theme engine's entry point: for each of
+// ClipPrompts, calls searcher for TopK, filtered by MinScore; CaptionKeywords
+// does a word-boundary match against asset_caption (see
+// matchCaptionKeywords, a hit gets the MinScore floor score); takes the
+// union of both paths (an asset hit by both takes the max score). The union
+// is then intersected with the candidate pool (the same candidate criteria
+// as the trip engine, see loadThemeCandidatePool), and only produces a
+// single MomentDraft once the member count reaches MinAssets; otherwise
+// returns an empty slice (this recipe has no theme moment to show this
+// round, not an error).
 func BuildThemeMoments(ctx context.Context, db *sql.DB, searcher clipTextSearcher, recipe MomentRecipe) ([]MomentDraft, error) {
 	params, err := ParseParams(recipe)
 	if err != nil {
 		return nil, err
 	}
 
-	// score 是"资产 id → 本轮两路取并集后的最终分数"的累积表。
+	// score is the accumulator table of "asset id → this round's final score
+	// after taking the union of both paths".
 	score := map[string]float64{}
 
 	for _, prompt := range params.ClipPrompts {
@@ -65,9 +73,11 @@ func BuildThemeMoments(ctx context.Context, db *sql.DB, searcher clipTextSearche
 			return nil, err
 		}
 		for _, id := range hits {
-			// 关键词命中没有连续相似度可用,记 MinScore 作保底分——刚好卡在
-			// 过滤线上,既不会被自己的门槛刷掉,也不会喧宾夺主盖过 CLIP 的
-			// 高置信命中(取 max 时 CLIP 分数更高则保留 CLIP 分数)。
+			// A keyword hit has no continuous similarity to use, so it gets the
+			// MinScore floor score — sitting exactly at the filter line, it neither
+			// gets filtered out by its own threshold nor overshadows a
+			// high-confidence CLIP hit (when taking the max, a higher CLIP score
+			// wins out).
 			if cur, ok := score[id]; !ok || params.MinScore > cur {
 				score[id] = params.MinScore
 			}
@@ -88,7 +98,7 @@ func BuildThemeMoments(ctx context.Context, db *sql.DB, searcher clipTextSearche
 	for id, s := range score {
 		takenAt, ok := pool[id]
 		if !ok {
-			continue // 不在候选池(回收站/离线/文档/live photo 视频侧/无 taken_at)。
+			continue // Not in the candidate pool (trash/offline/document/live photo companion video/no taken_at).
 		}
 		assets = append(assets, MomentAsset{AssetID: id, Score: s})
 		if from.IsZero() || takenAt.Before(from) {
@@ -103,8 +113,9 @@ func BuildThemeMoments(ctx context.Context, db *sql.DB, searcher clipTextSearche
 		return nil, nil
 	}
 
-	// 按分数降序、同分按 id 排序,保证多轮重算的成员顺序确定、可复现(与
-	// trip 引擎按 taken_at 排序同样的稳定性诉求)。
+	// Sorted by score descending, ties broken by id, guaranteeing a
+	// deterministic, reproducible member order across recompute rounds (the
+	// same stability requirement as the trip engine sorting by taken_at).
 	sort.Slice(assets, func(i, j int) bool {
 		if assets[i].Score != assets[j].Score {
 			return assets[i].Score > assets[j].Score
@@ -126,16 +137,20 @@ func BuildThemeMoments(ctx context.Context, db *sql.DB, searcher clipTextSearche
 	return []MomentDraft{draft}, nil
 }
 
-// matchCaptionKeywords 返回 asset_caption 中文本"词边界命中"任一关键词的资产
-// id 去重列表。
+// matchCaptionKeywords returns a deduplicated list of asset ids whose
+// asset_caption text has a "word-boundary hit" for any of the keywords.
 //
-// 真机验收踩坑:早期实现直接照搬 docscore/ocrSearch 的
-// instr(lower(text), lower(?)) > 0 子串判据,SQLite 无 REGEXP、只能子串匹配,
-// 结果是"cat"⊂vacation/location、"pet"⊂carpet、"ice"⊂nice/service 全部
-// 误命中,导致 theme:pets/theme:snow 命中过宽(全库 6882 张里分别命中
-// 1306/1610 张)。修复:SQL 先用 instr 粗筛缩小候选集(避免全表扫描,子串
-// 命中是词边界命中的必要条件、不会漏筛),再在 Go 侧用 `\bkw\b` 正则精滤
-// ——caption 是英文文本,\b 的单词字符语义可靠。
+// A pitfall found in real-device testing: the early implementation directly
+// reused docscore/ocrSearch's instr(lower(text), lower(?)) > 0 substring
+// criterion; SQLite has no REGEXP, only substring matching, and the result
+// was that "cat"⊂vacation/location, "pet"⊂carpet, "ice"⊂nice/service were
+// all falsely matched, causing theme:pets/theme:snow to over-match (out of
+// 6882 photos library-wide, they matched 1306/1610 respectively). Fix: SQL
+// first does a coarse pass with instr to shrink the candidate set (avoiding a
+// full table scan; a substring hit is a necessary condition for a
+// word-boundary hit, so nothing is missed), then does a precise pass on the
+// Go side with a `\bkw\b` regex — captions are English text, so \b's word-
+// character semantics are reliable.
 func matchCaptionKeywords(ctx context.Context, db *sql.DB, keywords []string) ([]string, error) {
 	if len(keywords) == 0 {
 		return nil, nil
@@ -165,7 +180,7 @@ func matchCaptionKeywords(ctx context.Context, db *sql.DB, keywords []string) ([
 			return nil, fmt.Errorf("moments: scan caption keyword hit: %w", err)
 		}
 		if seen[id] {
-			continue // 同一资产可能有多条 caption 行,去重不重复加入结果。
+			continue // The same asset can have multiple caption rows; dedup avoids adding it to the result more than once.
 		}
 		for _, re := range boundaryRe {
 			if re.MatchString(text) {
@@ -178,13 +193,16 @@ func matchCaptionKeywords(ctx context.Context, db *sql.DB, keywords []string) ([
 	return out, rows.Err()
 }
 
-// loadThemeCandidatePool 查询 theme 引擎的候选池:status='indexed'、非回收站
-// (deleted_at IS NULL AND offline=0)、排除文档(hasOcrExpr 取反)、排除
-// is_live_photo_video(与 trip 引擎的 loadTripCandidates 同一批判据,见
-// moments_trip.go 顶部注释——理由同样适用于 theme:live photo 视频侧不该被当
-// 成独立照片计入主题成员),且要求 taken_at 非空(否则无法纳入
-// TimeFrom/TimeTo 的成员时间范围计算)。返回 id → taken_at 的映射,供
-// BuildThemeMoments 与两路命中的并集取交集。
+// loadThemeCandidatePool queries the theme engine's candidate pool:
+// status='indexed', not trashed (deleted_at IS NULL AND offline=0), excludes
+// documents (the negation of hasOcrExpr), excludes is_live_photo_video (the
+// same criteria as the trip engine's loadTripCandidates, see the comment at
+// the top of moments_trip.go — the reasoning applies equally to theme: a
+// live photo's companion video shouldn't be counted as an independent photo
+// among the theme members), and requires non-null taken_at (otherwise it
+// can't be folded into the TimeFrom/TimeTo member time-range computation).
+// Returns a map of id → taken_at, for BuildThemeMoments to intersect with the
+// union of both paths' hits.
 func loadThemeCandidatePool(ctx context.Context, db *sql.DB) (map[string]time.Time, error) {
 	rows, err := db.QueryContext(ctx, `
 		SELECT a.id, a.taken_at
@@ -207,7 +225,7 @@ func loadThemeCandidatePool(ctx context.Context, db *sql.DB) (map[string]time.Ti
 		}
 		t := parseSQLiteTime(ts)
 		if t == nil {
-			continue // taken_at 已在 WHERE 里限定非空,这里只是双重保险。
+			continue // taken_at is already constrained non-null in the WHERE clause; this is just a belt-and-suspenders check.
 		}
 		out[id] = *t
 	}

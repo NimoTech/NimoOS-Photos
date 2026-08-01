@@ -42,5 +42,5 @@ func TestGetConfig_EffectiveWatchDirs_AutoModeNonEmpty(t *testing.T) {
 	body := getConfigJSON(t, h)
 	eff, ok := body["effectiveWatchDirs"].([]interface{})
 	require.True(t, ok, "effectiveWatchDirs must be an array")
-	require.NotEmpty(t, eff) // EnumerateScanRoots 兜底返回 ["/DATA"]
+	require.NotEmpty(t, eff) // EnumerateScanRoots falls back to ["/DATA"]
 }

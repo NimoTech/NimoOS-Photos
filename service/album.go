@@ -52,8 +52,9 @@ func (s *AlbumService) List() ([]Album, error) {
 	//    AND still visible (guards against a chosen-but-offline/deleted cover).
 	// 2. Aesthetic implicit fallback: when no valid explicit cover exists, pick the
 	//    member with the highest aesthetic_score (NULL scores last, then position/rowid
-	//    as the stable tiebreaker). 用户知情取舍:未手动选封面时,新入高分照片会
-	//    顶掉旧隐式封面(spec 2026-07-10)。
+	//    as the stable tiebreaker). This is a deliberate, user-visible tradeoff: when no
+	//    cover was manually picked, a newly-arrived high-scoring photo can bump out
+	//    the previous implicit cover (spec 2026-07-10).
 	rows, err := s.db.Query(`
 		SELECT a.id, a.name, a.created_at,
 		       COALESCE(
@@ -108,8 +109,9 @@ func (s *AlbumService) Get(id string) (*Album, error) {
 	//   AND still visible (not soft-deleted, not offline).
 	// - Aesthetic implicit fallback: when no valid explicit cover exists, pick the
 	//   member with the highest aesthetic_score (NULL scores last, then position/rowid
-	//   as the stable tiebreaker). 用户知情取舍:未手动选封面时,新入高分照片会
-	//   顶掉旧隐式封面(spec 2026-07-10)。
+	//   as the stable tiebreaker). This is a deliberate, user-visible tradeoff: when no
+	//   cover was manually picked, a newly-arrived high-scoring photo can bump out
+	//   the previous implicit cover (spec 2026-07-10).
 	err := s.db.QueryRow(`
 		SELECT id, name, created_at,
 		       COALESCE(

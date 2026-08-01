@@ -33,8 +33,9 @@ func TestMcpReadSkip(t *testing.T) {
 	}
 }
 
-// TestMediaGetSkip 是 mediaGetSkip 的单元测试：thumbnail/preview/sprite 等
-// 后缀白名单必须限定 GET，POST 命中同后缀（如 /smart-views/preview）不得放行。
+// TestMediaGetSkip is the unit test for mediaGetSkip: the thumbnail/preview/sprite
+// suffix whitelist must be GET-only; a POST hitting the same suffix (e.g.
+// /smart-views/preview) must not be let through.
 func TestMediaGetSkip(t *testing.T) {
 	base := common.V1APIPath
 	cases := []struct {
@@ -47,12 +48,12 @@ func TestMediaGetSkip(t *testing.T) {
 		{"GET assets/:id/thumbnail allowed", http.MethodGet, base + "/assets/:id/thumbnail", true},
 		{"GET favorites/export allowed", http.MethodGet, base + "/favorites/export", true},
 		{"GET albums/:id/export allowed", http.MethodGet, base + "/albums/:id/export", true},
-		{"POST albums/:id/export NOT allowed (方法前置校验)", http.MethodPost, base + "/albums/:id/export", false},
+		{"POST albums/:id/export NOT allowed (method pre-check)", http.MethodPost, base + "/albums/:id/export", false},
 		{"GET smart-views/:id/export allowed", http.MethodGet, base + "/smart-views/:id/export", true},
-		{"POST smart-views/:id/export NOT allowed (既有 POST 路由不应被误放行)", http.MethodPost, base + "/smart-views/:id/export", false},
-		{"POST smart-views/preview NOT allowed (碰撞回归)", http.MethodPost, base + "/smart-views/preview", false},
-		{"POST assets/:id/preview (若存在) NOT allowed", http.MethodPost, base + "/assets/:id/preview", false},
-		{"PUT assets/:id/sprite (若存在) NOT allowed", http.MethodPut, base + "/assets/:id/sprite", false},
+		{"POST smart-views/:id/export NOT allowed (existing POST route must not be wrongly let through)", http.MethodPost, base + "/smart-views/:id/export", false},
+		{"POST smart-views/preview NOT allowed (collision regression)", http.MethodPost, base + "/smart-views/preview", false},
+		{"POST assets/:id/preview (if present) NOT allowed", http.MethodPost, base + "/assets/:id/preview", false},
+		{"PUT assets/:id/sprite (if present) NOT allowed", http.MethodPut, base + "/assets/:id/sprite", false},
 	}
 	for _, c := range cases {
 		if got := mediaGetSkip(c.method, c.path); got != c.want {
@@ -61,12 +62,15 @@ func TestMediaGetSkip(t *testing.T) {
 	}
 }
 
-// newTestJWTRouter 搭建一个与 InitRouter 中 JWT 中间件完全同构（同一份
-// Skipper 逻辑：mediaGetSkip + mcpReadSkip）的最小 Echo 实例，并注册与生产
-// 环境路径前缀相同、且存在"POST /smart-views/preview 与 GET */preview"
-// 后缀碰撞风险的路由，用来在真实 HTTP 请求层面（而非仅调用裸函数）复现/回
-// 归验证审查者报告的鉴权绕过问题。ParseTokenFunc 恒失败，模拟"未带/带无效
-// JWT"的请求 —— 只要 Skipper 没有误放行，中间件必然返回 401。
+// newTestJWTRouter builds a minimal Echo instance whose JWT middleware is
+// structurally identical to InitRouter's (the same Skipper logic:
+// mediaGetSkip + mcpReadSkip), and registers routes with the same production
+// path prefix that carry the "POST /smart-views/preview vs GET */preview"
+// suffix-collision risk — used to reproduce/regress the auth-bypass issue
+// reported by the reviewer at the real HTTP request layer (not just by
+// calling the bare functions). ParseTokenFunc always fails, simulating a
+// request with "no/invalid JWT" — as long as the Skipper doesn't wrongly
+// let it through, the middleware must return 401.
 func newTestJWTRouter() *echo.Echo {
 	e := echo.New()
 	e.Use(echo_middleware.JWTWithConfig(echo_middleware.JWTConfig{
@@ -87,10 +91,13 @@ func newTestJWTRouter() *echo.Echo {
 		ParseTokenFunc: func(token string, c echo.Context) (interface{}, error) {
 			return nil, echo.ErrUnauthorized
 		},
-		// 与生产配置（router.go）保持一致：自定义提取器只做 TrimPrefix，
-		// 缺失 Authorization 头时返回空串而不报错，交由 ParseTokenFunc 判定失败。
-		// 若省略此项，Echo 会退回默认 header 提取器，请求缺头时会在提取阶段
-		// 就以 400（而非生产实际会看到的 401）短路，掩盖真实行为。
+		// Kept consistent with the production config (router.go): the custom
+		// extractor only does TrimPrefix, returning an empty string when the
+		// Authorization header is missing rather than erroring, leaving
+		// ParseTokenFunc to fail it. If this were omitted, Echo would fall back
+		// to its default header extractor, which short-circuits with 400 (instead
+		// of the 401 actually seen in production) when the header is missing,
+		// masking the real behavior.
 		TokenLookupFuncs: []echo_middleware.ValuesExtractor{
 			func(c echo.Context) ([]string, error) {
 				auth := c.Request().Header.Get(echo.HeaderAuthorization)
@@ -108,12 +115,15 @@ func newTestJWTRouter() *echo.Echo {
 	return e
 }
 
-// TestJWTExemption_PreviewSuffixCollision 是 route 层回归测试：
-//  1. 无 Authorization 头的 POST /smart-views/preview 必须被 JWT 中间件拒绝
-//     （审查者复现的鉴权绕过：修复前该请求会被 "/preview" 后缀白名单误放行，
-//     返回 200；本用例在修复前会 FAIL，修复后 PASS）。
-//  2. 无 Authorization 头的 GET /assets/:id/preview、GET /assets/:id/sprite
-//     仍应正常放行进入 handler（媒体豁免不能被误伤）。
+// TestJWTExemption_PreviewSuffixCollision is a route-layer regression test:
+//  1. POST /smart-views/preview without an Authorization header must be
+//     rejected by the JWT middleware (the auth bypass reproduced by the
+//     reviewer: before the fix, this request would be wrongly let through by
+//     the "/preview" suffix whitelist and return 200; this case FAILs before
+//     the fix and PASSes after).
+//  2. GET /assets/:id/preview and GET /assets/:id/sprite without an
+//     Authorization header should still be let through to the handler as
+//     normal (the media exemption must not be broken).
 func TestJWTExemption_PreviewSuffixCollision(t *testing.T) {
 	e := newTestJWTRouter()
 
@@ -121,17 +131,17 @@ func TestJWTExemption_PreviewSuffixCollision(t *testing.T) {
 	postRec := httptest.NewRecorder()
 	e.ServeHTTP(postRec, post)
 	require.Equal(t, http.StatusUnauthorized, postRec.Code,
-		"POST /smart-views/preview 不应被 /preview 后缀白名单误放行（鉴权绕过回归）")
+		"POST /smart-views/preview must not be wrongly let through by the /preview suffix whitelist (auth bypass regression)")
 
 	getPreview := httptest.NewRequest(http.MethodGet, common.V1APIPath+"/assets/abc/preview", nil)
 	getPreviewRec := httptest.NewRecorder()
 	e.ServeHTTP(getPreviewRec, getPreview)
 	require.Equal(t, http.StatusOK, getPreviewRec.Code,
-		"GET /assets/:id/preview 应保持 JWT 豁免、正常进入 handler")
+		"GET /assets/:id/preview should remain JWT-exempt and reach the handler normally")
 
 	getSprite := httptest.NewRequest(http.MethodGet, common.V1APIPath+"/assets/abc/sprite", nil)
 	getSpriteRec := httptest.NewRecorder()
 	e.ServeHTTP(getSpriteRec, getSprite)
 	require.Equal(t, http.StatusOK, getSpriteRec.Code,
-		"GET /assets/:id/sprite 应保持 JWT 豁免、正常进入 handler")
+		"GET /assets/:id/sprite should remain JWT-exempt and reach the handler normally")
 }

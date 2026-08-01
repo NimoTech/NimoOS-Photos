@@ -27,10 +27,12 @@ import (
 // preview/favorites/export/albums export/smart-views export). These are matched by PATH SUFFIX ONLY (Echo's
 // c.Path() is the route pattern, e.g. "/v1/photos/assets/:id/preview", and
 // does not encode the HTTP method), so this check MUST be GET-only:
-// method 前置校验不可省略 —— 否则会连带放行同后缀的写接口，例如
-// POST /v1/photos/smart-views/preview 会被误判命中 "/preview" 后缀而整体
-// 绕过 JWT 鉴权（复现过：无 Authorization 头的该 POST 请求返回 200）。
-// 媒体豁免名单里注册的路由全部是 GET，因此这里显式加 GET 前置条件兜底。
+// The method pre-check must not be dropped — otherwise write endpoints sharing
+// the same suffix get let through too, e.g. POST /v1/photos/smart-views/preview
+// would be wrongly matched by the "/preview" suffix and bypass JWT entirely
+// (reproduced before: that POST request without an Authorization header returned 200).
+// Every route registered in the media-exemption list is GET, hence the explicit
+// GET pre-condition guard here.
 func mediaGetSkip(method, path string) bool {
 	if method != http.MethodGet {
 		return false
@@ -42,15 +44,17 @@ func mediaGetSkip(method, path string) bool {
 		strings.HasSuffix(path, "/sprite") ||
 		strings.HasSuffix(path, "/preview") ||
 		strings.HasSuffix(path, "/favorites/export") ||
-		// 手动相册 ZIP 下载：window.location.href 浏览器导航同样发不出
-		// Authorization 头，与 favorites/export 同款 query-token 兜底方案
-		// （见 albums.go AlbumsHandler.Export）。字面量后缀精确匹配路由
-		// pattern（":id" 是字面文本，不是真实 id），不会误伤其它 /export 路由。
+		// Manual-album ZIP download: window.location.href browser navigation
+		// can't send an Authorization header either, same query-token fallback
+		// as favorites/export (see albums.go AlbumsHandler.Export). The literal
+		// suffix matches the route pattern exactly (":id" is literal text, not
+		// a real id), so it won't accidentally catch other /export routes.
 		strings.HasSuffix(path, "/albums/:id/export") ||
-		// 智能相册 ZIP 下载（GET+token 新端点，修 UI location.href 断链，见
-		// smartviews.go SmartViewsHandler.ExportZip）：与 albums 同款字面量
-		// 后缀精确匹配，且 GET-only 前置校验继续挡住同后缀的既有 POST /export
-		// （format=zip|album）不被误放行。
+		// Smart-album ZIP download (new GET+token endpoint fixing the UI's
+		// broken location.href link, see smartviews.go SmartViewsHandler.ExportZip):
+		// same literal suffix match as albums, and the GET-only pre-check still
+		// blocks the existing POST /export (format=zip|album) on the same suffix
+		// from being wrongly let through.
 		strings.HasSuffix(path, "/smart-views/:id/export")
 }
 
@@ -178,7 +182,8 @@ func InitRouter(ctx context.Context, svc service.Services, runtimePath string, t
 	g.PATCH("/albums/:id", albums.Update)
 	g.PATCH("/albums/:id/assets/order", albums.Reorder)
 
-	// 手动↔智能相册原地互转(智能→手动方向;手动→智能见 smart-views 路由组)
+	// In-place manual↔smart album conversion (smart→manual direction; manual→smart
+	// is in the smart-views route group)
 	g.POST("/albums/from-smartview", albums.FromSmartView)
 
 	// Places
@@ -200,7 +205,7 @@ func InitRouter(ctx context.Context, svc service.Services, runtimePath string, t
 	g.GET("/favorites/export", favorites.Export)
 	g.GET("/favorites/top", favorites.Top)
 
-	// Trash（回收站）
+	// Trash
 	g.GET("/trash", trash.List)
 	g.POST("/trash/restore", trash.RestoreBatch)
 	g.POST("/trash/empty", trash.Empty)
@@ -265,16 +270,16 @@ func InitRouter(ctx context.Context, svc service.Services, runtimePath string, t
 	g.PUT("/moments/order", moments.ReorderMoments)
 	g.DELETE("/moments/:id", moments.Delete)
 
-	// 构造 upload Store(连接 photos.db),供 TUS handler 与 uploads API 共用。
+	// Construct the upload Store (backed by photos.db), shared by the TUS handler and the uploads API.
 	uploadStore := uploadstore.NewStore(svc.DB())
 
-	// 注册 uploads 列出/详情/取消接口。
+	// Register the uploads list/detail/cancel endpoints.
 	uploadTasks := v1.NewUploadTasksHandler(uploadStore)
 	g.GET("/uploads", uploadTasks.ListUploads)
 	g.GET("/uploads/:id", uploadTasks.GetUpload)
 	g.POST("/uploads/:id/cancel", uploadTasks.CancelUpload)
 
-	// 启动分级 GC(后台 goroutine)。
+	// Start the tiered GC (background goroutine).
 	commonUpload.StartGC(uploadStore, commonUpload.GCConfig{
 		StagingDir:     common.StagingDir,
 		PausedTTL:      commonUpload.DefaultPausedTTLSeconds,

@@ -1,18 +1,24 @@
-// family 画像引擎:把"用户自己家人"从人脸聚类结果里挖出来——高频出现的
-// person(persons 表)归纳为画像实体,再产出两类时刻:高频人物同框的"合影
-// 集",以及已命名人物各自的"Through the Years"。区分信号沿用画像层一贯
-// 逻辑——复现性(自己家人反复出现,不像宠物有词表可匹配,家人靠人脸聚类
-// 频次判断),详见设计 spec 第一/二节。
+// The family profile engine: mines "the user's own family" out of face
+// clustering results — a frequently-appearing person (the persons table) is
+// inferred as a profile entity, then produces two kinds of moments: a
+// "together" collection of photos where frequent people co-occur, and a
+// "Through the Years" for each named person. The distinguishing signal
+// follows the profile layer's usual logic — recurrence (the user's own family
+// keeps reappearing; unlike pets there's no lexicon to match against, family
+// is judged by face-clustering frequency); see the design spec §1/§2 for
+// details.
 //
-// 三段职责:
-//   - MinePersonEntities:纯挖掘,统计 persons 出现频次(distinct asset,
-//     排除 excluded 人脸与 hidden 人物,join 写法照 persons.go
-//     ListPersons),达标(>= MinPersonPhotos)取前 TopPersons,不落库、不碰
-//     moments 表。
-//   - BuildFamilyMoments:挖掘 → ReplaceEntities 落画像表 → 合影集 draft
-//     (top 实体中 ≥ MinTogetherPersons 人同框)+ 具名人物 drafts(label
-//     非空者各一个),供 MomentsService.recomputeRecipe 走共用选优/落库
-//     管线,与 pet/trip/theme 引擎同一套装配方式。
+// Three responsibilities:
+//   - MinePersonEntities: pure mining. Tallies each person's appearance
+//     frequency (distinct assets, excluding excluded faces and hidden
+//     persons, join style mirrors persons.go's ListPersons); those that
+//     qualify (>= MinPersonPhotos) take the top TopPersons; doesn't persist,
+//     doesn't touch the moments table.
+//   - BuildFamilyMoments: mine → ReplaceEntities persists the profile table →
+//     a "together" draft (≥ MinTogetherPersons of the top entities co-occur)
+//     and named-person drafts (one per entity with a non-empty label), fed
+//     into MomentsService.recomputeRecipe's shared curation/persist
+//     pipeline — the same assembly approach as the pet/trip/theme engines.
 package service
 
 import (
@@ -25,15 +31,17 @@ import (
 	"time"
 )
 
-// personEvidence 是 person 实体挖掘依据的 JSON 快照结构,落
-// ProfileEntity.EvidenceJSON,供排障与后续升级读取,不参与查询过滤。
+// personEvidence is the JSON snapshot structure for the person entity mining
+// evidence, persisted to ProfileEntity.EvidenceJSON for troubleshooting and
+// future upgrades to read; it doesn't participate in query filtering.
 type personEvidence struct {
 	PhotoCount int    `json:"photo_count"`
 	First      string `json:"first"`
 	Last       string `json:"last"`
 }
 
-// personFreq 是 person 出现频次挖掘的一行中间结果(未落 ProfileEntity 前)。
+// personFreq is one row of intermediate result from person-frequency mining
+// (before being persisted as a ProfileEntity).
 type personFreq struct {
 	personID string
 	name     string
@@ -42,20 +50,29 @@ type personFreq struct {
 	last     time.Time
 }
 
-// MinePersonEntities 是 family 画像挖掘的纯函数入口:统计 persons 出现频次
-// (distinct asset,join 写法照 persons.go ListPersons——face_person join
-// face_detections 且 excluded=0、join persons 且 hidden=0),assets 侧判据
-// 逐字对齐 loadThemeCandidatePool(moments_theme.go)的候选池口径——
-// status='indexed'、非回收站(deleted_at IS NULL AND offline=0)、排除文档
-// (hasOcrExpr 取反)、排除 is_live_photo_video、要求 taken_at 非空——否则
-// 频次达标计数会虚高于成员侧实际可用的候选池(成员侧 buildTogetherDraft/
-// buildNamedPersonDraft 都要与候选池取交集,若挖掘口径更宽松,可能出现
-// "达标了但成员数怎么都凑不够 MinAssets"的口径落差)。
-// photo_count >= MinPersonPhotos 才达标;达标者按频次降序(并列按
-// person_id 字典序稳定,保证多轮挖掘结果确定、可复现)取前 TopPersons。
-// 未命名人物(persons.name 为空)同样参与挖掘、可以入选实体——"具名"的
-// 门槛只在 BuildFamilyMoments 产出个人 draft 时才生效,画像表本身如实记录
-// 挖掘结果,不因未命名而排除(与用户后续去 People 页面补名字的时序解耦)。
+// MinePersonEntities is the pure-function entry point for family profile
+// mining: tallies each person's appearance frequency (distinct assets, join
+// style mirrors persons.go's ListPersons — face_person joins face_detections
+// with excluded=0, joins persons with hidden=0); the assets-side criterion is
+// aligned character-for-character with loadThemeCandidatePool's
+// (moments_theme.go) candidate pool criteria — status='indexed', not trashed
+// (deleted_at IS NULL AND offline=0), excludes documents (the negation of
+// hasOcrExpr), excludes is_live_photo_video, requires non-null taken_at —
+// otherwise the frequency-qualification count could inflate above the
+// candidate pool actually available on the member side (both
+// buildTogetherDraft/buildNamedPersonDraft on the member side intersect with
+// the candidate pool, and a looser mining criterion could produce a
+// discrepancy of "it qualified, but the member count never reaches
+// MinAssets"). photo_count >= MinPersonPhotos is required to qualify;
+// qualifying entities are sorted by frequency descending (ties broken
+// stably by person_id lexical order, guaranteeing deterministic,
+// reproducible mining results across rounds), taking the top TopPersons.
+// Unnamed persons (persons.name empty) participate in mining and can be
+// selected as entities too — the "named" bar only takes effect when
+// BuildFamilyMoments produces the individual draft; the profile table itself
+// faithfully records the mining result, not excluding an entity for being
+// unnamed (decoupled from the timing of the user later adding a name on the
+// People page).
 func MinePersonEntities(ctx context.Context, db *sql.DB, recipe MomentRecipe) ([]ProfileEntity, error) {
 	params, err := ParseParams(recipe)
 	if err != nil {
@@ -122,18 +139,26 @@ func MinePersonEntities(ctx context.Context, db *sql.DB, recipe MomentRecipe) ([
 	return out, nil
 }
 
-// BuildFamilyMoments 是 family 引擎入口:先 MinePersonEntities 挖掘全库
-// 达标高频人物 → profileStore.ReplaceEntities("person", ...) 幂等落画像表
-// (无达标实体也要以空集调用,清空上一轮画像)→ 产出两类 draft:
-//   - 合影集(top 实体中 ≥ MinTogetherPersons 人同框的照片,至多一个,id 固定
-//     为 ProfileEntityID("family","together"));
-//   - 具名人物时刻(label 非空的实体各一个,id=实体 id,成员=该人全部照片)。
+// BuildFamilyMoments is the family engine's entry point: first
+// MinePersonEntities mines the library-wide qualifying frequent persons →
+// profileStore.ReplaceEntities("person", ...) persists the profile table
+// idempotently (must be called with an empty set even when there are no
+// qualifying entities, to clear the previous round's profile) → produces two
+// kinds of draft:
+//   - A "together" collection (photos where ≥ MinTogetherPersons of the top
+//     entities co-occur, at most one, with the id fixed as
+//     ProfileEntityID("family","together"));
+//   - Named-person moments (one per entity with a non-empty label, id=the
+//     entity's id, members=all of that person's photos).
 //
-// 两类 draft 的成员都要与候选池(loadThemeCandidatePool,排除回收站/离线/
-// 文档/live photo 视频侧,同 theme/trip 引擎判据)取交集,且 >= MinAssets
-// 才产出;成员 Score 统一置 0——不像 pet/theme 引擎有 CLIP 分数可用,精选交
-// 给 PickFeaturedAndCover 事后按美学分挑(与 trip 引擎同法,见
-// BuildTripMoments)。无达标实体返回空切片(不是错误)。
+// Both kinds of draft's members must intersect with the candidate pool
+// (loadThemeCandidatePool, which excludes trash/offline/documents/live photo
+// companion videos — the same criteria as the theme/trip engines), and are
+// only produced once >= MinAssets; member Score is uniformly set to 0 —
+// unlike the pet/theme engines which have a CLIP score available, curation is
+// left to PickFeaturedAndCover to pick by aesthetic score afterward (the same
+// approach as the trip engine, see BuildTripMoments). Returns an empty slice
+// (not an error) when there are no qualifying entities.
 func BuildFamilyMoments(ctx context.Context, db *sql.DB, profileStore *ProfileStore, recipe MomentRecipe) ([]MomentDraft, error) {
 	entities, err := MinePersonEntities(ctx, db, recipe)
 	if err != nil {
@@ -167,8 +192,10 @@ func BuildFamilyMoments(ctx context.Context, db *sql.DB, profileStore *ProfileSt
 
 	for _, e := range entities {
 		if e.Label == "" {
-			// 未命名人物不产出个人 draft:避免展示 "Person 1" 这类无意义占位名,
-			// 自然激励用户去 People 页面命名(见设计 spec 第二节)。
+			// An unnamed person doesn't produce an individual draft: avoids
+			// showing a meaningless placeholder name like "Person 1", naturally
+			// nudging the user toward naming them on the People page (see design
+			// spec §2).
 			continue
 		}
 		draft, err := buildNamedPersonDraft(ctx, db, e, pool, recipe, params)
@@ -183,19 +210,22 @@ func BuildFamilyMoments(ctx context.Context, db *sql.DB, profileStore *ProfileSt
 	return drafts, nil
 }
 
-// buildTogetherDraft 查询 top 实体中 ≥ MinTogetherPersons 人同框的照片
-// (face_person/face_detections join,GROUP BY asset HAVING COUNT(DISTINCT
-// person_id) >= N,excluded 排除惯例同 MinePersonEntities),与候选池取交集,
-// 达标(>= MinAssets)才返回 draft,否则返回 nil(不是错误)。
+// buildTogetherDraft queries photos where ≥ MinTogetherPersons of the top
+// entities co-occur (a face_person/face_detections join, GROUP BY asset
+// HAVING COUNT(DISTINCT person_id) >= N, the excluded-exclusion convention
+// same as MinePersonEntities), intersects with the candidate pool, and only
+// returns a draft once qualifying (>= MinAssets); otherwise returns nil (not
+// an error).
 func buildTogetherDraft(ctx context.Context, db *sql.DB, entities []ProfileEntity, pool map[string]time.Time, recipe MomentRecipe, params RecipeParams) (*MomentDraft, error) {
 	personIDs := make([]string, len(entities))
 	for i, e := range entities {
 		personIDs[i] = e.Key
 	}
 	if len(personIDs) == 0 {
-		// 防御:调用方 BuildFamilyMoments 在 entities 为空时已提前返回,这里
-		// 理论不可达;但 strings.Repeat(..., -1) 会 panic,加一行防御比依赖
-		// "调用方总是先检查"更稳妥。
+		// Defensive: the caller BuildFamilyMoments already returns early when
+		// entities is empty, so this is theoretically unreachable; but
+		// strings.Repeat(..., -1) would panic, and adding this guard is safer
+		// than relying on "the caller always checks first".
 		return nil, nil
 	}
 	placeholders := strings.Repeat("?,", len(personIDs)-1) + "?"
@@ -227,7 +257,7 @@ func buildTogetherDraft(ctx context.Context, db *sql.DB, entities []ProfileEntit
 		}
 		takenAt, ok := pool[id]
 		if !ok {
-			continue // 不在候选池(回收站/离线/文档/live photo 视频侧/无 taken_at)。
+			continue // Not in the candidate pool (trash/offline/document/live photo companion video/no taken_at).
 		}
 		assets = append(assets, MomentAsset{AssetID: id})
 		if from.IsZero() || takenAt.Before(from) {
@@ -259,9 +289,10 @@ func buildTogetherDraft(ctx context.Context, db *sql.DB, entities []ProfileEntit
 	}, nil
 }
 
-// buildNamedPersonDraft 查询某具名人物(label 非空)的全部照片(排除
-// excluded 人脸),与候选池取交集,达标(>= MinAssets)才返回 draft,否则
-// 返回 nil(不是错误)。
+// buildNamedPersonDraft queries all photos of a named person (non-empty
+// label, excluding excluded faces), intersects with the candidate pool, and
+// only returns a draft once qualifying (>= MinAssets); otherwise returns nil
+// (not an error).
 func buildNamedPersonDraft(ctx context.Context, db *sql.DB, e ProfileEntity, pool map[string]time.Time, recipe MomentRecipe, params RecipeParams) (*MomentDraft, error) {
 	rows, err := db.QueryContext(ctx, `
 		SELECT DISTINCT fd.asset_id
@@ -282,7 +313,7 @@ func buildNamedPersonDraft(ctx context.Context, db *sql.DB, e ProfileEntity, poo
 		}
 		takenAt, ok := pool[id]
 		if !ok {
-			continue // 不在候选池(回收站/离线/文档/live photo 视频侧/无 taken_at)。
+			continue // Not in the candidate pool (trash/offline/document/live photo companion video/no taken_at).
 		}
 		assets = append(assets, MomentAsset{AssetID: id})
 		if from.IsZero() || takenAt.Before(from) {

@@ -47,7 +47,7 @@ func TestListPersons_PlacesCount(t *testing.T) {
 	a[0] = 1.0
 	insertAssetFace(t, db, "pl-a1", normalize(a))
 	insertAssetFace(t, db, "pl-a2", normalize(a))
-	// 给两张 asset 不同 GPS（粗粒度 cell 不同），asset_exif 行
+	// Give the two assets different GPS (different coarse-grained cell), asset_exif rows
 	_, err := db.Exec(`INSERT INTO asset_exif(asset_id, latitude, longitude) VALUES('pl-a1', 35.6, 139.6)`)
 	require.NoError(t, err)
 	_, err = db.Exec(`INSERT INTO asset_exif(asset_id, latitude, longitude) VALUES('pl-a2', 37.7, -122.4)`)
@@ -59,7 +59,7 @@ func TestListPersons_PlacesCount(t *testing.T) {
 	require.Len(t, list, 1)
 	require.Equal(t, 2, list[0].PlacesCount)
 
-	// 软删 a2 后 places 应减为 1
+	// After soft-deleting a2, places should drop to 1
 	_, err = db.Exec(`UPDATE assets SET deleted_at='2026-05-01 00:00:00' WHERE id='pl-a2'`)
 	require.NoError(t, err)
 	list2, err := service.NewPersonService(db).ListPersons()
@@ -70,13 +70,13 @@ func TestListPersons_PlacesCount(t *testing.T) {
 
 func TestFacesIndexedUpTo(t *testing.T) {
 	db := makeTestFaceDB(t)
-	// 空库
+	// Empty database
 	ps := service.NewPersonService(db)
 	ts, err := ps.FacesIndexedUpTo()
 	require.NoError(t, err)
 	require.Nil(t, ts)
 
-	// 有脸：插入 asset + indexed_at + face
+	// Has a face: insert asset + indexed_at + face
 	_, err = db.Exec(`INSERT INTO assets(id, file_path, status, indexed_at) VALUES('fi-a', '/x/fi-a.jpg', 'indexed', '2026-05-01 12:00:00')`)
 	require.NoError(t, err)
 	_, err = db.Exec(`INSERT INTO face_detections(id, asset_id, bbox, embedding) VALUES('fi-f', 'fi-a', '{}', X'00000000')`)
@@ -173,7 +173,7 @@ func TestPersonRelations(t *testing.T) {
 	a[0] = 1.0
 	b := make([]float32, dim)
 	b[1] = 1.0
-	// 同一张 asset 内放 A、B 两张脸 → 共现
+	// Put faces A and B on the same asset → co-occurrence
 	_, err := db.Exec(`INSERT INTO assets(id, file_path, status) VALUES('shared','/x/s.jpg','indexed')`)
 	require.NoError(t, err)
 	insertFaceOnAsset(t, db, "shared", normalize(a))
@@ -215,7 +215,7 @@ func TestPersonPlaces(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, pts, 2)
 
-	// 至少一个点带 TakenAt（pp-a1 有 taken_at）
+	// At least one point should carry TakenAt (pp-a1 has taken_at)
 	hasTime := false
 	for _, p := range pts {
 		if p.TakenAt != nil {
@@ -286,7 +286,7 @@ func TestMergeSuggestions_StableOrder(t *testing.T) {
 	insertAssetFace(t, db, "so-c", normalize(c))
 	require.NoError(t, service.NewFaceService(db).RunClustering(context.Background()))
 
-	// 两个 person 都命名
+	// Both persons are named
 	rows, err := db.Query(`SELECT id FROM persons ORDER BY rowid`)
 	require.NoError(t, err)
 	var ids []string
@@ -329,7 +329,7 @@ func TestFaceThumbnail_CropsAndCaches(t *testing.T) {
 	writeTestJPEG(t, srcPath, 400, 300)
 	_, err := db.Exec(`INSERT INTO assets(id, file_path, status) VALUES('fa', ?, 'indexed')`, srcPath)
 	require.NoError(t, err)
-	// bbox 是基于 ML 输入图的绝对像素坐标（400×300 测试图上的人脸框）。
+	// bbox is in absolute pixel coordinates on the ML input image (a face box on a 400×300 test image).
 	_, err = db.Exec(`INSERT INTO face_detections(id, asset_id, bbox, embedding) VALUES('face1','fa',?,?)`,
 		`{"x1":100,"y1":75,"x2":240,"y2":210}`, sqlite.SerializeFloat32(make([]float32, common.FaceDim)))
 	require.NoError(t, err)
@@ -344,7 +344,7 @@ func TestFaceThumbnail_CropsAndCaches(t *testing.T) {
 	require.NoError(t, err)
 	require.Greater(t, st.Size(), int64(0))
 
-	// 第二次命中缓存：路径相同且不重建（mtime 不变即缓存命中）
+	// Second call hits the cache: same path and no rebuild (unchanged mtime means cache hit)
 	stat1, _ := os.Stat(out)
 	out2, err := ps.FaceThumbnail("pp", cacheDir, "")
 	require.NoError(t, err)
@@ -352,7 +352,7 @@ func TestFaceThumbnail_CropsAndCaches(t *testing.T) {
 	stat2, _ := os.Stat(out2)
 	require.Equal(t, stat1.ModTime(), stat2.ModTime())
 
-	// 不存在 person 返回 ErrNotFound
+	// A nonexistent person returns ErrNotFound
 	_, err = ps.FaceThumbnail("no-such", cacheDir, "")
 	require.ErrorIs(t, err, service.ErrNotFound)
 }
@@ -393,10 +393,13 @@ func TestFaceThumbnailOfflineCoverReturnsNotFound(t *testing.T) {
 	require.ErrorIs(t, err, service.ErrNotFound)
 }
 
-// 回归锁定：offline=1 的视频资产即便本地已有 thumbDir/large.jpg 缓存，
-// FaceThumbnail 也必须返回 ErrNotFound——"offline 一律隐藏/降级" 对视频源同样
-// 成立，不因为缩略图缓存还在本地就绕过。SQL 里的 a.offline=0 过滤本就已经
-// 挡住了这种情况，这条测试不改代码，只是把这个既有行为钉死防回归。
+// Regression lock: even when a video asset with offline=1 already has a local
+// thumbDir/large.jpg cache, FaceThumbnail must still return ErrNotFound —
+// "offline always hides/degrades" holds just the same for video sources, and
+// isn't bypassed just because a thumbnail cache still sits locally. The
+// a.offline=0 filter in the SQL already blocks this case; this test doesn't
+// change any code, it just pins down this existing behavior against
+// regression.
 func TestFaceThumbnailOfflineVideoWithCachedThumbReturnsNotFound(t *testing.T) {
 	db := makeTestFaceDB(t)
 	dir := t.TempDir()
@@ -422,8 +425,9 @@ func TestFaceThumbnailOfflineVideoWithCachedThumbReturnsNotFound(t *testing.T) {
 	require.ErrorIs(t, err, service.ErrNotFound)
 }
 
-// 视频源：bbox 基于关键帧（asset_exif W/H = 1920×1080），thumb large.jpg 是 1280×720。
-// FaceThumbnail 必须按 thumb/exif 比例缩放 bbox，否则坐标爆掉。
+// Video source: bbox is based on the keyframe (asset_exif W/H = 1920×1080),
+// the thumb large.jpg is 1280×720. FaceThumbnail must scale the bbox by the
+// thumb/exif ratio, otherwise the coordinates blow up.
 func TestFaceThumbnail_VideoScalesBBoxToThumb(t *testing.T) {
 	db := makeTestFaceDB(t)
 	dir := t.TempDir()
@@ -455,7 +459,7 @@ func TestFaceThumbnail_VideoScalesBBoxToThumb(t *testing.T) {
 func TestMergeSuggestions_RespectRejections(t *testing.T) {
 	db := makeTestFaceDB(t)
 	dim := 512
-	// 两个簇质心 cosine 距离落在 (dbscanEpsilon=0.6, suggestEpsilon=0.75) 带内
+	// The two clusters' centroid cosine distance falls within the (dbscanEpsilon=0.6, suggestEpsilon=0.75) band
 	a := make([]float32, dim)
 	a[0] = 1.0
 	c := make([]float32, dim)
@@ -468,7 +472,7 @@ func TestMergeSuggestions_RespectRejections(t *testing.T) {
 	ps := service.NewPersonService(db)
 	sugs, err := ps.MergeSuggestions()
 	require.NoError(t, err)
-	require.NotEmpty(t, sugs, "应至少一个建议落在距离带内")
+	require.NotEmpty(t, sugs, "at least one suggestion should fall within the distance band")
 
 	require.NoError(t, ps.RejectMerge(sugs[0].FromID, sugs[0].IntoID))
 	sugs2, err := ps.MergeSuggestions()
@@ -477,7 +481,7 @@ func TestMergeSuggestions_RespectRejections(t *testing.T) {
 		require.False(t,
 			(s.FromID == sugs[0].FromID && s.IntoID == sugs[0].IntoID) ||
 				(s.FromID == sugs[0].IntoID && s.IntoID == sugs[0].FromID),
-			"被拒绝的配对不应再出现")
+			"a rejected pair must not reappear")
 	}
 }
 
@@ -500,21 +504,21 @@ func TestDetachAssetsFromPerson_MarksExcludedAndUnbinds(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 2, removed)
 
-	// face_person 行减少
+	// face_person rows should decrease
 	var bound int
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM face_person WHERE person_id=?`, personID).Scan(&bound))
 	require.Equal(t, 1, bound)
 
-	// 被移除的脸 excluded=1
+	// The removed faces should have excluded=1
 	var excl int
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM face_detections WHERE excluded=1`).Scan(&excl))
 	require.Equal(t, 2, excl)
 
-	// 重跑聚类，excluded 脸不会再被聚回该 person
+	// Re-run clustering; excluded faces must not be clustered back into this person
 	require.NoError(t, service.NewFaceService(db).RunClustering(context.Background()))
 	list2, _ := ps.ListPersons()
 	for _, p := range list2 {
-		require.LessOrEqual(t, p.Count, 1, "excluded faces 不应再被聚回任何 person")
+		require.LessOrEqual(t, p.Count, 1, "excluded faces must not be re-clustered into any person")
 	}
 }
 
@@ -535,7 +539,7 @@ func TestDetachAssetsFromPerson_AutomaticEmptyPersonDeleted(t *testing.T) {
 
 	var n int
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM persons WHERE id=?`, personID).Scan(&n))
-	require.Equal(t, 0, n, "自动 person 移出最后一张脸后应被删除")
+	require.Equal(t, 0, n, "an automatic person should be deleted once its last face is removed")
 }
 
 func TestDetachAssetsFromPerson_AnchoredEmptyPersonKept(t *testing.T) {
@@ -549,7 +553,7 @@ func TestDetachAssetsFromPerson_AnchoredEmptyPersonKept(t *testing.T) {
 	require.Len(t, list, 1)
 	personID := list[0].ID
 
-	// 给该 person 取个名变成锚定
+	// Give this person a name to make it anchored
 	_, err := db.Exec(`UPDATE persons SET name='Alice' WHERE id=?`, personID)
 	require.NoError(t, err)
 
@@ -557,7 +561,7 @@ func TestDetachAssetsFromPerson_AnchoredEmptyPersonKept(t *testing.T) {
 	_, err = ps.DetachAssetsFromPerson(personID, []string{"dk-a1"})
 	require.NoError(t, err)
 
-	// 锚定 person 应被保留，但 cover/centroid 清空
+	// An anchored person should be kept, but cover/centroid should be cleared
 	var name string
 	var coverFace sql.NullString
 	require.NoError(t, db.QueryRow(`SELECT name, cover_face_id FROM persons WHERE id=?`, personID).Scan(&name, &coverFace))
@@ -604,17 +608,17 @@ func TestMergePersons_RecomputesCentroid(t *testing.T) {
 	from, into := list[0].ID, list[1].ID
 	require.NoError(t, service.NewSearchService(db, nil).MergePersons(from, into))
 
-	// into 名下应有 2 张脸，且 confidence 已重算。
-	// 合并前每个 person 各有 1 张脸，单脸 confidence=1.0。
-	// 合并后两个正交向量的质心余弦相似度 ≈ 0.707，必然 < 1.0。
-	// 若未重算则 confidence 仍为旧值 1.0，断言失败。
+	// into should now have 2 faces, and confidence should have been recomputed.
+	// Before merging, each person had 1 face, so a single-face confidence=1.0.
+	// After merging, the two orthogonal vectors' centroid cosine similarity ≈ 0.707, which must be < 1.0.
+	// If it wasn't recomputed, confidence would still be the old 1.0, failing the assertion.
 	var cnt int
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM face_person WHERE person_id=?`, into).Scan(&cnt))
 	require.Equal(t, 2, cnt)
 	var conf float64
 	require.NoError(t, db.QueryRow(`SELECT confidence FROM persons WHERE id=?`, into).Scan(&conf))
 	require.Greater(t, conf, 0.0)
-	require.Less(t, conf, 1.0, "confidence 应已重算（两个正交脸合并后 <1.0），若仍为 1.0 说明未重算")
+	require.Less(t, conf, 1.0, "confidence should have been recomputed (should be <1.0 after merging two orthogonal faces); if it's still 1.0, it wasn't recomputed")
 }
 
 // ---------------------------------------------------------------------------
@@ -985,12 +989,12 @@ func TestListPersons_ExcludesOfflineAssetsFromCounts(t *testing.T) {
 	ps := service.NewPersonService(db)
 	p, err := ps.GetPerson(personID)
 	require.NoError(t, err)
-	require.Equal(t, 1, p.Count, "offline 资产的脸不应计入 person 出现次数")
+	require.Equal(t, 1, p.Count, "a face on an offline asset must not count toward the person's appearance count")
 
 	list, err := ps.ListPersons()
 	require.NoError(t, err)
 	require.Len(t, list, 1)
-	require.Equal(t, 1, list[0].Count, "ListPersons 的 count 同样不应计入 offline 资产")
+	require.Equal(t, 1, list[0].Count, "ListPersons's count likewise must not count offline assets")
 }
 
 // TestPersonCoverFallsBackToHeroWhenOffline verifies the fix for the
@@ -1024,12 +1028,12 @@ func TestPersonCoverFallsBackToHeroWhenOffline(t *testing.T) {
 	// No hero set yet: cover must fall back to empty, not the offline asset.
 	p, err = ps.GetPerson(personID)
 	require.NoError(t, err)
-	require.Empty(t, p.CoverAssetID, "offline cover 应失效为空（无 hero 可回退）")
+	require.Empty(t, p.CoverAssetID, "an offline cover should collapse to empty (no hero to fall back to)")
 
 	list, err := ps.ListPersons()
 	require.NoError(t, err)
 	require.Len(t, list, 1)
-	require.Empty(t, list[0].CoverAssetID, "ListPersons 同样应回退为空")
+	require.Empty(t, list[0].CoverAssetID, "ListPersons should likewise fall back to empty")
 
 	// Now set a hero on the still-online asset — cover must fall back to it.
 	heroVal := "cov-a2"
@@ -1037,12 +1041,12 @@ func TestPersonCoverFallsBackToHeroWhenOffline(t *testing.T) {
 
 	p, err = ps.GetPerson(personID)
 	require.NoError(t, err)
-	require.Equal(t, "cov-a2", p.CoverAssetID, "offline cover 应回退到有效的 hero")
+	require.Equal(t, "cov-a2", p.CoverAssetID, "an offline cover should fall back to a valid hero")
 
 	list, err = ps.ListPersons()
 	require.NoError(t, err)
 	require.Len(t, list, 1)
-	require.Equal(t, "cov-a2", list[0].CoverAssetID, "ListPersons 同样应回退到 hero")
+	require.Equal(t, "cov-a2", list[0].CoverAssetID, "ListPersons should likewise fall back to hero")
 }
 
 func TestDetachAssetsFromPerson_ClearsHeroWhenDetached(t *testing.T) {
@@ -1118,10 +1122,10 @@ func TestMergePersons_LockedCoverPreserved(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// 封面混合分 + hero 兜底
+// Cover hybrid score + hero fallback
 // ---------------------------------------------------------------------------
 
-// setAssetAesthetic 更新指定 asset 的 aesthetic_score（nil 表示置 NULL）。
+// setAssetAesthetic updates the given asset's aesthetic_score (nil means set to NULL).
 func setAssetAesthetic(t *testing.T, db *sql.DB, assetID string, score *float64) {
 	t.Helper()
 	var err error
@@ -1133,7 +1137,7 @@ func setAssetAesthetic(t *testing.T, db *sql.DB, assetID string, score *float64)
 	require.NoError(t, err)
 }
 
-// setAssetExifSize 写入/更新 asset 的 EXIF 宽高（用于混合分的脸面积占比计算）。
+// setAssetExifSize writes/updates an asset's EXIF width/height (used for the hybrid score's face-area-ratio calculation).
 func setAssetExifSize(t *testing.T, db *sql.DB, assetID string, w, h int) {
 	t.Helper()
 	_, err := db.Exec(`INSERT INTO asset_exif(asset_id, width, height) VALUES(?,?,?)
@@ -1149,29 +1153,34 @@ func setFaceBBox(t *testing.T, db *sql.DB, faceID, bboxJSON string) {
 
 func f64(v float64) *float64 { return &v }
 
-// TestPersonCoverHybridSelection 验证封面选取从"质心最近"改为"混合分最高"：
-// 混合分 = clamp01((score-1)/9) × min(1, faceArea/imageArea)。
-// 三张脸同属一个 person（f1/f2/f3embedding 互相靠近可聚为一簇）：
+// TestPersonCoverHybridSelection verifies that cover selection changed from
+// "nearest centroid" to "highest hybrid score":
+// hybrid = clamp01((score-1)/9) × min(1, faceArea/imageArea).
+// Three faces belong to the same person (f1/f2/f3 embeddings are close
+// enough to cluster together):
 //
-//	f1: asset 分 9.0，脸占比 0.01 → hybrid = 0.8889*0.01 ≈ 0.0089
-//	f2: asset 分 7.0，脸占比 0.30 → hybrid = 0.6667*0.30 = 0.20  ← 应当选
-//	f3: asset 分 NULL（无分）      → 不可比（-1）
+//	f1: asset score 9.0, face ratio 0.01 → hybrid = 0.8889*0.01 ≈ 0.0089
+//	f2: asset score 7.0, face ratio 0.30 → hybrid = 0.6667*0.30 = 0.20  ← should be selected
+//	f3: asset score NULL (no score)      → incomparable (-1)
 //
-// 把 f2 的 asset 分置 NULL 后重算：f2/f3 都不可比，只剩 f1 可比 → 应选 f1。
-// 再把 f1 的 asset 分也置 NULL（全 NULL）→ 退回质心最近（原有行为）；
-// 三个 embedding 特意构造为 f1 恰好与质心方向重合，距离为 0，验证退回后选中 f1。
+// After setting f2's asset score to NULL and recomputing: f2/f3 are both
+// incomparable, leaving only f1 comparable → f1 should be selected.
+// After also setting f1's asset score to NULL (all NULL) → falls back to
+// nearest centroid (the original behavior); the three embeddings are
+// deliberately constructed so f1 exactly coincides with the centroid
+// direction, distance 0, verifying that f1 is selected after the fallback.
 func TestPersonCoverHybridSelection(t *testing.T) {
 	db := makeTestFaceDB(t)
 	dim := 512
 
-	// f1: 沿 dim0 的单位向量。
+	// f1: unit vector along dim0.
 	v1 := make([]float32, dim)
 	v1[0] = 1.0
-	// f2: dim0=1, dim1=0.3，归一化后与 f1 靠近但不重合。
+	// f2: dim0=1, dim1=0.3; after normalization it's close to f1 but not coincident.
 	v2raw := make([]float32, dim)
 	v2raw[0] = 1.0
 	v2raw[1] = 0.3
-	// f3: dim0=1, dim1=-0.3，归一化后与 f2 对称。
+	// f3: dim0=1, dim1=-0.3; after normalization it's symmetric to f2.
 	v3raw := make([]float32, dim)
 	v3raw[0] = 1.0
 	v3raw[1] = -0.3
@@ -1182,46 +1191,47 @@ func TestPersonCoverHybridSelection(t *testing.T) {
 	require.NoError(t, service.NewFaceService(db).RunClustering(context.Background()))
 	personID := mustFirstPersonID(t, db)
 
-	// 三张 asset 统一 1000x1000 图幅。
+	// All three assets use a uniform 1000x1000 frame.
 	for _, aid := range []string{"hy-a1", "hy-a2", "hy-a3"} {
 		setAssetExifSize(t, db, aid, 1000, 1000)
 	}
-	// f1: 脸占比 0.01（100x100=10000/1e6），分 9.0。
+	// f1: face ratio 0.01 (100x100=10000/1e6), score 9.0.
 	setFaceBBox(t, db, f1, `{"x1":0,"y1":0,"x2":100,"y2":100}`)
 	setAssetAesthetic(t, db, "hy-a1", f64(9.0))
-	// f2: 脸占比 0.30（约 547.72^2=300000/1e6），分 7.0。
+	// f2: face ratio 0.30 (approx 547.72^2=300000/1e6), score 7.0.
 	setFaceBBox(t, db, f2, `{"x1":0,"y1":0,"x2":547.7226,"y2":547.7226}`)
 	setAssetAesthetic(t, db, "hy-a2", f64(7.0))
-	// f3: 脸占比 0.50，但 asset 分 NULL → 不可比。
+	// f3: face ratio 0.50, but asset score NULL → incomparable.
 	setFaceBBox(t, db, f3, `{"x1":0,"y1":0,"x2":707.1068,"y2":707.1068}`)
 	setAssetAesthetic(t, db, "hy-a3", nil)
 
 	ps := service.NewPersonService(db)
 
-	// UnlockPersonCover 触发 recomputeOneCentroidTx；person 此时未锁，不受影响。
+	// UnlockPersonCover triggers recomputeOneCentroidTx; the person isn't locked at this point, so it's unaffected.
 	newFace, err := ps.UnlockPersonCover(personID)
 	require.NoError(t, err)
-	require.Equal(t, f2, newFace, "混合分最高的 f2 应被选为封面")
+	require.Equal(t, f2, newFace, "f2, with the highest hybrid score, should be selected as the cover")
 
 	var coverAsset string
 	require.NoError(t, db.QueryRow(`SELECT cover_asset_id FROM persons WHERE id=?`, personID).Scan(&coverAsset))
 	require.Equal(t, "hy-a2", coverAsset)
 
-	// 把 f2 的分置 NULL：f2/f3 都不可比，只剩 f1 可比 → 应选 f1。
+	// Set f2's score to NULL: f2/f3 are both incomparable, leaving only f1 comparable → f1 should be selected.
 	setAssetAesthetic(t, db, "hy-a2", nil)
 	newFace, err = ps.UnlockPersonCover(personID)
 	require.NoError(t, err)
-	require.Equal(t, f1, newFace, "f2 不可比后应回退到唯一可比的 f1")
+	require.Equal(t, f1, newFace, "once f2 is incomparable it should fall back to the only comparable face, f1")
 
-	// 全 NULL：退回质心最近。质心方向与 f1 完全重合（cosDist=0），应选 f1。
+	// All NULL: falls back to nearest centroid. The centroid direction exactly coincides with f1 (cosDist=0), so f1 should be selected.
 	setAssetAesthetic(t, db, "hy-a1", nil)
 	newFace, err = ps.UnlockPersonCover(personID)
 	require.NoError(t, err)
-	require.Equal(t, f1, newFace, "全部不可比时应退回质心最近，此处质心与 f1 方向重合")
+	require.Equal(t, f1, newFace, "when all faces are incomparable it should fall back to nearest centroid, and here the centroid coincides with f1's direction")
 }
 
-// TestPersonCoverLockedUnaffected 验证 cover_locked=1 且锁脸仍有效时，
-// 混合分选优不得改写封面 —— 即便另一张脸的混合分明显更高。
+// TestPersonCoverLockedUnaffected verifies that when cover_locked=1 and the
+// locked face is still valid, hybrid-score selection must not overwrite the
+// cover — even if another face has a clearly higher hybrid score.
 func TestPersonCoverLockedUnaffected(t *testing.T) {
 	db := makeTestFaceDB(t)
 	dim := 512
@@ -1229,28 +1239,28 @@ func TestPersonCoverLockedUnaffected(t *testing.T) {
 	v[0] = 1.0
 	f1 := insertAssetFace(t, db, "lkh-a1", normalize(v))
 	f2 := insertAssetFace(t, db, "lkh-a2", normalize(v))
-	f3 := insertAssetFace(t, db, "lkh-a3", normalize(v)) // 用于触发一次与锁无关的 detach 重算
+	f3 := insertAssetFace(t, db, "lkh-a3", normalize(v)) // used to trigger a recompute via detach unrelated to the lock
 	require.NoError(t, service.NewFaceService(db).RunClustering(context.Background()))
 	personID := mustFirstPersonID(t, db)
 
 	for _, aid := range []string{"lkh-a1", "lkh-a2", "lkh-a3"} {
 		setAssetExifSize(t, db, aid, 1000, 1000)
 	}
-	// f1（将被锁定）混合分很低：小脸 + 低分。
+	// f1 (to be locked) has a very low hybrid score: small face + low score.
 	setFaceBBox(t, db, f1, `{"x1":0,"y1":0,"x2":50,"y2":50}`)
 	setAssetAesthetic(t, db, "lkh-a1", f64(2.0))
-	// f2 混合分远高于 f1：大脸 + 满分。
+	// f2's hybrid score is far higher than f1's: large face + perfect score.
 	setFaceBBox(t, db, f2, `{"x1":0,"y1":0,"x2":900,"y2":900}`)
 	setAssetAesthetic(t, db, "lkh-a2", f64(10.0))
 	_ = f3
 
 	ps := service.NewPersonService(db)
-	// 锁定封面到 f1 所在的 asset。
+	// Lock the cover to the asset containing f1.
 	lockedFaceID, err := ps.SetPersonCover(personID, "lkh-a1")
 	require.NoError(t, err)
 	require.Equal(t, f1, lockedFaceID)
 
-	// 触发一次与锁无关的 recompute（detach 一个不相关的 asset），不应改写锁定的封面。
+	// Trigger a recompute unrelated to the lock (detach an unrelated asset); the locked cover must not be overwritten.
 	_, err = ps.DetachAssetsFromPerson(personID, []string{"lkh-a3"})
 	require.NoError(t, err)
 
@@ -1259,13 +1269,15 @@ func TestPersonCoverLockedUnaffected(t *testing.T) {
 	require.NoError(t, db.QueryRow(
 		`SELECT COALESCE(cover_asset_id,''), COALESCE(cover_face_id,''), cover_locked FROM persons WHERE id=?`, personID,
 	).Scan(&coverAsset, &coverFace, &locked))
-	require.Equal(t, "lkh-a1", coverAsset, "锁定封面不应被混合分更高的 f2 改写")
+	require.Equal(t, "lkh-a1", coverAsset, "the locked cover must not be overwritten by f2's higher hybrid score")
 	require.Equal(t, f1, coverFace)
 	require.Equal(t, 1, locked)
 }
 
-// TestPersonHeroAestheticFallback 验证 hero 未手动设置时回退为该人物照片中
-// 美学分最高者；已手动设置时保持不变（即便其他照片分更高）。
+// TestPersonHeroAestheticFallback verifies that when hero hasn't been
+// manually set, it falls back to the highest-scoring photo of this person;
+// once manually set, it stays unchanged (even if another photo scores
+// higher).
 func TestPersonHeroAestheticFallback(t *testing.T) {
 	db := makeTestFaceDB(t)
 	dim := 512
@@ -1281,23 +1293,23 @@ func TestPersonHeroAestheticFallback(t *testing.T) {
 
 	ps := service.NewPersonService(db)
 
-	// 未设置 hero：应回退为分数最高的 hf-a2。
+	// hero not set: should fall back to hf-a2, which has the highest score.
 	p, err := ps.GetPerson(personID)
 	require.NoError(t, err)
-	require.Equal(t, "hf-a2", p.HeroAssetID, "hero 未设置时应回退到美学分最高的照片")
+	require.Equal(t, "hf-a2", p.HeroAssetID, "when hero isn't set it should fall back to the highest-scoring photo")
 
 	list, err := ps.ListPersons()
 	require.NoError(t, err)
 	require.Len(t, list, 1)
-	require.Equal(t, "hf-a2", list[0].HeroAssetID, "ListPersons 的 hero 兜底同样应生效")
+	require.Equal(t, "hf-a2", list[0].HeroAssetID, "ListPersons's hero fallback should likewise take effect")
 
-	// 手动设置 hero 为分数较低的 hf-a1：应保持不变，不被兜底覆盖。
+	// Manually set hero to the lower-scoring hf-a1: it should stay unchanged, not be overwritten by the fallback.
 	heroVal := "hf-a1"
 	require.NoError(t, ps.UpdatePerson(personID, service.PersonPatch{HeroAssetID: &heroVal}))
 
 	p2, err := ps.GetPerson(personID)
 	require.NoError(t, err)
-	require.Equal(t, "hf-a1", p2.HeroAssetID, "已手动设置的 hero 不应被美学兜底覆盖")
+	require.Equal(t, "hf-a1", p2.HeroAssetID, "a manually set hero must not be overwritten by the aesthetic fallback")
 
 	list2, err := ps.ListPersons()
 	require.NoError(t, err)
@@ -1305,27 +1317,34 @@ func TestPersonHeroAestheticFallback(t *testing.T) {
 	require.Equal(t, "hf-a1", list2[0].HeroAssetID)
 }
 
-// TestRecomputeOneCentroid_AllFacesIncomparable_FallbackPicksValidFace 是一个回归测试:
-// 封面选优主路径(混合分)全不可比时,会退回质心最近的兜底循环。构造两张完全反向的
-// 单位向量脸——质心因此退化为零向量,cosDist(v, centroid) 对零向量恒返回 1.0——
-// 验证兜底循环最终仍落在合法脸索引上而不 panic(修复前 best 初值为 -1,理论边界下
-// 若循环体一次都不更新 best,会以 -1 越界访问 faceIDs/assetIDs)。
+// TestRecomputeOneCentroid_AllFacesIncomparable_FallbackPicksValidFace is a
+// regression test: when the main cover-selection path (hybrid score) is
+// entirely incomparable, it falls back to the nearest-centroid fallback
+// loop. Constructs two completely opposite unit-vector faces — so the
+// centroid degenerates to the zero vector, and cosDist(v, centroid) always
+// returns 1.0 for the zero vector — verifying that the fallback loop still
+// lands on a valid face index and doesn't panic (before the fix, best
+// defaulted to -1, and in the theoretical edge case where the loop body
+// never updates best even once, it would access faceIDs/assetIDs
+// out-of-bounds at -1).
 func TestRecomputeOneCentroid_AllFacesIncomparable_FallbackPicksValidFace(t *testing.T) {
 	db := makeTestFaceDB(t)
 	dim := 512
 
-	// f1: 沿 dim0 的单位向量。
+	// f1: unit vector along dim0.
 	v1 := make([]float32, dim)
 	v1[0] = 1.0
-	// f2: 与 f1 完全反向的单位向量;二者质心退化为零向量。
+	// f2: unit vector completely opposite to f1; their centroid degenerates to the zero vector.
 	v2 := make([]float32, dim)
 	v2[0] = -1.0
 
 	f1 := insertAssetFace(t, db, "rc-a1", v1)
 	f2 := insertAssetFace(t, db, "rc-a2", v2)
 
-	// 手动建人物 + 成员关系,跳过 RunClustering:两张脸 cosDist=2.0,远超 DBSCAN
-	// epsilon,天然不会被聚成同一人物,这里直接用 SQL 拼出「同一人物下全不可比」场景。
+	// Manually build the person + membership, skipping RunClustering: the two
+	// faces have cosDist=2.0, far beyond the DBSCAN epsilon, so they would
+	// naturally never cluster into the same person — here we build the "all
+	// incomparable under one person" scenario directly via SQL.
 	personID := "rc-person"
 	_, err := db.Exec(`INSERT INTO persons(id, name) VALUES(?, '')`, personID)
 	require.NoError(t, err)
@@ -1333,12 +1352,12 @@ func TestRecomputeOneCentroid_AllFacesIncomparable_FallbackPicksValidFace(t *tes
 		f1, personID, f2, personID)
 	require.NoError(t, err)
 
-	// 两张脸均无美学分/EXIF 尺寸 → hybridCoverScore 全部返回 -1,全不可比,
-	// 触发质心兜底循环。
+	// Both faces have no aesthetic score/EXIF size → hybridCoverScore returns
+	// -1 for both, all incomparable, triggering the centroid fallback loop.
 	ps := service.NewPersonService(db)
 	newFace, err := ps.UnlockPersonCover(personID)
-	require.NoError(t, err, "全不可比场景下不应 panic 或报错")
-	require.Contains(t, []string{f1, f2}, newFace, "应落在成员脸之一,而非越界索引")
+	require.NoError(t, err, "an all-incomparable scenario must not panic or error")
+	require.Contains(t, []string{f1, f2}, newFace, "should land on one of the member faces, not an out-of-bounds index")
 
 	var coverAsset string
 	require.NoError(t, db.QueryRow(`SELECT cover_asset_id FROM persons WHERE id=?`, personID).Scan(&coverAsset))

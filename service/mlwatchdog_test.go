@@ -25,7 +25,7 @@ func (f *fakeRunner) Restart(ctx context.Context, name string) error {
 	return f.restartErr
 }
 
-// tickN 连续跑 n 次 Tick,返回累计触发的重启次数
+// tickN runs Tick n times in a row, returning the cumulative number of restarts triggered.
 func tickN(w *MLWatchdog, n int) int {
 	restarted := 0
 	for i := 0; i < n; i++ {
@@ -40,10 +40,10 @@ func TestWatchdogRestartsWedgedContainer(t *testing.T) {
 	r := &fakeRunner{running: true}
 	ready := false
 	w := NewMLWatchdog(func() bool { return ready }, r)
-	// 连续失败未达阈值(mlWatchdogFailLimit=12):不重启
+	// Consecutive failures below the threshold (mlWatchdogFailLimit=12): no restart
 	require.Equal(t, 0, tickN(w, 11))
 	require.Equal(t, 0, r.restarts)
-	// 第 12 次失败:触发重启
+	// The 12th failure: triggers a restart
 	require.True(t, w.Tick(context.Background()))
 	require.Equal(t, 1, r.restarts)
 }
@@ -53,15 +53,15 @@ func TestWatchdogResetsOnRecovery(t *testing.T) {
 	ready := false
 	w := NewMLWatchdog(func() bool { return ready }, r)
 	tickN(w, 11)
-	ready = true // 恢复
+	ready = true // recovered
 	require.False(t, w.Tick(context.Background()))
-	ready = false // 再次失败,计数应从 0 重新累计
+	ready = false // fails again, the counter should accumulate from 0 again
 	require.Equal(t, 0, tickN(w, 11))
 	require.Equal(t, 0, r.restarts)
 }
 
 func TestWatchdogSkipsWhenContainerNotRunning(t *testing.T) {
-	r := &fakeRunner{running: false} // 未安装/被人为停止
+	r := &fakeRunner{running: false} // not installed / manually stopped
 	w := NewMLWatchdog(func() bool { return false }, r)
 	require.Equal(t, 0, tickN(w, 30))
 	require.Equal(t, 0, r.restarts)
@@ -74,10 +74,10 @@ func TestWatchdogCooldownBlocksSecondRestart(t *testing.T) {
 	w.now = func() time.Time { return now }
 	tickN(w, 12)
 	require.Equal(t, 1, r.restarts)
-	// 冷却期内继续失败:不再重启
+	// Continuing to fail during the cooldown: no further restart
 	tickN(w, 24)
 	require.Equal(t, 1, r.restarts)
-	// 冷却期过后:允许再次重启
+	// After the cooldown: another restart is allowed
 	now = now.Add(mlWatchdogCooldown + time.Second)
 	tickN(w, 12)
 	require.Equal(t, 2, r.restarts)
@@ -86,15 +86,16 @@ func TestWatchdogCooldownBlocksSecondRestart(t *testing.T) {
 func TestWatchdogToleratesRestartError(t *testing.T) {
 	r := &fakeRunner{running: true, restartErr: context.DeadlineExceeded}
 	w := NewMLWatchdog(func() bool { return false }, r)
-	require.Equal(t, 0, tickN(w, 12)) // Restart 报错时 Tick 返回 false,不 panic
-	require.Equal(t, 1, r.restarts)   // 但确实尝试过一次
+	require.Equal(t, 0, tickN(w, 12)) // Tick returns false when Restart errors, no panic
+	require.Equal(t, 1, r.restarts)   // but it did attempt one
 }
 
 func TestWatchdogInspectCadenceWhenContainerNotRunning(t *testing.T) {
 	r := &fakeRunner{running: false}
 	w := NewMLWatchdog(func() bool { return false }, r)
-	// 36 个 tick(18 分钟):只应在第 12/24/36 次各 inspect 一次,
-	// 而不是 fails 卡在阈值上后每个 tick 都 fork docker inspect
+	// 36 ticks (18 minutes): should inspect exactly once each at the
+	// 12th/24th/36th tick, not fork a docker inspect on every tick once
+	// fails is stuck at the threshold
 	require.Equal(t, 0, tickN(w, 36))
 	require.Equal(t, 3, r.inspects)
 	require.Equal(t, 0, r.restarts)

@@ -53,10 +53,11 @@ func TestSmartSearch(t *testing.T) {
 	require.Equal(t, "a1", results[0].ID)
 }
 
-// TestSearchAssetsByText 验证 Smart Moments theme 引擎复用的抽取方法
-// (search.go 的 SearchAssetsByText,从 SmartSearch 的文本编码 + vec KNN 通路
-// 拆出):返回按距离排序的 AssetScore,排除 live photo 视频侧/回收站/离线
-// 资产,且不受 IncludeOCR/MinMatchSimilarity 等 SmartSearch 专属策略影响。
+// TestSearchAssetsByText verifies the extracted method reused by the Smart
+// Moments theme engine (search.go's SearchAssetsByText, split out of
+// SmartSearch's text-encode + vec KNN pathway): returns AssetScore sorted by
+// distance, excluding live-photo video sides / trashed / offline assets, and
+// unaffected by SmartSearch-only policies like IncludeOCR/MinMatchSimilarity.
 func TestSearchAssetsByText(t *testing.T) {
 	db, err := sqlite.Open(filepath.Join(t.TempDir(), "s2.db"))
 	require.NoError(t, err)
@@ -70,7 +71,7 @@ func TestSearchAssetsByText(t *testing.T) {
 	vec[0] = 1.0
 	db.Exec(`INSERT INTO clip_embeddings(rowid, embedding) VALUES(?,?)`, rowid, sqlite.SerializeFloat32(vec))
 
-	// live photo 视频侧不应出现在结果里。
+	// The live photo video side must not appear in the results.
 	db.Exec(`INSERT INTO assets(id, file_path, status, is_live_photo_video) VALUES('a2','/p/a2.jpg','indexed',1)`)
 	db.Exec(`INSERT INTO asset_clip_idx(asset_id) VALUES('a2')`)
 	db.QueryRow(`SELECT rowid FROM asset_clip_idx WHERE asset_id='a2'`).Scan(&rowid)
@@ -83,21 +84,22 @@ func TestSearchAssetsByText(t *testing.T) {
 	require.Equal(t, "a1", hits[0].AssetID)
 	require.Greater(t, hits[0].Score, 0.0)
 
-	// 现有 SmartSearch 行为不受影响。
+	// Existing SmartSearch behavior is unaffected.
 	results, err := svc.SmartSearch("beach", 10, 0, service.SearchFilters{})
 	require.NoError(t, err)
 	require.NotEmpty(t, results)
 	require.Equal(t, "a1", results[0].ID)
 }
 
-// TestSmartSearchIncludeOCR 验证 IncludeOCR 开启时 OCR 子串命中以 1.0 分置顶、
-// 与 CLIP 结果按 ID 去重，且默认（关闭）行为不变。
+// TestSmartSearchIncludeOCR verifies that with IncludeOCR on, OCR substring
+// hits are pinned to the top at score 1.0, deduped against CLIP results by
+// ID, and that the default (off) behavior is unchanged.
 func TestSmartSearchIncludeOCR(t *testing.T) {
 	db, err := sqlite.Open(filepath.Join(t.TempDir(), "ocr.db"))
 	require.NoError(t, err)
 	defer db.Close()
 
-	// a1: 只有 CLIP 向量；a2: 只有 OCR 文本；a3: 两者都有（去重场景）
+	// a1: CLIP vector only; a2: OCR text only; a3: has both (dedup scenario)
 	for i, id := range []string{"a1", "a2", "a3"} {
 		db.Exec(`INSERT INTO assets(id,file_path,status,is_live_photo_video,taken_at)
 			VALUES(?,?,'indexed',0,?)`, id, "/p/"+id+".jpg", fmt.Sprintf("2025-07-%02d 10:00:00", i+1))
@@ -115,14 +117,15 @@ func TestSmartSearchIncludeOCR(t *testing.T) {
 
 	svc := service.NewSearchService(db, &mockTextML{})
 
-	// 默认关闭：纯 CLIP，OCR-only 的 a2 不出现
+	// Default off: pure CLIP, OCR-only a2 does not appear
 	results, err := svc.SmartSearch("receipt", 10, 0, service.SearchFilters{})
 	require.NoError(t, err)
 	for _, a := range results {
-		require.NotEqual(t, "a2", a.ID, "IncludeOCR=false 时不应返回 OCR-only 命中")
+		require.NotEqual(t, "a2", a.ID, "should not return an OCR-only hit when IncludeOCR=false")
 	}
 
-	// 开启：a2、a3 以 1.0 分置顶（OCR 组内按拍摄时间倒序 → a3 在前），a1 仍在
+	// On: a2, a3 pinned to the top at score 1.0 (newest-first within the OCR
+	// group → a3 first), a1 still present
 	results, err = svc.SmartSearch("receipt", 10, 0, service.SearchFilters{IncludeOCR: true})
 	require.NoError(t, err)
 	require.GreaterOrEqual(t, len(results), 3)
@@ -130,7 +133,7 @@ func TestSmartSearchIncludeOCR(t *testing.T) {
 	require.Equal(t, "a2", results[1].ID)
 	require.NotNil(t, results[0].MatchScore)
 	require.InDelta(t, 1.0, *results[0].MatchScore, 1e-9)
-	// OCR 命中带 matchedBy="ocr" 标记（双路命中时保留 OCR 版本）；纯 CLIP 命中带 "semantic"
+	// OCR hits are tagged matchedBy="ocr" (the OCR version wins on a double hit); pure CLIP hits are tagged "semantic"
 	require.Equal(t, "ocr", results[0].MatchedBy)
 	require.Equal(t, "ocr", results[1].MatchedBy)
 	for _, a := range results {
@@ -142,32 +145,35 @@ func TestSmartSearchIncludeOCR(t *testing.T) {
 	for _, a := range results {
 		ids[a.ID]++
 	}
-	require.Equal(t, 1, ids["a3"], "双路命中必须去重")
+	require.Equal(t, 1, ids["a3"], "a double hit must be deduped")
 	require.Equal(t, 1, ids["a1"])
 
-	// 大小写不敏感
+	// Case-insensitive
 	results, err = svc.SmartSearch("RECEIPT", 10, 0, service.SearchFilters{IncludeOCR: true})
 	require.NoError(t, err)
 	require.Equal(t, "a3", results[0].ID)
 }
 
-// TestSmartSearchBelowCutTiering 验证 SmartSearch 集成场景下的自适应断层落点：
-// OCR 命中恒最佳层（不参与断点计算），语义命中的教科书断崖尾部（同规格 §2 的
-// "fish" 示例：4 条真命中 0.86~0.66，随后断崖到 0.13 的噪声）被正确置 BelowCut。
+// TestSmartSearchBelowCutTiering verifies the adaptive cut placement in a
+// SmartSearch integration scenario: OCR hits always stay in the best tier
+// (excluded from the cut computation), and the textbook-cliff tail of
+// semantic hits (the same spec §2 "fish" example: 4 real hits 0.86~0.66,
+// then a cliff down to 0.13 noise) is correctly marked BelowCut.
 func TestSmartSearchBelowCutTiering(t *testing.T) {
 	db, err := sqlite.Open(filepath.Join(t.TempDir(), "cut.db"))
 	require.NoError(t, err)
 	defer db.Close()
 
-	// OCR 命中：精确文本子串命中，恒 1.0 分，恒最佳层。
+	// OCR hit: exact text substring match, always score 1.0, always the best tier.
 	_, err = db.Exec(`INSERT INTO assets(id,file_path,status,is_live_photo_video,taken_at)
 		VALUES('ocr1','/p/ocr1.jpg','indexed',0,'2025-07-01 10:00:00')`)
 	require.NoError(t, err)
 	_, err = db.Exec(`INSERT INTO asset_ocr(asset_id,text) VALUES('ocr1','fish menu special')`)
 	require.NoError(t, err)
 
-	// seedSemantic 反解 displayScore 的线性映射（floor=0.03/ceil=0.13 默认值），
-	// 构造出恰好产生目标展示分 ds 的 CLIP 向量（查询向量固定为 e0=[1,0,...]）。
+	// seedSemantic inverts displayScore's linear mapping (default floor=0.03/
+	// ceil=0.13) to construct a CLIP vector that produces exactly the target
+	// display score ds (the query vector is fixed at e0=[1,0,...]).
 	seedSemantic := func(id string, ds float64) {
 		x := 0.03 + ds*0.10
 		_, err := db.Exec(`INSERT INTO assets(id,file_path,status,is_live_photo_video) VALUES(?,?,'indexed',0)`, id, "/p/"+id+".jpg")
@@ -201,19 +207,20 @@ func TestSmartSearchBelowCutTiering(t *testing.T) {
 		matchedBy[a.ID] = a.MatchedBy
 	}
 	require.Equal(t, "ocr", matchedBy["ocr1"])
-	require.False(t, belowCut["ocr1"], "OCR 命中恒最佳层，不参与断点计算")
+	require.False(t, belowCut["ocr1"], "an OCR hit always stays in the best tier, excluded from the cut computation")
 	for _, id := range []string{"s1", "s2", "s3", "s4"} {
 		require.Equal(t, "semantic", matchedBy[id])
-		require.False(t, belowCut[id], id+" 应在最佳匹配层")
+		require.False(t, belowCut[id], id+" should be in the best-match tier")
 	}
 	for _, id := range []string{"tail1", "tail2"} {
 		require.Equal(t, "semantic", matchedBy[id])
-		require.True(t, belowCut[id], id+" 应折入 more-results 折叠层")
+		require.True(t, belowCut[id], id+" should be folded into the more-results tier")
 	}
 }
 
-// TestSmartSearchNoBelowCutWhenFewResults 验证边界守卫：语义结果少于 3 条时不分层
-// （全部落在最佳匹配层），即便分差很大。
+// TestSmartSearchNoBelowCutWhenFewResults verifies the boundary guard: fewer
+// than 3 semantic results never tier (all fall into the best-match tier),
+// even with a large score gap.
 func TestSmartSearchNoBelowCutWhenFewResults(t *testing.T) {
 	db, err := sqlite.Open(filepath.Join(t.TempDir(), "few.db"))
 	require.NoError(t, err)
@@ -240,17 +247,18 @@ func TestSmartSearchNoBelowCutWhenFewResults(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, results, 2)
 	for _, a := range results {
-		require.False(t, a.BelowCut, a.ID+"：语义结果<3 条时不应分层")
+		require.False(t, a.BelowCut, a.ID+": should not tier when semantic results < 3")
 	}
 }
 
-// seedRankedSemantic 依次插入 n 条语义资产 id0..id{n-1}，通过反解 displayScore 的
-// 线性映射构造严格递减的分数，从而固定 KNN 排序（id0 分最高排最前）。
+// seedRankedSemantic inserts n semantic assets id0..id{n-1} in order,
+// constructing strictly decreasing scores by inverting displayScore's linear
+// mapping, so the KNN ordering is fixed (id0 has the highest score and sorts first).
 func seedRankedSemantic(t *testing.T, db *sql.DB, n int) {
 	t.Helper()
 	for i := 0; i < n; i++ {
 		id := fmt.Sprintf("id%d", i)
-		ds := 0.95 - float64(i)*0.03 // 严格递减，彼此分差足够避免 cut/顺序歧义
+		ds := 0.95 - float64(i)*0.03 // strictly decreasing, with enough gap between entries to avoid cut/ordering ambiguity
 		x := 0.03 + ds*0.10
 		_, err := db.Exec(`INSERT INTO assets(id,file_path,status,is_live_photo_video) VALUES(?,?,'indexed',0)`, id, "/p/"+id+".jpg")
 		require.NoError(t, err)
@@ -266,8 +274,10 @@ func seedRankedSemantic(t *testing.T, db *sql.DB, n int) {
 	}
 }
 
-// TestSmartSearchOffsetPaginationMatchesFullList 验证分页切片正确性：offset>0 页
-// 的内容必须等于「一次性取全量列表」对应区段的资产（同一份 KNN 排序上切片）。
+// TestSmartSearchOffsetPaginationMatchesFullList verifies page-slicing
+// correctness: the content of an offset>0 page must equal the corresponding
+// section of a "fetch the full list at once" result (sliced from the same
+// KNN ordering).
 func TestSmartSearchOffsetPaginationMatchesFullList(t *testing.T) {
 	db, err := sqlite.Open(filepath.Join(t.TempDir(), "page.db"))
 	require.NoError(t, err)
@@ -283,18 +293,19 @@ func TestSmartSearchOffsetPaginationMatchesFullList(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, page, 5)
 	for i, a := range page {
-		require.Equal(t, full[5+i].ID, a.ID, "第二页第 %d 条应等于全量列表第 %d 条", i, 5+i)
+		require.Equal(t, full[5+i].ID, a.ID, "entry %d of page 2 should equal entry %d of the full list", i, 5+i)
 	}
 }
 
-// TestSmartSearchOffsetPageAllBelowCutNoOCR 验证 offset>0 时：不做 OCR 前置合并
-// （即便 IncludeOCR=true，纯 OCR 命中也不会出现在深页），且全部结果 BelowCut=true。
+// TestSmartSearchOffsetPageAllBelowCutNoOCR verifies that when offset>0: OCR
+// prepend-merging is skipped (even with IncludeOCR=true, a pure OCR hit does
+// not appear on a deep page), and every result has BelowCut=true.
 func TestSmartSearchOffsetPageAllBelowCutNoOCR(t *testing.T) {
 	db, err := sqlite.Open(filepath.Join(t.TempDir(), "page_ocr.db"))
 	require.NoError(t, err)
 	defer db.Close()
 	seedRankedSemantic(t, db, 8)
-	// 一条纯 OCR 命中：文本命中但没有 CLIP 向量，首页会被前置合并进来。
+	// A pure OCR hit: text matches but has no CLIP vector, gets prepend-merged into the first page.
 	_, err = db.Exec(`INSERT INTO assets(id,file_path,status,is_live_photo_video) VALUES('ocr1','/p/ocr1.jpg','indexed',0)`)
 	require.NoError(t, err)
 	_, err = db.Exec(`INSERT INTO asset_ocr(asset_id,text) VALUES('ocr1','fish menu special')`)
@@ -302,7 +313,7 @@ func TestSmartSearchOffsetPageAllBelowCutNoOCR(t *testing.T) {
 
 	svc := service.NewSearchService(db, &mockTextML{})
 
-	// 首页：OCR 命中应出现且恒最佳层。
+	// First page: the OCR hit should appear and always be in the best tier.
 	first, err := svc.SmartSearch("fish", 3, 0, service.SearchFilters{IncludeOCR: true})
 	require.NoError(t, err)
 	var sawOCR bool
@@ -312,29 +323,34 @@ func TestSmartSearchOffsetPageAllBelowCutNoOCR(t *testing.T) {
 			require.False(t, a.BelowCut)
 		}
 	}
-	require.True(t, sawOCR, "首页应包含 OCR 前置命中")
+	require.True(t, sawOCR, "the first page should include the OCR prepend hit")
 
-	// 深页：跳过 OCR 合并，不应再出现 ocr1；全部结果 BelowCut=true。
+	// Deep page: OCR merging is skipped, ocr1 should not appear again; every result has BelowCut=true.
 	deep, err := svc.SmartSearch("fish", 3, 3, service.SearchFilters{IncludeOCR: true})
 	require.NoError(t, err)
 	require.NotEmpty(t, deep)
 	for _, a := range deep {
-		require.NotEqual(t, "ocr1", a.ID, "深页不应做 OCR 前置合并")
+		require.NotEqual(t, "ocr1", a.ID, "a deep page should not do OCR prepend-merging")
 		require.Equal(t, "semantic", a.MatchedBy)
-		require.True(t, a.BelowCut, a.ID+"：offset>0 的结果应全部置 belowCut=true")
+		require.True(t, a.BelowCut, a.ID+": every offset>0 result should be belowCut=true")
 	}
 }
 
-// TestSmartSearchOCRDoesNotDisplaceSemanticAcrossPages 复现复审发现的 Critical 分页
-// 缺陷构造：8 条语义命中 id0..id7（严格递减）+ 1 条纯 OCR 命中，limit=3。
+// TestSmartSearchOCRDoesNotDisplaceSemanticAcrossPages reproduces the Critical
+// pagination defect found in review: 8 semantic hits id0..id7 (strictly
+// decreasing) + 1 pure OCR hit, limit=3.
 //
-// 旧行为（mergeOCRFirst 把 OCR+语义总长截到 limit）：首页 [ocr1,id0,id1]，id2 被
-// OCR 挤出去；次页固定从语义排名 offset=3 处切，得到 [id3,id4,id5]——id2 在任何
-// 页都不出现，永久丢失。
+// Old behavior (mergeOCRFirst truncated OCR+semantic total length to limit):
+// first page [ocr1,id0,id1], id2 gets pushed out by OCR; the next page always
+// slices the semantic ranking starting at offset=3, giving [id3,id4,id5] —
+// id2 never appears on any page, permanently lost.
 //
-// 新契约（OCR 不占语义名额）：offset/limit 只作用于语义序列，首页 = 去重后的
-// OCR 前置 + 语义[0:limit]，总长可超 limit；因此首页应为 4 条
-// [ocr1,id0,id1,id2]，次页仍从 id3 起，两页语义部分的并集覆盖 id0..id5 无缺口。
+// New contract (OCR does not occupy a semantic slot): offset/limit apply only
+// to the semantic sequence, so the first page = deduped OCR prepend +
+// semantic[0:limit], whose total length may exceed limit; the first page
+// should therefore be 4 entries [ocr1,id0,id1,id2], the next page still
+// starts at id3, and the union of the semantic portions of both pages covers
+// id0..id5 with no gap.
 func TestSmartSearchOCRDoesNotDisplaceSemanticAcrossPages(t *testing.T) {
 	db, err := sqlite.Open(filepath.Join(t.TempDir(), "ocr_page.db"))
 	require.NoError(t, err)
@@ -349,12 +365,12 @@ func TestSmartSearchOCRDoesNotDisplaceSemanticAcrossPages(t *testing.T) {
 
 	first, err := svc.SmartSearch("fish", 3, 0, service.SearchFilters{IncludeOCR: true})
 	require.NoError(t, err)
-	require.Len(t, first, 4, "首页应为 OCR 前置 + 语义[0:limit]，不因 OCR 挤占而截短")
+	require.Len(t, first, 4, "the first page should be OCR prepend + semantic[0:limit], not truncated by OCR occupying a slot")
 	firstIDs := make([]string, len(first))
 	for i, a := range first {
 		firstIDs[i] = a.ID
 	}
-	require.Equal(t, []string{"ocr1", "id0", "id1", "id2"}, firstIDs, "id2 不应被 OCR 挤出首页")
+	require.Equal(t, []string{"ocr1", "id0", "id1", "id2"}, firstIDs, "id2 should not be pushed out of the first page by OCR")
 
 	second, err := svc.SmartSearch("fish", 3, 3, service.SearchFilters{IncludeOCR: true})
 	require.NoError(t, err)
@@ -365,7 +381,8 @@ func TestSmartSearchOCRDoesNotDisplaceSemanticAcrossPages(t *testing.T) {
 	}
 	require.Equal(t, []string{"id3", "id4", "id5"}, secondIDs)
 
-	// 两页并集覆盖语义排名 id0..id5，无缺口（id2 在首页出现过，不会因跨页切割丢失）。
+	// The union of both pages covers the semantic ranking id0..id5, with no
+	// gap (id2 appeared on the first page, so it isn't lost to the cross-page cut).
 	seen := map[string]bool{}
 	for _, id := range firstIDs {
 		seen[id] = true
@@ -374,12 +391,13 @@ func TestSmartSearchOCRDoesNotDisplaceSemanticAcrossPages(t *testing.T) {
 		seen[id] = true
 	}
 	for _, id := range []string{"id0", "id1", "id2", "id3", "id4", "id5"} {
-		require.True(t, seen[id], id+" 不应在首页+次页的并集中缺失")
+		require.True(t, seen[id], id+" should not be missing from the union of the first and second pages")
 	}
 }
 
-// TestSmartSearchOffsetBeyondLibraryReturnsActualCount 验证库不足时（offset+limit
-// 超出库存量）返回实际数量而非报错或补齐空结果。
+// TestSmartSearchOffsetBeyondLibraryReturnsActualCount verifies that when the
+// library falls short (offset+limit exceeds the library size), the actual
+// count is returned rather than an error or a padded empty result.
 func TestSmartSearchOffsetBeyondLibraryReturnsActualCount(t *testing.T) {
 	db, err := sqlite.Open(filepath.Join(t.TempDir(), "short.db"))
 	require.NoError(t, err)
@@ -388,61 +406,69 @@ func TestSmartSearchOffsetBeyondLibraryReturnsActualCount(t *testing.T) {
 
 	svc := service.NewSearchService(db, &mockTextML{})
 
-	// offset 落在库存量内，但 offset+limit 超出：只应拿到剩余的那几条。
+	// offset is within the library size, but offset+limit exceeds it: only the remaining entries should come back.
 	partial, err := svc.SmartSearch("fish", 10, 3, service.SearchFilters{})
 	require.NoError(t, err)
 	require.Len(t, partial, 1)
 	require.Equal(t, "id3", partial[0].ID)
 
-	// offset 本身就超出库存量：返回空切片，不报错。
+	// offset itself already exceeds the library size: returns an empty slice, no error.
 	empty, err := svc.SmartSearch("fish", 10, 100, service.SearchFilters{})
 	require.NoError(t, err)
 	require.Empty(t, empty)
 }
 
-// markDeleted 软删除给定 id（置 deleted_at），模拟资产被移入回收站——它的 CLIP
-// 向量仍留在 clip_embeddings 里（不像硬删除会 dropClipVector），KNN 依旧会把它
-// 选为候选，但 SmartSearch 的 WHERE deleted_at IS NULL 会在 KNN 之后把它滤掉。
+// markDeleted soft-deletes the given id (sets deleted_at), simulating an
+// asset moved to the trash — its CLIP vector stays in clip_embeddings
+// (unlike a hard delete, which calls dropClipVector), so KNN still picks it
+// as a candidate, but SmartSearch's WHERE deleted_at IS NULL filters it out
+// after KNN.
 func markDeleted(t *testing.T, db *sql.DB, id string) {
 	t.Helper()
 	_, err := db.Exec(`UPDATE assets SET deleted_at = CURRENT_TIMESTAMP WHERE id = ?`, id)
 	require.NoError(t, err)
 }
 
-// TestSmartSearchOffsetFullPageDespiteDeletedInWindow 复现真机验收报告的 Critical
-// 缺陷：KNN 窗口内混入一条已被移入回收站（deleted_at 已置）的资产，若不做超取
-// 补齐，过滤后窗口会短一条，分页错位。构造 87 条带向量资产（id0..id86，按分数
-// 严格递减排名），把恰好落在 offset=20,limit=10 窗口内的 id25 标记为已删——修
-// 复前 k=offset+limit=30，KNN 拿到的 30 个候选里 id25 被过滤掉，只剩 9 条；修
-// 复后应超取补齐满 10 条，且内容等于「全量存活列表」对应区段。
+// TestSmartSearchOffsetFullPageDespiteDeletedInWindow reproduces the Critical
+// defect from a production acceptance report: an asset moved to the trash
+// (deleted_at set) mixed into the KNN window, which, without over-fetching to
+// pad the count, would leave the filtered window one entry short and
+// misalign pagination. Constructs 87 assets with vectors (id0..id86, ranked
+// by strictly decreasing score), marking id25 — which falls exactly in the
+// offset=20,limit=10 window — as deleted. Before the fix, k=offset+limit=30,
+// and id25 gets filtered out of the 30 KNN candidates, leaving only 9; after
+// the fix, over-fetching should pad the page to a full 10 entries matching
+// the corresponding section of the "full list of live assets".
 func TestSmartSearchOffsetFullPageDespiteDeletedInWindow(t *testing.T) {
 	db, err := sqlite.Open(filepath.Join(t.TempDir(), "del_window.db"))
 	require.NoError(t, err)
 	defer db.Close()
 	seedRankedSemantic(t, db, 87)
-	markDeleted(t, db, "id25") // 落在 offset=20,limit=10 的 [20,30) 窗口内
+	markDeleted(t, db, "id25") // falls within the offset=20,limit=10 window [20,30)
 
 	svc := service.NewSearchService(db, &mockTextML{})
 
-	// 全量存活列表（用一次性大 limit 取全部，作为分页结果的对照基准）。
+	// The full list of live assets (fetched at once with a large limit, as the baseline for the paginated result).
 	full, err := svc.SmartSearch("fish", 200, 0, service.SearchFilters{})
 	require.NoError(t, err)
-	require.Len(t, full, 86, "87 条减去 1 条已删应剩 86 条存活")
+	require.Len(t, full, 86, "87 minus 1 deleted should leave 86 alive")
 	for _, a := range full {
-		require.NotEqual(t, "id25", a.ID, "已删资产不应出现在存活列表里")
+		require.NotEqual(t, "id25", a.ID, "a deleted asset should not appear in the live list")
 	}
 
 	page, err := svc.SmartSearch("fish", 10, 20, service.SearchFilters{})
 	require.NoError(t, err)
-	require.Len(t, page, 10, "窗口内混入 1 条已删资产不应让该页少于 limit 条")
+	require.Len(t, page, 10, "1 deleted asset mixed into the window should not shrink the page below limit")
 	for i, a := range page {
-		require.Equal(t, full[20+i].ID, a.ID, "第 %d 条应等于全量存活列表第 %d 条", i, 20+i)
+		require.Equal(t, full[20+i].ID, a.ID, "entry %d should equal entry %d of the full live list", i, 20+i)
 	}
 }
 
-// TestSmartSearchOffsetUnionNoGapsOrDupesWithDeletedMixedIn 验证：库中散布多条
-// 已删资产时，连续翻页（offset 依次 +limit）的并集与全量存活列表完全一致——既
-// 无缺口（某条存活资产在任何页都不出现）也无重复（同一条出现在两页里）。
+// TestSmartSearchOffsetUnionNoGapsOrDupesWithDeletedMixedIn verifies that
+// when the library has several deleted assets scattered through it, the
+// union of consecutive pages (offset advancing by +limit each time) exactly
+// matches the full live list — no gaps (a live asset missing from every
+// page) and no duplicates (the same entry appearing on two pages).
 func TestSmartSearchOffsetUnionNoGapsOrDupesWithDeletedMixedIn(t *testing.T) {
 	db, err := sqlite.Open(filepath.Join(t.TempDir(), "del_union.db"))
 	require.NoError(t, err)
@@ -462,18 +488,20 @@ func TestSmartSearchOffsetUnionNoGapsOrDupesWithDeletedMixedIn(t *testing.T) {
 	for offset := 0; offset < len(full); offset += pageSize {
 		page, err := svc.SmartSearch("fish", pageSize, offset, service.SearchFilters{})
 		require.NoError(t, err)
-		require.Len(t, page, min(pageSize, len(full)-offset), "每页应尽量取满，仅末页可短")
+		require.Len(t, page, min(pageSize, len(full)-offset), "each page should be filled as much as possible, only the last page can be short")
 		union = append(union, page...)
 	}
-	require.Len(t, union, len(full), "翻页并集长度应等于全量存活列表长度（无缺口无重复）")
+	require.Len(t, union, len(full), "the union across pages should equal the full live list length (no gaps, no duplicates)")
 	for i, a := range union {
-		require.Equal(t, full[i].ID, a.ID, "并集第 %d 条应等于全量存活列表第 %d 条", i, i)
+		require.Equal(t, full[i].ID, a.ID, "union entry %d should equal entry %d of the full live list", i, i)
 	}
 }
 
-// TestSmartSearchOffsetTrueBottomReturnsActualCountWithDeletedMixedIn 验证：即使
-// 窗口内有已删资产需要超取补齐，一旦补齐到全局 k 上限仍不足 offset+limit，说明
-// 真到底了，应返回实际剩余数量而不是继续无谓重查或报错。
+// TestSmartSearchOffsetTrueBottomReturnsActualCountWithDeletedMixedIn verifies
+// that even when the window has deleted assets requiring over-fetch padding,
+// once padding hits the global k cap and still falls short of offset+limit,
+// that means the true bottom has been reached — the actual remaining count
+// should be returned rather than retrying pointlessly or erroring out.
 func TestSmartSearchOffsetTrueBottomReturnsActualCountWithDeletedMixedIn(t *testing.T) {
 	db, err := sqlite.Open(filepath.Join(t.TempDir(), "del_bottom.db"))
 	require.NoError(t, err)
@@ -481,22 +509,23 @@ func TestSmartSearchOffsetTrueBottomReturnsActualCountWithDeletedMixedIn(t *test
 	seedRankedSemantic(t, db, 10)
 	markDeleted(t, db, "id8")
 	markDeleted(t, db, "id9")
-	// 存活：id0..id7，共 8 条。
+	// Live: id0..id7, 8 total.
 
 	svc := service.NewSearchService(db, &mockTextML{})
 	page, err := svc.SmartSearch("fish", 10, 5, service.SearchFilters{})
 	require.NoError(t, err)
-	require.Len(t, page, 3, "存活 8 条，offset=5 时真到底应只剩 3 条")
+	require.Len(t, page, 3, "with 8 alive and offset=5, the true bottom should leave only 3")
 	require.Equal(t, []string{"id5", "id6", "id7"}, []string{page[0].ID, page[1].ID, page[2].ID})
 
 	empty, err := svc.SmartSearch("fish", 10, 8, service.SearchFilters{})
 	require.NoError(t, err)
-	require.Empty(t, empty, "offset 本身已越过存活总数应返回空切片而非报错")
+	require.Empty(t, empty, "offset already past the live total should return an empty slice, not an error")
 }
 
-// TestSmartSearchNegativeOffsetClampsToZero 验证 service 层对负数 offset 的防御性
-// 归零（路由层已经归零，这里确保 SmartSearch 本身也不会因负数 offset 产生异常行为，
-// 例如切片越界或 k 值被算小）。
+// TestSmartSearchNegativeOffsetClampsToZero verifies the service layer's
+// defensive clamping of a negative offset to zero (the route layer already
+// clamps it; this makes sure SmartSearch itself won't misbehave on a
+// negative offset either, e.g. a slice out-of-bounds or an undersized k).
 func TestSmartSearchNegativeOffsetClampsToZero(t *testing.T) {
 	db, err := sqlite.Open(filepath.Join(t.TempDir(), "negoff.db"))
 	require.NoError(t, err)
@@ -565,8 +594,9 @@ func TestTimelineEnrichesPlaceName(t *testing.T) {
 	}
 }
 
-// TestSmartSearchExcludesOffline 验证:资产所在可移动盘被拔出(offline=1)时,
-// 即使有 CLIP 向量也不应出现在语义搜索结果里,如同暂时不存在。
+// TestSmartSearchExcludesOffline verifies that when an asset's removable
+// drive is unplugged (offline=1), it should not appear in semantic search
+// results even with a CLIP vector — as if it temporarily doesn't exist.
 func TestSmartSearchExcludesOffline(t *testing.T) {
 	db, err := sqlite.Open(filepath.Join(t.TempDir(), "so.db"))
 	require.NoError(t, err)
@@ -596,11 +626,11 @@ func TestSmartSearchExcludesOffline(t *testing.T) {
 	for _, a := range results {
 		ids[a.ID] = true
 	}
-	require.True(t, ids["online"], "在线资产应出现在结果中")
-	require.False(t, ids["offline"], "offline 资产必须从语义搜索结果中隐藏")
+	require.True(t, ids["online"], "an online asset should appear in the results")
+	require.False(t, ids["offline"], "an offline asset must be hidden from semantic search results")
 }
 
-// TestTimelineExcludesOffline 验证时间线视图隐藏 offline=1 的资产。
+// TestTimelineExcludesOffline verifies the timeline view hides offline=1 assets.
 func TestTimelineExcludesOffline(t *testing.T) {
 	db, err := sqlite.Open(filepath.Join(t.TempDir(), "tlo.db"))
 	require.NoError(t, err)
@@ -615,11 +645,11 @@ func TestTimelineExcludesOffline(t *testing.T) {
 	groups, err := svc.Timeline("default")
 	require.NoError(t, err)
 	require.Len(t, groups, 1)
-	require.Len(t, groups[0].Assets, 1, "offline 资产必须从 Timeline 隐藏")
+	require.Len(t, groups[0].Assets, 1, "an offline asset must be hidden from Timeline")
 	require.Equal(t, "online", groups[0].Assets[0].ID)
 }
 
-// TestListAssetsExcludesOffline 验证 ListAssets 隐藏 offline=1 的资产。
+// TestListAssetsExcludesOffline verifies ListAssets hides offline=1 assets.
 func TestListAssetsExcludesOffline(t *testing.T) {
 	db, err := sqlite.Open(filepath.Join(t.TempDir(), "lao.db"))
 	require.NoError(t, err)
@@ -637,7 +667,7 @@ func TestListAssetsExcludesOffline(t *testing.T) {
 	require.Equal(t, "online", assets[0].ID)
 }
 
-// TestPersonAssetsExcludesOffline 验证人物详情页的资产列表隐藏 offline 资产。
+// TestPersonAssetsExcludesOffline verifies the person detail page's asset list hides offline assets.
 func TestPersonAssetsExcludesOffline(t *testing.T) {
 	db, err := sqlite.Open(filepath.Join(t.TempDir(), "pao.db"))
 	require.NoError(t, err)
@@ -738,8 +768,8 @@ func TestGetAssetWithoutExifRow(t *testing.T) {
 	require.Equal(t, 0, a.Width)
 }
 
-// TestListAssetsByPlaceKey 验证 place_key 过滤只返回该城市的照片。
-// TestListAssetsBySpotKey 验证 spot_key 精确过滤到网格单元内的照片。
+// TestListAssetsByPlaceKey verifies the place_key filter returns only that city's photos.
+// TestListAssetsBySpotKey verifies the spot_key filter precisely narrows to photos within a grid cell.
 func TestListAssetsByPlaceAndSpotKey(t *testing.T) {
 	db, err := sqlite.Open(filepath.Join(t.TempDir(), "geo_filter.db"))
 	require.NoError(t, err)
@@ -749,7 +779,7 @@ func TestListAssetsByPlaceAndSpotKey(t *testing.T) {
 	require.NoError(t, err)
 	geoSvc := service.NewGeoService(db, gaz)
 
-	// seed 辅助：插入 asset + exif，并反向地理编码写入 asset_geo
+	// seed helper: inserts asset + exif, and reverse-geocodes into asset_geo
 	seed := func(id string, lat, lon float64) {
 		_, err := db.Exec(
 			`INSERT INTO assets(id,file_path,status,taken_at,is_live_photo_video)
@@ -762,13 +792,13 @@ func TestListAssetsByPlaceAndSpotKey(t *testing.T) {
 		require.NoError(t, geoSvc.GeocodeAsset(id))
 	}
 
-	// 东京 2 张：同网格坐标 (35.6895, 139.6917)
+	// 2 photos in Tokyo: the same grid coordinate (35.6895, 139.6917)
 	seed("tok1", 35.6895, 139.6917)
 	seed("tok2", 35.6895, 139.6917)
-	// 纽约 1 张
+	// 1 photo in New York
 	seed("nyc1", 40.71, -74.00)
 
-	// 取东京的 city_id（通过 PlacesService.ListPlaces 查 City=="Tokyo"）
+	// Get Tokyo's city_id (via PlacesService.ListPlaces, looking up City=="Tokyo")
 	placesSvc := service.NewPlacesService(db, gaz, geoSvc)
 	resp, err := placesSvc.ListPlaces()
 	require.NoError(t, err)
@@ -784,7 +814,7 @@ func TestListAssetsByPlaceAndSpotKey(t *testing.T) {
 
 	searchSvc := service.NewSearchService(db, nil)
 
-	// ── 测试 place_key 过滤 ─────────────────────────────────
+	// ── Test place_key filter ─────────────────────────────────
 	assets, err := searchSvc.ListAssets("default", 50, 0,
 		service.AssetFilter{PlaceKey: tokyoCityID})
 	require.NoError(t, err)
@@ -793,8 +823,8 @@ func TestListAssetsByPlaceAndSpotKey(t *testing.T) {
 		require.Contains(t, []string{"tok1", "tok2"}, a.ID)
 	}
 
-	// ── 测试 spot_key 过滤 ──────────────────────────────────
-	// spot_key 格式：cityID:int(lat/0.01):int(lon/0.01)
+	// ── Test spot_key filter ──────────────────────────────────
+	// spot_key format: cityID:int(lat/0.01):int(lon/0.01)
 	tokLat, tokLon := 35.6895, 139.6917
 	gx := int(tokLat / 0.01) // 3568
 	gy := int(tokLon / 0.01) // 13969
@@ -808,7 +838,7 @@ func TestListAssetsByPlaceAndSpotKey(t *testing.T) {
 		require.Contains(t, []string{"tok1", "tok2"}, a.ID)
 	}
 
-	// ── 纽约 place_key 过滤 ─────────────────────────────────
+	// ── New York place_key filter ─────────────────────────────────
 	var nycCityID int32
 	for _, p := range resp.Places {
 		if p.City != "Tokyo" {
@@ -832,7 +862,7 @@ func TestUpdateDurationMs(t *testing.T) {
 		VALUES('v1','/v/v1.mp4','video/mp4',0,'indexed')`)
 	require.NoError(t, err)
 
-	s := service.NewSearchService(db, nil) // ml 可为 nil（仅用非 CLIP 方法）
+	s := service.NewSearchService(db, nil) // ml may be nil (only non-CLIP methods are used)
 	require.NoError(t, s.UpdateDurationMs("v1", 62000))
 
 	var got int64
@@ -840,9 +870,10 @@ func TestUpdateDurationMs(t *testing.T) {
 	require.Equal(t, int64(62000), got)
 }
 
-// TestOCRLinesMatchAndAll 验证 GET /assets/:id/ocr 背后的服务方法:
-// 带 query 时按 ocrSearch 同款规则(大小写不敏感子串)过滤行,
-// 不带 query 返回全部行(Live Text 预留);行序按 line_no;缺资产 ErrNotFound。
+// TestOCRLinesMatchAndAll verifies the service method backing
+// GET /assets/:id/ocr: with a query, filters lines using the same rule as
+// ocrSearch (case-insensitive substring); without one, returns all lines
+// (reserved for Live Text); line order is by line_no; a missing asset gives ErrNotFound.
 func TestOCRLinesMatchAndAll(t *testing.T) {
 	db, err := sqlite.Open(filepath.Join(t.TempDir(), "ocr.db"))
 	require.NoError(t, err)
@@ -857,43 +888,44 @@ func TestOCRLinesMatchAndAll(t *testing.T) {
 		('a1', 1, 'TOTAL $42.00',   '[0.1,0.3,0.5,0.3,0.5,0.4,0.1,0.4]', 0.95)`)
 	require.NoError(t, err)
 
-	// 命中过滤:中文子串。
+	// Hit filter: Chinese substring.
 	hits, err := s.OCRLines("a1", "发票")
 	require.NoError(t, err)
 	require.Len(t, hits, 1)
 	require.Equal(t, "XX公司发票代开", hits[0].Text)
 	require.Equal(t, []float64{0.1, 0.1, 0.9, 0.1, 0.9, 0.2, 0.1, 0.2}, hits[0].Box)
 
-	// 大小写不敏感(与 ocrSearch 的 instr(lower,lower) 同款)。
+	// Case-insensitive (same as ocrSearch's instr(lower,lower)).
 	hits, err = s.OCRLines("a1", "total")
 	require.NoError(t, err)
 	require.Len(t, hits, 1)
 
-	// 不带 query → 全部行,按 line_no 排序。
+	// No query → all lines, ordered by line_no.
 	all, err := s.OCRLines("a1", "")
 	require.NoError(t, err)
 	require.Len(t, all, 2)
 	require.Equal(t, "XX公司发票代开", all[0].Text)
 
-	// 无命中 → 空切片(非 nil 语义由 handler JSON 保证)。
+	// No hit → empty slice (handler JSON guarantees non-nil semantics).
 	none, err := s.OCRLines("a1", "不存在的词")
 	require.NoError(t, err)
 	require.Len(t, none, 0)
 
-	// 资产不存在 → ErrNotFound。
+	// Asset does not exist → ErrNotFound.
 	_, err = s.OCRLines("ghost", "x")
 	require.ErrorIs(t, err, service.ErrNotFound)
 
-	// 软删资产(deleted_at 非空)视同不存在 → ErrNotFound。
+	// Soft-deleted asset (deleted_at non-null) is treated as not existing → ErrNotFound.
 	_, err = db.Exec(`UPDATE assets SET deleted_at = CURRENT_TIMESTAMP WHERE id='a1'`)
 	require.NoError(t, err)
 	_, err = s.OCRLines("a1", "发票")
 	require.ErrorIs(t, err, service.ErrNotFound)
 }
 
-// TestDeleteAsset_TriggersCaptionDelete：物理删除（DeleteAsset，紧邻
-// dropClipVector 的调用点）成功后应调用 SetCaptionDelete 注入的回调，携带正确
-// 的 assetID（Task 4 caption 联动：防 agent 检索到已删除照片的幽灵结果）。
+// TestDeleteAsset_TriggersCaptionDelete: after a hard delete (DeleteAsset, the
+// call site right next to dropClipVector) succeeds, it should invoke the
+// callback injected via SetCaptionDelete with the correct assetID (Task 4
+// caption cascade: prevents the agent from retrieving ghost results for a deleted photo).
 func TestDeleteAsset_TriggersCaptionDelete(t *testing.T) {
 	db, err := sqlite.Open(filepath.Join(t.TempDir(), "delcap.db"))
 	require.NoError(t, err)

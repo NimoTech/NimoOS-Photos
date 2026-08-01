@@ -7,33 +7,36 @@ import (
 	"path/filepath"
 )
 
-// TrashService 实现软删除（回收站）：删除把原文件移到 <galleryDir>/.trash/<id>/，
-// DB 记 deleted_at；恢复移回；永久删除 rm 文件 + 缩略图 + DB 记录。
+// TrashService implements soft delete (trash): deleting moves the original
+// file to <galleryDir>/.trash/<id>/ and records deleted_at in the DB;
+// restoring moves it back; a permanent delete removes the file + thumbnail +
+// DB record.
 type TrashService struct {
 	db         *sql.DB
-	galleryDir string // 回收站根目录所在的 gallery 根（.trash 放它下面）
-	thumbDir   string // 缩略图根目录，用于永久删除时清理
+	galleryDir string // gallery root that holds the trash root (.trash lives under it)
+	thumbDir   string // thumbnail root, cleaned up on permanent delete
 
-	// onCaptionDelete/onCaptionRestore 是 caption 联动钩子（Task 4），函数字段
-	// 注入避免 TrashService 直接 import CaptionFeeder（同 MountGuard/Embedder
-	// 的注入惯例）。为 nil 时（未接线 / 测试）安全跳过。
+	// onCaptionDelete/onCaptionRestore are the caption hand-off hooks (Task
+	// 4). Function fields avoid TrashService importing CaptionFeeder
+	// directly (same injection convention as MountGuard/Embedder). Safely
+	// skipped when nil (not wired up / tests).
 	onCaptionDelete  func(assetID string)
 	onCaptionRestore func(assetID string)
 }
 
-// NewTrashService 构造 TrashService。
+// NewTrashService constructs a TrashService.
 func NewTrashService(db *sql.DB, galleryDir, thumbDir string) *TrashService {
 	return &TrashService{db: db, galleryDir: galleryDir, thumbDir: thumbDir}
 }
 
-// SetCaptionDelete 注入软删/永久删成功后的 caption 删除回调（通常是
-// CaptionFeeder.DeleteRemote）。
+// SetCaptionDelete injects the caption-delete callback fired after a
+// soft/permanent delete succeeds (usually CaptionFeeder.DeleteRemote).
 func (s *TrashService) SetCaptionDelete(fn func(assetID string)) {
 	s.onCaptionDelete = fn
 }
 
-// SetCaptionRestore 注入恢复成功后的 caption 复位回调（通常是
-// CaptionFeeder.OnRestore）。
+// SetCaptionRestore injects the caption-restore callback fired after a
+// restore succeeds (usually CaptionFeeder.OnRestore).
 func (s *TrashService) SetCaptionRestore(fn func(assetID string)) {
 	s.onCaptionRestore = fn
 }
@@ -42,7 +45,8 @@ func (s *TrashService) trashDir(id string) string {
 	return filepath.Join(s.galleryDir, ".trash", id)
 }
 
-// TrashAsset 把一个资产移入回收站（含其 Live Photo 视频伴随项）。
+// TrashAsset moves an asset into the trash (including its Live Photo video
+// companion, if any).
 func (s *TrashService) TrashAsset(id string) error {
 	var filePath, liveID string
 	err := s.db.QueryRow(
@@ -63,12 +67,12 @@ func (s *TrashService) TrashAsset(id string) error {
 			`SELECT file_path FROM assets WHERE id=? AND deleted_at IS NULL`, liveID,
 		).Scan(&livePath); e == nil {
 			if me := s.moveToTrash(liveID, livePath); me == nil && s.onCaptionDelete != nil {
-				s.onCaptionDelete(liveID) // caption 联动：Live Photo 伴随资产同步删除，防幽灵结果
+				s.onCaptionDelete(liveID) // caption hand-off: delete the Live Photo companion asset's caption too, to avoid ghost results
 			}
 		}
 	}
 	if s.onCaptionDelete != nil {
-		s.onCaptionDelete(id) // caption 联动：防 agent 检索到幽灵结果
+		s.onCaptionDelete(id) // caption hand-off: prevent the agent from retrieving ghost results
 	}
 	return nil
 }
@@ -96,7 +100,8 @@ func (s *TrashService) moveToTrash(id, filePath string) error {
 	return nil
 }
 
-// RestoreAsset 把一个资产移回原位（含 Live Photo 伴随项）。
+// RestoreAsset moves an asset back to its original location (including its
+// Live Photo companion, if any).
 func (s *TrashService) RestoreAsset(id string) error {
 	curPath, origPath, liveID, err := s.trashRow(id)
 	if err != nil {
@@ -108,17 +113,17 @@ func (s *TrashService) RestoreAsset(id string) error {
 	if liveID != "" {
 		if lp, lo, _, e := s.trashRow(liveID); e == nil {
 			if re := s.restoreFile(liveID, lp, lo); re == nil && s.onCaptionRestore != nil {
-				s.onCaptionRestore(liveID) // caption 联动：Live Photo 伴随资产同步复位重投
+				s.onCaptionRestore(liveID) // caption hand-off: restore the Live Photo companion asset's caption too
 			}
 		}
 	}
 	if s.onCaptionRestore != nil {
-		s.onCaptionRestore(id) // caption 联动：恢复后重投,防止 caption 缺失
+		s.onCaptionRestore(id) // caption hand-off: re-submit after restore, so the caption isn't missing
 	}
 	return nil
 }
 
-// trashRow 读取一个回收站项的当前路径/原路径/live 伴随 id。
+// trashRow reads a trash item's current path / original path / Live Photo companion id.
 func (s *TrashService) trashRow(id string) (curPath, origPath, liveID string, err error) {
 	err = s.db.QueryRow(
 		`SELECT file_path, COALESCE(original_path,''), COALESCE(live_photo_video_id,'')
@@ -136,10 +141,10 @@ func (s *TrashService) trashRow(id string) (curPath, origPath, liveID string, er
 func (s *TrashService) restoreFile(id, curPath, origPath string) error {
 	dst := origPath
 	if dst == "" {
-		dst = curPath // 兜底：没有原路径就留在原地，仅清标记
+		dst = curPath // fallback: no original path, leave it where it is and just clear the flag
 	} else {
 		if _, err := os.Stat(dst); err == nil {
-			dst = dedupePath(dst) // 原位被占用 → 去重命名
+			dst = dedupePath(dst) // original location taken → rename to dedupe
 		}
 		if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
 			return fmt.Errorf("restoreFile mkdir: %w", err)
@@ -156,7 +161,8 @@ func (s *TrashService) restoreFile(id, curPath, origPath string) error {
 	return nil
 }
 
-// dedupePath 在文件名扩展名前插入 " (restored)"，必要时加序号，直到路径不存在。
+// dedupePath inserts " (restored)" before the filename extension, adding a
+// number suffix if needed, until the path doesn't already exist.
 func dedupePath(p string) string {
 	ext := filepath.Ext(p)
 	base := p[:len(p)-len(ext)]
@@ -169,7 +175,8 @@ func dedupePath(p string) string {
 	}
 }
 
-// PurgeAsset 永久删除一个回收站项：rm 文件 + 缩略图目录 + DB 记录（含 Live 伴随项）。
+// PurgeAsset permanently deletes a trash item: removes the file + thumbnail
+// directory + DB record (including its Live Photo companion, if any).
 func (s *TrashService) PurgeAsset(id string) error {
 	var curPath, liveID string
 	err := s.db.QueryRow(
@@ -188,14 +195,14 @@ func (s *TrashService) PurgeAsset(id string) error {
 			s.purgeFiles(liveID, lp)
 			dropClipVector(s.db, liveID) // before the cascade drops asset_clip_idx
 			if s.onCaptionDelete != nil {
-				s.onCaptionDelete(liveID) // caption 联动：防 agent 检索到幽灵结果
+				s.onCaptionDelete(liveID) // caption hand-off: prevent the agent from retrieving ghost results
 			}
 			s.db.Exec(`DELETE FROM assets WHERE id=?`, liveID) //nolint:errcheck
 		}
 	}
 	dropClipVector(s.db, id) // before the cascade drops asset_clip_idx
 	if s.onCaptionDelete != nil {
-		s.onCaptionDelete(id) // caption 联动：防 agent 检索到幽灵结果
+		s.onCaptionDelete(id) // caption hand-off: prevent the agent from retrieving ghost results
 	}
 	if _, err := s.db.Exec(`DELETE FROM assets WHERE id=?`, id); err != nil {
 		return fmt.Errorf("PurgeAsset delete: %w", err)
@@ -209,7 +216,8 @@ func (s *TrashService) purgeFiles(id, curPath string) {
 	os.RemoveAll(filepath.Join(s.thumbDir, id)) //nolint:errcheck
 }
 
-// ListTrash 返回所有在回收站的资产（非 live-video），按删除时间倒序。
+// ListTrash returns every asset currently in the trash (excluding
+// live-video companions), ordered by delete time descending.
 func (s *TrashService) ListTrash(userID string) ([]Asset, error) {
 	rows, err := s.db.Query(`
 SELECT a.id, a.file_path, a.file_size, COALESCE(a.mime_type,''),
@@ -259,7 +267,7 @@ ORDER BY a.deleted_at DESC`)
 	return out, rows.Err()
 }
 
-// EmptyTrash 永久删除所有回收站项。
+// EmptyTrash permanently deletes every item in the trash.
 func (s *TrashService) EmptyTrash() error {
 	ids, err := s.trashIDs("")
 	if err != nil {
@@ -273,7 +281,7 @@ func (s *TrashService) EmptyTrash() error {
 	return nil
 }
 
-// RestoreAllTrash 恢复所有回收站项。
+// RestoreAllTrash restores every item in the trash.
 func (s *TrashService) RestoreAllTrash() error {
 	ids, err := s.trashIDs("")
 	if err != nil {
@@ -287,7 +295,8 @@ func (s *TrashService) RestoreAllTrash() error {
 	return nil
 }
 
-// trashIDs 返回回收站中（非 live-video）资产 id；whereExtra 为附加条件（可空）。
+// trashIDs returns asset ids currently in the trash (excluding live-video
+// companions); whereExtra is an optional additional condition.
 func (s *TrashService) trashIDs(whereExtra string) ([]string, error) {
 	q := `SELECT id FROM assets WHERE deleted_at IS NOT NULL AND is_live_photo_video = 0`
 	if whereExtra != "" {
@@ -309,7 +318,7 @@ func (s *TrashService) trashIDs(whereExtra string) ([]string, error) {
 	return ids, rows.Err()
 }
 
-// PurgeExpired 永久删除删除时间早于 (now - retentionDays) 的回收站项。
+// PurgeExpired permanently deletes trash items deleted before (now - retentionDays).
 func (s *TrashService) PurgeExpired(retentionDays int) error {
 	if retentionDays <= 0 {
 		retentionDays = 30

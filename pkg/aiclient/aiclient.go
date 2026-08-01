@@ -1,7 +1,8 @@
-// Package aiclient 是 NimoOS-AI `_internal` 接口的薄客户端,供 Smart Moments
-// 的 LLM 命名(best-effort)使用。`_internal` 分组 localhost-only、免 JWT
-// (见 NimoOS-AI route/v2.go:93 `g.Group("/_internal", LocalhostOnly)`),不
-// 经 Gateway/JWT 鉴权,是 wiki_summary_worker 同款的直连方式。
+// Package aiclient is a thin client for NimoOS-AI's `_internal` interface,
+// used by Smart Moments' (best-effort) LLM naming. The `_internal` group is
+// localhost-only and JWT-exempt (see NimoOS-AI route/v2.go:93
+// `g.Group("/_internal", LocalhostOnly)`), bypassing Gateway/JWT auth — the
+// same direct-connection approach used by wiki_summary_worker.
 package aiclient
 
 import (
@@ -18,45 +19,55 @@ import (
 	"strings"
 	"time"
 
-	_ "github.com/mattn/go-sqlite3" // CGO SQLite3 驱动,resolveUserID 只读打开 user.db 用
+	_ "github.com/mattn/go-sqlite3" // CGO SQLite3 driver, used by resolveUserID to open user.db read-only
 )
 
-// defaultAIURLFile 是 AI 服务发现文件的默认路径:NimoOS-AI 启动时把自己的
-// 地址写到这里(见 wiki_summary_worker/discovery.py:ai_url 同一份文件)。
+// defaultAIURLFile is the default path for the AI service discovery file:
+// NimoOS-AI writes its own address here on startup (see the same file
+// referenced by wiki_summary_worker/discovery.py:ai_url).
 const defaultAIURLFile = "/var/run/nimoos/ai.url"
 
-// usersDBPath 是 user.db 的路径,resolveUserID 用它兜底取 admin 用户 id;
-// 与 wiki_summary_worker/discovery.py 的 _USERS_DB 常量同一份文件。
-// 包级变量而非常量,是为了让白盒测试(同包)能重写指向临时库。
+// usersDBPath is the path to user.db, used by resolveUserID as a fallback to
+// get the admin user id; the same file referenced by
+// wiki_summary_worker/discovery.py's _USERS_DB constant.
+// A package-level var rather than a const so white-box tests (same package)
+// can override it to point at a temp DB.
 var usersDBPath = "/var/lib/nimoos/db/user.db"
 
-// completeTimeout 是 Complete 一次调用(选模型 + chat completions 两次请求
-// 合计)的整体超时。真机验收发现本地弱模型偶发比 5s 慢(命名请求超时后
-// best-effort 跳过、时刻留模板标题),放宽到 10s 换取更高的 LLM 命名成功率。
+// completeTimeout is the overall timeout for one Complete call (model
+// selection + chat completions requests combined). Real-machine acceptance
+// testing found weaker local models occasionally slower than 5s (naming
+// requests would time out and fall back best-effort, leaving the template
+// title); relaxed to 10s to trade for a higher LLM naming success rate.
 const completeTimeout = 10 * time.Second
 
-// chatMaxTokens/chatTemperature 是 chat completions 请求体里的防御性约束
-// (对照 wiki_summary_worker/llm.py 同款做法):Complete 只用来生成"至多 4
-// 个单词"的短标题,NimoOS-AI 云端适配层的 max_tokens 缺省高达 16000,不加
-// 约束会白白放大云端调用的成本/延迟;温度调低让输出风格更稳定。
+// chatMaxTokens/chatTemperature are defensive constraints on the chat
+// completions request body (mirroring the same approach in
+// wiki_summary_worker/llm.py): Complete is only used to generate a short
+// title of "at most 4 words", and NimoOS-AI's cloud adapter layer defaults
+// max_tokens as high as 16000 — without this cap it would needlessly inflate
+// the cost/latency of the cloud call; lowering the temperature makes the
+// output style more consistent.
 const (
 	chatMaxTokens   = 60
 	chatTemperature = 0.2
 )
 
-// ErrAIUnavailable 表示发现文件缺失/不可读(AI 服务未部署或未启动),调用方
-// 应据此静默跳过(best-effort)。
+// ErrAIUnavailable indicates the discovery file is missing/unreadable (the
+// AI service isn't deployed or isn't running); the caller should silently
+// skip (best-effort) based on this.
 var ErrAIUnavailable = errors.New("ai service not available")
 
-// Client 是 NimoOS-AI `_internal` 接口的薄客户端。
+// Client is a thin client for NimoOS-AI's `_internal` interface.
 type Client struct {
 	aiURLFile string
 	httpc     *http.Client
 }
 
-// New 构造 Client。aiURLFile 为空时用默认路径 /var/run/nimoos/ai.url;每次
-// 调用都重新读这个文件(AI 服务重启换随机端口时自适应),照
-// pkg/parserclient 的发现惯例。
+// New constructs a Client. If aiURLFile is empty, uses the default path
+// /var/run/nimoos/ai.url; the file is re-read on every call (adapting when
+// the AI service restarts on a new random port), following pkg/parserclient's
+// discovery convention.
 func New(aiURLFile string) *Client {
 	if aiURLFile == "" {
 		aiURLFile = defaultAIURLFile
@@ -79,8 +90,9 @@ func (c *Client) baseURL() (string, error) {
 	return u, nil
 }
 
-// internalModelsResponse 对应 GET /v1/ai/_internal/models 的响应体(只取
-// Complete 选模型用得到的字段,其余字段原样忽略)。
+// internalModelsResponse corresponds to the response body of GET
+// /v1/ai/_internal/models (only the fields Complete's model selection needs;
+// other fields are ignored as-is).
 type internalModelsResponse struct {
 	Local []struct {
 		Name string `json:"name"`
@@ -90,11 +102,12 @@ type internalModelsResponse struct {
 	} `json:"cloud"`
 }
 
-// pickModel 选模型 + 是否需要强制走云端。策略移植自
-// NimoOS-AI/wiki_summary_worker/discovery.py:41-79 的
-// resolve_model_and_routing:优先本地(Ollama)模型,本地为空才退回该用户
-// 已启用的云端 provider 默认模型;两者皆空返回 error(调用方 best-effort
-// 静默跳过)。
+// pickModel selects a model and whether the cloud must be forced. The
+// strategy is ported from resolve_model_and_routing in
+// NimoOS-AI/wiki_summary_worker/discovery.py:41-79: prefer a local (Ollama)
+// model, falling back to that user's enabled cloud provider's default model
+// only if there's no local model; if both are empty, returns an error (the
+// caller silently skips, best-effort).
 func pickModel(ctx context.Context, httpc *http.Client, base, userID string) (model string, forceCloud bool, err error) {
 	reqURL := base + "/v1/ai/_internal/models?user_id=" + url.QueryEscape(userID)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
@@ -122,13 +135,13 @@ func pickModel(ctx context.Context, httpc *http.Client, base, userID string) (mo
 	return "", false, errors.New("aiclient: no model available (no local Ollama model, no enabled cloud provider)")
 }
 
-// chatMessage 是 OpenAI messages 格式的最小子集。
+// chatMessage is a minimal subset of the OpenAI messages format.
 type chatMessage struct {
 	Role    string `json:"role"`
 	Content string `json:"content"`
 }
 
-// chatCompletionsResponse 是 chat completions 响应体里 Complete 用得到的部分。
+// chatCompletionsResponse is the part of the chat completions response body that Complete needs.
 type chatCompletionsResponse struct {
 	Choices []struct {
 		Message struct {
@@ -137,10 +150,12 @@ type chatCompletionsResponse struct {
 	} `json:"choices"`
 }
 
-// Complete 向 NimoOS-AI 发一次单轮 chat completion,返回模型输出的纯文本。
-// 整体(选模型 + chat completions 两次请求)5s 超时;发现文件缺失、HTTP
-// 非 2xx、无可用模型、超时均返回 error——调用方(Smart Moments 的 LLM
-// 命名)据此静默跳过,绝不能阻塞主流程。
+// Complete sends a single-turn chat completion to NimoOS-AI, returning the
+// model's plain-text output.
+// Overall (model selection + chat completions requests combined) 5s timeout;
+// a missing discovery file, non-2xx HTTP, no available model, or a timeout
+// all return an error — the caller (Smart Moments' LLM naming) silently
+// skips based on this, and must never block the main flow.
 func (c *Client) Complete(ctx context.Context, prompt string) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, completeTimeout)
 	defer cancel()
@@ -157,10 +172,11 @@ func (c *Client) Complete(ctx context.Context, prompt string) (string, error) {
 		return "", err
 	}
 
-	// max_tokens/temperature 是对照 wiki_summary_worker/llm.py 的同款防御:
-	// NimoOS-AI 云端适配层 max_tokens 缺省高达 16000,起名这种短输出调用不
-	// 加约束会放大云端调用的成本/延迟;temperature 走低值让标题风格更稳定、
-	// 少一些天马行空的联想。
+	// max_tokens/temperature mirror the same defensive pattern as
+	// wiki_summary_worker/llm.py: NimoOS-AI's cloud adapter layer defaults
+	// max_tokens as high as 16000, and a short-output call like naming would
+	// inflate cloud call cost/latency without this cap; a lower temperature
+	// makes the title style more consistent, with fewer wild associations.
 	body, err := json.Marshal(map[string]any{
 		"model":       model,
 		"messages":    []chatMessage{{Role: "user", Content: prompt}},
@@ -199,14 +215,16 @@ func (c *Client) Complete(ctx context.Context, prompt string) (string, error) {
 	return strings.TrimSpace(parsed.Choices[0].Message.Content), nil
 }
 
-// resolveUserID 取 X-NimoOS-User-ID 请求头值,策略完全对齐
-// NimoOS-AI/wiki_summary_worker/discovery.py 的 resolve_user_id 第 2/3/4 步
-// (本客户端没有它第 1 步那种运维配置覆盖项):
-//  1. user.db 里 role='admin' 的最小 id;
-//  2. 查不到 admin 则任意用户的最小 id;
-//  3. user.db 不可读/查询失败/空表,一律兜底常量 "system"——机器上没有
-//     user.db 时 chat-completions 会路由到本地 Ollama,是合理的兜底,worker
-//     不会因此崩溃。
+// resolveUserID gets the X-NimoOS-User-ID request header value, with a
+// strategy fully aligned with steps 2/3/4 of resolve_user_id in
+// NimoOS-AI/wiki_summary_worker/discovery.py (this client has no equivalent
+// of its step 1, the ops-config override):
+//  1. The smallest id among user.db rows with role='admin';
+//  2. If no admin is found, the smallest id among any users;
+//  3. If user.db is unreadable/the query fails/the table is empty, fall back
+//     to the constant "system" — on a machine with no user.db,
+//     chat-completions routes to local Ollama, which is a reasonable
+//     fallback; the worker won't crash over this.
 func resolveUserID() string {
 	db, err := sql.Open("sqlite3", "file:"+usersDBPath+"?mode=ro&_busy_timeout=2000")
 	if err != nil {

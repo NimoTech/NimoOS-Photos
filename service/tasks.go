@@ -9,67 +9,84 @@ import (
 	"time"
 )
 
-// 任务错误的结构化 i18n key 契约:英文原文本身即 key(含 {参数} 占位),
-// 前端按 key 查字典翻译、用 ErrorParams 填充占位;Error 字段只是英文 fallback。
-// 新增/改动 key 文案需与前端 i18n 字典同步(前端另行维护，此处不引用)。
+// The structured i18n key contract for task errors: the English text itself
+// is the key (with {param} placeholders); the frontend looks it up in its
+// dictionary and fills placeholders with ErrorParams. The Error field is
+// just the English fallback.
+// New/changed key text must be kept in sync with the frontend's i18n
+// dictionary (maintained separately, not referenced here).
 const (
-	// TaskErrMLLostDuringBackfill 无参数。
+	// TaskErrMLLostDuringBackfill takes no params.
 	TaskErrMLLostDuringBackfill = "ML service was lost during backfill; please check the service status"
-	// TaskErrOCRSourceReadFailed 参数: readFail。
+	// TaskErrOCRSourceReadFailed param: readFail.
 	TaskErrOCRSourceReadFailed = "Source files for {readFail} photos could not be read; text recognition skipped"
-	// TaskErrOCRBackfillFailed 参数: readFail, ocrFail。
+	// TaskErrOCRBackfillFailed params: readFail, ocrFail.
 	TaskErrOCRBackfillFailed = "Text recognition backfill failed (source read failed: {readFail}, ML failed: {ocrFail})"
-	// TaskErrFaceClusterFailed 参数: detail。
+	// TaskErrFaceClusterFailed param: detail.
 	TaskErrFaceClusterFailed = "Face clustering failed: {detail}"
-	// TaskErrPeopleRecognitionFailed 参数: detail。
+	// TaskErrPeopleRecognitionFailed param: detail.
 	TaskErrPeopleRecognitionFailed = "People recognition failed: {detail}"
-	// TaskErrQueryAssetsFailed 参数: detail。
+	// TaskErrQueryAssetsFailed param: detail.
 	TaskErrQueryAssetsFailed = "Failed to query assets: {detail}"
-	// TaskErrReadAssetListFailed 参数: detail。
+	// TaskErrReadAssetListFailed param: detail.
 	TaskErrReadAssetListFailed = "Failed to read asset list: {detail}"
-	// TaskErrPreviewFfmpegMissing 无参数。
+	// TaskErrPreviewFfmpegMissing takes no params.
 	TaskErrPreviewFfmpegMissing = "ffmpeg is unavailable; video preview generation skipped"
-	// TaskErrPreviewPartialFailed 参数: failed。仅在本轮候选全部生成失败时使用
-	// (对齐 BackfillOCR 惯例);出现部分失败但仍有成功项时任务终态为 done,失败
-	// 数只记入日志,不占用这个 error key,避免个别损坏视频反复刷 Failed。
+	// TaskErrPreviewPartialFailed param: failed. Used only when every
+	// candidate in this run failed to generate (matching BackfillOCR's
+	// convention); when some fail but others still succeed, the task's
+	// terminal state is done — the failure count is only logged, not routed
+	// through this error key, to avoid a few corrupt videos repeatedly
+	// flashing Failed.
 	TaskErrPreviewPartialFailed = "Failed to generate previews for {failed} videos"
-	// TaskErrMomentsRecomputeFailed 参数: detail。仅覆盖引擎/落库这类基础设施
-	// 故障;LLM 命名失败是 best-effort,静默跳过,不占用这个 error key。
+	// TaskErrMomentsRecomputeFailed param: detail. Covers only infrastructure
+	// failures like the engine or persistence; LLM naming failure is
+	// best-effort and silently skipped, not routed through this error key.
 	TaskErrMomentsRecomputeFailed = "Smart moments recompute failed: {detail}"
 )
 
-// 任务停滞阈值:running 任务超过这么久没有任何更新,视为僵尸(漏发 done、
-// goroutine 挂起、或声明总数>实际处理数导致 current 永远到不了 total),
-// 由清扫器强制收尾。取值需明显大于任何单步最坏耗时(mlclient 单次 120s,
-// 多模型串行最坏数百秒),5 分钟足够安全,不会误杀仍在缓慢推进的任务。
+// Task staleness threshold: a "running" task with no update for this long is
+// considered a zombie (a missed "done" emission, a hung goroutine, or a
+// declared total > actual processed count that keeps current from ever
+// reaching total), and the sweeper force-finalizes it. The value must be
+// clearly larger than any single step's worst-case duration (a single
+// mlclient call is 120s, serial multi-model worst case is hundreds of
+// seconds); 5 minutes is safely conservative without falsely killing tasks
+// still making slow progress.
 const taskStaleTimeout = 5 * time.Minute
 
-// 清扫器扫描周期。
+// taskSweepInterval is the sweeper's scan period.
 const taskSweepInterval = 1 * time.Minute
 
 // Task is the single contract object exchanged via REST and MessageBus.
 type Task struct {
-	ID         string    `json:"id"`
-	Type       string    `json:"type"`
-	Label      string    `json:"label"`
-	Current    int64     `json:"current,omitempty"`
-	Total      int64     `json:"total,omitempty"`
-	// Added 在终态(done)携带「本次新增数」语义:人脸聚类用它报本次新聚类(此前未分配)
-	// 的人脸数,供前端「有新增才提示、且显示新增数而非总数」。0 表示无新增。
+	ID      string `json:"id"`
+	Type    string `json:"type"`
+	Label   string `json:"label"`
+	Current int64  `json:"current,omitempty"`
+	Total   int64  `json:"total,omitempty"`
+	// Added carries "count added this run" semantics in the terminal (done)
+	// state: face clustering uses it to report the number of faces newly
+	// clustered (previously unassigned) this run, so the frontend only shows
+	// a hint when there's something new, displaying the added count rather
+	// than the total. 0 means nothing added.
 	Added      int64     `json:"added,omitempty"`
 	Progress   float64   `json:"progress"`
 	Status     string    `json:"status"`
 	ETASeconds int       `json:"eta_seconds,omitempty"`
 	StartedAt  time.Time `json:"started_at"`
 	Error      string    `json:"error,omitempty"`
-	// ErrorKey / ErrorParams 承载结构化 i18n 错误:ErrorKey 是上面契约里的英文原文
-	// (含 {参数} 占位),ErrorParams 是占位替换值。Error 字段随之降级为英文 fallback,
-	// 供没有走 i18n 字典的旧前端/日志兜底展示。均由 SetError 统一设置。
+	// ErrorKey / ErrorParams carry the structured i18n error: ErrorKey is the
+	// English text from the contract above (with {param} placeholders),
+	// ErrorParams holds the placeholder substitution values. The Error field
+	// then degrades to an English fallback, for older frontends/logs that
+	// don't go through the i18n dictionary. Both are set uniformly by SetError.
 	ErrorKey    string            `json:"errorKey,omitempty"`
 	ErrorParams map[string]string `json:"errorParams,omitempty"`
 }
 
-// SetError 设置结构化 i18n 错误(key + 参数),并生成英文 fallback 到 Error。
+// SetError sets a structured i18n error (key + params), and generates the
+// English fallback into Error.
 func (t *Task) SetError(key string, params map[string]string) {
 	t.ErrorKey = key
 	t.ErrorParams = params
@@ -90,7 +107,7 @@ type TaskRegistry struct {
 	lastPub  map[string]time.Time
 	lastPct  map[string]float64
 	lastSt   map[string]string
-	lastSeen map[string]time.Time // 每个任务最后一次 Upsert 的时刻(不受发布节流影响),供停滞清扫器判活
+	lastSeen map[string]time.Time // time of each task's last Upsert (unaffected by publish throttling), used by the stale sweeper to judge liveness
 	pub      TaskPublisher
 }
 
@@ -115,7 +132,7 @@ func (r *TaskRegistry) Upsert(t Task) {
 	r.mu.Lock()
 	r.tasks[t.ID] = t
 	now := time.Now()
-	r.lastSeen[t.ID] = now // 任何更新都刷新活动时间(即便本次因节流未发布)
+	r.lastSeen[t.ID] = now // any update refreshes the activity time (even if this one wasn't published due to throttling)
 	prevPub, hadPub := r.lastPub[t.ID]
 	prevPct := r.lastPct[t.ID]
 	prevSt := r.lastSt[t.ID]
@@ -164,13 +181,17 @@ func bucketCrossed(prev, next, step float64) bool {
 	return int(next/step) > int(prev/step)
 }
 
-// StartStaleSweeper 启动一个后台清扫器(A:通用兜底)。它周期性扫描注册表,
-// 把长时间(staleAfter)无更新、仍处于 "running" 的任务强制收尾为 "done" 并移除。
+// StartStaleSweeper starts a background sweeper (A: generic fallback). It
+// periodically scans the registry and force-finalizes any task still
+// "running" with no update for staleAfter to "done", then removes it.
 //
-// 这是与任务类型无关的存活性保障:有 DB 真值的任务(index/ocr/clip)由前端按真值
-// 对账即可自愈,但没有真值的任务(典型如人脸聚类——一次性内存计算,中途无可查询的
-// 进度)一旦 goroutine 挂起或漏发 done,只有这里能兜底,避免注册表里出现永久僵尸。
-// 阻塞直到 ctx 取消;通常以 go reg.StartStaleSweeper(ctx, ...) 方式调用。
+// This is a task-type-agnostic liveness guarantee: tasks backed by DB ground
+// truth (index/ocr/clip) can self-heal via the frontend reconciling against
+// that truth, but tasks with no ground truth (typically face clustering — a
+// one-shot in-memory computation with no queryable progress midway) rely
+// solely on this fallback if their goroutine hangs or misses emitting done,
+// otherwise they'd sit as permanent zombies in the registry. Blocks until ctx
+// is canceled; normally invoked as `go reg.StartStaleSweeper(ctx, ...)`.
 func (r *TaskRegistry) StartStaleSweeper(ctx context.Context, staleAfter, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -184,7 +205,8 @@ func (r *TaskRegistry) StartStaleSweeper(ctx context.Context, staleAfter, interv
 	}
 }
 
-// sweepStale 收集并清理停滞任务;now 作为参数注入以便测试。返回被清理的任务(便于测试断言)。
+// sweepStale collects and cleans up stale tasks; now is injected as a
+// parameter for testability. Returns the cleaned-up tasks (for test assertions).
 func (r *TaskRegistry) sweepStale(staleAfter time.Duration, now time.Time) []Task {
 	var stale []Task
 	r.mu.Lock()
@@ -214,7 +236,7 @@ func (r *TaskRegistry) sweepStale(staleAfter time.Duration, now time.Time) []Tas
 
 	for _, f := range stale {
 		fmt.Fprintf(os.Stderr,
-			"[taskRegistry] 清理停滞任务 id=%s type=%s label=%q last_progress=%.2f → 强制 done\n",
+			"[taskRegistry] cleaning up stale task id=%s type=%s label=%q last_progress=%.2f → forcing done\n",
 			f.ID, f.Type, f.Label, f.Progress)
 		if pub != nil {
 			pub(f)

@@ -74,8 +74,10 @@ func (s *SmartViewService) Create(in SmartViewInput) (*SmartView, error) {
 	return s.Get(in.ID)
 }
 
-// insertRow 只做 smart_views 行的落库(不触发 Evaluate/日志),供 Create 与
-// 转换端点(ConvertFromAlbum)共用同一段建行逻辑,避免转换流程里重复评估。
+// insertRow only persists the smart_views row (doesn't trigger Evaluate/
+// logging), shared by Create and the conversion endpoint (ConvertFromAlbum)
+// for the same row-creation logic, avoiding a duplicate evaluation in the
+// conversion flow.
 func (s *SmartViewService) insertRow(in *SmartViewInput) error {
 	if in.ID == "" || in.Name == "" {
 		return ErrInvalidInput
@@ -193,8 +195,9 @@ func (s *SmartViewService) Update(id string, p SmartViewPatch) (*SmartView, erro
 		}
 	}
 	s.logActivity(id, "updated", "", nil)
-	// 恢复 live(取消暂停)也要重算:暂停期间 displayScore 标定端点
-	// (simDisplayFloor/Ceil)可能已随模型换代调整,旧 match_score 是旧标度。
+	// Resuming live (unpausing) also needs a recompute: while paused, the
+	// displayScore calibration endpoints (simDisplayFloor/Ceil) may have shifted
+	// with a model changeover, so the old match_score is on the old scale.
 	resumed := p.Live != nil && *p.Live
 	if p.CondsRaw != nil || p.Description != nil || p.Threshold != nil || p.IncludeVideos != nil || resumed {
 		if err := s.Evaluate(id); err != nil {
@@ -253,7 +256,8 @@ func (s *SmartViewService) fillStats(sv *SmartView) {
 		}
 	}
 
-	// Seeds 预览优先展示美学分高的资产(NULL 排最后),同美学分档次内再按匹配分排序。
+	// The Seeds preview shows high-aesthetic-score assets first (NULL sorts
+	// last), with matches ordered by match score within the same aesthetic tier.
 	srows, err := s.db.Query(`SELECT m.asset_id FROM smart_view_matches m
 		JOIN assets a ON a.id = m.asset_id
 		WHERE m.smart_view_id=? AND m.origin<>2
@@ -274,7 +278,8 @@ func (s *SmartViewService) fillStats(sv *SmartView) {
 // IsNew is per-user: true until userID opens the asset after it matched
 // (asset_views row at/after matched_at) — drives the dismissible "New" tag.
 func (s *SmartViewService) MatchedAssets(id string, limit, offset int, recent bool, userID string) ([]Asset, error) {
-	// origin<>2 隐藏手动排除行(记忆保留在库里,读路径一律不可见)。
+	// origin<>2 hides manually excluded rows (the memory of them stays in the
+	// store, but they're never visible on any read path).
 	where := `m.smart_view_id=? AND m.origin<>2`
 	args := []any{userID, id}
 	if recent {
@@ -334,9 +339,11 @@ func (s *SmartViewService) MatchedAssets(id string, limit, offset int, recent bo
 	return out, nil
 }
 
-// PinAssets 把指定资产钉进视图:重估洗不掉,只有用户能移除。
-// 分数恒 1.0(与纯结构条件的既有语义一致),matched_at=now 使 IsNew 生效。
-// 无效 asset(不存在/软删)静默跳过;重复钉住幂等不计数。
+// PinAssets pins the given assets into the view: a recompute can't wash them
+// out, only the user can remove them. Score is always 1.0 (consistent with
+// the existing semantics for pure structural conditions), matched_at=now
+// makes IsNew take effect. An invalid asset (doesn't exist/soft-deleted) is
+// silently skipped; re-pinning is idempotent and doesn't count again.
 func (s *SmartViewService) PinAssets(id string, assetIDs []string) (int, error) {
 	var dummy string
 	err := s.db.QueryRow(`SELECT id FROM smart_views WHERE id=?`, id).Scan(&dummy)
@@ -355,7 +362,7 @@ func (s *SmartViewService) PinAssets(id string, assetIDs []string) (int, error) 
 	for _, aid := range assetIDs {
 		var ok string
 		if err := tx.QueryRow(`SELECT id FROM assets WHERE id=? AND deleted_at IS NULL`, aid).Scan(&ok); err != nil {
-			continue // 无效资产静默跳过
+			continue // silently skip an invalid asset
 		}
 		var org int
 		err := tx.QueryRow(`SELECT origin FROM smart_view_matches WHERE smart_view_id=? AND asset_id=?`, id, aid).Scan(&org)
@@ -368,7 +375,7 @@ func (s *SmartViewService) PinAssets(id string, assetIDs []string) (int, error) 
 			added++
 		case err != nil:
 			return 0, err
-		case org != 1: // 自动行升级钉住 / 排除行翻转恢复为钉住
+		case org != 1: // an auto row gets upgraded to pinned / an excluded row flips back to pinned
 			if _, err := tx.Exec(`UPDATE smart_view_matches SET origin=1, match_score=1.0 WHERE smart_view_id=? AND asset_id=?`,
 				id, aid); err != nil {
 				return 0, err
@@ -382,9 +389,12 @@ func (s *SmartViewService) PinAssets(id string, assetIDs []string) (int, error) 
 	return added, nil
 }
 
-// RemoveAssets 分层移除:钉住行=取消钉住(删行,重估后若自然匹配会以普通匹配回归);
-// 自动行=置为排除(origin=2);排除行与表外 id no-op。
-// 有取消钉住或排除发生且视图 live 时,同步触发一次重估让网格立即反映真实状态。
+// RemoveAssets removes in tiers: a pinned row = unpin (delete the row; after
+// a recompute, if it still naturally matches it comes back as a regular
+// match); an auto row = set to excluded (origin=2); an already-excluded row
+// or an id not in the table is a no-op.
+// When any unpin or exclude happens and the view is live, synchronously
+// triggers a recompute so the grid immediately reflects the true state.
 func (s *SmartViewService) RemoveAssets(id string, assetIDs []string) (int, int, error) {
 	var live int
 	err := s.db.QueryRow(`SELECT live FROM smart_views WHERE id=?`, id).Scan(&live)
@@ -425,16 +435,18 @@ func (s *SmartViewService) RemoveAssets(id string, assetIDs []string) (int, int,
 	if err := tx.Commit(); err != nil {
 		return 0, 0, err
 	}
-	// 取消钉住的照片若自然匹配,重估会把它以 origin=0 找回;暂停视图跳过(暂停=不重估)。
+	// If an unpinned photo still naturally matches, a recompute brings it back
+	// as origin=0; a paused view is skipped (paused = no recompute).
 	if unpinned > 0 && live == 1 {
 		if err := s.Evaluate(id); err != nil {
-			zap.L().Warn("smartview: 移除后重估失败", zap.String("id", id), zap.Error(err))
+			zap.L().Warn("smartview: recompute after remove failed", zap.String("id", id), zap.Error(err))
 		}
 	}
 	return unpinned, excluded, nil
 }
 
-// RestoreAssets 恢复被排除的资产:删除排除行,live 视图触发重估自然回归。
+// RestoreAssets restores excluded assets: deletes the excluded row; a live
+// view triggers a recompute so it naturally comes back.
 func (s *SmartViewService) RestoreAssets(id string, assetIDs []string) (int, error) {
 	var live int
 	err := s.db.QueryRow(`SELECT live FROM smart_views WHERE id=?`, id).Scan(&live)
@@ -456,13 +468,14 @@ func (s *SmartViewService) RestoreAssets(id string, assetIDs []string) (int, err
 	}
 	if restored > 0 && live == 1 {
 		if err := s.Evaluate(id); err != nil {
-			zap.L().Warn("smartview: 恢复后重估失败", zap.String("id", id), zap.Error(err))
+			zap.L().Warn("smartview: recompute after restore failed", zap.String("id", id), zap.Error(err))
 		}
 	}
 	return restored, nil
 }
 
-// ExcludedAssets 返回视图的排除清单(供详情页折叠区),量小不分页。
+// ExcludedAssets returns the view's exclusion list (for the detail page's
+// collapsed section); the volume is small so it isn't paginated.
 func (s *SmartViewService) ExcludedAssets(id string) ([]Asset, error) {
 	rows, err := s.db.Query(`SELECT a.id, a.file_path, a.file_size, COALESCE(a.mime_type,''),
 	       COALESCE(a.original_name,''), a.taken_at, a.duration_ms
@@ -558,7 +571,7 @@ func (s *SmartViewService) Evaluate(id string) error {
 	for aid, sc := range scoreMap {
 		keep = append(keep, scored{aid, sc})
 	}
-	existing := map[string]int{} // asset_id → origin(0=自动/1=钉住/2=排除)
+	existing := map[string]int{} // asset_id → origin (0=auto/1=pinned/2=excluded)
 	rows, err := s.db.Query(`SELECT asset_id, origin FROM smart_view_matches WHERE smart_view_id=?`, id)
 	if err != nil {
 		return err
@@ -581,7 +594,8 @@ func (s *SmartViewService) Evaluate(id string) error {
 	for _, k := range keep {
 		keepSet[k.id] = struct{}{}
 		if org, ok := existing[k.id]; ok {
-			// 手动行（钉住/排除）完全不碰：钉住分数恒 1.0,排除行保持"记忆"。
+			// A manual row (pinned/excluded) is never touched: a pinned score is
+			// always 1.0, an excluded row keeps its "memory".
 			if org != 0 {
 				continue
 			}
@@ -599,7 +613,7 @@ func (s *SmartViewService) Evaluate(id string) error {
 	}
 	for aid, org := range existing {
 		if org != 0 {
-			continue // 钉住/排除行只有用户能动,重估不删
+			continue // only the user can move a pinned/excluded row; a recompute never deletes one
 		}
 		if _, ok := keepSet[aid]; !ok {
 			if _, err := tx.Exec(`DELETE FROM smart_view_matches WHERE smart_view_id=? AND asset_id=?`, id, aid); err != nil {
@@ -991,27 +1005,32 @@ func topNByScore(m map[string]float64, n int) []string {
 	return out
 }
 
-// compensateDeleteSV 是 ConvertFromAlbum "先建新、后删旧"失败回滚路径的收尾:
-// 主错误(调用方原始 err)始终照常返回,这里只把补偿清理本身的失败留痕到日志
-// ——此前静默吞掉(_ = s.Delete(...)),半成品 smart_view 无人知晓也无法排查。
+// compensateDeleteSV is the cleanup step for ConvertFromAlbum's "create new,
+// then delete old" failure rollback path: the primary error (the caller's
+// original err) is always returned as usual; this just logs a failure of the
+// compensating cleanup itself — previously it was silently swallowed
+// (`_ = s.Delete(...)`), leaving a half-finished smart_view with no way to
+// know about it or track it down.
 func (s *SmartViewService) compensateDeleteSV(svID, stage string) {
 	if err := s.Delete(svID); err != nil {
-		zap.L().Warn("smartview: ConvertFromAlbum 补偿清理失败,可能遗留半成品 smart_view",
+		zap.L().Warn("smartview: ConvertFromAlbum compensating cleanup failed, may leave a half-finished smart_view",
 			zap.String("id", svID), zap.String("stage", stage), zap.Error(err))
 	}
 }
 
-// compensateDeleteAlbum 是 ConvertToAlbum "先建新、后删旧"失败回滚路径的收尾,
-// 语义同 compensateDeleteSV:补偿清理失败时留 warn 日志,不改变返回给调用方的
-// 主错误。
+// compensateDeleteAlbum is the cleanup step for ConvertToAlbum's "create new,
+// then delete old" failure rollback path, same semantics as
+// compensateDeleteSV: logs a warn when the compensating cleanup itself fails,
+// without changing the primary error returned to the caller.
 func compensateDeleteAlbum(albumSvc *AlbumService, albumID, stage string) {
 	if err := albumSvc.Delete(albumID); err != nil {
-		zap.L().Warn("smartview: ConvertToAlbum 补偿清理失败,可能遗留半成品 album",
+		zap.L().Warn("smartview: ConvertToAlbum compensating cleanup failed, may leave a half-finished album",
 			zap.String("id", albumID), zap.String("stage", stage), zap.Error(err))
 	}
 }
 
-// ConvertFromAlbumInput 是"手动相册→智能相册"原地互转端点的入参。
+// ConvertFromAlbumInput is the input for the "manual album → smart view"
+// in-place conversion endpoint.
 type ConvertFromAlbumInput struct {
 	AlbumID       string
 	Name          string
@@ -1021,14 +1040,17 @@ type ConvertFromAlbumInput struct {
 	IncludeVideos bool
 }
 
-// ConvertFromAlbum 把一个手动相册原地变身为智能相册:建 smart_views 行
-// (live=1)→ 原 album_assets 全量锁定为 pin 成员(照 PinAssets 的存储形状,
-// origin=1/match_score=1.0)→ 同步触发一次 Evaluate(与 Create 同链路,吸入
-// 主题命中)→ 删除原 album(级联 album_assets)。
+// ConvertFromAlbum turns a manual album in place into a smart view: creates
+// a smart_views row (live=1) → locks all of the original album_assets as
+// pinned members (in PinAssets's storage shape, origin=1/match_score=1.0) →
+// synchronously triggers an Evaluate (same path as Create, pulling in theme
+// matches) → deletes the original album (cascading album_assets).
 //
-// 事务边界:Evaluate 内部会调用语义检索(可能是外部 ML 调用),不适合整段包
-// 在一个数据库事务里持锁等待;这里改用"先建新、后删旧"的顺序 + 失败即清理
-// 新建的 smart_views 行,保证任一步失败都不留半成品。
+// Transaction boundary: Evaluate internally calls semantic search (possibly
+// an external ML call), which isn't a good fit for holding a lock inside one
+// database transaction for the whole span; instead this uses a "create new,
+// then delete old" order + cleans up the newly-created smart_views row on
+// any failure, so no step's failure leaves a half-finished result.
 func (s *SmartViewService) ConvertFromAlbum(in ConvertFromAlbumInput) (*SmartView, error) {
 	albumSvc := NewAlbumService(s.db)
 	album, err := albumSvc.Get(in.AlbumID)
@@ -1058,11 +1080,12 @@ func (s *SmartViewService) ConvertFromAlbum(in ConvertFromAlbumInput) (*SmartVie
 		return nil, err
 	}
 
-	// 原相册的全部成员(album_assets 全量,不做可见性过滤)照 PinAssets 的存储
-	// 形状锁定为钉住行;无效/软删资产由 PinAssets 静默跳过。
+	// All members of the original album (the full album_assets set, no
+	// visibility filtering) are locked as pinned rows in PinAssets's storage
+	// shape; invalid/soft-deleted assets are silently skipped by PinAssets.
 	memberRows, err := s.db.Query(`SELECT asset_id FROM album_assets WHERE album_id=?`, in.AlbumID)
 	if err != nil {
-		s.compensateDeleteSV(svID, "查询原相册成员失败")
+		s.compensateDeleteSV(svID, "query original album members failed")
 		return nil, err
 	}
 	var memberIDs []string
@@ -1070,47 +1093,51 @@ func (s *SmartViewService) ConvertFromAlbum(in ConvertFromAlbumInput) (*SmartVie
 		var aid string
 		if err := memberRows.Scan(&aid); err != nil {
 			memberRows.Close()
-			s.compensateDeleteSV(svID, "扫描原相册成员失败")
+			s.compensateDeleteSV(svID, "scan original album members failed")
 			return nil, err
 		}
 		memberIDs = append(memberIDs, aid)
 	}
 	memberRows.Close()
 	if err := memberRows.Err(); err != nil {
-		s.compensateDeleteSV(svID, "遍历原相册成员失败")
+		s.compensateDeleteSV(svID, "iterate original album members failed")
 		return nil, err
 	}
 	if len(memberIDs) > 0 {
 		if _, err := s.PinAssets(svID, memberIDs); err != nil {
-			s.compensateDeleteSV(svID, "PinAssets 失败")
+			s.compensateDeleteSV(svID, "PinAssets failed")
 			return nil, err
 		}
 	}
 
-	// 同步触发一次 Evaluate,与 Create 现行为一致——吸入主题命中的新照片。
+	// Synchronously triggers an Evaluate, consistent with Create's current
+	// behavior — pulls in new photos matched by theme.
 	if err := s.Evaluate(svID); err != nil {
-		s.compensateDeleteSV(svID, "Evaluate 失败")
+		s.compensateDeleteSV(svID, "Evaluate failed")
 		return nil, err
 	}
 	s.logActivity(svID, "converted_from_album", in.AlbumID, memberIDs)
 
-	// 新身份已就绪,删除原手动相册(级联 album_assets)。
+	// The new identity is ready; delete the original manual album (cascading album_assets).
 	if err := albumSvc.Delete(in.AlbumID); err != nil {
-		s.compensateDeleteSV(svID, "删除原手动相册失败")
+		s.compensateDeleteSV(svID, "delete original manual album failed")
 		return nil, err
 	}
 
 	return s.Get(svID)
 }
 
-// ConvertToAlbum 把一个智能相册原地固化为手动相册:建 albums 行(name=
-// sv.name)→ 当前成员(含 pinned,排除 excluded)按 score DESC 写入
-// album_assets(复用 MatchedAssets/ExportAsAlbum 的既有取数逻辑)→ 删除原
-// smart_views 行(级联 matches)。同名冲突照 Export/普通 Create 现有的 409
-// 语义(ErrAlbumNameExists,由 route 层映射)。
+// ConvertToAlbum solidifies a smart view in place into a manual album:
+// creates an albums row (name=sv.name) → writes current members (including
+// pinned, excluding excluded) into album_assets sorted by score DESC (reusing
+// MatchedAssets/ExportAsAlbum's existing data-fetching logic) → deletes the
+// original smart_views row (cascading matches). A name collision follows the
+// same 409 semantics as Export/regular Create (ErrAlbumNameExists, mapped by
+// the route layer).
 //
-// 事务边界同 ConvertFromAlbum:先建新、后删旧 + 失败清理已建的 album,不留
-// 半成品。
+// Same transaction boundary as ConvertFromAlbum: create new, then delete old
+// + clean up the already-created album on failure, leaving nothing
+// half-finished.
 func (s *SmartViewService) ConvertToAlbum(id string) (*Album, error) {
 	sv, err := s.Get(id)
 	if errors.Is(err, ErrNotFound) {
@@ -1126,18 +1153,23 @@ func (s *SmartViewService) ConvertToAlbum(id string) (*Album, error) {
 		return nil, err
 	}
 
-	// 直接查 smart_view_matches,而非复用 MatchedAssets:MatchedAssets 是读路径,
-	// 会额外过滤 a.offline=0(外置盘未挂载期间不展示离线资产);但转换是"固化
-	// 快照 + 删源"语义,若沿用该过滤,恰好在外置盘拔出期间转换会让离线成员
-	// 永久丢失(源 smart_view 已删,无处再找回)。这里只保留与 MatchedAssets
-	// 一致的回收站过滤(deleted_at IS NULL,合理——软删资产不该固化)与排除行
-	// 过滤(origin<>2),不再滤 offline,按 score DESC 排序写入。
+	// Queries smart_view_matches directly rather than reusing MatchedAssets:
+	// MatchedAssets is a read path that additionally filters a.offline=0 (an
+	// offline asset isn't shown while its removable drive is unmounted); but
+	// conversion has "solidify a snapshot + delete the source" semantics, and
+	// if it reused that filter, converting during exactly the window an
+	// external drive is unplugged would permanently lose the offline members
+	// (the source smart_view is already deleted, with nowhere left to recover
+	// them from). This only keeps the trash filter consistent with
+	// MatchedAssets (deleted_at IS NULL, which makes sense — a soft-deleted
+	// asset shouldn't be solidified) and the excluded-row filter (origin<>2),
+	// dropping the offline filter, sorted by score DESC when writing.
 	rows, err := s.db.Query(`
 		SELECT m.asset_id FROM smart_view_matches m JOIN assets a ON a.id=m.asset_id
 		WHERE m.smart_view_id=? AND m.origin<>2 AND a.deleted_at IS NULL
 		ORDER BY m.match_score DESC`, id)
 	if err != nil {
-		compensateDeleteAlbum(albumSvc, album.ID, "查询匹配成员失败")
+		compensateDeleteAlbum(albumSvc, album.ID, "query matched members failed")
 		return nil, err
 	}
 	var ids []string
@@ -1145,29 +1177,30 @@ func (s *SmartViewService) ConvertToAlbum(id string) (*Album, error) {
 		var aid string
 		if err := rows.Scan(&aid); err != nil {
 			rows.Close()
-			compensateDeleteAlbum(albumSvc, album.ID, "扫描匹配成员失败")
+			compensateDeleteAlbum(albumSvc, album.ID, "scan matched members failed")
 			return nil, err
 		}
 		ids = append(ids, aid)
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
-		compensateDeleteAlbum(albumSvc, album.ID, "遍历匹配成员失败")
+		compensateDeleteAlbum(albumSvc, album.ID, "iterate matched members failed")
 		return nil, err
 	}
 	if len(ids) > 0 {
 		if err := albumSvc.BatchAddAssets(album.ID, ids); err != nil {
-			compensateDeleteAlbum(albumSvc, album.ID, "BatchAddAssets 失败")
+			compensateDeleteAlbum(albumSvc, album.ID, "BatchAddAssets failed")
 			return nil, err
 		}
 	}
-	// 不记 activity:smart_view_activity 对 smart_views 是 ON DELETE CASCADE,
-	// 下面紧跟的 Delete 会把刚写的日志级联抹掉(审查发现的死代码),且 sv 删除
-	// 后本也无处可查其活动流。
+	// No activity is logged: smart_view_activity is ON DELETE CASCADE against
+	// smart_views, so the Delete right below would cascade away the log entry
+	// we just wrote (dead code found during review), and once the sv is
+	// deleted there's nowhere left to view its activity stream anyway.
 
-	// 新身份已就绪,删除原智能相册(级联 matches)。
+	// The new identity is ready; delete the original smart view (cascading matches).
 	if err := s.Delete(id); err != nil {
-		compensateDeleteAlbum(albumSvc, album.ID, "删除原智能相册失败")
+		compensateDeleteAlbum(albumSvc, album.ID, "delete original smart view failed")
 		return nil, err
 	}
 

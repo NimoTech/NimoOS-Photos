@@ -133,9 +133,10 @@ LIMIT ?`, cityID, n)
 	return out
 }
 
-// coverThumbs 返回一个城市用于卡片封面/马赛克的资产 id:美学分优先,
-// 未打分的排最后按时间倒序兜底。用户手动覆盖(place_cover_overrides)在路由层
-// 另行叠加,不经过这里。
+// coverThumbs returns a city's asset ids for the card cover/mosaic: aesthetic
+// score first, with unscored assets falling back to reverse-chronological
+// order at the end. User cover overrides (place_cover_overrides) are layered
+// in separately at the route level and don't go through here.
 func (s *PlacesService) coverThumbs(cityID int32, n int) []string {
 	rows, err := s.db.Query(`
 SELECT a.id FROM asset_geo g
@@ -385,12 +386,14 @@ ORDER BY a.taken_at DESC`, cityID)
 	return clusters
 }
 
-// bestByAesthetic 在给定资产 id 集中选美学分最高者;全 NULL/查询失败返回 ""。
+// bestByAesthetic picks the highest-aesthetic-score asset among the given ids;
+// returns "" if all are NULL or the query fails.
 func (s *PlacesService) bestByAesthetic(ids []string) string {
 	if len(ids) == 0 {
 		return ""
 	}
-	// 簇成员通常几十以内;超长时只取前 500 防止 SQL 变量上限。
+	// Cluster membership is usually well under this; cap at the first 500 when
+	// it's longer to stay under the SQL variable limit.
 	if len(ids) > 500 {
 		ids = ids[:500]
 	}
@@ -425,7 +428,7 @@ func (s *PlacesService) spots(cityID int32) []Spot {
 		}
 		thumb := s.bestByAesthetic(c.ids)
 		if thumb == "" {
-			thumb = c.firstID // 全未打分:退回最新一张(原行为)
+			thumb = c.firstID // all unscored: fall back to the newest photo (original behavior)
 		}
 		spots = append(spots, Spot{
 			// Key derived from the centroid rounded to spotGrid so it stays stable

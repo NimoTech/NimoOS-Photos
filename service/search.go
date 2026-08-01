@@ -74,9 +74,11 @@ type SearchService struct {
 	db *sql.DB
 	ml textEmbedder
 
-	// onCaptionDelete 在 DeleteAsset（紧邻 dropClipVector 的硬删调用点）成功后
-	// 调用，供 CaptionFeeder.DeleteRemote 联动使用（Task 4）。函数字段注入，
-	// 避免 SearchService 直接依赖 CaptionFeeder 类型；为 nil 时安全跳过。
+	// onCaptionDelete is called after DeleteAsset (the hard-delete call site
+	// right next to dropClipVector) succeeds, wired up for
+	// CaptionFeeder.DeleteRemote (Task 4). Injected as a function field to
+	// avoid SearchService depending directly on the CaptionFeeder type; safely
+	// skipped when nil.
 	onCaptionDelete func(assetID string)
 }
 
@@ -86,8 +88,8 @@ func NewSearchService(db *sql.DB, ml textEmbedder) *SearchService {
 	return &SearchService{db: db, ml: ml}
 }
 
-// SetCaptionDelete 注入硬删除资产成功后的 caption 删除回调（通常是
-// CaptionFeeder.DeleteRemote）。
+// SetCaptionDelete injects the caption-deletion callback invoked after an
+// asset's hard delete succeeds (typically CaptionFeeder.DeleteRemote).
 func (s *SearchService) SetCaptionDelete(fn func(assetID string)) {
 	s.onCaptionDelete = fn
 }
@@ -238,7 +240,7 @@ func (s *SearchService) SmartSearch(query string, limit int, offset int, filters
 		// would push the last semantic entry out of the first page while
 		// deep pages still slice the *semantic* ranking starting at
 		// `offset`, permanently losing that entry (found in review; see the
-		// design doc's "增量修正" section and
+		// design doc's "incremental correction" section and
 		// TestSmartSearchOCRDoesNotDisplaceSemanticAcrossPages).
 		if filters.IncludeOCR {
 			ocrHits, err := s.ocrSearch(query, limit, filters)
@@ -270,15 +272,19 @@ func (s *SearchService) SmartSearch(query string, limit int, offset int, filters
 	return page, nil
 }
 
-// SearchAssetsByText 是给 Smart Moments theme 引擎(service/moments_theme.go)
-// 复用的最小通路:纯"文本编码 + CLIP 向量 KNN",抽取自 SmartSearch 上半段
-// (本文件 174-184 行的 CLIPTextEmbed + 序列化,以及下面的 knnSemanticFetch)。
-// 刻意不套 SmartSearch 其余的 OCR 合并/自适应截断/全局 MinMatchSimilarity 门
-// 槛——那些是给交互式搜索结果展示用的策略,theme 引擎按 recipe 自己的
-// MinScore 门槛过滤,语义不同,不应该混在一起。只做结构性过滤(is_live_
-// photo_video/deleted_at/offline,knnSemanticFetch 内置的 raw 序列)+ 按距离
-// 序返回 topK 条,不受 SmartSearch 自身任何测试影响(未改动 SmartSearch/
-// knnSemanticFetch 一行代码)。
+// SearchAssetsByText is the minimal pathway reused by the Smart Moments theme
+// engine (service/moments_theme.go): pure "text encode + CLIP vector KNN",
+// extracted from SmartSearch's upper half (this file's CLIPTextEmbed +
+// serialization around lines 174-184, plus knnSemanticFetch below).
+// Deliberately does not apply SmartSearch's other policies — OCR merging,
+// adaptive cut tiering, the global MinMatchSimilarity floor — those are
+// strategies for interactive search result display; the theme engine
+// filters by its own recipe's MinScore threshold instead, a different
+// semantic that shouldn't be mixed in. Only structural filtering (is_live_
+// photo_video/deleted_at/offline, the raw sequence already built into
+// knnSemanticFetch) plus returning the top-K by distance order — unaffected
+// by any of SmartSearch's own tests (not a single line of SmartSearch/
+// knnSemanticFetch was changed).
 func (s *SearchService) SearchAssetsByText(ctx context.Context, prompt string, topK int) ([]AssetScore, error) {
 	queryVec, err := s.ml.CLIPTextEmbed(prompt)
 	if err != nil {
@@ -857,7 +863,7 @@ func (s *SearchService) UpdateDurationMs(id string, ms int64) error {
 func (s *SearchService) DeleteAsset(id string) error {
 	dropClipVector(s.db, id) // before the cascade drops asset_clip_idx
 	if s.onCaptionDelete != nil {
-		s.onCaptionDelete(id) // caption 联动：防 agent 检索到幽灵结果
+		s.onCaptionDelete(id) // caption cascade: prevents the agent from retrieving ghost results
 	}
 	res, err := s.db.Exec(`DELETE FROM assets WHERE id=?`, id)
 	if err != nil {

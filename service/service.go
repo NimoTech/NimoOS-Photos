@@ -112,8 +112,10 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 
 	// 4. Assemble individual services.
 	taskReg := NewTaskRegistry(pub)
-	// A:停滞清扫器兜底——任何 running 任务长时间无更新即强制收尾,杜绝永久僵尸任务
-	//（尤其覆盖人脸聚类这类没有 DB 真值、前端无法对账的任务)。
+	// A: stale-sweeper backstop — any "running" task with no update for too
+	// long is force-finished, ruling out permanent zombie tasks (especially
+	// covers tasks like face clustering that have no DB ground truth for the
+	// frontend to reconcile against).
 	go taskReg.StartStaleSweeper(parentCtx, taskStaleTimeout, taskSweepInterval)
 	idx := NewIndexer(db, ml, thumbDir, cfg.Workers)
 	idx.SetTaskRegistry(taskReg)
@@ -136,25 +138,30 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 	smartViews := NewSmartViewService(db, search)
 	persons := NewPersonService(db)
 
-	// Smart Moments:trip/theme 引擎调度装配 + LLM 命名(Task 4)。recipe 热更新
-	// 走 PUT /v1/photos/moments/recipes(Task 5,尚未接路由),这里先播种内置
-	// recipe、装配调度层。aiClient 走 NimoOS-AI 的 `_internal` 直连(localhost-
-	// only、免 JWT),AI 服务未部署时 aiURLFile 读不到,LLM 命名全链路静默跳过
-	// (best-effort,不影响模板打底的标题)。
+	// Smart Moments: trip/theme engine scheduling assembly + LLM naming (Task
+	// 4). Recipe hot-reload goes through PUT /v1/photos/moments/recipes (Task
+	// 5, not yet wired to a route); here we just seed the built-in recipes
+	// and assemble the scheduling layer. aiClient goes through NimoOS-AI's
+	// `_internal` direct connection (localhost-only, JWT-exempt); when the AI
+	// service isn't deployed, aiURLFile can't be read, and LLM naming is
+	// silently skipped end-to-end (best-effort, doesn't affect the
+	// template-backed title).
 	momentStore := NewMomentStore(db)
 	if err := momentStore.SeedDefaultRecipes(); err != nil {
-		zap.L().Warn("moments: 内置 recipe 播种失败", zap.Error(err))
+		zap.L().Warn("moments: failed to seed built-in recipes", zap.Error(err))
 	}
 	aiClient := aiclient.New(filepath.Join(cfg.RuntimePath, "ai.url"))
 	momentsSvc := NewMomentsService(db, momentStore, search, RealClipVecLoader(db), aiClient)
 	momentsSvc.SetTaskRegistry(taskReg)
 	momentsSvc.SetLoadCover(RealCoverImageLoader(thumbDir))
-	// 启动即补跑一次,捡起服务重启前遗留的欠重算(新装 recipe、上次重启前的
-	// 半程重算等);之后跟随批次节奏(见下方 SetOnBatchDone 链尾)与每日
-	// 调度(main.go 里的 StartScheduler)。
+	// Run a catch-up pass immediately on startup, picking up any recompute
+	// debt left over from before the service restarted (newly-installed
+	// recipes, a half-finished recompute before the last restart, etc.);
+	// after that it follows the batch cadence (see the SetOnBatchDone tail
+	// below) and the daily schedule (StartScheduler in main.go).
 	go func() {
 		if err := momentsSvc.RecomputeAll(parentCtx); err != nil {
-			zap.L().Warn("moments: 启动重算失败", zap.Error(err))
+			zap.L().Warn("moments: startup recompute failed", zap.Error(err))
 		}
 	}()
 	gaz, gerr := geo.Load()
@@ -165,45 +172,50 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 	placesSvc := NewPlacesServiceWithAlbums(db, gaz, geoSvc, albums)
 	faces := NewFaceService(db)
 	faces.SetTaskRegistry(taskReg)
-	faces.SetIndexIdleSource(idx.IdleFor) // 安全网聚类去抖:索引活动安静够久才触发
-	faces.SetML(ml)                       // RunPipeline 检测阶段用
-	faces.SetThumbDir(thumbDir)           // RunPipeline 视频关键帧缩略图用
+	faces.SetIndexIdleSource(idx.IdleFor) // safety-net clustering debounce: only triggers once index activity has been quiet long enough
+	faces.SetML(ml)                       // used by RunPipeline's detection stage
+	faces.SetThumbDir(thumbDir)           // used by RunPipeline for video keyframe thumbnails
 	rebuilder := NewRebuilder(parentCtx, db, idx, faces, taskReg, cfg.Workers)
 	embedder := NewEmbedder(db, ml, idx, taskReg)
-	// ML 恢复链尾补跑人脸检测(覆盖掉线期间的检测欠账)：函数字段注入，避免
-	// Embedder 直接依赖 FaceService 类型(同 MountGuard 的注入模式)。
+	// ML-recovery tail catches up on face detection (covers detection debt
+	// accrued while offline): injected as a function field to avoid Embedder
+	// depending directly on the FaceService type (same injection pattern as MountGuard).
 	embedder.SetOnRecovered(func(ctx context.Context) {
 		if err := faces.RunPipeline(ctx); err != nil {
 			zap.L().Warn("post-recovery face pipeline failed", zap.Error(err))
 		}
 	})
-	// 美学评分头:加载失败只告警降级(功能整体不可用,分数留 NULL)。
+	// Aesthetic scoring head: on load failure, just warn and degrade (the
+	// feature is entirely unavailable, scores stay NULL).
 	if cfg.AestheticEnabled {
 		if head, err := aesthetic.Load(); err != nil {
-			zap.L().Warn("aesthetic: 内嵌头加载失败,评分功能停用", zap.Error(err))
+			zap.L().Warn("aesthetic: embedded head failed to load, scoring disabled", zap.Error(err))
 		} else {
 			idx.SetAestheticHead(head)
 			embedder.SetAestheticHead(head)
 			if err := EnsureAestheticHeadVer(db, head.Version()); err != nil {
-				zap.L().Warn("aesthetic: 头版本对齐失败", zap.Error(err))
+				zap.L().Warn("aesthetic: head version alignment failed", zap.Error(err))
 			}
-			// 启动即补扫:纯本地计算不等 ML 就绪(与 OCR 的关键差异)。
+			// Sweep on startup: purely local computation, doesn't wait for ML readiness (the key difference from OCR).
 			go func() {
 				if err := embedder.BackfillAesthetic(parentCtx); err != nil {
-					zap.L().Warn("aesthetic: 启动补扫失败", zap.Error(err))
+					zap.L().Warn("aesthetic: startup backfill sweep failed", zap.Error(err))
 				}
 			}()
 		}
 	}
 
-	// MountGuard: 追踪 /media/* 可移动盘的挂载/拔出,维护 assets.offline。
-	// 回调用函数字段注入以避免与 Watcher/Indexer/Embedder 产生导入依赖:
-	//   - watcherRestart 直接闭包捕获 watcher/parentCtx/cfg，重新 Add 配置中
-	//     watch 的目录(对没被配置监听的目录是无副作用的 no-op)；
-	//   - scanDir 复用 Indexer.ScanDirectoryOnce 自愈新增/删除的文件，并与
-	//     watcher 挂载轮询共享同一份 per-root 去重，避免同一挂载被重复补扫；
-	//   - backfill/backfillOCR 复用 Embedder，修复换代次重建期间 offline
-	//     资产恢复后缺失的 CLIP/OCR。
+	// MountGuard: tracks mount/unmount of removable /media/* drives,
+	// maintaining assets.offline. Callbacks are injected as function fields
+	// to avoid an import dependency on Watcher/Indexer/Embedder:
+	//   - watcherRestart directly closes over watcher/parentCtx/cfg, re-Adding
+	//     the configured watch directories (a no-op with no side effects for
+	//     directories not configured to be watched);
+	//   - scanDir reuses Indexer.ScanDirectoryOnce to self-heal added/removed
+	//     files, sharing the same per-root dedup as the watcher's mount
+	//     polling, avoiding a redundant sweep of the same mount;
+	//   - backfill/backfillOCR reuse Embedder to repair CLIP/OCR missing after
+	//     an offline asset recovers during a rebuild across versions.
 	mountGuard := NewMountGuard(db)
 	mountGuard.SetWatcherRestart(func() { watcher.Restart(parentCtx, cfg.WatchDirs) })
 	mountGuard.SetScanDir(func(mount string) error {
@@ -212,57 +224,72 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 	})
 	mountGuard.SetBackfill(embedder.Backfill)
 	mountGuard.SetBackfillOCR(embedder.BackfillOCR)
-	// Run() 由 main.go 与其它后台 worker 一起以 goroutine 启动。
+	// Run() is started as a goroutine in main.go alongside the other background workers.
 
-	// CaptionFeeder：把已索引资产旁路投喂给 NimoOS-Parser 生成 caption
-	// （照片知识库子项目二)。Parser 未部署（discoveryFile 不存在）时
-	// parserclient 返回 ErrParserUnavailable，全链路静默跳过。
-	// parserClient 与下方 Puller 共用同一份 discoveryFile/http.Client。
+	// CaptionFeeder: side-feeds already-indexed assets to NimoOS-Parser to
+	// generate captions (photo knowledge base sub-project two). When Parser
+	// isn't deployed (discoveryFile doesn't exist), parserclient returns
+	// ErrParserUnavailable and the whole chain is silently skipped.
+	// parserClient shares the same discoveryFile/http.Client with the Puller below.
 	parserClient := parserclient.New(cfg.RuntimePath)
 	feeder := NewCaptionFeeder(db, parserClient, thumbDir)
 	idx.SetOnIndexed(func(id string) { feeder.FeedOne(parentCtx, id) })
-	// 删除/回收站全路径联动（Task 4）：软删/物理删（含清空回收站、Indexer 硬删、
-	// SearchService 硬删）异步通知 Parser 删 caption；恢复后置 caption_synced=0
-	// 待下轮补扫重投。函数字段注入，各 service 无需 import CaptionFeeder 类型。
+	// Full delete/trash-path cascade (Task 4): soft delete/hard delete
+	// (including emptying the trash, Indexer's hard delete, SearchService's
+	// hard delete) asynchronously notifies Parser to delete the caption;
+	// after a restore, caption_synced=0 is set, to be re-fed on the next
+	// backfill sweep. Injected as a function field so services don't need to
+	// import the CaptionFeeder type.
 	idx.SetCaptionDelete(feeder.DeleteRemote)
 	search.SetCaptionDelete(feeder.DeleteRemote)
 	trash.SetCaptionDelete(feeder.DeleteRemote)
 	trash.SetCaptionRestore(feeder.OnRestore)
-	// 启动即补扫一次，捡起服务重启前遗留的欠投喂资产。
+	// Sweep once on startup, catching up on assets left un-fed before the service restarted.
 	go func() {
 		if err := feeder.Backfill(parentCtx); err != nil {
-			zap.L().Warn("caption: 启动补扫失败", zap.Error(err))
+			zap.L().Warn("caption: startup backfill sweep failed", zap.Error(err))
 		}
 	}()
 
-	// Puller：周期性从 Parser 拉取已生成的 caption 回流进本地 asset_caption
-	// 表（照片知识库子项目二回流侧，消费/检索是后续子项目）。挂点节奏照抄
-	// CaptionFeeder 同款：启动即拉一次 + 挂在 SetOnBatchDone 链尾跟随批次
-	// 节奏。lister 出错（含 Parser 未部署）不向上传播，ErrParserUnavailable
-	// 完全静默、其它错误仅 Warn 留痕，均不影响索引主流程。deleter 复用同一
-	// parserClient：遇真孤儿（本地 assets 无此 id）时 best-effort 回删 Parser
-	// 侧向量，补齐删除通知 fire-and-forget 丢失场景的对账兜底。
+	// Puller: periodically pulls generated captions from Parser back into the
+	// local asset_caption table (the return-flow side of photo knowledge base
+	// sub-project two; consumption/retrieval is a later sub-project). Its
+	// cadence mirrors CaptionFeeder's: pull once on startup + hooked onto the
+	// SetOnBatchDone tail to follow the batch cadence. A lister error
+	// (including Parser not deployed) doesn't propagate upward:
+	// ErrParserUnavailable is fully silent, other errors are just Warn-logged
+	// — none of it affects the main indexing flow. The deleter reuses the
+	// same parserClient: on a genuine orphan (no such id in local assets), it
+	// best-effort deletes the vector back on Parser's side, reconciling for
+	// cases where a fire-and-forget delete notification was lost.
 	puller := NewPuller(db, parserClient, parserClient)
 	go func() {
 		if _, err := puller.PullOnce(parentCtx); err != nil && !errors.Is(err, parserclient.ErrParserUnavailable) {
-			zap.L().Warn("caption pull: 启动拉取失败", zap.Error(err))
+			zap.L().Warn("caption pull: startup pull failed", zap.Error(err))
 		}
 	}()
 
-	// batch 上传完成后触发人脸检测+聚类一体任务，让前端能看到从 0% 涨到 100% 的
-	// "识别人物" task（真实进度，而非旧的聚类专属假进度）。
-	// faces.RunPipeline 内部用 CAS 防重入，多个 batch 同时 done 也只会跑一次。
+	// After a batch upload completes, trigger the combined face
+	// detection+clustering task, so the frontend can see the "Recognizing
+	// people" task climb from 0% to 100% (real progress, rather than the old
+	// clustering-only fake progress).
+	// faces.RunPipeline uses CAS internally to prevent re-entrancy, so it only runs once even if multiple batches finish at the same time.
 	idx.SetOnBatchDone(func() {
 		go func() {
 			if err := faces.RunPipeline(parentCtx); err != nil {
 				zap.L().Warn("post-batch face pipeline failed", zap.Error(err))
 			}
 		}()
-		// CLIP/OCR 兜底补跑:索引期间 ML 冷加载/worker 回收会让 embedClip/ocrAsset
-		// 偶发失败且被吞(processFile 不因 ML 失败拒绝入库),而 Embedder 的恢复链
-		// 只在 ML「掉线→恢复」跳变时触发——ML 全程在线就永远没人补,资产无限期
-		// 缺向量、语义搜索搜不到(真实故障:两张鱼图撞上模型冷加载窗口)。批次末尾
-		// 补一手,CAS+rerunPending 已防重入,无欠账时两个调用都是秒级空跑。
+		// CLIP/OCR backstop catch-up: during indexing, ML cold-loading/worker
+		// reclamation can cause embedClip/ocrAsset to occasionally fail and
+		// get swallowed (processFile doesn't reject ingestion just because ML
+		// failed), while Embedder's recovery chain only triggers on an ML
+		// "offline→recovered" transition — if ML stays online the whole
+		// time, nobody ever catches up, leaving assets permanently missing
+		// vectors and unsearchable by semantic search (real incident: two
+		// fish photos hit a model cold-load window). Catch up at the end of
+		// each batch; CAS+rerunPending already prevent re-entrancy, so both
+		// calls are a fast no-op when there's no debt.
 		go func() {
 			if err := embedder.Backfill(parentCtx); err != nil {
 				zap.L().Warn("post-batch clip backfill failed", zap.Error(err))
@@ -276,12 +303,14 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 			if err := embedder.BackfillAesthetic(parentCtx); err != nil {
 				zap.L().Warn("post-batch aesthetic backfill failed", zap.Error(err))
 			}
-			// caption 补扫链尾:批次末尾捡起漏投喂的资产(Parser 未部署时静默空跑)。
+			// Caption backfill tail: catches up on any assets missed during
+			// feeding at the end of a batch (a silent no-op when Parser isn't deployed).
 			if err := feeder.Backfill(parentCtx); err != nil {
 				zap.L().Warn("post-batch caption backfill failed", zap.Error(err))
 			}
-			// caption 拉取链尾:批次末尾从 Parser 拉取新增/更新的 caption 回填
-			// 本地表(Parser 未部署时静默跳过,一般失败仅 Warn 留痕)。
+			// Caption pull tail: at the end of a batch, pulls new/updated
+			// captions from Parser back into the local table (silently
+			// skipped when Parser isn't deployed; other failures are just Warn-logged).
 			if _, err := puller.PullOnce(parentCtx); err != nil && !errors.Is(err, parserclient.ErrParserUnavailable) {
 				zap.L().Warn("post-batch caption pull failed", zap.Error(err))
 			}
@@ -299,15 +328,20 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 				zap.L().Warn("smart view incremental evaluate failed", zap.Error(err))
 			}
 		}()
-		// 批量导入视频后补漏 + 借任务栏展示转码进度;CAS 防与启动补跑/多批次并发重入。
-		// (内联预生成已在索引时逐条排队,批次末尾多数已就绪,该轮只处理剩余欠账,
-		// total 反映真实剩余量——正是任务栏该显示的。)
+		// Catches up after bulk video imports + uses the task bar to show
+		// transcode progress; CAS prevents re-entrancy against startup
+		// catch-up/concurrent batches. (Inline pregeneration is already
+		// queued per-item during indexing, so most are ready by the end of
+		// the batch — this round only handles the remaining debt, and total
+		// reflects the true remaining count, exactly what the task bar should show.)
 		go func() {
 			idx.BackfillSprites(parentCtx)
 		}()
-		// Smart Moments 链尾:批次末尾重算时刻(trip 时间窗切段 + theme CLIP/
-		// caption 命中会随新资产变化),CAS 防与启动补跑/每日调度并发重入;
-		// LLM 命名是 best-effort,失败只 Warn,不影响其它链尾步骤。
+		// Smart Moments tail: recompute moment at the end of a batch (trip
+		// time-window segmentation + theme CLIP/caption hits change as new
+		// assets arrive); CAS prevents re-entrancy against startup catch-up/
+		// daily scheduling; LLM naming is best-effort — a failure is just
+		// Warn-logged and doesn't affect the other tail steps.
 		go func() {
 			if err := momentsSvc.RecomputeAll(parentCtx); err != nil {
 				zap.L().Warn("post-batch moments recompute failed", zap.Error(err))
@@ -322,9 +356,9 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 		idx.ScanPending()
 		idx.pruneSystemMountAssets()
 		idx.pruneRcloneMountAssets(enumerateRcloneMounts())
-		idx.pruneSnapshotAssets()  // 清掉误入库的 btrfs .snapshots 快照子卷资产
+		idx.pruneSnapshotAssets()  // clears out assets wrongly ingested from btrfs .snapshots snapshot subvolumes
 		pruneOrphanClipVectors(db) // sweep any vec0 rows left orphaned by past deletes
-		pruneVideoOCR(db)          // 视频不再做 OCR:清掉历史遗留的视频 OCR 行,使其退出「OCR/文档」分类
+		pruneVideoOCR(db)          // videos no longer get OCR: clears legacy video OCR rows so they drop out of the "OCR/documents" category
 		idx.ScanAllRoots()
 		watcher.PairLivePhotos() //nolint:errcheck
 	}()
@@ -335,16 +369,18 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 	go StartMediaDeletedSubscriber(parentCtx, cfg.RuntimePath, idx)
 
 	// Real-time creation subscriber: index newly landed files (upload/copy/move)
-	// the moment NimoOS reports them. 独立连接:主服务未升级时自退避,不连累 deleted。
+	// the moment NimoOS reports them. Separate connection: self-backs-off when the main service hasn't been upgraded, without dragging down `deleted`.
 	go StartMediaCreatedSubscriber(parentCtx, cfg.RuntimePath, idx)
 
-	// ML 后端自愈：worker 卡死（端口在听但 /ping 不应答）时自动 docker restart
+	// ML backend self-heal: automatically docker restart when the worker hangs (port listening but /ping doesn't respond)
 	mlWatchdog := NewMLWatchdog(ml.IsReady, dockerRunner{})
 	go mlWatchdog.Run(parentCtx)
 
-	// 启动时重评估一次 live Smart View：Evaluate 会从 conds_raw 现解析并重新打分，
-	// 解析器 / 分数标定升级后旧视图无需用户干预即可自愈。semantic 条件需要 ML
-	// 文本向量，所以最多等 2 分钟 ML 就绪；失败只告警，下个 batch 会再触发。
+	// Re-evaluate live Smart Views once on startup: Evaluate re-parses from
+	// conds_raw and rescoring on the fly, so old views self-heal without
+	// user intervention after a parser/score-calibration upgrade. Semantic
+	// conditions need an ML text vector, so wait up to 2 minutes for ML
+	// readiness; a failure is just a warning, and the next batch will trigger it again.
 	go func() {
 		for i := 0; i < 24 && !ml.IsReady(); i++ {
 			select {
@@ -369,8 +405,9 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 	faceThumbDir := filepath.Join(cfg.DataPath, "face-thumbs")
 	storageSvc := NewStorageService(db, dbPath, thumbDir, faceThumbDir, statfsDir)
 
-	// 回收站自动清理：启动时跑一次，之后每 24 小时跑一次，到期项永久删除。
-	// CLIP 向量孤儿清理也在同一个每日 ticker 内独立运行，与回收站 purge 解耦。
+	// Trash auto-cleanup: runs once on startup, then every 24 hours; expired
+	// entries are permanently deleted. CLIP vector orphan cleanup also runs
+	// independently within the same daily ticker, decoupled from the trash purge.
 	go func() {
 		runPurge := func() {
 			days := 30
@@ -425,7 +462,7 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 
 func (s *services) RestartWatcher(dirs []string) {
 	if s.watcher == nil {
-		return // NewTestServices 不接 watcher；handler 测试走到这里直接跳过
+		return // NewTestServices doesn't wire up a watcher; handler tests skip straight through here
 	}
 	s.watcher.Restart(s.parentCtx, dirs)
 }

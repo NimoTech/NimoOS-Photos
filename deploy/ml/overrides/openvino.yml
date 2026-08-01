@@ -1,4 +1,4 @@
-# Intel 核显(OpenVINO)设备映射;由 install.sh 按检测结果部署为 docker-compose.override.yml
+# Intel iGPU (OpenVINO) device mapping; deployed by install.sh as docker-compose.override.yml based on detection
 services:
   immich-machine-learning:
     devices:

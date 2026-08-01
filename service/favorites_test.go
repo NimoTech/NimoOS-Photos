@@ -30,7 +30,7 @@ func TestFavoriteIdempotent(t *testing.T) {
 
 	t2, err := svc.Favorite("default", "a1")
 	require.NoError(t, err)
-	require.Equal(t, t1.Unix(), t2.Unix(), "二次收藏应保留原时间")
+	require.Equal(t, t1.Unix(), t2.Unix(), "re-favoriting should keep the original time")
 
 	ids, err := svc.ListIDs("default")
 	require.NoError(t, err)
@@ -132,7 +132,7 @@ func TestFavoritesListExcludesOffline(t *testing.T) {
 
 	list, err := svc.List("default", service.ListFavoritesOpts{})
 	require.NoError(t, err)
-	require.Len(t, list, 1, "offline 资产必须从收藏列表隐藏")
+	require.Len(t, list, 1, "offline assets must be hidden from the favorites list")
 	require.Equal(t, "online", list[0].ID)
 }
 
@@ -156,19 +156,20 @@ func TestFavoritesTopExcludesOfflineAndDeleted(t *testing.T) {
 		_, e := svc.Favorite("default", id)
 		require.NoError(t, e)
 	}
-	// 软删放在收藏之后:Favorite() 对不存在的资产会报错,但对已软删的资产,
-	// 现实顺序也是"先收藏、后进回收站"。
+	// Soft delete happens after favoriting: Favorite() errors on a
+	// nonexistent asset, but for an already-soft-deleted asset, the real-world
+	// order is also "favorite first, then goes to trash".
 	_, err = db.Exec(`UPDATE assets SET deleted_at='2026-01-01 00:00:00' WHERE id='trashed'`)
 	require.NoError(t, err)
 
 	top, err := svc.Top("default", 5)
 	require.NoError(t, err)
-	require.Len(t, top, 1, "offline 与回收站资产不得出现在热门收藏")
+	require.Len(t, top, 1, "offline and trashed assets must not appear in top favorites")
 	require.Equal(t, "online", top[0].ID)
 }
 
 func TestTopOrdersByViewCountThenFavoritedAt(t *testing.T) {
-	// 该用例需要同库的 ViewsService 播种浏览次数，openTestFavSvc 不暴露 db，故自建 db。
+	// This test needs ViewsService on the same db to seed view counts, and openTestFavSvc doesn't expose db, so build one here.
 	db, err := sqlite.Open(filepath.Join(t.TempDir(), "test.db"))
 	require.NoError(t, err)
 	defer db.Close()
@@ -179,7 +180,7 @@ func TestTopOrdersByViewCountThenFavoritedAt(t *testing.T) {
 	svc := service.NewFavoritesService(db)
 	views := service.NewViewsService(db)
 
-	// 三张都收藏（a1 最早、a3 最晚）。
+	// All three favorited (a1 earliest, a3 latest).
 	_, err = svc.Favorite("default", "a1")
 	require.NoError(t, err)
 	_, err = svc.Favorite("default", "a2")
@@ -187,7 +188,7 @@ func TestTopOrdersByViewCountThenFavoritedAt(t *testing.T) {
 	_, err = svc.Favorite("default", "a3")
 	require.NoError(t, err)
 
-	// a2 看 3 次、a1 看 1 次、a3 看 0 次。
+	// a2 viewed 3 times, a1 viewed 1 time, a3 viewed 0 times.
 	require.NoError(t, views.Record("default", "a2"))
 	require.NoError(t, views.Record("default", "a2"))
 	require.NoError(t, views.Record("default", "a2"))
@@ -196,9 +197,9 @@ func TestTopOrdersByViewCountThenFavoritedAt(t *testing.T) {
 	top, err := svc.Top("default", 5)
 	require.NoError(t, err)
 	require.Len(t, top, 3)
-	require.Equal(t, "a2", top[0].ID, "看得最多的排第一")
-	require.Equal(t, "a1", top[1].ID, "看过 1 次排第二")
-	require.Equal(t, "a3", top[2].ID, "0 次的按收藏时间兜底排最后")
+	require.Equal(t, "a2", top[0].ID, "the most-viewed ranks first")
+	require.Equal(t, "a1", top[1].ID, "viewed once ranks second")
+	require.Equal(t, "a3", top[2].ID, "0 views falls back to favorited time and ranks last")
 }
 
 func TestTopRespectsLimit(t *testing.T) {

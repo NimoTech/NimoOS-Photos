@@ -101,14 +101,18 @@ func scanAssets(rows *sql.Rows) ([]Asset, error) {
 	return assets, rows.Err()
 }
 
-// SigLIP2(SO400M)的图文余弦相似度分布比 openai CLIP 低一个量级:
-// 噪声 ≤0.03,强相关 ~0.09-0.13(本库 7 图 × 8 查询 A/B 实测标定,
-// 换 CLIP 模型后需重标)。展示层把 [simDisplayFloor, simDisplayCeil]
-// 线性映射到 [0,1],OCR 精确命中(sim=1.0)钳到 1 不受影响。
+// SigLIP2 (SO400M)'s image-text cosine similarity distribution sits an order
+// of magnitude lower than openai CLIP: noise floor ≤0.03, strong matches
+// ~0.09-0.13 (calibrated empirically via A/B testing with 7 images × 8
+// queries on this library; needs re-calibration if the CLIP model changes).
+// The display layer linearly maps [simDisplayFloor, simDisplayCeil] to
+// [0,1]; exact OCR hits (sim=1.0) clamp to 1 unaffected.
 //
-// 这两个端点现在经 pkg/config(photos.SimDisplayFloor / photos.SimDisplayCeil)
-// 可配置,默认值与上述硬编码经验值一致;config 未初始化(如直接构造
-// SearchService 的单测)或配置显式给出 0 时退回默认值。
+// These two endpoints are now configurable via pkg/config
+// (photos.SimDisplayFloor / photos.SimDisplayCeil), defaulting to the
+// hardcoded empirical values above; falls back to the defaults when config
+// is uninitialized (e.g. unit tests that construct SearchService directly)
+// or explicitly set to 0.
 const (
 	defaultSimDisplayFloor = 0.03
 	defaultSimDisplayCeil  = 0.13

@@ -90,11 +90,11 @@ func TestAlbumSummaryExcludesOffline(t *testing.T) {
 
 	sum, err := svc.Summary(album.ID)
 	require.NoError(t, err)
-	require.Equal(t, 1, sum.AssetCount, "offline 资产不应计入相册摘要总数")
+	require.Equal(t, 1, sum.AssetCount, "offline assets must not count toward the album summary total")
 	require.Equal(t, 1, sum.PhotoCount)
-	require.Empty(t, sum.TopPlaces, "offline 资产的地点不应出现在摘要里")
-	require.Empty(t, sum.OCRSamples, "offline 资产的 OCR 文本不应出现在摘要里")
-	require.Equal(t, []string{"online"}, sum.CoverCandidates, "封面候选不应包含 offline 资产")
+	require.Empty(t, sum.TopPlaces, "an offline asset's place must not appear in the summary")
+	require.Empty(t, sum.OCRSamples, "an offline asset's OCR text must not appear in the summary")
+	require.Equal(t, []string{"online"}, sum.CoverCandidates, "cover candidates must not include offline assets")
 }
 
 func TestAlbumSummaryEmptyAlbum(t *testing.T) {

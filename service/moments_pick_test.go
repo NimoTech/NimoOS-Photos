@@ -1,6 +1,9 @@
-// 共用选优测试:覆盖简报 Step 1 清单——内存库造 aesthetic_score + 注入可控
-// 向量读取,断言连拍(60s 窗内向量余弦 > 0.95)只留最高分、featured 数量按
-// maxFeatured 截断、cover 为分数最高者、向量缺失的资产跳过去重直接入池。
+// Tests for shared curation: covers the Step 1 brief checklist — an in-memory
+// DB seeded with aesthetic_score + an injectable, controllable vector reader;
+// asserts that a burst (vector cosine > 0.95 within a 60s window) keeps only
+// the highest score, featured count is truncated by maxFeatured, cover is the
+// highest-score candidate, and an asset with no vector skips dedup and goes
+// straight into the pool.
 package service
 
 import (
@@ -14,12 +17,15 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// noCoverLoader 模拟"读不到缩略图"(照 moments_test.go 的 noVecLoader 同款
-// 命名范式),用于不关心亮度闸、只想验证 featured/排序逻辑的用例——loader
-// 返回 false 时 pickCover 直接采用该候选,等价于跳过亮度闸。
+// noCoverLoader simulates "thumbnail can't be read" (same naming convention
+// as moments_test.go's noVecLoader), for test cases that don't care about the
+// brightness gate and only want to verify featured/sort logic — when the
+// loader returns false, pickCover accepts that candidate outright, equivalent
+// to skipping the brightness gate.
 func noCoverLoader(_ string) (image.Image, bool) { return nil, false }
 
-// fakeCoverLoader 从预设 map 里查图像;不在 map 里的资产视为"读不到"。
+// fakeCoverLoader looks up images from a preset map; an asset not in the map
+// is treated as "unreadable".
 func fakeCoverLoader(imgs map[string]image.Image) coverImageLoader {
 	return func(assetID string) (image.Image, bool) {
 		img, ok := imgs[assetID]
@@ -27,8 +33,9 @@ func fakeCoverLoader(imgs map[string]image.Image) coverImageLoader {
 	}
 }
 
-// solidGrayImage 造一张 w x h、灰度值全为 gray(0-255)的图片,用于亮度闸测试
-// 里的"过暗/过曝/低对比灰雾"三种候选。
+// solidGrayImage builds a w x h image whose grayscale value is uniformly gray
+// (0-255), used for the "too dark/overexposed/low-contrast hazy" three
+// candidate cases in the brightness gate tests.
 func solidGrayImage(w, h int, gray uint8) image.Image {
 	img := image.NewGray(image.Rect(0, 0, w, h))
 	for y := 0; y < h; y++ {
@@ -39,8 +46,9 @@ func solidGrayImage(w, h int, gray uint8) image.Image {
 	return img
 }
 
-// checkerImage 造一张黑白棋盘格图片(均值 ~0.5、标准差高),代表亮度/对比都
-// 正常、能通过闸的"正常照片"。
+// checkerImage builds a black-and-white checkerboard image (mean ~0.5, high
+// std dev), representing a "normal photo" with normal brightness/contrast
+// that passes the gate.
 func checkerImage(w, h int) image.Image {
 	img := image.NewGray(image.Rect(0, 0, w, h))
 	for y := 0; y < h; y++ {
@@ -55,8 +63,8 @@ func checkerImage(w, h int) image.Image {
 	return img
 }
 
-// insertPickAsset 插入一条带 taken_at + aesthetic_score 的资产,供
-// PickFeaturedAndCover 测试使用。
+// insertPickAsset inserts an asset with taken_at + aesthetic_score, for use
+// by PickFeaturedAndCover tests.
 func insertPickAsset(t *testing.T, db *sql.DB, id string, takenAt time.Time, aesthetic float64) {
 	t.Helper()
 	_, err := db.Exec(`INSERT INTO assets(id, file_path, status, taken_at, aesthetic_score) VALUES(?,?,'indexed',?,?)`,
@@ -64,7 +72,8 @@ func insertPickAsset(t *testing.T, db *sql.DB, id string, takenAt time.Time, aes
 	require.NoError(t, err)
 }
 
-// fakeVecLoader 从预设 map 里查向量;不在 map 里的资产视为"无向量"。
+// fakeVecLoader looks up vectors from a preset map; an asset not in the map
+// is treated as "no vector".
 func fakeVecLoader(vecs map[string][]float32) clipVecLoader {
 	return func(assetID string) ([]float32, bool) {
 		v, ok := vecs[assetID]
@@ -77,30 +86,37 @@ func TestPickFeaturedAndCover_BurstDedupAndVectorlessSkip(t *testing.T) {
 
 	t0 := time.Date(2011, time.April, 1, 10, 0, 0, 0, time.UTC)
 
-	// 簇 A(60s 窗内的一次连拍):b1/b2 向量高度相似(>0.95)判连拍,只留美学分
-	// 更高的 b2;b3 向量正交,不与 b1/b2 同组,独立入池。
+	// Cluster A (one burst within the 60s window): b1/b2 have highly similar
+	// vectors (>0.95), judged a burst, keeping only b2 (the higher aesthetic
+	// score); b3's vector is orthogonal, not in the same group as b1/b2, enters
+	// the pool independently.
 	insertPickAsset(t, db, "b1", t0, 0.9)
 	insertPickAsset(t, db, "b2", t0.Add(10*time.Second), 0.95)
 	insertPickAsset(t, db, "b3", t0.Add(20*time.Second), 0.5)
 
-	// 簇 B(与簇 A 相隔远超 60s,自成一簇):d1 无向量、e1 有向量,即便二者彼此
-	// 相邻(10s 内),d1 因为没有向量必须跳过去重步骤直接入池,不与 e1 合并。
+	// Cluster B (far more than 60s from cluster A, so it forms its own
+	// cluster): d1 has no vector, e1 has a vector; even though the two are
+	// adjacent to each other (within 10s), d1 must skip the dedup step and go
+	// straight into the pool because it has no vector, not merging with e1.
 	t1 := t0.Add(2000 * time.Second)
 	insertPickAsset(t, db, "d1", t1, 0.4)
 	insertPickAsset(t, db, "e1", t1.Add(10*time.Second), 0.6)
 
-	// 簇 C:孤立的单张,美学分全场最高,应作为 cover。
+	// Cluster C: an isolated single photo, the highest aesthetic score overall,
+	// should become the cover.
 	t2 := t1.Add(2000 * time.Second)
 	insertPickAsset(t, db, "c1", t2, 0.99)
 
 	vecs := map[string][]float32{
 		"b1": {1, 0},
-		"b2": {1, 0.1}, // 与 b1 余弦相似度约 0.995 > 0.95,判连拍
-		"b3": {0, 1},   // 与 b1/b2 都正交,不判连拍
+		"b2": {1, 0.1}, // ~0.995 cosine similarity with b1, > 0.95, judged a burst
+		"b3": {0, 1},   // orthogonal to both b1/b2, not judged a burst
 		"e1": {0.5, 0.5},
-		// d1、c1 故意不放入向量表:d1 测试"无向量跳过去重直接入池";
-		// c1 本就是簇内唯一成员,无论是否有向量都会单独入池,顺带验证
-		// "缺向量"不影响其入选。
+		// d1 and c1 are deliberately left out of the vector table: d1 tests "no
+		// vector skips dedup and goes straight into the pool"; c1 is already the
+		// only member of its cluster and would enter the pool alone regardless
+		// of whether it has a vector, incidentally verifying that "missing a
+		// vector" doesn't affect its selection.
 	}
 
 	assets := []MomentAsset{
@@ -110,19 +126,21 @@ func TestPickFeaturedAndCover_BurstDedupAndVectorlessSkip(t *testing.T) {
 
 	loadVec := fakeVecLoader(vecs)
 
-	// maxFeatured=3:候选池(去重后)按 aesthetic_score 降序为
-	// c1(0.99) > b2(0.95) > e1(0.6) > b3(0.5) > d1(0.4),取前 3。
+	// maxFeatured=3: the (deduped) candidate pool sorted by aesthetic_score
+	// descending is c1(0.99) > b2(0.95) > e1(0.6) > b3(0.5) > d1(0.4), take the
+	// top 3.
 	featured, cover, err := PickFeaturedAndCover(context.Background(), db, assets, 3, loadVec, noCoverLoader)
 	require.NoError(t, err)
 	require.Equal(t, []string{"c1", "b2", "e1"}, featured)
 	require.Equal(t, "c1", cover)
 
-	// 不截断(maxFeatured 足够大):完整候选池应为 5 个,b1 因连拍去重被剔除。
+	// Untruncated (maxFeatured large enough): the full candidate pool should
+	// be 5 entries, b1 removed by burst dedup.
 	full, cover2, err := PickFeaturedAndCover(context.Background(), db, assets, 10, loadVec, noCoverLoader)
 	require.NoError(t, err)
 	require.Equal(t, []string{"c1", "b2", "e1", "b3", "d1"}, full)
 	require.Equal(t, "c1", cover2)
-	require.NotContains(t, full, "b1", "连拍组内非最高分应被剔除出精选候选池")
+	require.NotContains(t, full, "b1", "a non-highest-score member within a burst group should be excluded from the featured candidate pool")
 }
 
 func TestPickFeaturedAndCover_EmptyAssets(t *testing.T) {
@@ -133,34 +151,40 @@ func TestPickFeaturedAndCover_EmptyAssets(t *testing.T) {
 	require.Empty(t, cover)
 }
 
-// TestPickFeaturedAndCover_CoverPrefersScore 覆盖 theme/pet 场景:featured 候选
-// 里美学分最高的不是 MomentAsset.Score 最高的,cover 应该跟着 score 走(CLIP
-// 主题相似分),而不是 aesthetic_score——这正是"Your Beagle 封面挑最像狗的
-// 那张"的诉求。全程用 noCoverLoader 跳过亮度闸,只验证排序。
+// TestPickFeaturedAndCover_CoverPrefersScore covers the theme/pet scenario:
+// among the featured candidates, the one with the highest aesthetic score
+// isn't the one with the highest MomentAsset.Score, and cover should follow
+// score (the CLIP topic-similarity score), not aesthetic_score — exactly the
+// requirement of "Your Beagle's cover picks the photo that looks most like a
+// dog". Uses noCoverLoader throughout to skip the brightness gate, verifying
+// only the ordering.
 func TestPickFeaturedAndCover_CoverPrefersScore(t *testing.T) {
 	db := makeTestDB(t)
 	t0 := time.Date(2011, time.April, 1, 10, 0, 0, 0, time.UTC)
-	// 三张互不相邻(间隔远超 60s 连拍窗),各自独立入池。
+	// Three photos, none adjacent (gaps far exceed the 60s burst window), each
+	// entering the pool independently.
 	insertPickAsset(t, db, "hi-aesthetic", t0, 0.99)
 	insertPickAsset(t, db, "hi-score", t0.Add(2000*time.Second), 0.5)
 	insertPickAsset(t, db, "low-both", t0.Add(4000*time.Second), 0.1)
 
 	assets := []MomentAsset{
 		{AssetID: "hi-aesthetic", Score: 0.2},
-		{AssetID: "hi-score", Score: 0.9}, // 主题相似分全场最高
+		{AssetID: "hi-score", Score: 0.9}, // highest topic-similarity score overall
 		{AssetID: "low-both", Score: 0.1},
 	}
 
 	featured, cover, err := PickFeaturedAndCover(context.Background(), db, assets, 10, noVecLoader, noCoverLoader)
 	require.NoError(t, err)
-	// featured 逻辑不变:仍按 aesthetic_score 降序。
+	// featured logic is unchanged: still sorted by aesthetic_score descending.
 	require.Equal(t, []string{"hi-aesthetic", "hi-score", "low-both"}, featured)
-	// 但 cover 跟着 score 走,不是 featured[0]。
+	// But cover follows score, not featured[0].
 	require.Equal(t, "hi-score", cover)
 }
 
-// TestPickFeaturedAndCover_CoverSkipsDarkCandidate 覆盖亮度闸的"过暗"分支:
-// score 最高的候选缩略图过暗,应被跳过,cover 落到次高分且通过闸的候选。
+// TestPickFeaturedAndCover_CoverSkipsDarkCandidate covers the brightness
+// gate's "too dark" branch: the highest-score candidate's thumbnail is too
+// dark and should be skipped, with cover falling to the next-highest-score
+// candidate that passes the gate.
 func TestPickFeaturedAndCover_CoverSkipsDarkCandidate(t *testing.T) {
 	db := makeTestDB(t)
 	t0 := time.Date(2011, time.April, 1, 10, 0, 0, 0, time.UTC)
@@ -172,18 +196,20 @@ func TestPickFeaturedAndCover_CoverSkipsDarkCandidate(t *testing.T) {
 		{AssetID: "normal-second", Score: 0.5},
 	}
 	imgs := map[string]image.Image{
-		"dark-top":      solidGrayImage(4, 4, 5), // 5/255 ≈ 0.02,过暗
+		"dark-top":      solidGrayImage(4, 4, 5), // 5/255 ≈ 0.02, too dark
 		"normal-second": checkerImage(4, 4),
 	}
 
 	featured, cover, err := PickFeaturedAndCover(context.Background(), db, assets, 10, noVecLoader, fakeCoverLoader(imgs))
 	require.NoError(t, err)
-	require.Equal(t, []string{"dark-top", "normal-second"}, featured, "featured 排序不受亮度闸影响")
-	require.Equal(t, "normal-second", cover, "过暗候选应被亮度闸跳过")
+	require.Equal(t, []string{"dark-top", "normal-second"}, featured, "featured ordering is unaffected by the brightness gate")
+	require.Equal(t, "normal-second", cover, "a too-dark candidate should be skipped by the brightness gate")
 }
 
-// TestPickFeaturedAndCover_CoverSkipsLowContrastCandidate 覆盖"灰雾/低对比"
-// 分支:候选缩略图亮度均值正常但标准差过低(近乎纯色平面),应被跳过。
+// TestPickFeaturedAndCover_CoverSkipsLowContrastCandidate covers the "hazy/
+// low-contrast" branch: the candidate thumbnail's brightness mean is normal
+// but its std dev is too low (a near-solid-color flat image), should be
+// skipped.
 func TestPickFeaturedAndCover_CoverSkipsLowContrastCandidate(t *testing.T) {
 	db := makeTestDB(t)
 	t0 := time.Date(2011, time.April, 1, 10, 0, 0, 0, time.UTC)
@@ -195,19 +221,20 @@ func TestPickFeaturedAndCover_CoverSkipsLowContrastCandidate(t *testing.T) {
 		{AssetID: "normal-second", Score: 0.5},
 	}
 	imgs := map[string]image.Image{
-		"foggy-top":     solidGrayImage(4, 4, 128), // 均值 0.5 正常,但纯色标准差=0
+		"foggy-top":     solidGrayImage(4, 4, 128), // mean 0.5 is normal, but a solid color has std dev=0
 		"normal-second": checkerImage(4, 4),
 	}
 
 	featured, cover, err := PickFeaturedAndCover(context.Background(), db, assets, 10, noVecLoader, fakeCoverLoader(imgs))
 	require.NoError(t, err)
 	require.Equal(t, []string{"foggy-top", "normal-second"}, featured)
-	require.Equal(t, "normal-second", cover, "低对比灰雾候选应被亮度闸跳过")
+	require.Equal(t, "normal-second", cover, "a low-contrast hazy candidate should be skipped by the brightness gate")
 }
 
-// TestPickFeaturedAndCover_CoverAllRejectedFallsBackToFeaturedFirst 覆盖全拒
-// 回退:所有候选都过不了亮度闸时,cover 应回退到原 featured[0]
-// (aesthetic_score 序下的最高分),而不是"没有封面"。
+// TestPickFeaturedAndCover_CoverAllRejectedFallsBackToFeaturedFirst covers
+// the all-rejected fallback: when every candidate fails the brightness gate,
+// cover should fall back to the original featured[0] (the highest score
+// under aesthetic_score order), rather than "no cover".
 func TestPickFeaturedAndCover_CoverAllRejectedFallsBackToFeaturedFirst(t *testing.T) {
 	db := makeTestDB(t)
 	t0 := time.Date(2011, time.April, 1, 10, 0, 0, 0, time.UTC)
@@ -219,19 +246,21 @@ func TestPickFeaturedAndCover_CoverAllRejectedFallsBackToFeaturedFirst(t *testin
 		{AssetID: "b", Score: 0.9},
 	}
 	imgs := map[string]image.Image{
-		"a": solidGrayImage(4, 4, 5),   // 过暗
-		"b": solidGrayImage(4, 4, 250), // 过曝
+		"a": solidGrayImage(4, 4, 5),   // too dark
+		"b": solidGrayImage(4, 4, 250), // overexposed
 	}
 
 	featured, cover, err := PickFeaturedAndCover(context.Background(), db, assets, 10, noVecLoader, fakeCoverLoader(imgs))
 	require.NoError(t, err)
-	require.Equal(t, []string{"a", "b"}, featured, "featured[0] 应为 aesthetic 序最高的 a")
-	require.Equal(t, "a", cover, "全部候选被拒时应回退 featured[0]")
+	require.Equal(t, []string{"a", "b"}, featured, "featured[0] should be a, the highest under aesthetic order")
+	require.Equal(t, "a", cover, "with every candidate rejected, it should fall back to featured[0]")
 }
 
-// TestPickFeaturedAndCover_CoverLoaderMissingParticipates 覆盖 loader 读不到
-// 缩略图的分支:该候选应跳过亮度闸直接参选(而不是被剔除),分数最高、又读
-// 不到图的候选依然当选 cover。
+// TestPickFeaturedAndCover_CoverLoaderMissingParticipates covers the branch
+// where the loader can't read a thumbnail: that candidate should skip the
+// brightness gate and participate directly (rather than being excluded), and
+// the highest-score candidate whose image can't be read still gets picked as
+// cover.
 func TestPickFeaturedAndCover_CoverLoaderMissingParticipates(t *testing.T) {
 	db := makeTestDB(t)
 	t0 := time.Date(2011, time.April, 1, 10, 0, 0, 0, time.UTC)
@@ -242,7 +271,8 @@ func TestPickFeaturedAndCover_CoverLoaderMissingParticipates(t *testing.T) {
 		{AssetID: "no-thumb-top", Score: 0.9},
 		{AssetID: "normal-second", Score: 0.5},
 	}
-	// imgs 里故意不放 no-thumb-top:模拟缩略图缺失/解码失败。
+	// no-thumb-top is deliberately left out of imgs: simulates a missing
+	// thumbnail/decode failure.
 	imgs := map[string]image.Image{
 		"normal-second": checkerImage(4, 4),
 	}
@@ -250,5 +280,5 @@ func TestPickFeaturedAndCover_CoverLoaderMissingParticipates(t *testing.T) {
 	featured, cover, err := PickFeaturedAndCover(context.Background(), db, assets, 10, noVecLoader, fakeCoverLoader(imgs))
 	require.NoError(t, err)
 	require.Equal(t, []string{"no-thumb-top", "normal-second"}, featured)
-	require.Equal(t, "no-thumb-top", cover, "loader 读不到应跳闸直接采用该候选")
+	require.Equal(t, "no-thumb-top", cover, "when the loader can't read it, the gate should be skipped and the candidate accepted outright")
 }

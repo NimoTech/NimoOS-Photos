@@ -1,6 +1,8 @@
-// theme 引擎测试:覆盖简报 Step 1 清单——两条 ClipPrompts 有重叠命中(score
-// 取 max)、caption 关键词命中并入(不覆盖更高的 clip 分)、MinScore 过滤、
-// 候选池交集(排除文档/回收站/离线/live photo 视频侧)、MinAssets 门槛。
+// Tests for the theme engine: covers the Step 1 brief checklist — two
+// ClipPrompts with overlapping hits (score takes the max), a caption keyword
+// hit merged in (doesn't overwrite a higher clip score), MinScore filtering,
+// candidate pool intersection (excluding documents/trash/offline/live photo
+// companion videos), the MinAssets threshold.
 package service
 
 import (
@@ -12,10 +14,11 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// fakeThemeSearcher 是 clipTextSearcher 的测试替身:按 prompt 返回预设命中,
-// 不接触真实 ML/向量表。err 非 nil 时模拟 ML(immich CLIP 容器)掉线——
-// SearchAssetsByText 对任意 prompt 都返回这个 error,供
-// MomentsService.RecomputeAll 的 per-recipe 失败隔离测试使用。
+// fakeThemeSearcher is a test double for clipTextSearcher: returns preset
+// hits per prompt, without touching the real ML/vector table. When err is
+// non-nil, it simulates ML (the immich CLIP container) being offline —
+// SearchAssetsByText returns this error for any prompt, used by
+// MomentsService.RecomputeAll's per-recipe failure isolation tests.
 type fakeThemeSearcher struct {
 	hits map[string][]AssetScore
 	err  error
@@ -28,8 +31,9 @@ func (f fakeThemeSearcher) SearchAssetsByText(_ context.Context, prompt string, 
 	return f.hits[prompt], nil
 }
 
-// insertThemeAsset 插入一条资产,可选自定义 status/deleted_at/offline/
-// is_live_photo_video 覆盖(通过后续 UPDATE),默认满足候选池条件。
+// insertThemeAsset inserts an asset; status/deleted_at/offline/
+// is_live_photo_video can optionally be overridden afterward (via a
+// subsequent UPDATE); by default it satisfies the candidate pool criteria.
 func insertThemeAsset(t *testing.T, db *sql.DB, id string, takenAt time.Time) {
 	t.Helper()
 	_, err := db.Exec(`INSERT INTO assets(id, file_path, status, taken_at) VALUES(?,?,'indexed',?)`,
@@ -49,37 +53,38 @@ func TestBuildThemeMoments_UnionScoreMaxAndCandidatePool(t *testing.T) {
 	base := time.Date(2011, time.January, 1, 12, 0, 0, 0, time.UTC)
 	day := func(n int) time.Time { return base.AddDate(0, 0, n-1) }
 
-	// 5 个应最终入选的候选:
-	insertThemeAsset(t, db, "a1", day(1))   // clip prompt1 命中 0.9
-	insertThemeAsset(t, db, "a2", day(2))   // clip 两条 prompt 都命中,取 max=0.6;caption 也命中但不拉低分数
-	insertThemeAsset(t, db, "a4", day(4))   // clip prompt2 命中 0.3
-	insertThemeAsset(t, db, "a5", day(5))   // 仅 caption 关键词命中,记 MinScore 保底分
-	insertThemeAsset(t, db, "a10", day(10)) // clip prompt1 命中 0.25(高于默认 MinScore=0.2)
+	// 5 candidates that should end up selected:
+	insertThemeAsset(t, db, "a1", day(1))   // clip prompt1 hits 0.9
+	insertThemeAsset(t, db, "a2", day(2))   // both clip prompts hit, take max=0.6; caption also hits but doesn't pull the score down
+	insertThemeAsset(t, db, "a4", day(4))   // clip prompt2 hits 0.3
+	insertThemeAsset(t, db, "a5", day(5))   // only the caption keyword hits, gets the MinScore floor score
+	insertThemeAsset(t, db, "a10", day(10)) // clip prompt1 hits 0.25 (above the default MinScore=0.2)
 
-	// 应被 MinScore(默认 0.2)过滤掉:0.1 < 0.2。
+	// Should be filtered by MinScore (default 0.2): 0.1 < 0.2.
 	insertThemeAsset(t, db, "a11", day(11))
 
-	// 候选池排除项(各自命中但不该出现在结果里):
-	insertThemeAsset(t, db, "doc6", day(6)) // 文档:hasOcrExpr 命中
+	// Candidate pool exclusions (each has a hit but shouldn't appear in the result):
+	insertThemeAsset(t, db, "doc6", day(6)) // document: hasOcrExpr matches
 	_, err := db.Exec(`INSERT INTO asset_ocr(asset_id, text, coverage, line_count, is_doc)
 		VALUES('doc6','a long ocr text with many lines of content here',0.9,20,1)`)
 	require.NoError(t, err)
 
-	insertThemeAsset(t, db, "trash7", day(7)) // 回收站
+	insertThemeAsset(t, db, "trash7", day(7)) // trash
 	_, err = db.Exec(`UPDATE assets SET deleted_at=? WHERE id='trash7'`, "2011-01-08 00:00:00")
 	require.NoError(t, err)
 	insertCaption(t, db, "trash7", "a dog in the trash")
 
-	insertThemeAsset(t, db, "offline8", day(8)) // 离线
+	insertThemeAsset(t, db, "offline8", day(8)) // offline
 	_, err = db.Exec(`UPDATE assets SET offline=1 WHERE id='offline8'`)
 	require.NoError(t, err)
 
-	insertThemeAsset(t, db, "livevid9", day(9)) // live photo 视频侧
+	insertThemeAsset(t, db, "livevid9", day(9)) // live photo companion video
 	_, err = db.Exec(`UPDATE assets SET is_live_photo_video=1 WHERE id='livevid9'`)
 	require.NoError(t, err)
 
-	// caption 关键词命中:a5(应保留)、a2(命中但不应拉低其已有的更高 clip 分)、
-	// trash7(应被候选池滤掉)。
+	// Caption keyword hits: a5 (should be kept), a2 (hits but shouldn't pull
+	// down its already-higher clip score), trash7 (should be filtered out by
+	// the candidate pool).
 	insertCaption(t, db, "a5", "a cute dog playing in the yard")
 	insertCaption(t, db, "a2", "a dog and a cat both sitting here")
 
@@ -88,12 +93,12 @@ func TestBuildThemeMoments_UnionScoreMaxAndCandidatePool(t *testing.T) {
 			{AssetID: "a1", Score: 0.9},
 			{AssetID: "a2", Score: 0.5},
 			{AssetID: "a10", Score: 0.25},
-			{AssetID: "a11", Score: 0.1}, // 低于 MinScore,应被过滤
+			{AssetID: "a11", Score: 0.1}, // below MinScore, should be filtered
 			{AssetID: "doc6", Score: 0.9},
 			{AssetID: "offline8", Score: 0.9},
 		},
 		"prompt2": {
-			{AssetID: "a2", Score: 0.6}, // 与 prompt1 的 0.5 取 max => 0.6
+			{AssetID: "a2", Score: 0.6}, // takes the max against prompt1's 0.5 => 0.6
 			{AssetID: "a4", Score: 0.3},
 			{AssetID: "livevid9", Score: 0.9},
 		},
@@ -126,16 +131,16 @@ func TestBuildThemeMoments_UnionScoreMaxAndCandidatePool(t *testing.T) {
 	require.Contains(t, byID, "a4")
 	require.Contains(t, byID, "a5")
 	require.Contains(t, byID, "a10")
-	require.NotContains(t, byID, "a11", "低于 MinScore 应被过滤")
-	require.NotContains(t, byID, "doc6", "文档应被候选池排除")
-	require.NotContains(t, byID, "trash7", "回收站应被候选池排除")
-	require.NotContains(t, byID, "offline8", "离线应被候选池排除")
-	require.NotContains(t, byID, "livevid9", "live photo 视频侧应被候选池排除")
+	require.NotContains(t, byID, "a11", "below MinScore should be filtered")
+	require.NotContains(t, byID, "doc6", "a document should be excluded by the candidate pool")
+	require.NotContains(t, byID, "trash7", "trash should be excluded by the candidate pool")
+	require.NotContains(t, byID, "offline8", "offline should be excluded by the candidate pool")
+	require.NotContains(t, byID, "livevid9", "a live photo companion video should be excluded by the candidate pool")
 
 	require.InDelta(t, 0.9, byID["a1"].Score, 1e-9)
-	require.InDelta(t, 0.6, byID["a2"].Score, 1e-9, "两路命中取 max,不应被 caption 保底分拉低")
+	require.InDelta(t, 0.6, byID["a2"].Score, 1e-9, "a hit on both paths takes the max, must not be pulled down by the caption floor score")
 	require.InDelta(t, 0.3, byID["a4"].Score, 1e-9)
-	require.InDelta(t, 0.2, byID["a5"].Score, 1e-9, "仅 caption 命中应记 MinScore 保底分")
+	require.InDelta(t, 0.2, byID["a5"].Score, 1e-9, "a caption-only hit should get the MinScore floor score")
 	require.InDelta(t, 0.25, byID["a10"].Score, 1e-9)
 
 	require.True(t, d.TimeFrom.Equal(day(1)))
@@ -158,7 +163,8 @@ func TestBuildThemeMoments_BelowMinAssetsReturnsEmpty(t *testing.T) {
 		},
 	}}
 
-	// 未覆盖 min_assets,回落默认值 10;只有 3 个候选,应产不出 draft。
+	// min_assets not overridden, falls back to the default of 10; with only 3
+	// candidates, no draft should be produced.
 	recipe := MomentRecipe{
 		Key:        "theme:pets",
 		Kind:       "theme",
@@ -171,11 +177,13 @@ func TestBuildThemeMoments_BelowMinAssetsReturnsEmpty(t *testing.T) {
 	require.Empty(t, drafts)
 }
 
-// TestMatchCaptionKeywords_WordBoundaryNotSubstring:真机验收发现旧版子串
-// 判据 instr(lower(text), kw) 无词边界,"cat"⊂vacation/location、
-// "pet"⊂carpet、"ice"⊂nice/service 全部误命中(是 theme:pets 1306/
-// theme:snow 1610(全库 6882)命中过宽的根因)。断言修复后:整词命中的正常
-// 收录,子串误命中的必须被排除。
+// TestMatchCaptionKeywords_WordBoundaryNotSubstring: real-device testing
+// found the old substring criterion instr(lower(text), kw) has no word
+// boundary, so "cat"⊂vacation/location, "pet"⊂carpet, "ice"⊂nice/service
+// were all falsely matched (the root cause of theme:pets 1306/theme:snow
+// 1610 over-matching out of 6882 library-wide). Asserts that after the fix:
+// a genuine whole-word hit is still recorded, while a substring false match
+// must be excluded.
 func TestMatchCaptionKeywords_WordBoundaryNotSubstring(t *testing.T) {
 	db := makeTestDB(t)
 	insertThemeAsset(t, db, "vac1", time.Now())
@@ -193,10 +201,10 @@ func TestMatchCaptionKeywords_WordBoundaryNotSubstring(t *testing.T) {
 	hits, err := matchCaptionKeywords(context.Background(), db, []string{"cat", "pet", "ice"})
 	require.NoError(t, err)
 
-	require.NotContains(t, hits, "vac1", `"vacation" 含子串 "cat" 但不是整词,不应命中`)
-	require.Contains(t, hits, "cat1", `"a cat on the sofa" 整词命中 "cat"`)
-	require.NotContains(t, hits, "carpet1", `"carpet" 含子串 "pet" 但不是整词,不应命中`)
-	require.NotContains(t, hits, "nice1", `"nice"/"service" 含子串 "ice" 但不是整词,不应命中`)
+	require.NotContains(t, hits, "vac1", `"vacation" contains the substring "cat" but isn't the whole word, should not match`)
+	require.Contains(t, hits, "cat1", `"a cat on the sofa" matches "cat" as a whole word`)
+	require.NotContains(t, hits, "carpet1", `"carpet" contains the substring "pet" but isn't the whole word, should not match`)
+	require.NotContains(t, hits, "nice1", `"nice"/"service" contain the substring "ice" but aren't the whole word, should not match`)
 }
 
 func TestBuildThemeMoments_NoHitsReturnsEmpty(t *testing.T) {

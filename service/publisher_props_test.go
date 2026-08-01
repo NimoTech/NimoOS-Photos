@@ -6,64 +6,67 @@ import (
 	"time"
 )
 
-// taskToProps 必须把 added(本次新增人脸数)带进 Properties——否则前端永远收不到、
-// 「新识别 N 个人脸」提示永不弹出(曾经的回归)。
+// taskToProps must carry added (the number of faces newly added this run)
+// into Properties — otherwise the frontend never receives it and the
+// "N new faces recognized" hint never pops (a past regression).
 func TestTaskToProps_CarriesAdded(t *testing.T) {
 	props := taskToProps(Task{
-		ID: "face_1", Type: "face", Label: "识别人物",
+		ID: "face_1", Type: "face", Label: "Recognizing people",
 		Current: 90, Total: 90, Added: 90, Progress: 1, Status: "done",
 		StartedAt: time.Unix(0, 0),
 	})
 	if props["added"] != "90" {
-		t.Fatalf("added 应为 \"90\"，实际 %q", props["added"])
+		t.Fatalf("added should be \"90\", got %q", props["added"])
 	}
 	if props["status"] != "done" || props["current"] != "90" {
-		t.Fatalf("基础字段缺失: %#v", props)
+		t.Fatalf("basic fields missing: %#v", props)
 	}
 }
 
-// added==0 时不应出现在 Properties(与 >0 才发的约定一致)。
+// added==0 should not appear in Properties (consistent with the "only sent when >0" convention).
 func TestTaskToProps_OmitsZeroAdded(t *testing.T) {
 	props := taskToProps(Task{
 		ID: "face_1", Type: "face", Added: 0, Status: "done", StartedAt: time.Unix(0, 0),
 	})
 	if _, ok := props["added"]; ok {
-		t.Fatalf("added==0 时不应出现在 Properties: %#v", props)
+		t.Fatalf("added==0 should not appear in Properties: %#v", props)
 	}
 }
 
-// taskToProps 必须把结构化 i18n 错误(errorKey + errorParams)带进 Properties——
-// 否则前端拿不到 key/参数，只能退回旧的整句 Error 展示，i18n 白做。
-// errorParams 序列化成 JSON 字符串（Properties 只收 map[string]string）。
+// taskToProps must carry the structured i18n error (errorKey + errorParams)
+// into Properties — otherwise the frontend can't get the key/params and has
+// to fall back to displaying the old plain-sentence Error, making i18n
+// pointless. errorParams is serialized to a JSON string (Properties only
+// accepts map[string]string).
 func TestTaskToProps_CarriesErrorKeyAndParams(t *testing.T) {
 	tk := Task{ID: "face_1", Type: "face", Status: "error", StartedAt: time.Unix(0, 0)}
 	tk.SetError(TaskErrFaceClusterFailed, map[string]string{"detail": "boom"})
 	props := taskToProps(tk)
 
 	if props["errorKey"] != TaskErrFaceClusterFailed {
-		t.Fatalf("errorKey 应为契约 key，实际 %q", props["errorKey"])
+		t.Fatalf("errorKey should be the contract key, got %q", props["errorKey"])
 	}
 	if props["error"] != "Face clustering failed: boom" {
-		t.Fatalf("error 应为英文 fallback，实际 %q", props["error"])
+		t.Fatalf("error should be the English fallback, got %q", props["error"])
 	}
 	var params map[string]string
 	if err := json.Unmarshal([]byte(props["errorParams"]), &params); err != nil {
-		t.Fatalf("errorParams 应是合法 JSON: %v (%q)", err, props["errorParams"])
+		t.Fatalf("errorParams should be valid JSON: %v (%q)", err, props["errorParams"])
 	}
 	if params["detail"] != "boom" {
-		t.Fatalf("errorParams.detail 应为 \"boom\"，实际 %#v", params)
+		t.Fatalf("errorParams.detail should be \"boom\", got %#v", params)
 	}
 }
 
-// 没有结构化错误(ErrorKey 为空)时,errorKey/errorParams 都不应出现在 Properties。
+// When there's no structured error (ErrorKey is empty), neither errorKey nor errorParams should appear in Properties.
 func TestTaskToProps_OmitsEmptyErrorKey(t *testing.T) {
 	props := taskToProps(Task{
 		ID: "face_1", Type: "face", Status: "done", StartedAt: time.Unix(0, 0),
 	})
 	if _, ok := props["errorKey"]; ok {
-		t.Fatalf("errorKey 为空时不应出现在 Properties: %#v", props)
+		t.Fatalf("errorKey should not appear in Properties when empty: %#v", props)
 	}
 	if _, ok := props["errorParams"]; ok {
-		t.Fatalf("errorParams 为空时不应出现在 Properties: %#v", props)
+		t.Fatalf("errorParams should not appear in Properties when empty: %#v", props)
 	}
 }

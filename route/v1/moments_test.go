@@ -18,9 +18,11 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// momentsFakeServices 只实现 MomentsHandler 依赖的 Moments()/Albums()/Search(),
-// 其余方法由内嵌的 service.Services 接口零值满足(未调用到,panic 即视为
-// 测试写错)——照 route/v1 既有 stub 惯例(tasks_test.go/views_test.go)。
+// momentsFakeServices only implements the Moments()/Albums()/Search() that
+// MomentsHandler depends on; the other methods are satisfied by the zero
+// value of the embedded service.Services interface (never called — a
+// panic there means the test itself is wrong) — following route/v1's
+// existing stub convention (tasks_test.go/views_test.go).
 type momentsFakeServices struct {
 	service.Services
 	moments *service.MomentsService
@@ -32,9 +34,11 @@ func (f *momentsFakeServices) Moments() *service.MomentsService { return f.momen
 func (f *momentsFakeServices) Albums() *service.AlbumService    { return f.albums }
 func (f *momentsFakeServices) Search() *service.SearchService   { return f.search }
 
-// newMomentsHarness 打开临时 sqlite 库,装配 MomentsHandler 所需的最小服务集。
-// searcher/loadVec/namer 传 nil——list/assets/album/recipes 用例都不触发引擎,
-// recompute 用例保证 recipe 表为空(不进入 recomputeRecipe 分支),nil 安全。
+// newMomentsHarness opens a temp sqlite DB and wires up the minimal set of
+// services MomentsHandler needs. searcher/loadVec/namer are passed nil —
+// the list/assets/album/recipes test cases never trigger the engine, and
+// the recompute test case keeps the recipe table empty (never entering the
+// recomputeRecipe branch), so nil is safe.
 func newMomentsHarness(t *testing.T) (*MomentsHandler, *sql.DB, *service.MomentStore) {
 	t.Helper()
 	db, err := sqlite.Open(filepath.Join(t.TempDir(), "moments_route.db"))
@@ -52,8 +56,9 @@ func newMomentsHarness(t *testing.T) (*MomentsHandler, *sql.DB, *service.MomentS
 	return h, db, store
 }
 
-// zeroMLStub 满足 SearchService 依赖的文本嵌入接口,返回零向量——本文件测试
-// 不涉及语义检索,只用 Search().ListAssets/GetAsset 的按 id 查询路径。
+// zeroMLStub satisfies the text-embedding interface SearchService depends
+// on, returning a zero vector — this file's tests don't involve semantic
+// search, only Search().ListAssets/GetAsset's by-id query path.
 type zeroMLStub struct{}
 
 func (zeroMLStub) CLIPTextEmbed(string) ([]float32, error) {
@@ -119,8 +124,8 @@ func TestMomentsHandler_ListReturnsShapedFields(t *testing.T) {
 	require.Equal(t, false, m["named_by_llm"])
 	require.NotEmpty(t, m["time_from"])
 	require.NotEmpty(t, m["time_to"])
-	require.Contains(t, m, "cover_ratio", "cover_ratio 应恒输出")
-	require.Equal(t, float64(0), m["cover_ratio"], "seedOneMoment 未造 asset_exif,应回落 0")
+	require.Contains(t, m, "cover_ratio", "cover_ratio should always be present")
+	require.Equal(t, float64(0), m["cover_ratio"], "seedOneMoment doesn't create asset_exif, should fall back to 0")
 }
 
 func TestMomentsHandler_ListEmpty(t *testing.T) {
@@ -288,10 +293,12 @@ func TestMomentsHandler_UpdateRecipesEmptyBodyRejected(t *testing.T) {
 	require.Equal(t, http.StatusBadRequest, he.Code)
 }
 
-// TestMomentsHandler_UpdateRecipesUnknownKindRejected:kind 不在
-// {"trip","theme"} 白名单内(如运维/脚本手误的 "thmee")应 400,而不是静默
-// 落库——引擎(recomputeRecipe)对未知 kind 只 Warn 跳过、永不产出/永不报错,
-// 若在这一层不拦,typo 会悄悄进库且没有任何用户可见的提示。
+// TestMomentsHandler_UpdateRecipesUnknownKindRejected: a kind outside the
+// {"trip","theme"} whitelist (e.g. an ops/script typo like "thmee") should
+// be a 400, not silently persisted — the engine (recomputeRecipe) only
+// Warns and skips unknown kinds, never producing output or erroring, so if
+// this layer doesn't catch it, the typo quietly ends up in the DB with no
+// user-visible indication.
 // ── PUT /v1/photos/moments/order ────────────────────────────────────────
 
 func TestMomentsHandler_ReorderEmptyIdsRejected(t *testing.T) {
@@ -306,10 +313,11 @@ func TestMomentsHandler_ReorderEmptyIdsRejected(t *testing.T) {
 
 func TestMomentsHandler_ReorderSuccess(t *testing.T) {
 	h, db, store := newMomentsHarness(t)
-	// 两个 moment 落在不同 recipe_key 下,才能共存——seedOneMoment 内部走
-	// SyncRecipeMoments("trip", ...),同 recipe 二次调用会把前一个当"消失的
-	// 旧时刻"删掉(见 momentstore.go 语义),故这里不能用同一 recipeKey 连续
-	// seed 两次。
+	// The two moments must live under different recipe_keys to coexist —
+	// seedOneMoment internally calls SyncRecipeMoments("trip", ...), and a
+	// second call with the same recipe would treat the previous one as a
+	// "vanished old moment" and delete it (see momentstore.go semantics),
+	// so we can't seed twice in a row with the same recipeKey here.
 	seedOneMoment(t, db, store, "m1", []string{"a1"})
 	for _, id := range []string{"a2"} {
 		_, err := db.Exec(`INSERT INTO assets(id,file_path,status) VALUES(?,?,'indexed')`, id, "/p/"+id+".jpg")
@@ -333,7 +341,7 @@ func TestMomentsHandler_ReorderSuccess(t *testing.T) {
 	moments, err := store.ListMoments()
 	require.NoError(t, err)
 	require.Len(t, moments, 2)
-	require.Equal(t, "m2", moments[0].ID, "手排后 m2(ids[0])应排在 m1 前面")
+	require.Equal(t, "m2", moments[0].ID, "after manual reorder, m2 (ids[0]) should come before m1")
 	require.Equal(t, "m1", moments[1].ID)
 }
 
@@ -366,7 +374,7 @@ func TestMomentsHandler_PinAssetsAddsMemberAndReturnsCount(t *testing.T) {
 			pinned = m
 		}
 	}
-	require.True(t, pinned.Manual, "pin 落库的成员应标 manual=1")
+	require.True(t, pinned.Manual, "a member persisted via pin should be marked manual=1")
 }
 
 func TestMomentsHandler_PinAssetsEmptyIdsRejected(t *testing.T) {
@@ -457,7 +465,7 @@ func TestMomentsHandler_DeleteHidesMomentAndFollowUpsReturn404(t *testing.T) {
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &body))
 	require.Equal(t, true, body["ok"])
 
-	// 隐藏后:List 不再包含它。
+	// After hiding: List no longer includes it.
 	lc, lrec := newEchoCtx(http.MethodGet, "/v1/photos/moments", nil)
 	require.NoError(t, h.List(lc))
 	var listBody struct {
@@ -466,7 +474,7 @@ func TestMomentsHandler_DeleteHidesMomentAndFollowUpsReturn404(t *testing.T) {
 	require.NoError(t, json.Unmarshal(lrec.Body.Bytes(), &listBody))
 	require.Len(t, listBody.Moments, 0)
 
-	// 隐藏后:assets/album 端点均 404。
+	// After hiding: both the assets and album endpoints return 404.
 	ac, _ := newEchoCtx(http.MethodGet, "/v1/photos/moments/m1/assets", nil)
 	ac.SetParamNames("id")
 	ac.SetParamValues("m1")
@@ -496,10 +504,12 @@ func TestMomentsHandler_DeleteNotFound(t *testing.T) {
 	require.Equal(t, http.StatusNotFound, he.Code)
 }
 
-// TestMomentsHandler_DeleteTwiceStillReturns404:补齐九期终审点名的边界——
-// 第一次 DELETE 隐藏成功(200),第二次对同一 id 再 DELETE 应仍是 404(
-// findMoment 基于 ListMoments,已过滤 hidden=0,故第二次起视为"不存在"),
-// 而非误报已隐藏或再次 200。
+// TestMomentsHandler_DeleteTwiceStillReturns404: covers the edge case
+// flagged in the ninth-round final review — the first DELETE succeeds in
+// hiding (200), and a second DELETE on the same id should still be 404
+// (findMoment is based on ListMoments, which already filters hidden=0, so
+// it's treated as "not found" from the second call on), rather than
+// mistakenly reporting "already hidden" or another 200.
 func TestMomentsHandler_DeleteTwiceStillReturns404(t *testing.T) {
 	h, db, store := newMomentsHarness(t)
 	seedOneMoment(t, db, store, "m1", []string{"a1", "a2"})
@@ -515,16 +525,18 @@ func TestMomentsHandler_DeleteTwiceStillReturns404(t *testing.T) {
 	err := h.Delete(c2)
 	he, ok := err.(*echo.HTTPError)
 	require.True(t, ok)
-	require.Equal(t, http.StatusNotFound, he.Code, "二次 DELETE 同一 id 仍应是 404")
+	require.Equal(t, http.StatusNotFound, he.Code, "a second DELETE on the same id should still be 404")
 }
 
 // ── momentDTO.featured_asset_ids ─────────────────────────────────────────
 
 func TestMomentsHandler_ListIncludesFeaturedAssetIDsExcludingCover(t *testing.T) {
 	h, db, store := newMomentsHarness(t)
-	// a1 是封面且 featured,a2/a3/a4 也 featured(非封面),a5 不 featured——
-	// TopFeaturedByMoment(3) 应排除封面 a1,按 score 降序截取前 3:a2、a3、a4
-	// (马赛克三联模板需要,证明上限已从 2 提到 3)。
+	// a1 is the cover and featured; a2/a3/a4 are also featured (not the
+	// cover); a5 is not featured — TopFeaturedByMoment(3) should exclude
+	// cover a1 and take the top 3 by score DESC: a2, a3, a4 (needed for
+	// the mosaic three-tile template, proving the cap was raised from 2
+	// to 3).
 	for _, id := range []string{"a1", "a2", "a3", "a4", "a5"} {
 		_, err := db.Exec(`INSERT INTO assets(id,file_path,status) VALUES(?,?,'indexed')`, id, "/p/"+id+".jpg")
 		require.NoError(t, err)
@@ -563,7 +575,7 @@ func TestMomentsHandler_ListIncludesFeaturedAssetIDsExcludingCover(t *testing.T)
 
 func TestMomentsHandler_ListFeaturedAssetIDsEmptyWhenNoneFeatured(t *testing.T) {
 	h, db, store := newMomentsHarness(t)
-	seedOneMoment(t, db, store, "m1", []string{"a1"}) // 唯一成员即封面,被 Top 排除
+	seedOneMoment(t, db, store, "m1", []string{"a1"}) // sole member is the cover, excluded by Top
 
 	c, rec := newEchoCtx(http.MethodGet, "/v1/photos/moments", nil)
 	require.NoError(t, h.List(c))
@@ -574,7 +586,7 @@ func TestMomentsHandler_ListFeaturedAssetIDsEmptyWhenNoneFeatured(t *testing.T) 
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &body))
 	require.Len(t, body.Moments, 1)
 	ids, ok := body.Moments[0]["featured_asset_ids"].([]any)
-	require.True(t, ok, "featured_asset_ids 字段应始终是数组(即使为空),不是 null 或缺失")
+	require.True(t, ok, "featured_asset_ids should always be an array (even if empty), not null or missing")
 	require.Len(t, ids, 0)
 }
 
@@ -582,7 +594,7 @@ func TestMomentsHandler_ListFeaturedAssetIDsEmptyWhenNoneFeatured(t *testing.T) 
 
 func TestMomentsHandler_AssetsWithMembersReturnsShapeWithManualFeatured(t *testing.T) {
 	h, db, store := newMomentsHarness(t)
-	seedOneMoment(t, db, store, "m1", []string{"a1", "a2"}) // a1 featured/manual=0,a2 非 featured/manual=0
+	seedOneMoment(t, db, store, "m1", []string{"a1", "a2"}) // a1 featured/manual=0, a2 not featured/manual=0
 	_, err := db.Exec(`INSERT INTO assets(id,file_path,status) VALUES(?,?,'indexed')`, "a3", "/p/a3.jpg")
 	require.NoError(t, err)
 	_, err = store.PinMomentAssets("m1", []string{"a3"}) // manual=1/featured=0
@@ -625,10 +637,12 @@ func TestMomentsHandler_AssetsWithoutParamStaysBareArray(t *testing.T) {
 	c.SetParamValues("m1")
 	require.NoError(t, h.Assets(c))
 
-	// 不带 with_members 参数时响应必须是裸数组,不能是 {"assets":...} 对象——
-	// 部署窗口内旧前端仍按裸数组解析(见简报歧义裁决)。
+	// Without the with_members param, the response must be a bare array,
+	// not a {"assets":...} object — during the deploy window, old
+	// frontends still parse it as a bare array (see the brief's
+	// ambiguity ruling).
 	var raw []any
-	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &raw), "响应应能直接解析为裸数组")
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &raw), "response should parse directly as a bare array")
 	require.Len(t, raw, 2)
 }
 
@@ -637,8 +651,9 @@ func TestMomentsHandler_AssetsWithoutParamStaysBareArray(t *testing.T) {
 func TestMomentsHandler_ListIncludesAddedThisWeekZeroWhenNoneRecent(t *testing.T) {
 	h, db, store := newMomentsHarness(t)
 	seedOneMoment(t, db, store, "m1", []string{"a1", "a2"})
-	// seedOneMoment 走 SyncRecipeMoments,新成员的 added_at 恰好是本次调用的
-	// "现在",天然落在 7 天窗口内——这里把它们回填成很久以前,验证 0 的场景。
+	// seedOneMoment goes through SyncRecipeMoments, so new members' added_at
+	// is exactly "now" for this call, naturally falling inside the 7-day
+	// window — here we backdate them to long ago, to test the 0 scenario.
 	_, err := db.Exec(`UPDATE moment_assets SET added_at=1 WHERE moment_id='m1'`)
 	require.NoError(t, err)
 
@@ -651,7 +666,7 @@ func TestMomentsHandler_ListIncludesAddedThisWeekZeroWhenNoneRecent(t *testing.T
 	}
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &body))
 	require.Len(t, body.Moments, 1)
-	// 字段恒输出(0 也带),前端判 >0 才显示。
+	// Field is always output (0 included); the frontend only shows it when >0.
 	require.Contains(t, body.Moments[0], "added_this_week")
 	require.Equal(t, float64(0), body.Moments[0]["added_this_week"])
 }
@@ -659,8 +674,9 @@ func TestMomentsHandler_ListIncludesAddedThisWeekZeroWhenNoneRecent(t *testing.T
 func TestMomentsHandler_ListIncludesAddedThisWeekPositiveWhenRecent(t *testing.T) {
 	h, db, store := newMomentsHarness(t)
 	seedOneMoment(t, db, store, "m1", []string{"a1", "a2"})
-	// seedOneMoment 内的 SyncRecipeMoments 已把 added_at 打成"刚刚",天然落在
-	// 7 天窗口内,无需额外造数据。
+	// seedOneMoment's internal SyncRecipeMoments already stamps added_at as
+	// "just now", naturally falling inside the 7-day window, so no extra
+	// data setup is needed.
 
 	c, rec := newEchoCtx(http.MethodGet, "/v1/photos/moments", nil)
 	require.NoError(t, h.List(c))
@@ -671,10 +687,10 @@ func TestMomentsHandler_ListIncludesAddedThisWeekPositiveWhenRecent(t *testing.T
 	}
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &body))
 	require.Len(t, body.Moments, 1)
-	require.Equal(t, float64(2), body.Moments[0]["added_this_week"], "两个成员均在本周新增")
+	require.Equal(t, float64(2), body.Moments[0]["added_this_week"], "both members were added this week")
 }
 
-// ── GET /moments 附带 cover_ratio ────────────────────────────────────────
+// ── GET /moments with cover_ratio ───────────────────────────────────────
 
 func TestMomentsHandler_ListIncludesCoverRatioNormal(t *testing.T) {
 	h, db, store := newMomentsHarness(t)
@@ -696,7 +712,7 @@ func TestMomentsHandler_ListIncludesCoverRatioNormal(t *testing.T) {
 
 func TestMomentsHandler_ListCoverRatioZeroWhenExifMissing(t *testing.T) {
 	h, db, store := newMomentsHarness(t)
-	seedOneMoment(t, db, store, "m1", []string{"a1", "a2"}) // 无 asset_exif 行
+	seedOneMoment(t, db, store, "m1", []string{"a1", "a2"}) // no asset_exif row
 
 	c, rec := newEchoCtx(http.MethodGet, "/v1/photos/moments", nil)
 	require.NoError(t, h.List(c))
@@ -707,7 +723,7 @@ func TestMomentsHandler_ListCoverRatioZeroWhenExifMissing(t *testing.T) {
 	}
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &body))
 	require.Len(t, body.Moments, 1)
-	require.Contains(t, body.Moments[0], "cover_ratio", "cover_ratio 应恒输出,不用 omitempty")
+	require.Contains(t, body.Moments[0], "cover_ratio", "cover_ratio should always be present, no omitempty")
 	require.Equal(t, float64(0), body.Moments[0]["cover_ratio"])
 }
 
@@ -729,7 +745,7 @@ func TestMomentsHandler_ListCoverRatioZeroWhenWidthOrHeightZero(t *testing.T) {
 	require.Equal(t, float64(0), body.Moments[0]["cover_ratio"])
 }
 
-// ── GET /moments/:id/assets?with_members=1 附带 places ──────────────────
+// ── GET /moments/:id/assets?with_members=1 with places ──────────────────
 
 func TestMomentsHandler_AssetsWithMembersIncludesPlaces(t *testing.T) {
 	h, db, store := newMomentsHarness(t)
@@ -774,5 +790,5 @@ func TestMomentsHandler_UpdateRecipesUnknownKindRejected(t *testing.T) {
 
 	recipes, lerr := store.ListRecipes(false)
 	require.NoError(t, lerr)
-	require.Empty(t, recipes, "被拒绝的 recipe 不应落库")
+	require.Empty(t, recipes, "a rejected recipe should not be persisted")
 }
