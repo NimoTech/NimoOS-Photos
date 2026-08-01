@@ -27,14 +27,19 @@ type Config struct {
 	ScenesEnabled    bool
 	OCREnabled       bool
 	SmartViewEnabled bool
-	// AestheticEnabled 控制美学评分:关闭时不内联打分、不跑 BackfillAesthetic;
-	// 已有分数保留并继续参与封面排序,新资产分数为 NULL 走各处兜底排序。
+	// AestheticEnabled controls aesthetic scoring: when off, no inline
+	// scoring and no BackfillAesthetic run; existing scores are kept and
+	// keep participating in cover ranking, while new assets' NULL scores
+	// fall back to each site's own ranking.
 	AestheticEnabled bool
 
-	// PreviewPregen 控制视频低码率悬浮预览(preview.mp4,单个可达数十 MB)是否
-	// 在索引期/启动补跑时预生成。缺省 false = 纯懒生成:仅当用户真正悬浮预览时
-	// 由路由端现场生成(route/v1/assets.go Preview),不为从不预览的视频付出磁盘。
-	// sprite.jpg(雪碧图,数百 KB)不受此开关影响,始终预生成。
+	// PreviewPregen controls whether the low-bitrate video hover preview
+	// (preview.mp4, can reach tens of MB each) is pre-generated during
+	// indexing/startup backfill. Default false = purely lazy generation:
+	// only generated on the spot by the route handler (route/v1/assets.go
+	// Preview) when the user actually hovers to preview, so disk isn't spent
+	// on videos that are never previewed. sprite.jpg (the sprite sheet, a
+	// few hundred KB) is unaffected by this toggle and is always pre-generated.
 	PreviewPregen bool
 
 	// MinMatchSimilarity, when > 0, drops SmartSearch results whose (display-scale,
@@ -59,10 +64,13 @@ type Config struct {
 	// cliff-detection signal it combines with).
 	SearchCutAlpha float64
 
-	// Doc 分类混合判据(OCR 类)的权重与标定(见 service/docscore.go):
-	// DocWSem/DocWGeo 语义与几何权重;DocScoreFloor 判文档的加权分下限;
-	// DocSemFloor/DocSemCeil 语义边际线性归一的两个标定端点。
-	// 默认值为当前库校准的经验值,换 CLIP 模型代次后需复核。
+	// Weights and calibration for the doc-classification mixed criterion
+	// (OCR class), see service/docscore.go: DocWSem/DocWGeo are the semantic
+	// and geometric weights; DocScoreFloor is the weighted-score floor for
+	// classifying as a document; DocSemFloor/DocSemCeil are the two
+	// calibration endpoints for linearly normalizing the semantic margin.
+	// Defaults are empirical values calibrated against the current library;
+	// review after a CLIP model generation change.
 	DocWSem       float64
 	DocWGeo       float64
 	DocScoreFloor float64
@@ -93,8 +101,9 @@ func Init(configFile, confSample string) error {
 			watchDirs = append(watchDirs, d)
 		}
 	}
-	// watchDirs 为空 ⇒ watcher 自动模式（范围 = EnumerateScanRoots，即系统盘
-	// + 全部已挂载用户分区，动态跟随挂载）；非空 ⇒ 手工监控清单（向后兼容）。
+	// watchDirs empty => watcher auto mode (scope = EnumerateScanRoots, i.e.
+	// the system disk + all mounted user partitions, dynamically following
+	// mounts); non-empty => manual watch list (backward compatible).
 	Cfg = &Config{
 		RuntimePath:      v.GetString("common.RuntimePath"),
 		LogPath:          v.GetString("common.LogPath"),
@@ -140,11 +149,11 @@ func Init(configFile, confSample string) error {
 	if Cfg.RetentionDays <= 0 {
 		Cfg.RetentionDays = 30
 	}
-	// FacesEnabled 缺省（配置无此 key）时默认开启。
+	// FacesEnabled defaults to on when absent from the config (no such key).
 	if !v.IsSet("photos.FacesEnabled") {
 		Cfg.FacesEnabled = true
 	}
-	// 新开关缺省（配置无此 key）时默认开启，与 FacesEnabled 同语义。
+	// New toggles default to on when absent from the config (no such key), same semantics as FacesEnabled.
 	if !v.IsSet("photos.ScenesEnabled") {
 		Cfg.ScenesEnabled = true
 	}
@@ -157,27 +166,28 @@ func Init(configFile, confSample string) error {
 	if !v.IsSet("photos.AestheticEnabled") {
 		Cfg.AestheticEnabled = true
 	}
-	// 扫描间隔（分钟）；配置无此 key 时默认 1440（24h）。0 = 关闭周期重扫。
+	// Scan interval (minutes); defaults to 1440 (24h) when absent from the config. 0 = disable periodic rescans.
 	if !v.IsSet("photos.ScanInterval") {
 		Cfg.ScanInterval = 1440
 	}
-	// 语义搜索相关性下限：配置无此 key 时默认 0（不过滤），与改配置化之前的硬编码行为一致。
+	// Semantic search relevance floor: defaults to 0 (no filtering) when absent from the config, matching the hardcoded behavior before this became configurable.
 	if !v.IsSet("photos.MinMatchSimilarity") {
 		Cfg.MinMatchSimilarity = 0.0
 	}
-	// 展示层标定区间端点：配置无此 key 时使用当前模型的经验默认值。
+	// Display-layer calibration interval endpoints: use the current model's empirical defaults when absent from the config.
 	if !v.IsSet("photos.SimDisplayFloor") {
 		Cfg.SimDisplayFloor = 0.03
 	}
 	if !v.IsSet("photos.SimDisplayCeil") {
 		Cfg.SimDisplayCeil = 0.13
 	}
-	// 语义搜索自适应断层的相对阈值系数：配置无此 key 时默认 0.7。
+	// Relative threshold coefficient for the semantic search adaptive cliff: defaults to 0.7 when absent from the config.
 	if !v.IsSet("photos.SearchCutAlpha") {
 		Cfg.SearchCutAlpha = 0.7
 	}
-	// Doc 分类判据五项(DocWSem/DocWGeo/DocScoreFloor/DocSemFloor/DocSemCeil)
-	// 不在此兜底：0 值由 service/docscore.go 的访问器回退经验默认值(simDisplayFloor 同款)。
+	// The five doc-classification criteria (DocWSem/DocWGeo/DocScoreFloor/
+	// DocSemFloor/DocSemCeil) have no fallback here: a 0 value falls back to
+	// the empirical default in service/docscore.go's accessor (same pattern as simDisplayFloor).
 	return nil
 }
 

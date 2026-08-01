@@ -8,8 +8,8 @@ import (
 
 func TestTaskRegistry_AddListRemove(t *testing.T) {
 	r := NewTaskRegistry(nil)
-	r.Upsert(Task{ID: "a", Type: "index", Label: "索引", Progress: 0.3, Status: "running", StartedAt: time.Now()})
-	r.Upsert(Task{ID: "b", Type: "face", Label: "人脸", Progress: 0.1, Status: "running", StartedAt: time.Now()})
+	r.Upsert(Task{ID: "a", Type: "index", Label: "Indexing", Progress: 0.3, Status: "running", StartedAt: time.Now()})
+	r.Upsert(Task{ID: "b", Type: "face", Label: "Face", Progress: 0.1, Status: "running", StartedAt: time.Now()})
 
 	list := r.List()
 	if len(list) != 2 {

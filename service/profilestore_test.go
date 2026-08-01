@@ -1,5 +1,5 @@
-// ProfileStore 的测试:user_profile_entities 表的全量替换语义。
-// 覆盖简报清单:ReplaceEntities 幂等/跨 kind 隔离、ListEntities 排序。
+// Tests for ProfileStore: full-replace semantics of the user_profile_entities table.
+// Covers: ReplaceEntities idempotency/cross-kind isolation, ListEntities ordering.
 package service
 
 import (
@@ -9,19 +9,19 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// ── ProfileEntityID:稳定派生 id ──────────────────────────────────────────
+// ── ProfileEntityID: stable derived id ──────────────────────────────────
 
 func TestProfileEntityID(t *testing.T) {
 	id1 := ProfileEntityID("pet", "beagle")
 	id2 := ProfileEntityID("pet", "beagle")
-	require.Equal(t, id1, id2, "同 kind+key 应得到同一 id")
-	require.Len(t, id1, 16, "应为 sha1 前 16 hex")
+	require.Equal(t, id1, id2, "same kind+key should get the same id")
+	require.Len(t, id1, 16, "should be the first 16 hex chars of sha1")
 
-	require.NotEqual(t, id1, ProfileEntityID("pet", "labrador"), "key 不同应换 id")
-	require.NotEqual(t, id1, ProfileEntityID("person", "beagle"), "kind 不同应换 id")
+	require.NotEqual(t, id1, ProfileEntityID("pet", "labrador"), "different key should change the id")
+	require.NotEqual(t, id1, ProfileEntityID("person", "beagle"), "different kind should change the id")
 }
 
-// ── ReplaceEntities:幂等全量替换 + 跨 kind 隔离 ──────────────────────────
+// ── ReplaceEntities: idempotent full replace + cross-kind isolation ─────
 
 func TestProfileStore_ReplaceEntitiesIdempotentAndIsolatesKind(t *testing.T) {
 	db := makeTestDB(t)
@@ -33,16 +33,19 @@ func TestProfileStore_ReplaceEntitiesIdempotentAndIsolatesKind(t *testing.T) {
 	}
 	require.NoError(t, store.ReplaceEntities("pet", pets))
 
-	// 跨 kind 隔离用 spec 词汇表内的 kind('pet'|'person')——family 合影集
-	// 不落本表(见设计 spec 第一节:family 挖掘只对具名 person 逐一落实体行,
-	// "合影集"是另一张 moments 表的产出,不经 ProfileStore),这里只是借
-	// person 做隔离对照,不代表 family 引擎会调用这条路径。
+	// Cross-kind isolation uses the kinds from the spec's vocabulary ('pet' |
+	// 'person') — family group photos never land in this table (per the
+	// design spec's first section: family mining only writes an entity row
+	// per named person; "group photo" is the output of a different moments
+	// table, not routed through ProfileStore). person is only borrowed here
+	// as an isolation control; it doesn't imply the family engine calls this
+	// path.
 	persons := []ProfileEntity{
 		{ID: ProfileEntityID("person", "p1"), Kind: "person", Key: "p1", Label: "Alice", PhotoCount: 40},
 	}
 	require.NoError(t, store.ReplaceEntities("person", persons))
 
-	// 跨 kind 隔离:写 person 不应影响 pet。
+	// Cross-kind isolation: writing person should not affect pet.
 	petList, err := store.ListEntities("pet")
 	require.NoError(t, err)
 	require.Len(t, petList, 1)
@@ -53,17 +56,18 @@ func TestProfileStore_ReplaceEntitiesIdempotentAndIsolatesKind(t *testing.T) {
 	require.Len(t, personList, 1)
 	require.Equal(t, "p1", personList[0].Key)
 
-	// 幂等全量替换:再次写 pet(缩减为空集)应清空该 kind,不影响 person。
+	// Idempotent full replace: writing pet again (shrunk to an empty set)
+	// should clear that kind without affecting person.
 	require.NoError(t, store.ReplaceEntities("pet", nil))
 	petList2, err := store.ListEntities("pet")
 	require.NoError(t, err)
-	require.Len(t, petList2, 0, "全量替换为空集应清空该 kind 下全部实体")
+	require.Len(t, petList2, 0, "replacing with an empty set should clear all entities of that kind")
 
 	personList2, err := store.ListEntities("person")
 	require.NoError(t, err)
-	require.Len(t, personList2, 1, "替换 pet 不应影响 person")
+	require.Len(t, personList2, 1, "replacing pet should not affect person")
 
-	// 再次写入不同的 pet 集合,应完全替换旧集合(而非合并)。
+	// Writing a different pet set again should fully replace the old set (not merge with it).
 	require.NoError(t, store.ReplaceEntities("pet", []ProfileEntity{
 		{ID: ProfileEntityID("pet", "corgi"), Kind: "pet", Key: "corgi", Label: "Corgi", PhotoCount: 20},
 	}))
@@ -73,7 +77,7 @@ func TestProfileStore_ReplaceEntitiesIdempotentAndIsolatesKind(t *testing.T) {
 	require.Equal(t, "corgi", petList3[0].Key)
 }
 
-// ── ListEntities:排序(按 photo_count 倒序)──────────────────────────────
+// ── ListEntities: ordering (photo_count descending) ─────────────────────
 
 func TestProfileStore_ListEntitiesOrder(t *testing.T) {
 	db := makeTestDB(t)
@@ -89,12 +93,12 @@ func TestProfileStore_ListEntitiesOrder(t *testing.T) {
 	list, err := store.ListEntities("pet")
 	require.NoError(t, err)
 	require.Len(t, list, 3)
-	require.Equal(t, "corgi", list[0].Key, "photo_count 最高应排第一")
+	require.Equal(t, "corgi", list[0].Key, "highest photo_count should be first")
 	require.Equal(t, "beagle", list[1].Key)
 	require.Equal(t, "husky", list[2].Key)
 }
 
-// ── evidence/first_seen/last_seen 往返 ──────────────────────────────────
+// ── evidence/first_seen/last_seen round-trip ─────────────────────────────
 
 func TestProfileStore_ReplaceEntitiesRoundTripsFields(t *testing.T) {
 	db := makeTestDB(t)
@@ -122,7 +126,7 @@ func TestProfileStore_ReplaceEntitiesRoundTripsFields(t *testing.T) {
 	require.Equal(t, "Beagle", e.Label)
 	require.Equal(t, `{"photo_count":14,"months":["2011-08","2026-07"]}`, e.EvidenceJSON)
 	require.Equal(t, 14, e.PhotoCount)
-	require.True(t, e.FirstSeen.Equal(first), "first_seen 应往返一致")
-	require.True(t, e.LastSeen.Equal(last), "last_seen 应往返一致")
-	require.Greater(t, e.UpdatedAt, int64(0), "updated_at 应由 Store 写入 Unix ms")
+	require.True(t, e.FirstSeen.Equal(first), "first_seen should round-trip consistently")
+	require.True(t, e.LastSeen.Equal(last), "last_seen should round-trip consistently")
+	require.Greater(t, e.UpdatedAt, int64(0), "updated_at should be written by Store as Unix ms")
 }

@@ -16,9 +16,10 @@ import (
 // SmartViewsHandler handles smart view CRUD, preview, and export endpoints.
 type SmartViewsHandler struct {
 	svc service.Services
-	// runtimePath 供 ExportZip 的 query-token JWT 校验取公钥用（同
-	// AlbumsHandler/FavoritesHandler 的既有约定）；空串表示测试/单机直连
-	// 场景，跳过真实 JWT 校验。
+	// runtimePath is used by ExportZip's query-token JWT check to fetch
+	// the public key (same convention as AlbumsHandler/FavoritesHandler);
+	// an empty string means test/standalone mode, skipping real JWT
+	// validation.
 	runtimePath string
 }
 
@@ -42,21 +43,23 @@ func RegisterSmartViewRoutes(g *echo.Group, h *SmartViewsHandler) {
 	g.POST("/smart-views/:id/assets/restore", h.RestoreAssets)
 	g.GET("/smart-views/:id/excluded", h.Excluded)
 	g.GET("/smart-views/:id/activity", h.Activity)
-	// 既有 POST /export(format=zip|album)保持不动，向后兼容。
+	// Existing POST /export (format=zip|album) is left unchanged for backward compatibility.
 	g.POST("/smart-views/:id/export", h.Export)
-	// 新增 GET+token 的 ZIP 直下载端点，修 UI window.location.href 断链：
-	// 浏览器导航发不出 Authorization 头，POST-only 路由也接不住 GET，旧链路
-	// 会被 JWT 中间件 401。镜像 albums.go AlbumsHandler.Export 的实现形状。
+	// New GET+token ZIP direct-download endpoint, fixing a broken UI
+	// window.location.href link: browser navigation can't send an
+	// Authorization header, and the POST-only route can't handle GET,
+	// so the old path gets 401'd by the JWT middleware. Mirrors the
+	// shape of albums.go's AlbumsHandler.Export.
 	g.GET("/smart-views/:id/export", h.ExportZip)
 	g.POST("/smart-views/from-album", h.FromAlbum)
 }
 
-// svAssetIDsReq 是钉住/移除/恢复三个写接口共用的请求体。
+// svAssetIDsReq is the shared request body for the pin/remove/restore write endpoints.
 type svAssetIDsReq struct {
 	AssetIDs []string `json:"assetIds"`
 }
 
-// PinAssets 把指定资产钉进视图,返回本次实际发生状态变化的数量。
+// PinAssets pins the given assets into the view, returning the count of assets whose state actually changed.
 func (h *SmartViewsHandler) PinAssets(c echo.Context) error {
 	var req svAssetIDsReq
 	if err := c.Bind(&req); err != nil || len(req.AssetIDs) == 0 {
@@ -72,7 +75,7 @@ func (h *SmartViewsHandler) PinAssets(c echo.Context) error {
 	return c.JSON(http.StatusOK, map[string]int{"added": added})
 }
 
-// RemoveAssets 分层移除:钉住行取消钉住,自动行置为排除。
+// RemoveAssets removes assets in a tiered way: pinned rows get unpinned, auto rows get marked excluded.
 func (h *SmartViewsHandler) RemoveAssets(c echo.Context) error {
 	var req svAssetIDsReq
 	if err := c.Bind(&req); err != nil || len(req.AssetIDs) == 0 {
@@ -88,7 +91,7 @@ func (h *SmartViewsHandler) RemoveAssets(c echo.Context) error {
 	return c.JSON(http.StatusOK, map[string]int{"unpinned": unpinned, "excluded": excluded})
 }
 
-// RestoreAssets 恢复被排除的资产,使其重新参与视图匹配。
+// RestoreAssets restores excluded assets so they participate in view matching again.
 func (h *SmartViewsHandler) RestoreAssets(c echo.Context) error {
 	var req svAssetIDsReq
 	if err := c.Bind(&req); err != nil || len(req.AssetIDs) == 0 {
@@ -104,7 +107,7 @@ func (h *SmartViewsHandler) RestoreAssets(c echo.Context) error {
 	return c.JSON(http.StatusOK, map[string]int{"restored": restored})
 }
 
-// Excluded 返回视图的排除清单(供详情页折叠区展示)。
+// Excluded returns the view's exclusion list (for the collapsible section on the detail page).
 func (h *SmartViewsHandler) Excluded(c echo.Context) error {
 	assets, err := h.svc.SmartViews().ExcludedAssets(c.Param("id"))
 	if err != nil {
@@ -222,8 +225,9 @@ func (h *SmartViewsHandler) Preview(c echo.Context) error {
 	return c.JSON(http.StatusOK, map[string]any{"count": count, "seeds": ids, "thresholdActive": thresholdActive})
 }
 
-// fromAlbumReq 是"手动相册→智能相册"转换端点的请求体,字段名对齐库内
-// camelCase 惯例(与响应体 albumId 等字段一致)。
+// fromAlbumReq is the request body for the "manual album -> smart view"
+// conversion endpoint; field names follow the codebase's camelCase
+// convention (consistent with response fields like albumId).
 type fromAlbumReq struct {
 	AlbumID       string   `json:"albumId"`
 	Name          string   `json:"name"`
@@ -233,8 +237,9 @@ type fromAlbumReq struct {
 	IncludeVideos bool     `json:"includeVideos"`
 }
 
-// FromAlbum 把手动相册原地变身为智能相册:既有成员全部锁定为 pin,原相册
-// 随之删除,Nimo 按主题持续吸入新照片。
+// FromAlbum turns a manual album into a smart view in place: existing
+// members are all locked as pinned, the original album is deleted, and
+// Nimo keeps pulling in new photos matching the topic.
 func (h *SmartViewsHandler) FromAlbum(c echo.Context) error {
 	var req fromAlbumReq
 	if err := c.Bind(&req); err != nil || req.AlbumID == "" {
@@ -261,7 +266,9 @@ func (h *SmartViewsHandler) Export(c echo.Context) error {
 	id := c.Param("id")
 	format := c.QueryParam("format")
 	if format == "" {
-		var req struct{ Format string `json:"format"` }
+		var req struct {
+			Format string `json:"format"`
+		}
 		_ = c.Bind(&req)
 		format = req.Format
 	}
@@ -287,14 +294,19 @@ func (h *SmartViewsHandler) Export(c echo.Context) error {
 
 // ExportZip — GET /v1/photos/smart-views/:id/export?token=<jwt>
 //
-// 与 albums.go AlbumsHandler.Export 同款的浏览器直下载入口：修复既有 UI 断链
-// ——PhotosSmartViewDetail.vue 的 runExport('zip') 用 window.location.href
-// 触发下载,浏览器导航发不出 Authorization 头,而旧的 POST /export 既没注册
-// GET,也不在 router.go 的 mediaGetSkip 白名单里,导致请求在 JWT 中间件就被
-// 拦成 401。这里改用 query token 自行校验(runtimePath=="" 时是测试/单机
-// 直连场景,跳过真实校验,同 Albums/Favorites 的既有约定),流式落地复用
-// service.SmartViewService.ExportZip(与旧 POST /export?format=zip 分支完全
-// 同一份实现,行为不变)。既有 POST 路由保持不动,两者并存、互不影响。
+// Same browser direct-download entry point as albums.go's
+// AlbumsHandler.Export: fixes an existing broken UI link —
+// PhotosSmartViewDetail.vue's runExport('zip') triggers the download with
+// window.location.href, and browser navigation can't send an Authorization
+// header, while the old POST /export neither registers GET nor appears in
+// router.go's mediaGetSkip allowlist, so the request gets 401'd right at
+// the JWT middleware. This switches to self-validating a query token
+// (when runtimePath=="" it's a test/standalone scenario, skipping real
+// validation, same convention as Albums/Favorites); the streaming
+// implementation reuses service.SmartViewService.ExportZip (the exact
+// same implementation as the old POST /export?format=zip branch, behavior
+// unchanged). The existing POST route is left unchanged; the two coexist
+// without affecting each other.
 func (h *SmartViewsHandler) ExportZip(c echo.Context) error {
 	token := c.QueryParam("token")
 	if token == "" {

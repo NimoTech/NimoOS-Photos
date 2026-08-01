@@ -67,7 +67,7 @@ func TestSpriteGeneratesAndServes(t *testing.T) {
 	}
 	h, db, cleanup := newSpriteHarness(t)
 	defer cleanup()
-	// 造源视频
+	// Build the source video
 	dir := t.TempDir()
 	src := filepath.Join(dir, "v1.mp4")
 	require.NoError(t, exec.Command("ffmpeg", "-hide_banner", "-loglevel", "error",
@@ -83,6 +83,6 @@ func TestSpriteGeneratesAndServes(t *testing.T) {
 	c.SetParamValues("v1")
 	require.NoError(t, h.Sprite(c))
 	require.Equal(t, http.StatusOK, rec.Code)
-	require.Equal(t, "6", rec.Header().Get("X-Sprite-Frames")) // 6s → 1帧/s → 6（>下限5，不钳制）
+	require.Equal(t, "6", rec.Header().Get("X-Sprite-Frames")) // 6s → 1 frame/s → 6 (above the floor of 5, so not clamped)
 	require.Equal(t, "6000", rec.Header().Get("X-Sprite-Duration-Ms"))
 }

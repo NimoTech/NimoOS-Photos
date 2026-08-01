@@ -10,7 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// newTrashFixture 建一个临时库 + gallery/thumb 目录，插入一个磁盘上真实存在的资产。
+// newTrashFixture builds a temp DB + gallery/thumb directories and inserts an asset that really exists on disk.
 func newTrashFixture(t *testing.T) (*TrashService, string, string) {
 	t.Helper()
 	dir := t.TempDir()
@@ -43,9 +43,10 @@ func newTrashFixture(t *testing.T) (*TrashService, string, string) {
 	return NewTrashService(db, gallery, thumb), gallery, thumb
 }
 
-// newTrashFixtureWithLive 在 newTrashFixture 基础上追加一个 Live Photo 视频
-// 伴随资产 "a1v"（磁盘上真实存在），并把 "a1" 的 live_photo_video_id 指向它，
-// 供 TrashAsset/RestoreAsset 的 Live Photo caption 联动测试用。
+// newTrashFixtureWithLive builds on newTrashFixture by adding a Live Photo
+// video companion asset "a1v" (which really exists on disk), and points
+// "a1"'s live_photo_video_id at it, for use by TrashAsset/RestoreAsset's Live
+// Photo caption hand-off tests.
 func newTrashFixtureWithLive(t *testing.T) (*TrashService, string, string) {
 	t.Helper()
 	ts, gallery, thumb := newTrashFixture(t)
@@ -176,8 +177,9 @@ func TestPurgeExpiredKeepsRecent(t *testing.T) {
 	}
 }
 
-// TestTrashAsset_TriggersCaptionDelete：软删移动成功后应调用 SetCaptionDelete
-// 注入的回调（Task 4 caption 联动），携带正确的 assetID。
+// TestTrashAsset_TriggersCaptionDelete: after a successful soft-delete move,
+// the SetCaptionDelete-injected callback (Task 4 caption hand-off) should
+// fire with the correct assetID.
 func TestTrashAsset_TriggersCaptionDelete(t *testing.T) {
 	ts, _, _ := newTrashFixture(t)
 
@@ -200,8 +202,9 @@ func TestTrashAsset_TriggersCaptionDelete(t *testing.T) {
 	}
 }
 
-// TestRestoreAsset_TriggersCaptionRestore：恢复成功后应调用 SetCaptionRestore
-// 注入的回调，携带正确的 assetID（供 caption_synced 复位重投）。
+// TestRestoreAsset_TriggersCaptionRestore: after a successful restore, the
+// SetCaptionRestore-injected callback should fire with the correct assetID
+// (so caption_synced can be reset and re-submitted).
 func TestRestoreAsset_TriggersCaptionRestore(t *testing.T) {
 	ts, _, _ := newTrashFixture(t)
 	if err := ts.TrashAsset("a1"); err != nil {
@@ -227,9 +230,10 @@ func TestRestoreAsset_TriggersCaptionRestore(t *testing.T) {
 	}
 }
 
-// TestTrashAsset_TriggersCaptionDeleteForLivePhoto：带 Live Photo 伴随资产的
-// 软删应对主资产和伴随资产各触发一次 caption 删除回调（照 PurgeAsset 的
-// liveID 处理样式补齐 TrashAsset 一侧）。
+// TestTrashAsset_TriggersCaptionDeleteForLivePhoto: soft-deleting an asset
+// with a Live Photo companion should fire the caption-delete callback once
+// each for the primary asset and its companion (mirroring PurgeAsset's liveID
+// handling, filled in on the TrashAsset side).
 func TestTrashAsset_TriggersCaptionDeleteForLivePhoto(t *testing.T) {
 	ts, _, _ := newTrashFixtureWithLive(t)
 
@@ -253,8 +257,9 @@ func TestTrashAsset_TriggersCaptionDeleteForLivePhoto(t *testing.T) {
 	require.ElementsMatch(t, []string{"a1", "a1v"}, got)
 }
 
-// TestRestoreAsset_TriggersCaptionRestoreForLivePhoto：带 Live Photo 伴随资产
-// 的恢复应对主资产和伴随资产各触发一次 caption 复位回调。
+// TestRestoreAsset_TriggersCaptionRestoreForLivePhoto: restoring an asset
+// with a Live Photo companion should fire the caption-restore callback once
+// each for the primary asset and its companion.
 func TestRestoreAsset_TriggersCaptionRestoreForLivePhoto(t *testing.T) {
 	ts, _, _ := newTrashFixtureWithLive(t)
 	if err := ts.TrashAsset("a1"); err != nil {
@@ -281,8 +286,10 @@ func TestRestoreAsset_TriggersCaptionRestoreForLivePhoto(t *testing.T) {
 	require.ElementsMatch(t, []string{"a1", "a1v"}, got)
 }
 
-// TestPurgeAsset_TriggersCaptionDelete：物理删除（永久删除单项）成功后应调用
-// caption 删除回调，紧邻 dropClipVector 的两处调用点之一（本项测主资产项）。
+// TestPurgeAsset_TriggersCaptionDelete: after a successful physical delete
+// (permanently deleting a single item), the caption-delete callback should
+// fire — one of the two call sites next to dropClipVector (this test covers
+// the primary-asset one).
 func TestPurgeAsset_TriggersCaptionDelete(t *testing.T) {
 	ts, _, _ := newTrashFixture(t)
 	if err := ts.TrashAsset("a1"); err != nil {
@@ -308,8 +315,8 @@ func TestPurgeAsset_TriggersCaptionDelete(t *testing.T) {
 	}
 }
 
-// TestEmptyTrash_TriggersCaptionDelete：清空回收站（EmptyTrash → PurgeAsset）
-// 每一项都应触发 caption 删除回调。
+// TestEmptyTrash_TriggersCaptionDelete: emptying the trash (EmptyTrash →
+// PurgeAsset) should fire the caption-delete callback for every item.
 func TestEmptyTrash_TriggersCaptionDelete(t *testing.T) {
 	ts, _, _ := newTrashFixture(t)
 	if err := ts.TrashAsset("a1"); err != nil {

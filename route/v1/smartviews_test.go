@@ -12,9 +12,9 @@ import (
 	"github.com/labstack/echo/v4"
 	"github.com/stretchr/testify/require"
 
+	"github.com/NimoTech/NimoOS-Photos/pkg/sqlite"
 	v1 "github.com/NimoTech/NimoOS-Photos/route/v1"
 	"github.com/NimoTech/NimoOS-Photos/service"
-	"github.com/NimoTech/NimoOS-Photos/pkg/sqlite"
 )
 
 func newTestEcho(t *testing.T) *echo.Echo {
@@ -30,8 +30,9 @@ func newTestEcho(t *testing.T) *echo.Echo {
 	return e
 }
 
-// newAssetsTestEcho 同 newTestEcho,但额外返回底层 db,供钉住/移除/恢复/排除清单
-// 用例直接插入 assets / smart_views / smart_view_matches 造数据。
+// newAssetsTestEcho is the same as newTestEcho, but also returns the
+// underlying db so pin/remove/restore/excluded-list tests can insert data
+// directly into assets / smart_views / smart_view_matches.
 func newAssetsTestEcho(t *testing.T) (*echo.Echo, *sql.DB) {
 	t.Helper()
 	db, err := sqlite.Open(filepath.Join(t.TempDir(), "h.db"))
@@ -45,7 +46,7 @@ func newAssetsTestEcho(t *testing.T) (*echo.Echo, *sql.DB) {
 	return e, db
 }
 
-// postAssetIDs 向指定路径 POST {"assetIds":ids} 并返回响应。
+// postAssetIDs POSTs {"assetIds":ids} to the given path and returns the response.
 func postAssetIDs(t *testing.T, e *echo.Echo, path string, ids []string) *httptest.ResponseRecorder {
 	t.Helper()
 	body, _ := json.Marshal(map[string]any{"assetIds": ids})
@@ -56,14 +57,14 @@ func postAssetIDs(t *testing.T, e *echo.Echo, path string, ids []string) *httpte
 	return rec
 }
 
-// TestPinAssetsHTTPNotFound 视图不存在应返回 404。
+// TestPinAssetsHTTPNotFound expects 404 when the view doesn't exist.
 func TestPinAssetsHTTPNotFound(t *testing.T) {
 	e, _ := newAssetsTestEcho(t)
 	rec := postAssetIDs(t, e, "/v1/photos/smart-views/sv-missing/assets", []string{"a1"})
 	require.Equal(t, http.StatusNotFound, rec.Code)
 }
 
-// TestPinAssetsHTTPEmptyBody assetIds 为空应返回 400。
+// TestPinAssetsHTTPEmptyBody expects 400 when assetIds is empty.
 func TestPinAssetsHTTPEmptyBody(t *testing.T) {
 	e, db := newAssetsTestEcho(t)
 	_, err := db.Exec(`INSERT INTO smart_views(id,name,conds_raw,conds_parsed,threshold,live) VALUES('sv-1','V','[]','[]',70,0)`)
@@ -73,7 +74,7 @@ func TestPinAssetsHTTPEmptyBody(t *testing.T) {
 	require.Equal(t, http.StatusBadRequest, rec.Code)
 }
 
-// TestPinAssetsHTTPSuccess 正常路径:钉住一个有效资产,返回 added 计数。
+// TestPinAssetsHTTPSuccess is the happy path: pin one valid asset, and get back the added count.
 func TestPinAssetsHTTPSuccess(t *testing.T) {
 	e, db := newAssetsTestEcho(t)
 	_, err := db.Exec(`INSERT INTO smart_views(id,name,conds_raw,conds_parsed,threshold,live) VALUES('sv-1','V','[]','[]',70,0)`)
@@ -92,7 +93,8 @@ func TestPinAssetsHTTPSuccess(t *testing.T) {
 	require.Equal(t, 1, org)
 }
 
-// TestRemoveAssetsHTTPSuccess 正常路径:一个钉住行 + 一个自动行,分别计 unpinned/excluded。
+// TestRemoveAssetsHTTPSuccess is the happy path: one pinned row + one auto
+// row, counted separately as unpinned/excluded.
 func TestRemoveAssetsHTTPSuccess(t *testing.T) {
 	e, db := newAssetsTestEcho(t)
 	_, err := db.Exec(`INSERT INTO smart_views(id,name,conds_raw,conds_parsed,threshold,live) VALUES('sv-1','V','[]','[]',70,0)`)
@@ -114,7 +116,7 @@ func TestRemoveAssetsHTTPSuccess(t *testing.T) {
 	require.Equal(t, 1, resp["excluded"])
 }
 
-// TestRestoreAssetsHTTPSuccess 正常路径:恢复一个排除行,返回 restored 计数。
+// TestRestoreAssetsHTTPSuccess is the happy path: restore one excluded row, and get back the restored count.
 func TestRestoreAssetsHTTPSuccess(t *testing.T) {
 	e, db := newAssetsTestEcho(t)
 	_, err := db.Exec(`INSERT INTO smart_views(id,name,conds_raw,conds_parsed,threshold,live) VALUES('sv-1','V','[]','[]',70,0)`)
@@ -131,7 +133,7 @@ func TestRestoreAssetsHTTPSuccess(t *testing.T) {
 	require.Equal(t, 1, resp["restored"])
 }
 
-// TestExcludedAssetsHTTPSuccess 正常路径:只返回 origin=2 的排除清单。
+// TestExcludedAssetsHTTPSuccess is the happy path: only the origin=2 exclusion list is returned.
 func TestExcludedAssetsHTTPSuccess(t *testing.T) {
 	e, db := newAssetsTestEcho(t)
 	_, err := db.Exec(`INSERT INTO smart_views(id,name,conds_raw,conds_parsed,threshold,live) VALUES('sv-1','V','[]','[]',70,0)`)
@@ -156,7 +158,7 @@ func TestExcludedAssetsHTTPSuccess(t *testing.T) {
 	require.Equal(t, "aExcl", assets[0]["id"])
 }
 
-// TestFromAlbumHTTPNotFound albumId 不存在应返回 404。
+// TestFromAlbumHTTPNotFound expects 404 when albumId doesn't exist.
 func TestFromAlbumHTTPNotFound(t *testing.T) {
 	e := newTestEcho(t)
 	body, _ := json.Marshal(map[string]any{"albumId": "missing"})
@@ -167,7 +169,7 @@ func TestFromAlbumHTTPNotFound(t *testing.T) {
 	require.Equal(t, http.StatusNotFound, rec.Code)
 }
 
-// TestFromAlbumHTTPBadRequest 缺 albumId 应返回 400。
+// TestFromAlbumHTTPBadRequest expects 400 when albumId is missing.
 func TestFromAlbumHTTPBadRequest(t *testing.T) {
 	e := newTestEcho(t)
 	body, _ := json.Marshal(map[string]any{})
@@ -178,8 +180,9 @@ func TestFromAlbumHTTPBadRequest(t *testing.T) {
 	require.Equal(t, http.StatusBadRequest, rec.Code)
 }
 
-// TestFromAlbumHTTPSuccess 正常路径:手动相册变身为智能相册,原相册消失,
-// 响应带 createdAt。
+// TestFromAlbumHTTPSuccess is the happy path: a manual album turns into a
+// smart view, the original album disappears, and the response includes
+// createdAt.
 func TestFromAlbumHTTPSuccess(t *testing.T) {
 	e, db := newAssetsTestEcho(t)
 	_, err := db.Exec(`INSERT INTO albums(id,name) VALUES('al-1','Trip')`)
@@ -204,7 +207,7 @@ func TestFromAlbumHTTPSuccess(t *testing.T) {
 
 	var n int
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM albums WHERE id='al-1'`).Scan(&n))
-	require.Equal(t, 0, n, "原相册应已删除")
+	require.Equal(t, 0, n, "original album should be deleted")
 }
 
 func TestSmartViewHTTPCreateAndList(t *testing.T) {

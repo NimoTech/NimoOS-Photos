@@ -19,31 +19,38 @@ services:
         bind:
           create_host_path: true
     restart: unless-stopped
-    # ML 进程(SigLIP2/OCR/人脸)历史上多次把 31G 整机吃到全局 OOM,
-    # 容器必须有硬上限;MODEL_TTL=300 已保证闲时卸载,8g 保证多模型
-    # 并存(CLIP+OCR+人脸+翻译)时不会在正常负载下被误杀。
+    # The ML process (SigLIP2/OCR/faces) has repeatedly dragged the whole
+    # 31G box into a global OOM in the past; the container needs a hard
+    # ceiling. MODEL_TTL=300 already unloads models when idle, and 8g ensures
+    # multiple co-resident models (CLIP+OCR+faces+translation) aren't killed
+    # under normal load.
     mem_limit: 8g
     memswap_limit: 8g
-    # 仅可观测性:docker ps / AppManagement 能直接看到 unhealthy。
-    # docker 原生不会因 unhealthy 重启;真正的自愈由 nimoos-photos 内置看门狗负责。
+    # Observability only: docker ps / AppManagement can see "unhealthy" directly.
+    # Docker itself never restarts on unhealthy; actual self-healing is handled
+    # by the built-in watchdog in nimoos-photos.
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:3003/ping', timeout=5)"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 300s # 对齐 MACHINE_LEARNING_WORKER_TIMEOUT,避免冷加载慢时误报 unhealthy
+      start_period: 300s # aligned with MACHINE_LEARNING_WORKER_TIMEOUT, avoids false unhealthy on a slow cold load
     labels:
       nimoos.system: "true"            # hide from the user-facing App grid
       nimoos.display_name: "Photos AI" # friendly name in UI / container stats
       icon: "/img/system-apps/photos.svg"
     environment:
       MACHINE_LEARNING_WORKERS: "1"
-      # 300s:SigLIP2-SO400M 冷加载在低端盘上可能超过 120s,被 gunicorn 中途
-      # 杀掉会留下「端口在听、worker 空壳」的卡死态(2026-07 实际宕机 1.8 天的诱因之一)
+      # 300s: SigLIP2-SO400M cold load can exceed 120s on slower disks; if
+      # gunicorn kills the worker mid-load it leaves a stuck "port listening,
+      # worker is an empty shell" state (one cause of an actual 1.8-day outage
+      # in 2026-07).
       MACHINE_LEARNING_WORKER_TIMEOUT: "300"
       MACHINE_LEARNING_CACHE_FOLDER: "/cache"
-      # 闲置 5 分钟自动卸载模型释放内存(nllb-large + PP-OCRv5_server 常驻很吃内存)
+      # Auto-unload models after 5 minutes idle to free memory (nllb-large +
+      # PP-OCRv5_server are memory-hungry when resident).
       MACHINE_LEARNING_MODEL_TTL: "300"
       MACHINE_LEARNING_MODEL_TTL_POLL_S: "10"
-      # 模型缓存随包预置,禁止运行时联网查 HuggingFace(离线/内网机器上会卡超时)
+      # Model cache is preloaded with the bundle; forbid runtime network calls
+      # to HuggingFace (would hang on offline/intranet machines).
       HF_HUB_OFFLINE: "1"

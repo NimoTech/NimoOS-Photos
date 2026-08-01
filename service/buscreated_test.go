@@ -36,7 +36,7 @@ func TestHandleCreatedPathsEnqueuesFilesAndWalksDirs(t *testing.T) {
 		got = append(got, k.(string))
 		return true
 	})
-	// 目录递归展开(album/b.png)、单个媒体文件(a.jpg)入队;
-	// 非媒体(c.txt)与已消失(gone.jpg)丢弃
+	// Directory recursively expanded (album/b.png), single media file (a.jpg)
+	// enqueued; non-media (c.txt) and gone (gone.jpg) discarded
 	require.ElementsMatch(t, []string{inDir, single}, got)
 }

@@ -11,7 +11,7 @@ import (
 	"github.com/NimoTech/NimoOS-Photos/service/uploadstore"
 )
 
-// newTask 返回一个最小有效的 UploadTask。
+// newTask returns a minimal valid UploadTask.
 func newTask(id, owner string) *upload.UploadTask {
 	now := time.Now().Unix()
 	return &upload.UploadTask{
@@ -26,7 +26,7 @@ func newTask(id, owner string) *upload.UploadTask {
 	}
 }
 
-// TestCreateAndGet 验证 Create 写入、Get 按 id 读取、ErrNotFound 映射。
+// TestCreateAndGet verifies Create writes, Get reads by id, and ErrNotFound mapping.
 func TestCreateAndGet(t *testing.T) {
 	dir := t.TempDir()
 	db, err := sqlite.Open(filepath.Join(dir, "test.db"))
@@ -58,7 +58,7 @@ func TestCreateAndGet(t *testing.T) {
 	if got.Status != upload.UploadStatusUploading {
 		t.Errorf("Status mismatch: got %q", got.Status)
 	}
-	// created_at / updated_at 由 Create 显式写入，不应为零
+	// created_at / updated_at are explicitly written by Create, should not be zero
 	if got.CreatedAt == 0 {
 		t.Error("CreatedAt should not be zero after Create")
 	}
@@ -67,7 +67,7 @@ func TestCreateAndGet(t *testing.T) {
 	}
 }
 
-// TestGetErrNotFound 验证缺失 id 返回 upload.ErrNotFound（errors.Is）。
+// TestGetErrNotFound verifies a missing id returns upload.ErrNotFound (via errors.Is).
 func TestGetErrNotFound(t *testing.T) {
 	dir := t.TempDir()
 	db, err := sqlite.Open(filepath.Join(dir, "test.db"))
@@ -87,7 +87,7 @@ func TestGetErrNotFound(t *testing.T) {
 	}
 }
 
-// TestListActiveByOwner 验证 ListActiveByOwner 按 owner 过滤、只返回活跃状态。
+// TestListActiveByOwner verifies ListActiveByOwner filters by owner and only returns active statuses.
 func TestListActiveByOwner(t *testing.T) {
 	dir := t.TempDir()
 	db, err := sqlite.Open(filepath.Join(dir, "test.db"))
@@ -101,7 +101,7 @@ func TestListActiveByOwner(t *testing.T) {
 	owner1 := "owner-1"
 	owner2 := "owner-2"
 
-	// owner1: 3 种活跃状态
+	// owner1: 3 active statuses
 	tasks := []*upload.UploadTask{
 		{ID: "t1", OwnerUserID: owner1, Status: upload.UploadStatusUploading,
 			Filename: "a.jpg", CreatedAt: time.Now().Unix(), UpdatedAt: time.Now().Unix(), ExpiresAt: time.Now().Unix() + 3600},
@@ -109,12 +109,12 @@ func TestListActiveByOwner(t *testing.T) {
 			Filename: "b.jpg", CreatedAt: time.Now().Unix(), UpdatedAt: time.Now().Unix(), ExpiresAt: time.Now().Unix() + 3600},
 		{ID: "t3", OwnerUserID: owner1, Status: upload.UploadStatusFailed,
 			Filename: "c.jpg", CreatedAt: time.Now().Unix(), UpdatedAt: time.Now().Unix(), ExpiresAt: time.Now().Unix() + 3600},
-		// completed/canceled 不应出现在 active 列表
+		// completed/canceled should not appear in the active list
 		{ID: "t4", OwnerUserID: owner1, Status: upload.UploadStatusCompleted,
 			Filename: "d.jpg", CreatedAt: time.Now().Unix(), UpdatedAt: time.Now().Unix(), ExpiresAt: 0},
 		{ID: "t5", OwnerUserID: owner1, Status: upload.UploadStatusCanceled,
 			Filename: "e.jpg", CreatedAt: time.Now().Unix(), UpdatedAt: time.Now().Unix(), ExpiresAt: time.Now().Unix() + 3600},
-		// owner2 的任务不应出现在 owner1 的列表
+		// owner2's task should not appear in owner1's list
 		{ID: "t6", OwnerUserID: owner2, Status: upload.UploadStatusUploading,
 			Filename: "f.jpg", CreatedAt: time.Now().Unix(), UpdatedAt: time.Now().Unix(), ExpiresAt: time.Now().Unix() + 3600},
 	}
@@ -144,7 +144,7 @@ func TestListActiveByOwner(t *testing.T) {
 	}
 }
 
-// TestListDueForGC 验证 ListDueForGC 按 expires_at 过滤(>0 AND <=now)。
+// TestListDueForGC verifies ListDueForGC filters by expires_at (>0 AND <=now).
 func TestListDueForGC(t *testing.T) {
 	dir := t.TempDir()
 	db, err := sqlite.Open(filepath.Join(dir, "test.db"))
@@ -157,13 +157,13 @@ func TestListDueForGC(t *testing.T) {
 
 	now := time.Now().Unix()
 	tasks := []*upload.UploadTask{
-		// 已过期，应被 GC
+		// already expired, should be GC'd
 		{ID: "gc1", OwnerUserID: "u1", Status: upload.UploadStatusCanceled,
 			Filename: "a.jpg", CreatedAt: now, UpdatedAt: now, ExpiresAt: now - 100},
-		// 未来过期，不应被 GC
+		// expires in the future, should not be GC'd
 		{ID: "gc2", OwnerUserID: "u1", Status: upload.UploadStatusPaused,
 			Filename: "b.jpg", CreatedAt: now, UpdatedAt: now, ExpiresAt: now + 9999},
-		// expires_at=0(永不过期，如 completed)，不应被 GC
+		// expires_at=0 (never expires, e.g. completed), should not be GC'd
 		{ID: "gc3", OwnerUserID: "u1", Status: upload.UploadStatusCompleted,
 			Filename: "c.jpg", CreatedAt: now, UpdatedAt: now, ExpiresAt: 0},
 	}
@@ -185,11 +185,11 @@ func TestListDueForGC(t *testing.T) {
 	}
 }
 
-// TestCancelIdempotent 验证 upload.Cancel 幂等:
-//   - 已 canceled 任务再 Cancel → (false, nil)
-//   - 已 completed 任务再 Cancel → (false, nil)
-//   - 不存在任务 Cancel → (false, nil)
-//   - uploading 任务 Cancel → (true, nil)，之后状态为 canceled
+// TestCancelIdempotent verifies upload.Cancel is idempotent:
+//   - Cancel on an already-canceled task → (false, nil)
+//   - Cancel on an already-completed task → (false, nil)
+//   - Cancel on a nonexistent task → (false, nil)
+//   - Cancel on an uploading task → (true, nil), status becomes canceled afterward
 func TestCancelIdempotent(t *testing.T) {
 	dir := t.TempDir()
 	db, err := sqlite.Open(filepath.Join(dir, "test.db"))
@@ -201,7 +201,7 @@ func TestCancelIdempotent(t *testing.T) {
 	store := uploadstore.NewStore(db)
 	now := time.Now().Unix()
 
-	// 1. uploading → cancel 成功
+	// 1. uploading → cancel succeeds
 	t1 := &upload.UploadTask{
 		ID: "cancel-1", OwnerUserID: "u1", Status: upload.UploadStatusUploading,
 		Filename: "a.jpg", CreatedAt: now, UpdatedAt: now, ExpiresAt: now + 3600,
@@ -221,7 +221,7 @@ func TestCancelIdempotent(t *testing.T) {
 		t.Errorf("expected canceled, got %s", got.Status)
 	}
 
-	// 2. 已 canceled → 再 cancel 幂等
+	// 2. already canceled → cancel again is idempotent
 	ok, err = upload.Cancel(store, "cancel-1", now+60)
 	if err != nil {
 		t.Fatalf("Cancel already-canceled: %v", err)
@@ -230,7 +230,7 @@ func TestCancelIdempotent(t *testing.T) {
 		t.Error("expected Cancel to return false for already-canceled task")
 	}
 
-	// 3. completed → cancel 不改状态
+	// 3. completed → cancel does not change the status
 	t2 := &upload.UploadTask{
 		ID: "cancel-2", OwnerUserID: "u1", Status: upload.UploadStatusCompleted,
 		Filename: "b.jpg", CreatedAt: now, UpdatedAt: now, ExpiresAt: 0,
@@ -246,7 +246,7 @@ func TestCancelIdempotent(t *testing.T) {
 		t.Error("expected Cancel to return false for completed task")
 	}
 
-	// 4. 不存在的 id → (false, nil)
+	// 4. nonexistent id → (false, nil)
 	ok, err = upload.Cancel(store, "nonexistent", now+60)
 	if err != nil {
 		t.Fatalf("Cancel nonexistent: %v", err)
@@ -256,7 +256,7 @@ func TestCancelIdempotent(t *testing.T) {
 	}
 }
 
-// TestUpdateOffset 验证 UpdateOffset 更新 uploaded_offset 和 updated_at。
+// TestUpdateOffset verifies UpdateOffset updates uploaded_offset and updated_at.
 func TestUpdateOffset(t *testing.T) {
 	dir := t.TempDir()
 	db, err := sqlite.Open(filepath.Join(dir, "test.db"))
@@ -292,7 +292,7 @@ func TestUpdateOffset(t *testing.T) {
 	}
 }
 
-// TestDelete 验证 Delete 删除记录，且对不存在的 id 不报错（静默）。
+// TestDelete verifies Delete removes the record, and does not error (silently succeeds) for a nonexistent id.
 func TestDelete(t *testing.T) {
 	dir := t.TempDir()
 	db, err := sqlite.Open(filepath.Join(dir, "test.db"))
@@ -312,7 +312,7 @@ func TestDelete(t *testing.T) {
 		t.Fatalf("Create: %v", err)
 	}
 
-	// 删除存在的记录
+	// delete an existing record
 	if err := store.Delete("del-1"); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
@@ -321,7 +321,7 @@ func TestDelete(t *testing.T) {
 		t.Errorf("expected ErrNotFound after Delete, got: %v", err)
 	}
 
-	// 静默删除不存在的记录——不报错
+	// silently delete a nonexistent record — no error
 	if err := store.Delete("nonexistent-xyz"); err != nil {
 		t.Errorf("Delete nonexistent should be silent, got: %v", err)
 	}

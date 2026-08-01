@@ -50,8 +50,9 @@ func TestParseScanRootsAlwaysIncludesDATAOnce(t *testing.T) {
 	}
 }
 
-// TestIsExcludedMountAndUserPartition:U 盘(devmon 命名空间)整体排除,
-// RAID/单盘 storage/任意用户挂载保留,系统挂载点仍被拒。
+// TestIsExcludedMountAndUserPartition: USB drives (devmon namespace) are
+// excluded entirely, RAID/single-disk storage/arbitrary user mounts are
+// retained, and system mount points are still rejected.
 func TestIsExcludedMountAndUserPartition(t *testing.T) {
 	cases := []struct {
 		mp       string
@@ -65,13 +66,16 @@ func TestIsExcludedMountAndUserPartition(t *testing.T) {
 		{"/mnt/Disk-abc12345", false, true},
 		{"/media/root-ro", true, false},
 		{"/mnt/overlay", true, false},
-		{"/home/user", false, false}, // 前缀不符,非用户分区但也非"排除名单"
-		// btrbk/snapper 把每个只读小时级快照子卷各自挂载为一条独立
-		// /proc/mounts 记录:这条记录一旦被当成普通用户分区,就会绕开
-		// walk 时才生效的隐藏目录跳过规则(该规则只在"遍历途中遇到"时
-		// 才拦,永远拦不住"walk 的根本身就在 .snapshots 里面"这种情况)。
+		{"/home/user", false, false}, // prefix doesn't match, not a user partition but also not on the "exclusion list"
+		// btrbk/snapper mounts each read-only hourly snapshot subvolume as its
+		// own /proc/mounts entry: once such an entry is treated as an
+		// ordinary user partition, it bypasses the hidden-directory skip rule
+		// that only kicks in during a walk (that rule only blocks when
+		// "encountered during traversal", never blocking the case where "the
+		// walk's own root is already inside .snapshots").
 		{"/media/RAID_0/.snapshots/20260716T200714Z_auto-hourly", true, false},
-		// 仅路径子串命中、并非真正的 .snapshots 目录组件,不得被误拦。
+		// Only a path-substring hit, not an actual .snapshots directory
+		// component, must not be falsely blocked.
 		{"/media/RAID_0/my.snapshots.backup", false, true},
 	}
 	for _, c := range cases {
@@ -84,9 +88,10 @@ func TestIsExcludedMountAndUserPartition(t *testing.T) {
 	}
 }
 
-// TestParseScanRootsExcludesRcloneFuse:rclone 云盘挂载(fuse.rclone)不进
-// 扫描/监控范围——FUSE 上 inotify 不可靠,索引云盘会把远端文件全量拉下来;
-// MergerFS(fuse.mergerfs)是一等用户存储,必须保留。
+// TestParseScanRootsExcludesRcloneFuse: rclone cloud-drive mounts
+// (fuse.rclone) are not in scope for scanning/watching — inotify on FUSE is
+// unreliable, and indexing a cloud drive would pull down every remote file;
+// MergerFS (fuse.mergerfs) is first-class user storage and must be kept.
 func TestParseScanRootsExcludesRcloneFuse(t *testing.T) {
 	mounts := strings.Join([]string{
 		"/dev/sda1 /DATA ext4 rw 0 0",
@@ -95,18 +100,19 @@ func TestParseScanRootsExcludesRcloneFuse(t *testing.T) {
 		"/dev/md0 /media/RAID_0 btrfs rw 0 0",
 	}, "\n")
 	roots := parseScanRoots(mounts)
-	require.NotContains(t, roots, "/mnt/yu.wu_dropbox_1782892446", "fuse.rclone 挂载必须被排除")
-	require.Contains(t, roots, "/mnt/pool", "fuse.mergerfs 必须保留")
+	require.NotContains(t, roots, "/mnt/yu.wu_dropbox_1782892446", "fuse.rclone mounts must be excluded")
+	require.Contains(t, roots, "/mnt/pool", "fuse.mergerfs must be retained")
 	require.Contains(t, roots, "/media/RAID_0")
 	require.Contains(t, roots, "/DATA")
 }
 
-// TestParseRcloneMounts:rclone 挂载点枚举(供启动清理历史误入库资产用)。
+// TestParseRcloneMounts: enumerates rclone mount points (used by the startup
+// cleanup of legacy assets mistakenly indexed).
 func TestParseRcloneMounts(t *testing.T) {
 	mounts := strings.Join([]string{
 		"/dev/sda1 /DATA ext4 rw 0 0",
 		"dropbox: /mnt/yu.wu_dropbox_1782892446 fuse.rclone rw 0 0",
-		"gdrive: /mnt/a_gdrive_9\\040x fuse.rclone rw 0 0", // 挂载点含空格转义
+		"gdrive: /mnt/a_gdrive_9\\040x fuse.rclone rw 0 0", // mount point contains an escaped space
 		"pool /mnt/pool fuse.mergerfs rw 0 0",
 	}, "\n")
 	require.Equal(t, []string{"/mnt/a_gdrive_9 x", "/mnt/yu.wu_dropbox_1782892446"},

@@ -8,7 +8,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// writeFileOfSize 在 dir/name 写出指定字节数的文件。
+// writeFileOfSize writes a file of the given size in bytes at dir/name.
 func writeFileOfSize(t *testing.T, dir, name string, size int) string {
 	t.Helper()
 	p := filepath.Join(dir, name)
@@ -19,15 +19,15 @@ func writeFileOfSize(t *testing.T, dir, name string, size int) string {
 
 func TestStorageStats(t *testing.T) {
 	db := makeTestDB(t)
-	// 两个资产：一张图片 + 一个视频；另有一个孤儿缩略图目录。
+	// Two assets: one image + one video; plus one orphan thumbnail directory.
 	_, err := db.Exec(`INSERT INTO assets(id, file_path, file_size, mime_type, status)
 		VALUES('a1','/x/a.jpg',1000,'image/jpeg','indexed'),
 		      ('a2','/x/b.mp4',5000,'video/mp4','indexed')`)
 	require.NoError(t, err)
 
 	thumbDir := t.TempDir()
-	writeFileOfSize(t, thumbDir, "a1/small.jpg", 100)    // 有效缓存
-	writeFileOfSize(t, thumbDir, "ghost/small.jpg", 300) // 孤儿缓存
+	writeFileOfSize(t, thumbDir, "a1/small.jpg", 100)    // valid cache
+	writeFileOfSize(t, thumbDir, "ghost/small.jpg", 300) // orphan cache
 	faceDir := t.TempDir()
 	writeFileOfSize(t, faceDir, "p1.jpg", 50)
 
@@ -40,8 +40,8 @@ func TestStorageStats(t *testing.T) {
 	require.Equal(t, int64(1000), st.PhotosBytes)
 	require.Equal(t, int64(5000), st.VideosBytes)
 	require.Equal(t, int64(0), st.RawBytes)
-	require.Equal(t, int64(450), st.CacheBytes)   // 100 + 300 + 50
-	require.Equal(t, int64(300), st.PrunableBytes) // 仅孤儿目录
+	require.Equal(t, int64(450), st.CacheBytes)    // 100 + 300 + 50
+	require.Equal(t, int64(300), st.PrunableBytes) // orphan directory only
 	require.Equal(t, int64(700), st.AIBytes)
 	require.Greater(t, st.DiskTotalBytes, int64(0))
 	require.Greater(t, st.DiskFreeBytes, int64(0))
@@ -52,14 +52,14 @@ func TestStorageStatsCached(t *testing.T) {
 	s := NewStorageService(db, filepath.Join(t.TempDir(), "photos.db"), t.TempDir(), t.TempDir(), t.TempDir())
 	st1, err := s.Stats()
 	require.NoError(t, err)
-	// 缓存窗口内新插入资产不影响返回值
+	// An asset inserted within the cache window doesn't affect the returned value
 	_, err = db.Exec(`INSERT INTO assets(id, file_path, file_size, mime_type, status)
 		VALUES('a9','/x/c.jpg',1234,'image/jpeg','indexed')`)
 	require.NoError(t, err)
 	st2, err := s.Stats()
 	require.NoError(t, err)
 	require.Equal(t, st1.PhotosBytes, st2.PhotosBytes)
-	// Invalidate 后重新计算
+	// Recomputed after Invalidate
 	s.Invalidate()
 	st3, err := s.Stats()
 	require.NoError(t, err)
@@ -77,22 +77,22 @@ func TestStoragePruneRemovesOnlyOrphans(t *testing.T) {
 	writeFileOfSize(t, thumbDir, "ghost/small.jpg", 300)
 
 	s := NewStorageService(db, filepath.Join(t.TempDir(), "photos.db"), thumbDir, t.TempDir(), t.TempDir())
-	_, err = s.Stats() // 填充缓存，验证 Prune 会失效它
+	_, err = s.Stats() // populate the cache, to verify Prune invalidates it
 	require.NoError(t, err)
 
-	res, err := s.Prune("", 0) // 无 staging 目录场景
+	res, err := s.Prune("", 0) // scenario with no staging directory
 	require.NoError(t, err)
 	require.Equal(t, int64(300), res.FreedBytes)
 	require.Equal(t, 1, res.RemovedCount)
 
 	_, statErr := os.Stat(valid)
-	require.NoError(t, statErr) // 有效缩略图保留
+	require.NoError(t, statErr) // valid thumbnail retained
 	_, statErr = os.Stat(filepath.Join(thumbDir, "ghost"))
-	require.True(t, os.IsNotExist(statErr)) // 孤儿目录删除
+	require.True(t, os.IsNotExist(statErr)) // orphan directory removed
 
 	st, err := s.Stats()
 	require.NoError(t, err)
-	require.Equal(t, int64(0), st.PrunableBytes) // 缓存已失效并重算
+	require.Equal(t, int64(0), st.PrunableBytes) // cache invalidated and recomputed
 }
 
 func TestPruneRemovesOrphanFaceThumbs(t *testing.T) {
@@ -113,9 +113,9 @@ func TestPruneRemovesOrphanFaceThumbs(t *testing.T) {
 	require.NoError(t, err)
 
 	_, statErr := os.Stat(keep)
-	require.NoError(t, statErr) // 有对应 face_detections 行，保留
+	require.NoError(t, statErr) // has a matching face_detections row, retained
 	_, statErr = os.Stat(orphan)
-	require.True(t, os.IsNotExist(statErr)) // 孤儿脸缩略图删除
+	require.True(t, os.IsNotExist(statErr)) // orphan face thumbnail removed
 
 	require.Equal(t, int64(80), res.FreedBytes)
 	require.Equal(t, 1, res.RemovedCount)

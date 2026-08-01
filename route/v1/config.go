@@ -43,18 +43,19 @@ func (h *ConfigHandler) UpdateConfig(c echo.Context) error {
 	var req struct {
 		WatchDirs        []string `json:"watchDirs"`
 		RetentionDays    int      `json:"retentionDays"`
-		FacesEnabled     *bool `json:"facesEnabled"`
-		ScenesEnabled    *bool `json:"scenesEnabled"`
-		OCREnabled       *bool `json:"ocrEnabled"`
-		SmartViewEnabled *bool `json:"smartViewEnabled"`
-		ScanInterval     *int  `json:"scanInterval"`
+		FacesEnabled     *bool    `json:"facesEnabled"`
+		ScenesEnabled    *bool    `json:"scenesEnabled"`
+		OCREnabled       *bool    `json:"ocrEnabled"`
+		SmartViewEnabled *bool    `json:"smartViewEnabled"`
+		ScanInterval     *int     `json:"scanInterval"`
 	}
 	if err := c.Bind(&req); err != nil {
 		return echo.NewHTTPError(http.StatusBadRequest, "invalid request body")
 	}
-	// watchDirs 为空 ⇒ 显式切换到自动模式（范围 = EnumerateScanRoots，动态跟随
-	// 挂载），是合法的全量替换取值，不再当作缺失字段拒绝；口径同
-	// pkg/config/config.go 的注释。
+	// An empty watchDirs ⇒ an explicit switch to auto mode (scope =
+	// EnumerateScanRoots, dynamically following mounts); this is a valid
+	// full-replacement value and is no longer rejected as a missing field —
+	// consistent with the comment in pkg/config/config.go.
 	if req.RetentionDays != 0 && (req.RetentionDays < 1 || req.RetentionDays > 365) {
 		return echo.NewHTTPError(http.StatusBadRequest, "retentionDays must be between 1 and 365")
 	}

@@ -1,6 +1,8 @@
-// Package parserclient 是 NimoOS-Parser visual 接口的薄客户端。
-// 发现文件每次调用时读(Parser 重启换端口自适应);文件不存在返回
-// ErrParserUnavailable,调用侧应静默跳过——Parser 未部署的机器不能刷日志。
+// Package parserclient is a thin client for NimoOS-Parser's visual interface.
+// The discovery file is read on every call (adapting when Parser restarts on
+// a new port); if the file doesn't exist, returns ErrParserUnavailable, which
+// the caller should silently skip on — a machine without Parser deployed
+// must not spam the logs.
 package parserclient
 
 import (
@@ -43,7 +45,7 @@ func (c *Client) baseURL() (string, error) {
 	return u, nil
 }
 
-// IngestAsset 投喂一张资产的缩略图;takenAt/place 为空串时省略对应 meta 键。
+// IngestAsset feeds in an asset's thumbnail; when takenAt/place are empty strings, the corresponding meta key is omitted.
 func (c *Client) IngestAsset(ctx context.Context, assetID, imagePath, mime, takenAt, place string) error {
 	base, err := c.baseURL()
 	if err != nil {
@@ -76,7 +78,7 @@ func (c *Client) IngestAsset(ctx context.Context, assetID, imagePath, mime, take
 	return nil
 }
 
-// DeleteAsset 删除该资产的 caption 块(Photos 删资产/入回收站时联动)。
+// DeleteAsset deletes this asset's caption block (triggered alongside Photos deleting an asset / moving it to trash).
 func (c *Client) DeleteAsset(ctx context.Context, assetID string) error {
 	base, err := c.baseURL()
 	if err != nil {
@@ -98,27 +100,31 @@ func (c *Client) DeleteAsset(ctx context.Context, assetID string) error {
 	return nil
 }
 
-// CaptionItem 是 ListCaptions 分页返回的一条 caption 记录,字段精确对齐
-// Parser 端 GET /v1/parser/visual/captions 的 items 契约。
+// CaptionItem is one caption record returned by ListCaptions' pagination, its
+// fields exactly matching the items contract of Parser's GET
+// /v1/parser/visual/captions.
 type CaptionItem struct {
 	AssetID string `json:"asset_id"`
 	Text    string `json:"text"`
 	MtimeMs int64  `json:"mtime_ms"`
 }
 
-// captionListResponse 是 ListCaptions 端点的原始响应体。NextOffset 用指针
-// 承接 JSON null(最后一页)与省略字段两种情况,统一在 ListCaptions 里折成
-// 空字符串返回。
+// captionListResponse is the raw response body of the ListCaptions endpoint.
+// NextOffset uses a pointer to hold both the JSON null (last page) and
+// omitted-field cases, both folded into an empty string returned by ListCaptions.
 type captionListResponse struct {
 	Items      []CaptionItem `json:"items"`
 	NextOffset *string       `json:"next_offset"`
 }
 
-// ListCaptions 分页拉取 Parser 侧已生成的 caption(照片知识库子项目二回流侧)。
-// offset 为空串表示拉首页(此时请求不携带 offset 查询参数,由 Parser 端按
-// "缺省=首页"处理);返回的 nextOffset 为空串表示已是最后一页。非 2xx(含
-// 503 qdrant 不可用)一律视为 error,调用方(captionpull.Puller)据此静默
-// 跳过本轮,不影响 Photos 主流程。
+// ListCaptions paginates through captions already generated on the Parser
+// side (the backflow side of the photo knowledge-base sub-project).
+// offset empty means fetch the first page (in this case the request carries
+// no offset query parameter, handled by Parser as "absent = first page");
+// a returned nextOffset of empty string means this is the last page. Any
+// non-2xx (including 503 qdrant unavailable) is treated as an error, and the
+// caller (captionpull.Puller) silently skips this round based on it, without
+// affecting the main Photos flow.
 func (c *Client) ListCaptions(ctx context.Context, offset string) ([]CaptionItem, string, error) {
 	base, err := c.baseURL()
 	if err != nil {

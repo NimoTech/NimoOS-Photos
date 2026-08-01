@@ -38,13 +38,13 @@ func insertClipIdx(t *testing.T, db *sql.DB, assetID string) {
 	require.NoError(t, err)
 }
 
-// TestEmbedder_QueryMissing 只返回 status='indexed' 且 asset_clip_idx 没有行的 asset。
+// TestEmbedder_QueryMissing only returns assets that are status='indexed' and have no row in asset_clip_idx.
 func TestEmbedder_QueryMissing(t *testing.T) {
 	db := makeTestDB(t)
 	missing := insertAsset(t, db, "/a.jpg", "indexed")
-	_ = insertAsset(t, db, "/b.jpg", "pending") // 不该返回
+	_ = insertAsset(t, db, "/b.jpg", "pending") // should not be returned
 	hasIdx := insertAsset(t, db, "/c.jpg", "indexed")
-	insertClipIdx(t, db, hasIdx) // 已有 idx，不该返回
+	insertClipIdx(t, db, hasIdx) // already has an idx row, should not be returned
 
 	e := NewEmbedder(db, &mockML{}, nil, nil)
 	paths, err := e.queryMissing(context.Background())
@@ -53,9 +53,12 @@ func TestEmbedder_QueryMissing(t *testing.T) {
 	_ = missing
 }
 
-// TestEmbedder_QueryMissingExcludesOffline 验证:资产的移动盘已拔出
-// (offline=1)时,即使 asset_clip_idx 缺行也不应进入 CLIP 补跑目标——
-// 源文件读不到,补跑只会一直失败;插回后 MountGuard 会主动重新触发 Backfill。
+// TestEmbedder_QueryMissingExcludesOffline verifies: when an asset's
+// removable drive has been unplugged (offline=1), it must not enter the
+// CLIP backfill targets even with a missing asset_clip_idx row — the
+// source file can't be read, so a backfill attempt would only keep
+// failing; MountGuard proactively re-triggers Backfill once the drive is
+// replugged.
 func TestEmbedder_QueryMissingExcludesOffline(t *testing.T) {
 	db := makeTestDB(t)
 	online := insertAsset(t, db, "/a.jpg", "indexed")
@@ -70,7 +73,7 @@ func TestEmbedder_QueryMissingExcludesOffline(t *testing.T) {
 	_ = online
 }
 
-// TestEmbedder_QueryMissingOCRExcludesOffline 同上,针对 OCR 补跑目标查询。
+// TestEmbedder_QueryMissingOCRExcludesOffline: same as above, for the OCR backfill target query.
 func TestEmbedder_QueryMissingOCRExcludesOffline(t *testing.T) {
 	db := makeTestDB(t)
 	online := insertAsset(t, db, "/photo-online.jpg", "indexed")
@@ -85,23 +88,24 @@ func TestEmbedder_QueryMissingOCRExcludesOffline(t *testing.T) {
 	for _, tg := range targets {
 		ids[tg.id] = true
 	}
-	require.True(t, ids[online], "在线资产应是 OCR 补跑目标")
-	require.False(t, ids[offline], "offline 资产必须被排除出 OCR 补跑")
+	require.True(t, ids[online], "an online asset should be an OCR backfill target")
+	require.False(t, ids[offline], "an offline asset must be excluded from the OCR backfill")
 }
 
-// TestQueryMissingOCRIncludesLegacyBoxless 验证补跑筛选覆盖「有 OCR 文本但
-// boxes_ver=0(坐标缺失)」的旧资产,且 boxes_ver=1 后出队。
+// TestQueryMissingOCRIncludesLegacyBoxless verifies the backfill filter
+// covers legacy assets that "have OCR text but boxes_ver=0 (coordinates
+// missing)", and that they drop out of the queue once boxes_ver=1.
 func TestQueryMissingOCRIncludesLegacyBoxless(t *testing.T) {
 	db := makeTestDB(t)
 	_, err := db.Exec(`INSERT INTO assets(id, file_path, mime_type, status) VALUES
 		('legacy', '/g/legacy.jpg', 'image/jpeg', 'indexed'),
 		('fresh',  '/g/fresh.jpg',  'image/jpeg', 'indexed')`)
 	require.NoError(t, err)
-	// legacy: 旧版 OCR——有文本有 coverage,但 boxes_ver=0。
+	// legacy: old-version OCR — has text and coverage, but boxes_ver=0.
 	_, err = db.Exec(`INSERT INTO asset_ocr(asset_id, text, coverage, line_count, boxes_ver)
 		VALUES('legacy', 'hello', 0.05, 1, 0)`)
 	require.NoError(t, err)
-	// fresh: 新版 OCR——boxes_ver=1,不应入队。
+	// fresh: new-version OCR — boxes_ver=1, should not be queued.
 	_, err = db.Exec(`INSERT INTO asset_ocr(asset_id, text, coverage, line_count, boxes_ver)
 		VALUES('fresh', 'world', 0.05, 1, 1)`)
 	require.NoError(t, err)
@@ -117,10 +121,11 @@ func TestQueryMissingOCRIncludesLegacyBoxless(t *testing.T) {
 	require.Equal(t, []string{"legacy"}, ids)
 }
 
-// 视频不参与 OCR:既不进补跑目标,历史遗留的视频 OCR 行也被 pruneVideoOCR 清掉。
+// Videos don't participate in OCR: they neither enter the backfill targets,
+// nor do legacy video OCR rows survive — pruneVideoOCR clears those too.
 func TestVideoOCRExcludedAndPruned(t *testing.T) {
 	db := makeTestDB(t)
-	img := insertAsset(t, db, "/photo.jpg", "indexed") // 图片:缺 OCR → 应是补跑目标
+	img := insertAsset(t, db, "/photo.jpg", "indexed") // image: missing OCR → should be a backfill target
 	vid := uuid.NewString()
 	_, err := db.Exec(`INSERT INTO assets(id,file_path,file_size,mime_type,original_name,is_live_photo_video,status,checksum)
 		VALUES(?, '/clip.mp4', 1, 'video/mp4', 'clip.mp4', 0, 'indexed', ?)`, vid, uuid.NewString())
@@ -133,10 +138,10 @@ func TestVideoOCRExcludedAndPruned(t *testing.T) {
 	for _, tg := range targets {
 		ids[tg.id] = true
 	}
-	require.True(t, ids[img], "图片应是缺 OCR 补跑目标")
-	require.False(t, ids[vid], "视频必须被排除出 OCR 补跑")
+	require.True(t, ids[img], "an image missing OCR should be a backfill target")
+	require.False(t, ids[vid], "videos must be excluded from the OCR backfill")
 
-	// pruneVideoOCR 删视频 OCR 行、保留图片 OCR 行。
+	// pruneVideoOCR deletes video OCR rows, keeps image OCR rows.
 	_, err = db.Exec(`INSERT INTO asset_ocr(asset_id, text) VALUES(?, ?)`, vid, "spreadsheet text")
 	require.NoError(t, err)
 	_, err = db.Exec(`INSERT INTO asset_ocr(asset_id, text) VALUES(?, ?)`, img, "receipt")
@@ -145,12 +150,13 @@ func TestVideoOCRExcludedAndPruned(t *testing.T) {
 	var vidRows, imgRows int
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM asset_ocr WHERE asset_id=?`, vid).Scan(&vidRows))
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM asset_ocr WHERE asset_id=?`, img).Scan(&imgRows))
-	require.Equal(t, 0, vidRows, "视频 OCR 行应被清掉")
-	require.Equal(t, 1, imgRows, "图片 OCR 行应保留")
+	require.Equal(t, 0, vidRows, "the video's OCR row should be cleared")
+	require.Equal(t, 1, imgRows, "the image's OCR row should be kept")
 }
 
-// gateML 的 CLIPImageEmbed 第一次调用会阻塞在 release 上并始终返回错误,
-// 用于制造「Backfill 长时间运行中」的窗口并让缺失向量的资产保持缺失。
+// gateML's CLIPImageEmbed blocks on release on its first call and always
+// returns an error, used to create a "Backfill running for a long time"
+// window and keep an asset with a missing vector missing.
 type gateML struct {
 	mockML
 	clipCalls atomic.Int32
@@ -166,20 +172,23 @@ func (m *gateML) CLIPImageEmbed(_ []byte) ([]float32, error) {
 	return nil, fmt.Errorf("clip backend unavailable")
 }
 
-// TestEmbedder_BackfillRerunsWhenTriggeredMidRun 验证 rerun-pending 机制:
-// Backfill 运行中收到第二次调用时,不能像以前那样撞上 CAS 就静默吞掉——
-// 进行中的那轮可能早已查过目标列表,查不到刚变成可补的资产(典型:MountGuard
-// 刚把插回的盘标回 online)。第二次调用应置 pending,当前轮结束后自动重新
-// 查询、再跑一轮。
+// TestEmbedder_BackfillRerunsWhenTriggeredMidRun verifies the
+// rerun-pending mechanism: when a second call arrives while Backfill is
+// already running, it can't be silently swallowed by losing the CAS like
+// before — the in-progress pass may have already queried its target list
+// and wouldn't see an asset that just became backfillable (typically:
+// MountGuard just marked a replugged drive back to online). The second
+// call should set pending, so the current pass automatically requeries and
+// runs another round once it finishes.
 func TestEmbedder_BackfillRerunsWhenTriggeredMidRun(t *testing.T) {
 	prev := config.Cfg
 	t.Cleanup(func() { config.Cfg = prev })
-	// 只开 CLIP:人脸/OCR 关闭,避免无关 ML 调用干扰计数。
+	// Only enable CLIP: faces/OCR are off, to avoid unrelated ML calls interfering with the count.
 	config.Cfg = &config.Config{ScenesEnabled: true}
 
 	db := makeTestDB(t)
 	path := makeTestJPEG(t, t.TempDir())
-	insertAsset(t, db, path, "indexed") // 缺 CLIP 向量 → Backfill 目标
+	insertAsset(t, db, path, "indexed") // missing CLIP vector → a Backfill target
 
 	ml := &gateML{entered: make(chan struct{}, 1), release: make(chan struct{})}
 	idx := NewIndexer(db, ml, t.TempDir(), 1)
@@ -187,37 +196,38 @@ func TestEmbedder_BackfillRerunsWhenTriggeredMidRun(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() { errCh <- e.Backfill(context.Background()) }()
-	<-ml.entered // 第一轮已进入 ML 调用:Backfill 确认处于运行中
+	<-ml.entered // the first pass has entered the ML call: Backfill is confirmed running
 
-	// 运行中的第二次触发:立即返回 nil,但必须置 rerunPending 而不是被吞掉。
+	// Second trigger while running: returns nil immediately, but must set rerunPending instead of being swallowed.
 	require.NoError(t, e.Backfill(context.Background()))
-	require.True(t, e.rerunPending.Load(), "运行中收到的触发必须置 rerunPending")
+	require.True(t, e.rerunPending.Load(), "a trigger received while running must set rerunPending")
 
 	close(ml.release)
 	require.NoError(t, <-errCh)
 
-	// 第一轮结束后自动重跑了一轮:同一个仍缺向量的资产被再次尝试(共 2 次 CLIP 调用)。
-	require.Equal(t, int32(2), ml.clipCalls.Load(), "当前轮结束后应自动再跑一轮补跑")
-	require.False(t, e.rerunPending.Load(), "重跑轮结束后 pending 应被消费")
+	// After the first pass finished, it automatically reran a round: the
+	// same still-missing-vector asset was retried (2 CLIP calls total).
+	require.Equal(t, int32(2), ml.clipCalls.Load(), "another backfill round should run automatically after the current round finishes")
+	require.False(t, e.rerunPending.Load(), "pending should be consumed after the rerun round finishes")
 	require.False(t, e.running.Load())
 }
 
-// TestEmbedder_BackfillOCRRerunPendingConsumedAfterRun 验证 OCR 补跑的同款
-// rerun-pending 机制(与 Backfill 共享同一循环形态,这里只验证 CAS/pending
-// 的置位与消费)。
+// TestEmbedder_BackfillOCRRerunPendingConsumedAfterRun verifies the same
+// rerun-pending mechanism for the OCR backfill (shares the same loop shape
+// with Backfill; this only verifies the CAS/pending being set and consumed).
 func TestEmbedder_BackfillOCRRerunPendingConsumedAfterRun(t *testing.T) {
 	db := makeTestDB(t)
 	e := NewEmbedder(db, &mockML{}, nil, nil)
 
-	// 模拟一轮 OCR 补跑正在运行:此时的触发必须置 pending 而不是被吞。
+	// Simulate an OCR backfill round already running: a trigger arriving now must set pending, not be swallowed.
 	e.ocrRunning.Store(true)
 	require.NoError(t, e.BackfillOCR(context.Background()))
-	require.True(t, e.ocrRerunPending.Load(), "运行中收到的 OCR 触发必须置 ocrRerunPending")
+	require.True(t, e.ocrRerunPending.Load(), "an OCR trigger received while running must set ocrRerunPending")
 	e.ocrRunning.Store(false)
 
-	// 下一次真正运行结束时消费 pending 并再跑一轮(空库上两轮都立即完成)。
+	// The next actual run consumes pending and runs one more round (both rounds complete immediately on an empty DB).
 	require.NoError(t, e.BackfillOCR(context.Background()))
-	require.False(t, e.ocrRerunPending.Load(), "补跑结束后 pending 应被消费")
+	require.False(t, e.ocrRerunPending.Load(), "pending should be consumed once the backfill finishes")
 }
 
 // TestEmbedder_HasEmbeddingForPath
@@ -233,7 +243,7 @@ func TestEmbedder_HasEmbeddingForPath(t *testing.T) {
 	require.False(t, e.hasEmbeddingForPath("/nope.jpg"))
 }
 
-// flakyML：第 N 次 CLIPImageEmbed 返回 error，其余返回正常向量。
+// flakyML: the Nth CLIPImageEmbed call returns an error, the rest return normal vectors.
 type flakyML struct {
 	mockML
 	failOnCalls map[int]bool
@@ -248,8 +258,9 @@ func (m *flakyML) CLIPImageEmbed(d []byte) ([]float32, error) {
 	return m.mockML.CLIPImageEmbed(d)
 }
 
-// makeUniqueJPEG 生成内容唯一的 JPEG（不同序号 → 不同 checksum），供 Backfill 测试使用。
-// 与 makeTestJPEGNamed 的区别：填充 idx 颜色避免所有文件 checksum 相同。
+// makeUniqueJPEG generates a JPEG with unique content (different idx →
+// different checksum), for use by Backfill tests. Unlike makeTestJPEGNamed:
+// fills with an idx-derived color to avoid every file having the same checksum.
 func makeUniqueJPEG(t *testing.T, dir string, idx int) string {
 	t.Helper()
 	img := image.NewRGBA(image.Rect(0, 0, 50, 50))
@@ -267,13 +278,13 @@ func makeUniqueJPEG(t *testing.T, dir string, idx int) string {
 	return path
 }
 
-// TestEmbedder_Backfill_AllSuccess 5 个缺向量 → done, current=5
+// TestEmbedder_Backfill_AllSuccess: 5 missing vectors → done, current=5
 func TestEmbedder_Backfill_AllSuccess(t *testing.T) {
 	db := makeTestDB(t)
 	thumbDir := t.TempDir()
 	imgDir := t.TempDir()
 
-	// 用 indexer 先把图片 indexed-without-embedding：ML 不就绪跑一次
+	// Use the indexer to get images to indexed-without-embedding first: run once with ML not ready
 	idx := NewIndexer(db, &mockMLNotReady{}, thumbDir, 1)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -290,7 +301,7 @@ func TestEmbedder_Backfill_AllSuccess(t *testing.T) {
 		return n == 5
 	}, 10*time.Second, 100*time.Millisecond)
 
-	// 现在用 ready ML 起 embedder
+	// Now start the embedder with a ready ML
 	var emitted []Task
 	var mu sync.Mutex
 	reg := NewTaskRegistry(func(t Task) { mu.Lock(); emitted = append(emitted, t); mu.Unlock() })
@@ -307,12 +318,12 @@ func TestEmbedder_Backfill_AllSuccess(t *testing.T) {
 			doneEv = &emitted[i]
 		}
 	}
-	require.NotNil(t, doneEv, "应有 done event")
+	require.NotNil(t, doneEv, "there should be a done event")
 	require.Equal(t, int64(5), doneEv.Current)
-	require.Equal(t, "生成 AI 索引", doneEv.Label)
+	require.Equal(t, "Generating AI index", doneEv.Label)
 }
 
-// TestEmbedder_Backfill_PartialFail 3 成功 + 2 失败 → done, label 含"失败 2 张"
+// TestEmbedder_Backfill_PartialFail: 3 succeed + 2 fail → done, label contains "(2 failed)"
 func TestEmbedder_Backfill_PartialFail(t *testing.T) {
 	db := makeTestDB(t)
 	thumbDir := t.TempDir()
@@ -349,10 +360,10 @@ func TestEmbedder_Backfill_PartialFail(t *testing.T) {
 		}
 	}
 	require.NotNil(t, doneEv)
-	require.Contains(t, doneEv.Label, "失败 2 张")
+	require.Contains(t, doneEv.Label, "2 failed")
 }
 
-// TestEmbedder_Backfill_AllFail 0 成功 + N 失败 → error
+// TestEmbedder_Backfill_AllFail: 0 succeed + N fail → error
 func TestEmbedder_Backfill_AllFail(t *testing.T) {
 	db := makeTestDB(t)
 	thumbDir := t.TempDir()
@@ -388,24 +399,29 @@ func TestEmbedder_Backfill_AllFail(t *testing.T) {
 			errEv = &emitted[i]
 		}
 	}
-	require.NotNil(t, errEv, "全失败应发 error event")
+	require.NotNil(t, errEv, "an error event should be published when everything fails")
 	require.Contains(t, errEv.Error, "ML")
 }
 
 // TestEmbedder_Backfill_CtxCancelMidwayDoesNotEmitDone:
-// ctx 在循环中途被取消时，不应发 "done" 状态的 final task，且应返回 context.Canceled。
+// when ctx is cancelled midway through the loop, a "done"-status final task
+// must not be published, and context.Canceled should be returned.
 //
-// 策略：
-//   - 插 10 个真实 JPEG，让 Indexer 先把它们变成 status='indexed'（无 CLIP 向量）。
-//   - 用 slowML（每次 CLIPImageEmbed 延迟 50ms）使整个循环需要 ~500ms。
-//   - ctx 在 150ms 后超时，届时大约处理 2-3 个，break 触发。
-//   - 修复前：break 后直接落入 final 决策 → 发 done；修复后：检查 ctx.Err() → return，不发 done。
+// Strategy:
+//   - Insert 10 real JPEGs, letting Indexer first turn them into
+//     status='indexed' (no CLIP vector).
+//   - Use slowML (adds a 50ms delay per CLIPImageEmbed call) so the whole
+//     loop takes ~500ms.
+//   - ctx times out after 150ms, by which point roughly 2-3 have been
+//     processed, triggering break.
+//   - Before the fix: break fell straight into the final-state decision →
+//     published done; after the fix: checks ctx.Err() → returns, no done published.
 func TestEmbedder_Backfill_CtxCancelMidwayDoesNotEmitDone(t *testing.T) {
 	db := makeTestDB(t)
 	thumbDir := t.TempDir()
 	imgDir := t.TempDir()
 
-	// 用 mockMLNotReady 先把图片 indexed（无 CLIP 向量）
+	// Use mockMLNotReady to first get the images indexed (no CLIP vector)
 	notReady := &mockMLNotReady{}
 	idx0 := NewIndexer(db, notReady, thumbDir, 1)
 	bgCtx, bgCancel := context.WithCancel(context.Background())
@@ -418,35 +434,35 @@ func TestEmbedder_Backfill_CtxCancelMidwayDoesNotEmitDone(t *testing.T) {
 		var n int
 		_ = db.QueryRow(`SELECT COUNT(*) FROM assets WHERE status='indexed'`).Scan(&n)
 		return n == 10
-	}, 15*time.Second, 100*time.Millisecond, "等待 10 个 asset indexed")
+	}, 15*time.Second, 100*time.Millisecond, "waiting for 10 assets to be indexed")
 
 	var emitted []Task
 	var mu sync.Mutex
 	reg := NewTaskRegistry(func(tk Task) { mu.Lock(); emitted = append(emitted, tk); mu.Unlock() })
 
-	// slowML：每次 CLIPImageEmbed 延迟 50ms，10 个文件共需 ~500ms
+	// slowML: adds a 50ms delay to each CLIPImageEmbed call, ~500ms total for 10 files
 	slow := &slowML{delay: 50 * time.Millisecond}
 	idx2 := NewIndexer(db, slow, thumbDir, 1)
 	go idx2.Start(bgCtx)
 	e := NewEmbedder(db, slow, idx2, reg)
 
-	// 150ms 后取消，届时循环只跑了 2-3 轮，尚未完成全部 10 个
+	// Cancel after 150ms, by which point the loop has only run 2-3 rounds, nowhere near all 10
 	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
 	defer cancel()
 
 	err := e.Backfill(ctx)
-	require.ErrorIs(t, err, context.DeadlineExceeded, "ctx 超时后应返回 DeadlineExceeded")
+	require.ErrorIs(t, err, context.DeadlineExceeded, "should return DeadlineExceeded once ctx times out")
 
 	mu.Lock()
 	defer mu.Unlock()
 	for _, ev := range emitted {
 		if ev.Type == "embedding" && ev.Status == "done" {
-			t.Fatalf("不应在 ctx 取消后发 done event：%+v", ev)
+			t.Fatalf("should not publish a done event after ctx is cancelled: %+v", ev)
 		}
 	}
 }
 
-// slowML 包装 mockML 给 CLIPImageEmbed 加固定延迟。
+// slowML wraps mockML, adding a fixed delay to CLIPImageEmbed.
 type slowML struct {
 	mockML
 	delay time.Duration
@@ -457,16 +473,16 @@ func (m *slowML) CLIPImageEmbed(d []byte) ([]float32, error) {
 	return m.mockML.CLIPImageEmbed(d)
 }
 
-// TestEmbedder_Backfill_ConcurrencyGuard 同时调两次，第二个秒返回。
+// TestEmbedder_Backfill_ConcurrencyGuard calls Backfill twice at once; the second returns instantly.
 func TestEmbedder_Backfill_ConcurrencyGuard(t *testing.T) {
 	db := makeTestDB(t)
-	_ = insertAsset(t, db, "/a.jpg", "indexed") // 1 个缺向量
+	_ = insertAsset(t, db, "/a.jpg", "indexed") // 1 asset missing a vector
 
-	e := NewEmbedder(db, &mockML{}, nil /* indexer 此用例不被调用 */, NewTaskRegistry(nil))
+	e := NewEmbedder(db, &mockML{}, nil /* indexer is not called in this test */, NewTaskRegistry(nil))
 
 	e.running.Store(true)
 	err := e.Backfill(context.Background())
-	require.NoError(t, err, "已 running 时应秒返回 nil")
+	require.NoError(t, err, "should return nil instantly while already running")
 	e.running.Store(false)
 
 	db2 := makeTestDB(t)
@@ -474,7 +490,7 @@ func TestEmbedder_Backfill_ConcurrencyGuard(t *testing.T) {
 	require.NoError(t, e2.Backfill(context.Background()))
 }
 
-// togglingML：IsReady 返回值由外部 atomic 控制。
+// togglingML: its IsReady return value is controlled externally via an atomic.
 type togglingML struct {
 	mockML
 	ready atomic.Bool
@@ -482,7 +498,7 @@ type togglingML struct {
 
 func (m *togglingML) IsReady() bool { return m.ready.Load() }
 
-// TestEmbedder_Run_TriggersOnReadyJump: ML ready false→true 跳变时触发一次 Backfill。
+// TestEmbedder_Run_TriggersOnReadyJump: a Backfill fires once on ML ready's false→true transition.
 func TestEmbedder_Run_TriggersOnReadyJump(t *testing.T) {
 	db := makeTestDB(t)
 	thumbDir := t.TempDir()
@@ -510,13 +526,13 @@ func TestEmbedder_Run_TriggersOnReadyJump(t *testing.T) {
 	e.SetPollInterval(50 * time.Millisecond)
 
 	go e.Run(ctx)
-	// 在 ready=false 时不应触发
+	// Should not trigger while ready=false
 	time.Sleep(200 * time.Millisecond)
 	mu.Lock()
-	require.Empty(t, embeddingTasks(emitted), "ML 未就绪时不应触发 Backfill")
+	require.Empty(t, embeddingTasks(emitted), "Backfill should not trigger while ML isn't ready")
 	mu.Unlock()
 
-	// 翻转 ready=true
+	// Flip ready=true
 	tog.ready.Store(true)
 	require.Eventually(t, func() bool {
 		mu.Lock()
@@ -541,10 +557,10 @@ func embeddingTasks(all []Task) []Task {
 }
 
 // TestEmbedder_Run_DoesNotRetriggerOnSustainedReady:
-// ML 持续 ready 且无活可干时，不应反复发 task。
+// no repeated task publishing when ML stays ready with nothing to do.
 func TestEmbedder_Run_DoesNotRetriggerOnSustainedReady(t *testing.T) {
 	db := makeTestDB(t)
-	// 没有缺向量的 asset → Backfill 应该 noop 但不应被多次调用造成 task spam
+	// No asset missing a vector → Backfill should no-op, and repeated calls shouldn't spam tasks
 	var emitted []Task
 	var mu sync.Mutex
 	reg := NewTaskRegistry(func(t Task) { mu.Lock(); emitted = append(emitted, t); mu.Unlock() })
@@ -556,12 +572,14 @@ func TestEmbedder_Run_DoesNotRetriggerOnSustainedReady(t *testing.T) {
 	time.Sleep(300 * time.Millisecond)
 	mu.Lock()
 	defer mu.Unlock()
-	require.Empty(t, embeddingTasks(emitted), "ML 持续 ready 且无活可干时不应反复发 task")
+	require.Empty(t, embeddingTasks(emitted), "no repeated task publishing while ML stays ready with nothing to do")
 }
 
-// TestEmbedder_Run_CallsOnRecoveredAtChainTail 断言 ML ready false→true 跳变的
-// 恢复链尾（Backfill → reembed → BackfillOCR 之后）会调用 onRecovered 钩子——
-// service.go 把它接线为 faces.RunPipeline，覆盖 ML 掉线期间积压的人脸检测欠账。
+// TestEmbedder_Run_CallsOnRecoveredAtChainTail asserts that the onRecovered
+// hook is called at the tail of the recovery chain (after Backfill →
+// reembed → BackfillOCR) on ML ready's false→true transition — service.go
+// wires it to faces.RunPipeline, covering face-detection backlog
+// accumulated while ML was down.
 func TestEmbedder_Run_CallsOnRecoveredAtChainTail(t *testing.T) {
 	db := makeTestDB(t)
 	tog := &togglingML{}
@@ -570,7 +588,7 @@ func TestEmbedder_Run_CallsOnRecoveredAtChainTail(t *testing.T) {
 	e.SetPollInterval(50 * time.Millisecond)
 
 	var calls atomic.Int32
-	var lastCtx atomic.Bool // true 一旦收到非 nil ctx
+	var lastCtx atomic.Bool // true once a non-nil ctx is received
 	e.SetOnRecovered(func(ctx context.Context) {
 		calls.Add(1)
 		lastCtx.Store(ctx != nil)
@@ -580,17 +598,17 @@ func TestEmbedder_Run_CallsOnRecoveredAtChainTail(t *testing.T) {
 	defer cancel()
 	go e.Run(ctx)
 
-	// ready 仍为 false 时不应触发。
+	// Should not trigger while ready is still false.
 	time.Sleep(150 * time.Millisecond)
-	require.Zero(t, calls.Load(), "ML 未就绪时不应调用 onRecovered")
+	require.Zero(t, calls.Load(), "onRecovered should not be called while ML isn't ready")
 
 	tog.ready.Store(true)
 	require.Eventually(t, func() bool { return calls.Load() >= 1 }, 5*time.Second, 50*time.Millisecond,
-		"ML ready 跳变后应在恢复链尾调用 onRecovered")
-	require.True(t, lastCtx.Load(), "onRecovered 应收到非 nil ctx")
+		"onRecovered should be called at the recovery chain tail after ML ready transitions")
+	require.True(t, lastCtx.Load(), "onRecovered should receive a non-nil ctx")
 }
 
-// recordingOCRML 记录最近一次 OCR 收到的输入字节,其余行为同 mockML。
+// recordingOCRML records the input bytes received by the most recent OCR call; otherwise behaves like mockML.
 type recordingOCRML struct {
 	mockML
 	lastOCRData []byte
@@ -601,9 +619,11 @@ func (m *recordingOCRML) OCR(data []byte) ([]mlclient.OCRLine, error) {
 	return []mlclient.OCRLine{}, nil
 }
 
-// TestBackfillOCR_OversizedImageFallsBackToThumbnail:OCR 补跑(embedder 侧)
-// 是超大图守卫的第三个调用点——图片路径直读原图,超过 PIL 上限的图必然 500,
-// 且每次 ML 恢复都重试。守卫后必须换用 large.jpg 缩略图字节喂 ML。
+// TestBackfillOCR_OversizedImageFallsBackToThumbnail: the OCR backfill (on
+// the embedder side) is the third call site for the oversized-image guard —
+// the image path reads the original directly, and an image over PIL's cap
+// necessarily 500s, retrying on every ML recovery. After the guard kicks in,
+// it must switch to feeding ML the large.jpg thumbnail bytes.
 func TestBackfillOCR_OversizedImageFallsBackToThumbnail(t *testing.T) {
 	db := makeTestDB(t)
 	srcDir := t.TempDir()
@@ -626,5 +646,5 @@ func TestBackfillOCR_OversizedImageFallsBackToThumbnail(t *testing.T) {
 
 	require.NoError(t, e.BackfillOCR(context.Background()))
 	require.Equal(t, thumbBytes, ml.lastOCRData,
-		"超限原图应换成 large.jpg 缩略图字节喂 OCR,而不是原图字节")
+		"an oversized original should be swapped for the large.jpg thumbnail bytes fed to OCR, not the original's bytes")
 }

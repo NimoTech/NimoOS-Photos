@@ -90,7 +90,7 @@ func TestListPlacesExcludesOffline(t *testing.T) {
 	resp, err := svc.ListPlaces()
 	require.NoError(t, err)
 	require.Len(t, resp.Places, 1)
-	require.Equal(t, 1, resp.Places[0].Count, "offline 资产不应计入城市照片数")
+	require.Equal(t, 1, resp.Places[0].Count, "offline assets must not count toward a city's photo count")
 	require.Contains(t, resp.Places[0].Thumbs, "online")
 	require.NotContains(t, resp.Places[0].Thumbs, "offline")
 }
@@ -383,13 +383,14 @@ func TestCoverCandidatesTabs(t *testing.T) {
 	require.NotEmpty(t, recent.Items)
 }
 
-// TestCoverCandidatesNegativePage 确认 page<0 不 panic，且行为等同于 page=0。
+// TestCoverCandidatesNegativePage confirms page<0 doesn't panic and behaves
+// the same as page=0.
 func TestCoverCandidatesNegativePage(t *testing.T) {
 	svc := placesFixture(t)
 	resp, _ := svc.ListPlaces()
 	key := resp.Places[0].Key
 
-	// page=-1 不应 panic，且应等同于 page=0 的结果。
+	// page=-1 must not panic and should match the page=0 result.
 	res, err := svc.CoverCandidates(key, "all", "", -1, 40)
 	require.NoError(t, err)
 	require.Equal(t, 0, res.Page)
@@ -525,9 +526,10 @@ func TestSpotMemberIDsAtPinsExactCluster(t *testing.T) {
 	require.Empty(t, ids)
 }
 
-// TestPlacesCoverThumbsPrefersAesthetic 验证城市卡 Thumbs 按美学分优先排序(未打分的
-// 兜底按拍摄时间倒序),而详情页 Detail.Recent(「最近」区块)仍保持纯时间语义,不受
-// 美学分影响。
+// TestPlacesCoverThumbsPrefersAesthetic verifies the city card's Thumbs sort by
+// aesthetic score first (unscored assets fall back to reverse-chronological
+// order), while the detail page's Detail.Recent ("Recent" section) keeps a
+// pure time semantic, unaffected by aesthetic score.
 func TestPlacesCoverThumbsPrefersAesthetic(t *testing.T) {
 	db, err := sqlite.Open(filepath.Join(t.TempDir(), "t.db"))
 	require.NoError(t, err)
@@ -545,7 +547,8 @@ func TestPlacesCoverThumbsPrefersAesthetic(t *testing.T) {
 		require.NoError(t, err)
 		require.NoError(t, geoSvc.GeocodeAsset(id))
 	}
-	// t1 最新但未打分;t2 打分最高但拍摄较早;t3 打分较低;t4 最旧且未打分。
+	// t1 is newest but unscored; t2 scores highest but was taken earlier; t3 scores
+	// lower; t4 is oldest and unscored.
 	seed("t1", 1)
 	seed("t2", 5)
 	seed("t3", 3)
@@ -561,19 +564,21 @@ func TestPlacesCoverThumbsPrefersAesthetic(t *testing.T) {
 	require.Len(t, resp.Places, 1)
 	cityID := resp.Places[0].Key
 
-	// 城市卡 Thumbs:美学分优先(t2 最高在前、t3 次之),未打分的兜底按时间倒序(t1 比 t4 新)。
+	// City card Thumbs: aesthetic score first (t2 highest, then t3), unscored
+	// assets fall back to reverse-chronological order (t1 newer than t4).
 	require.Equal(t, []string{"t2", "t3", "t1", "t4"}, resp.Places[0].Thumbs,
-		"城市卡封面应美学分优先,未打分资产兜底按拍摄时间倒序")
+		"city card cover should prefer aesthetic score, unscored assets fall back to reverse-chronological order")
 
-	// 详情页 Recent 仍是纯时间倒序,不受美学分影响。
+	// Detail page Recent is still pure reverse-chronological, unaffected by aesthetic score.
 	detail, err := svc.GetPlace(cityID)
 	require.NoError(t, err)
 	require.Equal(t, []string{"t1", "t3", "t2", "t4"}, detail.Recent,
-		"详情页「最近」区块必须保持纯时间语义,不被美学分打乱")
+		"detail page Recent section must keep a pure time semantic, not be reordered by aesthetic score")
 }
 
-// TestSpotsCoverPrefersAesthetic 验证 spot 封面取簇内美学分最高的资产;当簇内全部未打分
-// 时退回原行为(最新一张,即 firstID)。
+// TestSpotsCoverPrefersAesthetic verifies the spot cover picks the
+// highest-aesthetic-score asset within the cluster; when the whole cluster is
+// unscored it falls back to the original behavior (newest photo, i.e. firstID).
 func TestSpotsCoverPrefersAesthetic(t *testing.T) {
 	db, err := sqlite.Open(filepath.Join(t.TempDir(), "t.db"))
 	require.NoError(t, err)
@@ -585,7 +590,7 @@ func TestSpotsCoverPrefersAesthetic(t *testing.T) {
 		db.Exec(`INSERT INTO asset_exif(asset_id,latitude,longitude) VALUES(?,?,?)`, id, lat, lon)
 		geoSvc.GeocodeAsset(id)
 	}
-	// 单个簇,3 张照片,刚好达到 spotMinPhotos(=3)阈值。
+	// A single cluster, 3 photos, exactly hitting the spotMinPhotos (=3) threshold.
 	mk("s1", 35.6579, 139.7036)
 	mk("s2", 35.6569, 139.7046)
 	mk("s3", 35.6589, 139.7036)
@@ -595,12 +600,12 @@ func TestSpotsCoverPrefersAesthetic(t *testing.T) {
 	require.NotEmpty(t, resp.Places)
 	cityID := resp.Places[0].Key
 
-	// 全未打分:退回原行为(firstID,即簇内最新一张)。
+	// All unscored: fall back to the original behavior (firstID, the newest in the cluster).
 	spotsBefore := svc.Spots(cityID)
 	require.Len(t, spotsBefore, 1)
-	require.NotEmpty(t, spotsBefore[0].Thumb, "全未打分应退回 firstID 兜底")
+	require.NotEmpty(t, spotsBefore[0].Thumb, "all unscored should fall back to firstID")
 
-	// s2 打分最高:封面应切到 s2,即便 s2 不是簇内最新的一张。
+	// s2 scores highest: cover should switch to s2, even though it's not the newest in the cluster.
 	_, err = db.Exec(`UPDATE assets SET aesthetic_score=7.5 WHERE id='s2'`)
 	require.NoError(t, err)
 	_, err = db.Exec(`UPDATE assets SET aesthetic_score=1.0 WHERE id='s1'`)
@@ -608,7 +613,7 @@ func TestSpotsCoverPrefersAesthetic(t *testing.T) {
 
 	spotsAfter := svc.Spots(cityID)
 	require.Len(t, spotsAfter, 1)
-	require.Equal(t, "s2", spotsAfter[0].Thumb, "簇内美学分最高的资产应作为 spot 封面")
+	require.Equal(t, "s2", spotsAfter[0].Thumb, "the highest-aesthetic-score asset in the cluster should be the spot cover")
 }
 
 // TestSpotJumpSmallerClusterByCentroid is the end-to-end guard for the bug

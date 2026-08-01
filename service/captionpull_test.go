@@ -1,4 +1,5 @@
-// Puller 的测试:用 fakeLister 注入分页/错误场景,验证 diff-upsert 语义。
+// Tests for Puller: injects pagination/error scenarios via fakeLister to
+// verify diff-upsert semantics.
 package service
 
 import (
@@ -11,8 +12,9 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// fakeLister 是供测试注入的 captionLister 假实现:按 offset 返回预设页,
-// 或直接返回注入的错误(模拟 Parser 未部署/网络失败/503)。
+// fakeLister is a captionLister fake for test injection: returns a preset
+// page keyed by offset, or directly returns the injected error (simulating
+// Parser not deployed / network failure / 503).
 type fakeLister struct {
 	pages map[string]struct {
 		items []parserclient.CaptionItem
@@ -29,7 +31,8 @@ func (f *fakeLister) ListCaptions(_ context.Context, offset string) ([]parsercli
 	return p.items, p.next, nil
 }
 
-// fakeDeleter 是供测试注入的 captionDeleter 假实现,记录被回删的 asset_id。
+// fakeDeleter is a captionDeleter fake for test injection, recording the
+// asset_ids that were cleaned up.
 type fakeDeleter struct{ deleted []string }
 
 func (f *fakeDeleter) DeleteAsset(_ context.Context, id string) error {
@@ -37,15 +40,17 @@ func (f *fakeDeleter) DeleteAsset(_ context.Context, id string) error {
 	return nil
 }
 
-// insertCaptionAsset 插入一条 asset_caption 会外键引用到的资产行(id 存在即可,
-// 其它字段对本测试无关紧要)。
+// insertCaptionAsset inserts an asset row that asset_caption's foreign key
+// will reference (only the id needs to exist, other fields are irrelevant to
+// this test).
 func insertCaptionAsset(t *testing.T, db *sql.DB, id string) {
 	t.Helper()
 	_, err := db.Exec(`INSERT INTO assets(id, file_path, status) VALUES(?,?,'indexed')`, id, "/g/"+id+".jpg")
 	require.NoError(t, err)
 }
 
-// PullOnce 应分页拉全量并逐条 upsert 进本地表。
+// PullOnce should page through the full set and upsert each item into the
+// local table.
 func TestPullOnce_PagesAndUpserts(t *testing.T) {
 	db := makeTestDB(t)
 	insertCaptionAsset(t, db, "a1")
@@ -55,7 +60,7 @@ func TestPullOnce_PagesAndUpserts(t *testing.T) {
 		items []parserclient.CaptionItem
 		next  string
 	}{
-		"": {items: []parserclient.CaptionItem{{AssetID: "a1", Text: "一只猫", MtimeMs: 100}}, next: "c2"},
+		"":   {items: []parserclient.CaptionItem{{AssetID: "a1", Text: "一只猫", MtimeMs: 100}}, next: "c2"},
 		"c2": {items: []parserclient.CaptionItem{{AssetID: "a2", Text: "一片海", MtimeMs: 200}}, next: ""},
 	}}
 
@@ -75,14 +80,15 @@ func TestPullOnce_PagesAndUpserts(t *testing.T) {
 	require.Equal(t, int64(200), mtime)
 }
 
-// PullOnce 对 mtime 未变的记录跳过覆盖,对 mtime 变大的记录覆盖。
+// PullOnce skips overwriting records whose mtime hasn't changed, and
+// overwrites records whose mtime increased.
 func TestPullOnce_SkipsUnchangedUpdatesChanged(t *testing.T) {
 	db := makeTestDB(t)
 	insertCaptionAsset(t, db, "a1")
 	_, err := db.Exec(`INSERT INTO asset_caption(asset_id, text, mtime_ms) VALUES('a1','旧文本',5)`)
 	require.NoError(t, err)
 
-	// 第一轮:mtime 相同(5),文本不同 → 不应覆盖。
+	// Round 1: same mtime (5), different text → should not overwrite.
 	lister := &fakeLister{pages: map[string]struct {
 		items []parserclient.CaptionItem
 		next  string
@@ -92,15 +98,15 @@ func TestPullOnce_SkipsUnchangedUpdatesChanged(t *testing.T) {
 	p := NewPuller(db, lister, nil)
 	n, err := p.PullOnce(context.Background())
 	require.NoError(t, err)
-	require.Equal(t, 0, n, "mtime 未变不应计入 upsert")
+	require.Equal(t, 0, n, "an unchanged mtime should not count toward upserted")
 
 	var text string
 	var mtime int64
 	require.NoError(t, db.QueryRow(`SELECT text, mtime_ms FROM asset_caption WHERE asset_id='a1'`).Scan(&text, &mtime))
-	require.Equal(t, "旧文本", text, "mtime 未变应保留旧文本")
+	require.Equal(t, "旧文本", text, "an unchanged mtime should keep the old text")
 	require.Equal(t, int64(5), mtime)
 
-	// 第二轮:mtime 变大(9) → 应覆盖。
+	// Round 2: mtime increased (9) → should overwrite.
 	lister2 := &fakeLister{pages: map[string]struct {
 		items []parserclient.CaptionItem
 		next  string
@@ -110,14 +116,15 @@ func TestPullOnce_SkipsUnchangedUpdatesChanged(t *testing.T) {
 	p2 := NewPuller(db, lister2, nil)
 	n2, err := p2.PullOnce(context.Background())
 	require.NoError(t, err)
-	require.Equal(t, 1, n2, "mtime 变大应计入 upsert")
+	require.Equal(t, 1, n2, "an increased mtime should count toward upserted")
 
 	require.NoError(t, db.QueryRow(`SELECT text, mtime_ms FROM asset_caption WHERE asset_id='a1'`).Scan(&text, &mtime))
 	require.Equal(t, "新文本-已变", text)
 	require.Equal(t, int64(9), mtime)
 }
 
-// PullOnce:lister 出错时返回 err 但不 panic,本地表不受影响(调用方挂点处仅记日志)。
+// PullOnce: when lister errors it returns err but doesn't panic, and the
+// local table is unaffected (the caller's hook only logs it).
 func TestPullOnce_ListerErrorSilent(t *testing.T) {
 	db := makeTestDB(t)
 	insertCaptionAsset(t, db, "a1")
@@ -130,19 +137,24 @@ func TestPullOnce_ListerErrorSilent(t *testing.T) {
 
 	var count int
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM asset_caption`).Scan(&count))
-	require.Equal(t, 0, count, "lister 出错时本地表不应有任何变化")
+	require.Equal(t, 0, count, "the local table should have no changes when lister errors")
 }
 
-// PullOnce:写入时遇到"非外键"错误(用触发器模拟磁盘 I/O/约束等真实故障,
-// 区别于孤儿资产的外键约束失败)应整轮直接返回 err,不能被误当孤儿静默
-// continue——否则 SQLITE_BUSY 超时等真实故障会被抹平成"孤儿跳过"。
+// PullOnce: a "non-foreign-key" error on write (simulating a disk I/O/
+// constraint real failure via a trigger, as distinct from an orphan asset's
+// foreign key constraint failure) should return err directly for the whole
+// round, and must not be silently treated as an orphan continue — otherwise
+// a real failure like an SQLITE_BUSY timeout would get erased into an
+// "orphan skip".
 //
-// 用 BEFORE INSERT 触发器对特定 asset_id 主动 RAISE(ABORT,...) 来制造一个
-// "sqlite3.Error 但 ExtendedCode 不是 ErrConstraintForeignKey"的写入失败,
-// 精确验证 PullOnce 是按 ExtendedCode 判断而非"任何 Exec 错误都当孤儿"。
+// Uses a BEFORE INSERT trigger to actively RAISE(ABORT,...) for a specific
+// asset_id, producing a write failure that is a "sqlite3.Error but
+// ExtendedCode isn't ErrConstraintForeignKey", precisely verifying that
+// PullOnce judges by ExtendedCode rather than "treat any Exec error as an
+// orphan".
 func TestPullOnce_NonForeignKeyErrorPropagates(t *testing.T) {
 	db := makeTestDB(t)
-	insertCaptionAsset(t, db, "boom") // 资产真实存在,不是孤儿
+	insertCaptionAsset(t, db, "boom") // the asset genuinely exists, it's not an orphan
 
 	_, err := db.Exec(`
 		CREATE TRIGGER trg_force_fail BEFORE INSERT ON asset_caption
@@ -160,18 +172,20 @@ func TestPullOnce_NonForeignKeyErrorPropagates(t *testing.T) {
 	}}
 	p := NewPuller(db, lister, nil)
 	n, err := p.PullOnce(context.Background())
-	require.Error(t, err, "非外键的写入失败应向上返回 err,不应被静默吞掉")
+	require.Error(t, err, "a non-foreign-key write failure should propagate as err, not be silently swallowed")
 	require.Equal(t, 0, n)
 
 	var count int
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM asset_caption WHERE asset_id='boom'`).Scan(&count))
-	require.Equal(t, 0, count, "写入失败不应留下半成品记录")
+	require.Equal(t, 0, count, "a write failure should not leave a half-finished record")
 }
 
-// PullOnce:遇到本地 assets 不存在的孤儿 asset_id 应跳过继续,不影响其余条目入库。
+// PullOnce: an orphan asset_id that doesn't exist in local assets should be
+// skipped and processing continues, without affecting the rest of the items
+// being written.
 func TestPullOnce_OrphanSkipped(t *testing.T) {
 	db := makeTestDB(t)
-	insertCaptionAsset(t, db, "a2") // 只插 a2,a1 是孤儿
+	insertCaptionAsset(t, db, "a2") // only a2 is inserted, a1 is an orphan
 
 	lister := &fakeLister{pages: map[string]struct {
 		items []parserclient.CaptionItem
@@ -185,22 +199,25 @@ func TestPullOnce_OrphanSkipped(t *testing.T) {
 	p := NewPuller(db, lister, nil)
 	n, err := p.PullOnce(context.Background())
 	require.NoError(t, err)
-	require.Equal(t, 1, n, "孤儿应跳过,只有 a2 计入 upsert")
+	require.Equal(t, 1, n, "the orphan should be skipped, only a2 counts toward upserted")
 
 	var count int
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM asset_caption WHERE asset_id='a1'`).Scan(&count))
-	require.Equal(t, 0, count, "孤儿不应写入")
+	require.Equal(t, 0, count, "the orphan should not be written")
 
 	var text string
 	require.NoError(t, db.QueryRow(`SELECT text FROM asset_caption WHERE asset_id='a2'`).Scan(&text))
 	require.Equal(t, "正常", text)
 }
 
-// PullOnce 遇到孤儿(本地 assets 无此 id)时,应 best-effort 回删 Parser 侧
-// 向量——删除通知是 fire-and-forget,Parser 当时不可达会永久漏删,这是唯一
-// 的对账兜底。回删失败不应影响本轮拉取(不计入 err、不阻断其它条目)。
+// PullOnce, when it hits an orphan (local assets has no such id), should
+// best-effort delete the vector on Parser's side — the delete notification is
+// fire-and-forget, and Parser being unreachable at the time causes a
+// permanent missed delete; this is the only reconciliation backstop.
+// A cleanup failure must not affect this round's pull (doesn't count as err,
+// doesn't block other items).
 func TestPullOnceDeletesOrphanRemote(t *testing.T) {
-	db := makeTestDB(t) // 未插入 "ghost" 对应的 assets 行,是真孤儿
+	db := makeTestDB(t) // no assets row is inserted for "ghost", it's a genuine orphan
 
 	lister := &fakeLister{pages: map[string]struct {
 		items []parserclient.CaptionItem

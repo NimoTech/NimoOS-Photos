@@ -168,8 +168,8 @@ func TestIsReady(t *testing.T) {
 	}
 }
 
-// captureEntries 起一个假 ML 服务,把收到的 multipart entries 字段抓出来,
-// 并按任务类型返回合法响应体。
+// captureEntries starts a fake ML service, captures the received multipart
+// entries field, and returns a valid response body per task type.
 func captureEntries(t *testing.T, respBody string, got *string) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -227,7 +227,7 @@ func TestEntriesUseConfiguredModelNames(t *testing.T) {
 					t.Errorf("entries %q missing %q", entries, sub)
 				}
 			}
-			// 旧模型名绝不能再出现
+			// Old model names must never appear again
 			for _, old := range []string{"ViT-B-32__openai", "buffalo_l", "PP-OCRv5_mobile"} {
 				if strings.Contains(entries, old) {
 					t.Errorf("entries %q still references old model %q", entries, old)

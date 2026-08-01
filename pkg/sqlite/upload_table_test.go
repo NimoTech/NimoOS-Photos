@@ -5,7 +5,7 @@ import (
 	"testing"
 )
 
-// TestUploadTasksTable 验证 migrate() 在 o_upload_tasks 表中创建了所有必需列。
+// TestUploadTasksTable verifies migrate() created all required columns in the o_upload_tasks table.
 func TestUploadTasksTable(t *testing.T) {
 	dir := t.TempDir()
 	db, err := Open(filepath.Join(dir, "test.db"))
@@ -51,7 +51,7 @@ func TestUploadTasksTable(t *testing.T) {
 		}
 	}
 
-	// 验证索引是否创建（通过查 sqlite_master）
+	// Verify the indexes were created (by querying sqlite_master)
 	indexes := map[string]bool{}
 	idxRows, err := db.Query(`SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='o_upload_tasks'`)
 	if err != nil {
@@ -71,6 +71,5 @@ func TestUploadTasksTable(t *testing.T) {
 			t.Errorf("missing index: %s", idx)
 		}
 	}
-
 
 }

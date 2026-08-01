@@ -83,13 +83,13 @@ func TestDBSCAN_TwoClusters(t *testing.T) {
 	dim := 512
 	v1, v2, v3 := make([]float32, dim), make([]float32, dim), make([]float32, dim)
 	v1[0] = 1.0
-	v2[0] = 0.99 // 接近 v1，余弦距离 ≈ 0
-	v3[1] = 1.0  // 与 v1 正交，余弦距离 = 1.0
+	v2[0] = 0.99 // close to v1, cosine distance ≈ 0
+	v3[1] = 1.0  // orthogonal to v1, cosine distance = 1.0
 
 	labels := service.DBSCAN([][]float32{normalize(v1), normalize(v2), normalize(v3)}, 0.4, 1)
 	require.Len(t, labels, 3)
-	require.Equal(t, labels[0], labels[1], "v1 和 v2 应在同一 cluster")
-	require.NotEqual(t, labels[0], labels[2], "v3 应在不同 cluster")
+	require.Equal(t, labels[0], labels[1], "v1 and v2 should be in the same cluster")
+	require.NotEqual(t, labels[0], labels[2], "v3 should be in a different cluster")
 	require.GreaterOrEqual(t, labels[0], 0)
 	require.GreaterOrEqual(t, labels[2], 0)
 }
@@ -98,7 +98,7 @@ func TestDBSCAN_SingletonClusters(t *testing.T) {
 	dim := 512
 	v1, v2 := make([]float32, dim), make([]float32, dim)
 	v1[0] = 1.0
-	v2[1] = 1.0 // 正交，余弦距离 = 1.0 > 0.4
+	v2[1] = 1.0 // orthogonal, cosine distance = 1.0 > 0.4
 	labels := service.DBSCAN([][]float32{normalize(v1), normalize(v2)}, 0.4, 1)
 	require.NotEqual(t, labels[0], labels[1])
 	require.GreaterOrEqual(t, labels[0], 0)
@@ -113,9 +113,10 @@ func TestDBSCAN_Empty(t *testing.T) {
 func TestRunClustering(t *testing.T) {
 	db := makeTestFaceDB(t)
 
-	// 插入 2 个相似人脸（应聚成 1 个 person）+ 1 个不相似（单独 person）
-	// 人脸 1 和 2：v[0]=1，归一化后余弦距离 ≈ 0
-	// 人脸 3：v[1]=1，正交
+	// Insert 2 similar faces (should cluster into 1 person) + 1 dissimilar one
+	// (its own person).
+	// Faces 1 and 2: v[0]=1, cosine distance ≈ 0 after normalizing.
+	// Face 3: v[1]=1, orthogonal.
 
 	db.Exec(`INSERT INTO assets(id,file_path,status) VALUES('a1','/p1.jpg','indexed')`)
 	db.Exec(`INSERT INTO assets(id,file_path,status) VALUES('a2','/p2.jpg','indexed')`)
@@ -132,23 +133,24 @@ func TestRunClustering(t *testing.T) {
 			faceID, assetID, sqlite.SerializeFloat32(vec))
 	}
 	insert("f1", "a1", face(1.0, 0))
-	insert("f2", "a1", face(0.9999, 0)) // 极相似
-	insert("f3", "a2", face(1.0, 1))    // 正交
+	insert("f2", "a1", face(0.9999, 0)) // near-identical
+	insert("f3", "a2", face(1.0, 1))    // orthogonal
 
 	svc := service.NewFaceService(db)
 	require.NoError(t, svc.RunClustering(context.Background()))
 
 	var personCount int
 	db.QueryRow(`SELECT COUNT(*) FROM persons`).Scan(&personCount)
-	require.Equal(t, 2, personCount, "应有 2 个 person（1 个双脸，1 个单脸）")
+	require.Equal(t, 2, personCount, "should have 2 persons (1 with two faces, 1 with one face)")
 
 	var fpCount int
 	db.QueryRow(`SELECT COUNT(*) FROM face_person`).Scan(&fpCount)
-	require.Equal(t, 3, fpCount, "所有 3 个 face 都应有 person 关联")
+	require.Equal(t, 3, fpCount, "all 3 faces should have a person association")
 }
 
-// TestRunClustering_ConcurrencyGuard 同时启两个 RunClustering，
-// 期待第二个秒返回 nil，且 persons / face_person 状态只被一次操作改写。
+// TestRunClustering_ConcurrencyGuard starts two RunClustering calls at the
+// same time; expects the second to return nil immediately, and persons /
+// face_person state to be rewritten by only one of the two operations.
 func TestRunClustering_ConcurrencyGuard(t *testing.T) {
 	db := makeTestFaceDB(t)
 	_, err := db.Exec(`INSERT INTO assets(id,file_path,status) VALUES('a','/a.jpg','indexed')`)
@@ -176,10 +178,10 @@ func TestRunClustering_ConcurrencyGuard(t *testing.T) {
 
 	var personCount int
 	_ = db.QueryRow(`SELECT COUNT(*) FROM persons`).Scan(&personCount)
-	require.Equal(t, 60, personCount, "60 face、minPts=1 应得 60 簇/60 persons")
+	require.Equal(t, 60, personCount, "60 faces, minPts=1 should yield 60 clusters/60 persons")
 }
 
-// TestRunClustering_EmptyDoesNotPublish 0 人脸时不发任何 task。
+// TestRunClustering_EmptyDoesNotPublish asserts no task is published with 0 faces.
 func TestRunClustering_EmptyDoesNotPublish(t *testing.T) {
 	db := makeTestFaceDB(t)
 	var emitted []service.Task
@@ -193,7 +195,7 @@ func TestRunClustering_EmptyDoesNotPublish(t *testing.T) {
 	require.Empty(t, emitted)
 }
 
-// TestRunClustering_StagesPublishProgress 断言三阶段都发出 progress。
+// TestRunClustering_StagesPublishProgress asserts all three stages emit progress.
 func TestRunClustering_StagesPublishProgress(t *testing.T) {
 	db := makeTestFaceDB(t)
 	_, _ = db.Exec(`INSERT INTO assets(id,file_path,status) VALUES('a','/a.jpg','indexed')`)
@@ -228,16 +230,16 @@ func TestRunClustering_StagesPublishProgress(t *testing.T) {
 			sawPersisting = true
 		}
 	}
-	require.True(t, sawLoading, "应有 loading 阶段 progress")
-	require.True(t, sawClustering, "应有 clustering 阶段 progress")
-	require.True(t, sawPersisting, "应有 persisting 阶段 progress")
-	require.True(t, sawDone, "应有 done event")
+	require.True(t, sawLoading, "should have progress from the loading stage")
+	require.True(t, sawClustering, "should have progress from the clustering stage")
+	require.True(t, sawPersisting, "should have progress from the persisting stage")
+	require.True(t, sawDone, "should have a done event")
 }
 
-// TestDBSCANWithProgress 断言 onProgress 回调被调用，progress 单调递增，
-// 最后一次回调 done == n。
+// TestDBSCANWithProgress asserts the onProgress callback is invoked, progress
+// is monotonically non-decreasing, and the last callback has done == n.
 func TestDBSCANWithProgress(t *testing.T) {
-	// 50 个完全分离的点，每个独立成簇（minPts=1）。
+	// 50 fully separated points, each forming its own cluster (minPts=1).
 	vecs := make([][]float32, 50)
 	for i := range vecs {
 		v := make([]float32, common.FaceDim)
@@ -251,17 +253,18 @@ func TestDBSCANWithProgress(t *testing.T) {
 	})
 
 	require.Equal(t, 50, len(labels))
-	require.NotEmpty(t, calls, "应至少触发一次回调")
-	require.Equal(t, [2]int{50, 50}, calls[len(calls)-1], "最后一次回调应是 done==n")
+	require.NotEmpty(t, calls, "should trigger the callback at least once")
+	require.Equal(t, [2]int{50, 50}, calls[len(calls)-1], "the last callback should have done==n")
 
-	// 单调递增
+	// Monotonically non-decreasing
 	for i := 1; i < len(calls); i++ {
-		require.GreaterOrEqual(t, calls[i][0], calls[i-1][0], "done 应单调递增")
+		require.GreaterOrEqual(t, calls[i][0], calls[i-1][0], "done should be monotonically non-decreasing")
 	}
 }
 
-// TestRunPipeline_DetectsAndClusters 覆盖 TDD 用例①:两张 face_scanned=0 资产，
-// RunPipeline 后 face_detections 有行、face_scanned=1、任务 done 且 Total=2。
+// TestRunPipeline_DetectsAndClusters covers TDD case (1): two assets with
+// face_scanned=0; after RunPipeline, face_detections has rows, face_scanned=1,
+// and the task is done with Total=2.
 func TestRunPipeline_DetectsAndClusters(t *testing.T) {
 	db := makeTestFaceDB(t)
 	dir := t.TempDir()
@@ -288,7 +291,7 @@ func TestRunPipeline_DetectsAndClusters(t *testing.T) {
 
 	var faceCount int
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM face_detections`).Scan(&faceCount))
-	require.Equal(t, 2, faceCount, "两张资产各检测出 1 张脸")
+	require.Equal(t, 2, faceCount, "each of the two assets should detect 1 face")
 
 	scanned := map[string]int{}
 	rows, err := db.Query(`SELECT id, face_scanned FROM assets`)
@@ -308,18 +311,22 @@ func TestRunPipeline_DetectsAndClusters(t *testing.T) {
 	for _, e := range emitted {
 		if e.Type == "face" && e.Status == "done" {
 			sawDone = true
-			require.Equal(t, int64(2), e.Total, "done 事件 Total 应为待检测资产数 2")
+			require.Equal(t, int64(2), e.Total, "the done event's Total should be the asset count awaiting detection: 2")
 		}
 	}
-	require.True(t, sawDone, "应有 face done 事件")
+	require.True(t, sawDone, "should have a face done event")
 }
 
-// TestRunPipeline_TailClusteringDoesNotFillCurrentTotal 覆盖终审点名主项:
-// 聚类尾段(检测完成后 95%→100%)的 running 中间态不应填 Current/Total(需置 0)。
-// 若仍填 current=processed、total=len(targets)(此时两者恒等)，前端 NimoTaskBar
-// 在 total>0 时会优先用 current/total 算百分比，导致尾段还在 running 就显示
-// 100%。断言：尾段 running 事件 Total==0、Current==0，且 progress 落在
-// (0.95, 1.0) 区间；done 终态的 Current/Total/Added 语义维持不变。
+// TestRunPipeline_TailClusteringDoesNotFillCurrentTotal covers a point the
+// final review specifically flagged: the running intermediate states of the
+// clustering tail (95%→100% after detection completes) must not fill in
+// Current/Total (must be zeroed). If current=processed and
+// total=len(targets) were still filled in (the two are equal by this point),
+// the frontend NimoTaskBar would prefer current/total to compute the
+// percentage whenever total>0, causing the tail to display 100% while still
+// running. Asserts: the tail's running events have Total==0, Current==0, and
+// progress falling in (0.95, 1.0); the done terminal state's
+// Current/Total/Added semantics are unchanged.
 func TestRunPipeline_TailClusteringDoesNotFillCurrentTotal(t *testing.T) {
 	db := makeTestFaceDB(t)
 	dir := t.TempDir()
@@ -359,21 +366,22 @@ func TestRunPipeline_TailClusteringDoesNotFillCurrentTotal(t *testing.T) {
 		}
 		if e.Status == "running" && e.Progress > 0.95 && e.Progress < 1.0 {
 			sawTailRunning = true
-			require.Equal(t, int64(0), e.Total, "聚类尾段 running 事件 Total 应置 0，不应等于 processed 造成前端提前 100%%")
-			require.Equal(t, int64(0), e.Current, "聚类尾段 running 事件 Current 应置 0")
+			require.Equal(t, int64(0), e.Total, "the clustering tail's running event Total should be 0, not equal to processed which would make the frontend show 100%% early")
+			require.Equal(t, int64(0), e.Current, "the clustering tail's running event Current should be 0")
 		}
 		if e.Status == "done" {
 			sawDone = true
-			require.Equal(t, int64(n), e.Total, "done 事件 Total 语义不变：仍为待检测资产数")
-			require.Equal(t, int64(n), e.Current, "done 事件 Current 语义不变：仍为待检测资产数")
+			require.Equal(t, int64(n), e.Total, "the done event's Total semantics are unchanged: still the asset count awaiting detection")
+			require.Equal(t, int64(n), e.Current, "the done event's Current semantics are unchanged: still the asset count awaiting detection")
 		}
 	}
-	require.True(t, sawTailRunning, "应观测到聚类尾段(progress 落在 0.95~1.0 之间)的 running 事件")
-	require.True(t, sawDone, "应有 face done 事件")
+	require.True(t, sawTailRunning, "should observe a running event from the clustering tail (progress in 0.95~1.0)")
+	require.True(t, sawDone, "should have a face done event")
 }
 
-// TestRunPipeline_NothingToDoDoesNotPublish 覆盖 TDD 用例②:全部已扫且无未分配
-// 人脸时不发任务（taskReg 无 face 条目）。
+// TestRunPipeline_NothingToDoDoesNotPublish covers TDD case (2): when
+// everything has been scanned and there are no unassigned faces, no task is
+// published (taskReg has no face entry).
 func TestRunPipeline_NothingToDoDoesNotPublish(t *testing.T) {
 	db := makeTestFaceDB(t)
 	_, err := db.Exec(`INSERT INTO assets(id, file_path, status, face_scanned) VALUES('a1','/g/1.jpg','indexed',1)`)
@@ -392,17 +400,18 @@ func TestRunPipeline_NothingToDoDoesNotPublish(t *testing.T) {
 
 	mu.Lock()
 	defer mu.Unlock()
-	require.Empty(t, emitted, "无待检测且无未分配人脸时不应发任何任务")
-	require.Empty(t, ml.calls, "不应调用 ML")
+	require.Empty(t, emitted, "should not publish any task when there's nothing to detect and no unassigned faces")
+	require.Empty(t, ml.calls, "should not call ML")
 }
 
-// TestRunPipeline_SkipsUnreadableAssetWithoutInterrupting 覆盖 TDD 用例③:单张
-// 读文件失败跳过不中断，face_scanned 保持 0。
+// TestRunPipeline_SkipsUnreadableAssetWithoutInterrupting covers TDD case
+// (3): a single asset's file read failure is skipped without interrupting
+// the batch, and face_scanned stays 0.
 func TestRunPipeline_SkipsUnreadableAssetWithoutInterrupting(t *testing.T) {
 	db := makeTestFaceDB(t)
 	dir := t.TempDir()
 
-	// a1 的源文件不存在（模拟读取失败）；a2 正常。
+	// a1's source file doesn't exist (simulating a read failure); a2 is normal.
 	missing := filepath.Join(dir, "missing.jpg")
 	ok := filepath.Join(dir, "ok.jpg")
 	require.NoError(t, os.WriteFile(ok, []byte("img-ok"), 0o644))
@@ -429,16 +438,16 @@ func TestRunPipeline_SkipsUnreadableAssetWithoutInterrupting(t *testing.T) {
 		scanned[id] = fs
 	}
 	rows.Close()
-	require.Equal(t, 0, scanned["a1"], "读取失败的资产 face_scanned 应保持 0，供下轮重试")
-	require.Equal(t, 1, scanned["a2"], "正常资产应完成检测")
+	require.Equal(t, 0, scanned["a1"], "the asset that failed to read should keep face_scanned at 0, for the next retry")
+	require.Equal(t, 1, scanned["a2"], "the normal asset should complete detection")
 
 	var faceCount int
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM face_detections WHERE asset_id='a1'`).Scan(&faceCount))
 	require.Equal(t, 0, faceCount)
 }
 
-// TestRunPipeline_FacesDisabledReturnsImmediately 覆盖 TDD 用例④:
-// FacesEnabled=false 直接返回，不查询、不发任务。
+// TestRunPipeline_FacesDisabledReturnsImmediately covers TDD case (4):
+// FacesEnabled=false returns immediately, with no query and no task published.
 func TestRunPipeline_FacesDisabledReturnsImmediately(t *testing.T) {
 	prev := config.Cfg
 	t.Cleanup(func() { config.Cfg = prev })
@@ -466,7 +475,7 @@ func TestRunPipeline_FacesDisabledReturnsImmediately(t *testing.T) {
 
 	var fs int
 	require.NoError(t, db.QueryRow(`SELECT face_scanned FROM assets WHERE id='a1'`).Scan(&fs))
-	require.Equal(t, 0, fs, "关闭时资产不应被检测")
+	require.Equal(t, 0, fs, "asset should not be detected while disabled")
 }
 
 func TestComputeCentroidAndConfidence(t *testing.T) {
@@ -482,27 +491,27 @@ func TestComputeCentroidAndConfidence(t *testing.T) {
 	require.Len(t, c, dim)
 
 	conf := service.ClusterConfidence(vecs, c)
-	require.Greater(t, conf, 0.9, "近似向量簇置信度应高")
+	require.Greater(t, conf, 0.9, "a cluster of near-identical vectors should have high confidence")
 	require.LessOrEqual(t, conf, 1.0)
 
-	// 单元素簇置信度为 1.0
+	// A singleton cluster has confidence 1.0
 	require.Equal(t, 1.0, service.ClusterConfidence([][]float32{normalize(v1)}, normalize(v1)))
-	// 空簇安全
+	// Empty cluster is safe
 	require.Equal(t, 0.0, service.ClusterConfidence(nil, nil))
 
-	// 对立向量簇置信度应低
+	// A cluster of opposing vectors should have low confidence
 	v3 := make([]float32, dim)
 	v3[0] = -1.0
 	vecs2 := [][]float32{normalize(v1), normalize(v3)}
 	c2 := service.ComputeCentroid(vecs2)
 	conf2 := service.ClusterConfidence(vecs2, c2)
-	require.Less(t, conf2, 0.1, "对立向量簇置信度应低")
+	require.Less(t, conf2, 0.1, "a cluster of opposing vectors should have low confidence")
 
-	// 维度不一致返回 nil
+	// Mismatched dimensions return nil
 	require.Nil(t, service.ComputeCentroid([][]float32{make([]float32, 4), make([]float32, 5)}))
 }
 
-// insertAssetFace 是测试辅助：写一个 asset 与一张人脸 embedding。
+// insertAssetFace is a test helper: writes one asset and one face embedding.
 func insertAssetFace(t *testing.T, db *sql.DB, assetID string, vec []float32) string {
 	t.Helper()
 	_, err := db.Exec(`INSERT INTO assets(id, file_path, status) VALUES(?,?, 'indexed')`,
@@ -524,25 +533,26 @@ func TestRunClustering_HiddenPersonNotDeletedAndExcludedFromNewClusters(t *testi
 	svc := service.NewFaceService(db)
 	require.NoError(t, svc.RunClustering(context.Background()))
 
-	// 取唯一 person，标 hidden=1
+	// Get the sole person and mark it hidden=1
 	var pid string
 	require.NoError(t, db.QueryRow(`SELECT id FROM persons`).Scan(&pid))
 	_, err := db.Exec(`UPDATE persons SET hidden=1 WHERE id=?`, pid)
 	require.NoError(t, err)
 
-	// 加一张与 hidden 相近的脸再跑
+	// Add a face close to the hidden one and rerun
 	a2 := make([]float32, dim)
 	a2[0] = 0.97
 	a2[1] = 0.03
 	insertAssetFace(t, db, "hp-2", normalize(a2))
 	require.NoError(t, svc.RunClustering(context.Background()))
 
-	// 隐藏 person 仍在
+	// The hidden person is still there
 	var hidden int
 	require.NoError(t, db.QueryRow(`SELECT hidden FROM persons WHERE id=?`, pid).Scan(&hidden))
 	require.Equal(t, 1, hidden)
 
-	// 近邻脸被吸附到隐藏 person（hidden 也作为锚定参与吸附）
+	// The nearby face is snapped onto the hidden person (hidden also
+	// participates in snapping as an anchor)
 	var cnt int
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM face_person WHERE person_id=?`, pid).Scan(&cnt))
 	require.Equal(t, 2, cnt)
@@ -558,30 +568,30 @@ func TestRunClustering_PreservesNamedAcrossReruns(t *testing.T) {
 	svc := service.NewFaceService(db)
 	require.NoError(t, svc.RunClustering(context.Background()))
 
-	// 给生成的（唯一）person 命名
+	// Name the generated (sole) person
 	var pid string
 	require.NoError(t, db.QueryRow(`SELECT id FROM persons`).Scan(&pid))
 	_, err := db.Exec(`UPDATE persons SET name='Alice' WHERE id=?`, pid)
 	require.NoError(t, err)
 
-	// 加入一张与 Alice 相近的新脸后重跑聚类
+	// Add a new face close to Alice and rerun clustering
 	a2 := make([]float32, dim)
 	a2[0] = 0.97
 	a2[1] = 0.03
 	insertAssetFace(t, db, "asset-a2", normalize(a2))
 	require.NoError(t, svc.RunClustering(context.Background()))
 
-	// Alice 仍在且仍叫 Alice
+	// Alice is still there and still named Alice
 	var name string
 	require.NoError(t, db.QueryRow(`SELECT name FROM persons WHERE id=?`, pid).Scan(&name))
 	require.Equal(t, "Alice", name)
 
-	// 新近脸被吸附到 Alice（Alice 名下 2 张脸）
+	// The newly added face is snapped onto Alice (2 faces under Alice now)
 	var cnt int
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM face_person WHERE person_id=?`, pid).Scan(&cnt))
 	require.Equal(t, 2, cnt)
 
-	// centroid/confidence 已回写
+	// centroid/confidence have been written back
 	var conf float64
 	var centroid []byte
 	require.NoError(t, db.QueryRow(`SELECT confidence, centroid FROM persons WHERE id=?`, pid).Scan(&conf, &centroid))
@@ -589,7 +599,9 @@ func TestRunClustering_PreservesNamedAcrossReruns(t *testing.T) {
 	require.NotEmpty(t, centroid)
 }
 
-// 删光照片(0 人脸)后再聚类,应清掉自动产生的孤儿 person,而不是早退留残留。
+// After deleting all photos (0 faces) and reclustering, orphan persons
+// produced by auto-clustering should be cleaned up, not left behind by an
+// early return.
 func TestRunClustering_ZeroFaces_PurgesOrphanPersons(t *testing.T) {
 	db := makeTestFaceDB(t)
 	dim := 512
@@ -602,9 +614,9 @@ func TestRunClustering_ZeroFaces_PurgesOrphanPersons(t *testing.T) {
 
 	var before int
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM persons`).Scan(&before))
-	require.Greater(t, before, 0, "聚类后应有 person")
+	require.Greater(t, before, 0, "should have persons after clustering")
 
-	// 模拟“照片被全部删除”:清空 face_detections 与 assets。
+	// Simulate "all photos deleted": clear out face_detections and assets.
 	_, err := db.Exec(`DELETE FROM face_person`)
 	require.NoError(t, err)
 	_, err = db.Exec(`DELETE FROM face_detections`)
@@ -612,15 +624,15 @@ func TestRunClustering_ZeroFaces_PurgesOrphanPersons(t *testing.T) {
 	_, err = db.Exec(`DELETE FROM assets`)
 	require.NoError(t, err)
 
-	// 再次聚类:0 人脸路径应清掉孤儿 person。
+	// Cluster again: the 0-face path should clean up orphan persons.
 	require.NoError(t, svc.RunClustering(context.Background()))
 
 	var after int
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM persons`).Scan(&after))
-	require.Equal(t, 0, after, "0 人脸时自动孤儿 person 应被清空")
+	require.Equal(t, 0, after, "auto orphan persons should be cleared when there are 0 faces")
 }
 
-// 0 人脸清理只删非锚定 person;用户命名的人物应保留。
+// The 0-face cleanup only deletes non-anchored persons; user-named persons should be kept.
 func TestRunClustering_ZeroFaces_KeepsNamedPerson(t *testing.T) {
 	db := makeTestFaceDB(t)
 	dim := 512
@@ -630,13 +642,13 @@ func TestRunClustering_ZeroFaces_KeepsNamedPerson(t *testing.T) {
 	svc := service.NewFaceService(db)
 	require.NoError(t, svc.RunClustering(context.Background()))
 
-	// 给唯一 person 命名(锚定)。
+	// Name the sole person (anchoring it).
 	var pid string
 	require.NoError(t, db.QueryRow(`SELECT id FROM persons`).Scan(&pid))
 	_, err := db.Exec(`UPDATE persons SET name='Alice' WHERE id=?`, pid)
 	require.NoError(t, err)
 
-	// 删光照片/人脸后再聚类。
+	// Delete all photos/faces and recluster.
 	_, err = db.Exec(`DELETE FROM face_person`)
 	require.NoError(t, err)
 	_, err = db.Exec(`DELETE FROM face_detections`)
@@ -647,5 +659,5 @@ func TestRunClustering_ZeroFaces_KeepsNamedPerson(t *testing.T) {
 
 	var cnt int
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM persons WHERE name='Alice'`).Scan(&cnt))
-	require.Equal(t, 1, cnt, "命名(锚定)人物应保留")
+	require.Equal(t, 1, cnt, "the named (anchored) person should be kept")
 }

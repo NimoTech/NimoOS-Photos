@@ -17,8 +17,9 @@ import (
 	"github.com/NimoTech/NimoOS-Photos/service"
 )
 
-// newAlbumsTestEcho 起一个只挂载 FromSmartView 的 echo 实例,并返回底层 db
-// 供用例直接插入 albums/smart_views/smart_view_matches 造数据。
+// newAlbumsTestEcho spins up an echo instance with only FromSmartView
+// mounted, and returns the underlying db so tests can insert data directly
+// into albums/smart_views/smart_view_matches.
 func newAlbumsTestEcho(t *testing.T) (*echo.Echo, *sql.DB) {
 	t.Helper()
 	db, err := sqlite.Open(filepath.Join(t.TempDir(), "h.db"))
@@ -32,7 +33,7 @@ func newAlbumsTestEcho(t *testing.T) (*echo.Echo, *sql.DB) {
 	return e, db
 }
 
-// postJSON 向指定路径 POST payload 并返回响应。
+// postJSON POSTs payload to the given path and returns the response.
 func postJSON(t *testing.T, e *echo.Echo, path string, payload any) *httptest.ResponseRecorder {
 	t.Helper()
 	body, _ := json.Marshal(payload)
@@ -43,21 +44,22 @@ func postJSON(t *testing.T, e *echo.Echo, path string, payload any) *httptest.Re
 	return rec
 }
 
-// TestFromSmartViewHTTPNotFound smartViewId 不存在应返回 404。
+// TestFromSmartViewHTTPNotFound expects 404 when smartViewId doesn't exist.
 func TestFromSmartViewHTTPNotFound(t *testing.T) {
 	e, _ := newAlbumsTestEcho(t)
 	rec := postJSON(t, e, "/v1/photos/albums/from-smartview", map[string]string{"smartViewId": "missing"})
 	require.Equal(t, http.StatusNotFound, rec.Code)
 }
 
-// TestFromSmartViewHTTPBadRequest 缺 smartViewId 应返回 400。
+// TestFromSmartViewHTTPBadRequest expects 400 when smartViewId is missing.
 func TestFromSmartViewHTTPBadRequest(t *testing.T) {
 	e, _ := newAlbumsTestEcho(t)
 	rec := postJSON(t, e, "/v1/photos/albums/from-smartview", map[string]string{})
 	require.Equal(t, http.StatusBadRequest, rec.Code)
 }
 
-// TestFromSmartViewHTTPSuccess 正常路径:智能相册固化为手动相册,原智能相册消失。
+// TestFromSmartViewHTTPSuccess is the happy path: a smart view solidifies
+// into a manual album and the original smart view disappears.
 func TestFromSmartViewHTTPSuccess(t *testing.T) {
 	e, db := newAlbumsTestEcho(t)
 	_, err := db.Exec(`INSERT INTO smart_views(id,name,conds_raw,conds_parsed,threshold,live) VALUES('sv-h','H','[]','[]',70,1)`)
@@ -75,10 +77,10 @@ func TestFromSmartViewHTTPSuccess(t *testing.T) {
 
 	var n int
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM smart_views WHERE id='sv-h'`).Scan(&n))
-	require.Equal(t, 0, n, "原智能相册应已删除")
+	require.Equal(t, 0, n, "original smart view should be deleted")
 }
 
-// TestFromSmartViewHTTPNameConflict 同名冲突应返回 409。
+// TestFromSmartViewHTTPNameConflict expects 409 on a name conflict.
 func TestFromSmartViewHTTPNameConflict(t *testing.T) {
 	e, db := newAlbumsTestEcho(t)
 	_, err := db.Exec(`INSERT INTO albums(id,name) VALUES('al-dup','Dup')`)

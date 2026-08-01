@@ -15,7 +15,7 @@ import (
 	"github.com/labstack/echo/v4"
 )
 
-// makeTask 创建最小有效任务记录。
+// makeTask creates a minimal valid task record.
 func makeTask(id, owner, status string) *upload.UploadTask {
 	now := time.Now().Unix()
 	return &upload.UploadTask{
@@ -30,7 +30,7 @@ func makeTask(id, owner, status string) *upload.UploadTask {
 	}
 }
 
-// TestListUploadsFiltersByOwner 验证 ListUploads 只返回请求 owner 的活跃任务。
+// TestListUploadsFiltersByOwner verifies ListUploads only returns active tasks for the requesting owner.
 func TestListUploadsFiltersByOwner(t *testing.T) {
 	dir := t.TempDir()
 	db, err := sqlite.Open(filepath.Join(dir, "test.db"))
@@ -41,14 +41,14 @@ func TestListUploadsFiltersByOwner(t *testing.T) {
 
 	store := uploadstore.NewStore(db)
 
-	// owner-A 有 2 个活跃任务
+	// owner-A has 2 active tasks
 	if err := store.Create(makeTask("ua1", "owner-A", upload.UploadStatusUploading)); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	if err := store.Create(makeTask("ua2", "owner-A", upload.UploadStatusPaused)); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	// owner-B 有 1 个任务,不应出现在 owner-A 的响应里
+	// owner-B has 1 task, which should not appear in owner-A's response
 	if err := store.Create(makeTask("ub1", "owner-B", upload.UploadStatusUploading)); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -84,7 +84,7 @@ func TestListUploadsFiltersByOwner(t *testing.T) {
 	}
 }
 
-// TestGetUploadIDOR 验证 GetUpload 对不属于请求 owner 的任务返回 404(IDOR 防护)。
+// TestGetUploadIDOR verifies GetUpload returns 404 for a task not owned by the requester (IDOR protection).
 func TestGetUploadIDOR(t *testing.T) {
 	dir := t.TempDir()
 	db, err := sqlite.Open(filepath.Join(dir, "test.db"))
@@ -101,7 +101,7 @@ func TestGetUploadIDOR(t *testing.T) {
 	h := v1.NewUploadTasksHandler(store)
 	e := echo.New()
 
-	// 1. 不同 owner 请求 → 404
+	// 1. Request from a different owner → 404
 	req := httptest.NewRequest(http.MethodGet, "/v1/photos/uploads/idor-task", nil)
 	req.Header.Set("X-NimoOS-User-ID", "attacker")
 	rec := httptest.NewRecorder()
@@ -118,7 +118,7 @@ func TestGetUploadIDOR(t *testing.T) {
 		t.Errorf("expected 404 HTTPError, got: %v", err)
 	}
 
-	// 2. 正确 owner 请求 → 200
+	// 2. Request from the correct owner → 200
 	req2 := httptest.NewRequest(http.MethodGet, "/v1/photos/uploads/idor-task", nil)
 	req2.Header.Set("X-NimoOS-User-ID", "real-owner")
 	rec2 := httptest.NewRecorder()
@@ -133,7 +133,7 @@ func TestGetUploadIDOR(t *testing.T) {
 		t.Errorf("expected 200 for owner, got %d", rec2.Code)
 	}
 
-	// 3. 不存在 id → 404
+	// 3. Nonexistent id → 404
 	req3 := httptest.NewRequest(http.MethodGet, "/v1/photos/uploads/nonexistent", nil)
 	req3.Header.Set("X-NimoOS-User-ID", "real-owner")
 	rec3 := httptest.NewRecorder()
@@ -151,7 +151,7 @@ func TestGetUploadIDOR(t *testing.T) {
 	}
 }
 
-// TestCancelUploadIDOR 验证 CancelUpload 先校验 owner 防 IDOR,且幂等返回 200。
+// TestCancelUploadIDOR verifies CancelUpload validates owner first to prevent IDOR, and returns 200 idempotently.
 func TestCancelUploadIDOR(t *testing.T) {
 	tmpStaging := t.TempDir()
 
@@ -170,7 +170,7 @@ func TestCancelUploadIDOR(t *testing.T) {
 	h := v1.NewUploadTasksHandlerWithStaging(store, tmpStaging)
 	e := echo.New()
 
-	// 1. 攻击者取消别人的任务 → 404
+	// 1. Attacker cancels someone else's task → 404
 	req := httptest.NewRequest(http.MethodPost, "/v1/photos/uploads/cancel-task/cancel", nil)
 	req.Header.Set("X-NimoOS-User-ID", "attacker")
 	rec := httptest.NewRecorder()
@@ -187,13 +187,13 @@ func TestCancelUploadIDOR(t *testing.T) {
 		t.Errorf("expected 404 HTTPError for IDOR cancel, got: %v", err)
 	}
 
-	// 任务状态不应因攻击者的请求而改变
+	// The task status should not change because of the attacker's request
 	task, _ := store.Get("cancel-task")
 	if task.Status != upload.UploadStatusUploading {
 		t.Errorf("task status changed by IDOR attempt: %s", task.Status)
 	}
 
-	// 2. 真实 owner 取消 → 200,canceled=true
+	// 2. Real owner cancels → 200, canceled=true
 	req2 := httptest.NewRequest(http.MethodPost, "/v1/photos/uploads/cancel-task/cancel", nil)
 	req2.Header.Set("X-NimoOS-User-ID", "real-owner")
 	rec2 := httptest.NewRecorder()
@@ -208,7 +208,7 @@ func TestCancelUploadIDOR(t *testing.T) {
 		t.Errorf("expected 200, got %d", rec2.Code)
 	}
 
-	// 3. 同一任务再取消 → 200,幂等
+	// 3. Cancel the same task again → 200, idempotent
 	req3 := httptest.NewRequest(http.MethodPost, "/v1/photos/uploads/cancel-task/cancel", nil)
 	req3.Header.Set("X-NimoOS-User-ID", "real-owner")
 	rec3 := httptest.NewRecorder()

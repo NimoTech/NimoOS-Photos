@@ -31,15 +31,19 @@ var unsupportedPrefixes = []string{
 	"older than", "amount detected",
 }
 
-// scoreCondRe：score 后跟（可选空白 +）比较符的任意变体，或裸数字（无比较符，
-// 如 "score 80"）。之前用前缀字面量枚举（"score "/"score≥"/"score >="），漏掉了
-// 无空格的 "score>=80" 这类写法；改成比较符正则后又丢了旧版能拦的裸数字写法
-// "score 80"——两者都要拦，同时保留 "score of the game" 这类正常语义词不误伤。
+// scoreCondRe: "score" followed by (optional whitespace +) any comparison
+// operator variant, or a bare number (no operator, e.g. "score 80"). The
+// previous prefix-literal enumeration ("score "/"score≥"/"score >=") missed
+// the no-space form "score>=80"; switching to a comparator regex then lost
+// the bare-number form "score 80" the old version caught — both must be
+// blocked, while still not misfiring on ordinary semantic phrases like
+// "score of the game".
 var scoreCondRe = regexp.MustCompile(`^score(\s*(>=|<=|==|=|≥|≤|>|<)|\s+\d)`)
 
 var (
-	// "year: 2024" 显式前缀，或裸年份 "2024"（与搜索链路的
-	// "Nimo understood: date" 行为一致——用户直接把年份当 chip 很常见）
+	// "year: 2024" explicit prefix, or a bare year "2024" (consistent with
+	// the search pipeline's "Nimo understood: date" behavior — users
+	// commonly type a bare year as a chip)
 	reYear      = regexp.MustCompile(`(?i)^(?:year:\s*)?((?:19|20)\d{2})$`)
 	reLastNDays = regexp.MustCompile(`(?i)^(?:captured:\s*)?last\s+(\d+)\s+days$`)
 	reMonthSpan = regexp.MustCompile(`(?i)^([a-z]{3})\s+(\d{1,2})\s*[–\-]\s*(\d{1,2}),\s*(\d{4})$`)

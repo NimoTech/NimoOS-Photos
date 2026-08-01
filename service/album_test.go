@@ -815,13 +815,13 @@ func TestAlbumListAssetsExcludesOffline(t *testing.T) {
 
 	assets, err := svc.ListAssets(a.ID)
 	require.NoError(t, err)
-	require.Len(t, assets, 1, "offline 资产必须从相册内容中隐藏")
+	require.Len(t, assets, 1, "offline assets must be hidden from album contents")
 	require.Equal(t, "online", assets[0].ID)
 
 	albums, err := svc.List()
 	require.NoError(t, err)
 	require.Len(t, albums, 1)
-	require.Equal(t, 1, albums[0].PhotoCount, "photo_cnt 不应计入 offline 资产")
+	require.Equal(t, 1, albums[0].PhotoCount, "photo_cnt must not count offline assets")
 }
 
 // TestAlbumAssetCountExcludesOfflineAndTrashed verifies that Album.AssetCount
@@ -851,11 +851,11 @@ func TestAlbumAssetCountExcludesOfflineAndTrashed(t *testing.T) {
 	albums, err := svc.List()
 	require.NoError(t, err)
 	require.Len(t, albums, 1)
-	require.Equal(t, 1, albums[0].AssetCount, "assetCount 徽章不应计入 offline/回收站成员")
+	require.Equal(t, 1, albums[0].AssetCount, "assetCount badge must not count offline/trashed members")
 
 	assets, err := svc.ListAssets(a.ID)
 	require.NoError(t, err)
-	require.Len(t, assets, albums[0].AssetCount, "徽章数必须与打开相册看到的张数一致")
+	require.Len(t, assets, albums[0].AssetCount, "badge count must match the number of assets shown when opening the album")
 }
 
 // --- Cover fallback chain must exclude offline/deleted assets ---

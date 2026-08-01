@@ -36,10 +36,12 @@ func parseScanRoots(mounts string) []string {
 			continue
 		}
 		mp := unescapeMount(fields[1])
-		// fuse.rclone 云盘挂载既不扫描也不监控:FUSE 上 inotify 事件不可靠,
-		// 全量索引会把云端文件都拉下来(带宽/流量);云盘照片走专门导入功能。
-		// 只点名 fuse.rclone——MergerFS(fuse.mergerfs)等其它 FUSE 是一等
-		// 用户存储,必须保留。
+		// fuse.rclone cloud-drive mounts are neither scanned nor watched: inotify
+		// events on FUSE are unreliable, and a full index would pull down every
+		// cloud file (bandwidth/traffic); cloud-drive photos go through a
+		// dedicated import feature instead. Only fuse.rclone is singled out —
+		// other FUSE mounts like MergerFS (fuse.mergerfs) are first-class user
+		// storage and must be kept.
 		if fields[2] == rcloneFSType {
 			continue
 		}

@@ -1,7 +1,9 @@
-// MomentsService 的测试:覆盖简报 Step 1 清单——重算调通 trip/theme 两个
-// kind、LLM 命名成功覆盖 title、namer 失败不影响 RecomputeAll 返回 nil、
-// CAS 重入直接返回。用真 MomentStore(makeTestDB)+ fakeThemeSearcher(已在
-// moments_theme_test.go 定义,同包复用)+ fake namer,不接触真实 ML/AI。
+// Tests for MomentsService: covers the Step 1 brief checklist — recompute
+// wires up both the trip/theme kinds, successful LLM naming overwrites title,
+// namer failure doesn't stop RecomputeAll from returning nil, CAS
+// re-entrancy returns immediately. Uses a real MomentStore (makeTestDB) +
+// fakeThemeSearcher (already defined in moments_theme_test.go, reused in the
+// same package) + a fake namer, no real ML/AI involved.
 package service
 
 import (
@@ -16,13 +18,16 @@ import (
 	"go.uber.org/zap/zaptest/observer"
 )
 
-// noVecLoader 是 clipVecLoader 的测试替身:永远返回"无向量",PickFeaturedAndCover
-// 据此跳过连拍去重、直接按 aesthetic_score(测试里也不打分,故全部并列)
-// 进候选池——不影响本文件测试关注的"调通"语义。
+// noVecLoader is a test double for clipVecLoader: always returns "no
+// vector", so PickFeaturedAndCover skips burst dedup and goes straight to the
+// candidate pool by aesthetic_score (also unscored in these tests, so they
+// all tie) — doesn't affect the "wiring works" semantics this file's tests
+// care about.
 func noVecLoader(_ string) ([]float32, bool) { return nil, false }
 
-// fakeNamer 是 namer 接口的测试替身:固定返回同一个标题,或固定返回错误
-// (模拟 LLM 超时/AI 未部署),并记录被调用次数供断言。
+// fakeNamer is a test double for the namer interface: returns a fixed title,
+// or a fixed error (simulating LLM timeout/AI not deployed), and records the
+// call count for assertions.
 type fakeNamer struct {
 	title string
 	err   error
@@ -41,7 +46,7 @@ func TestRecomputeAll_TripAndThemeKinds(t *testing.T) {
 	db := makeTestDB(t)
 	store := NewMomentStore(db)
 
-	// trip recipe:10 张带 GPS 的照片,足量成团。
+	// trip recipe: 10 photos with GPS, enough to form a group.
 	require.NoError(t, store.UpsertRecipes([]MomentRecipe{
 		{Key: "trip", Kind: "trip", Title: "Trip", Enabled: true, ParamsJSON: `{"min_assets":3}`},
 		{Key: "theme:pets", Kind: "theme", Title: "Pet Moments", Enabled: true,
@@ -59,7 +64,7 @@ func TestRecomputeAll_TripAndThemeKinds(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	// theme recipe:2 张被 CLIP 命中的照片。
+	// theme recipe: 2 photos matched by CLIP.
 	searcher := fakeThemeSearcher{hits: map[string][]AssetScore{
 		"a photo of a dog": {{AssetID: "theme-a", Score: 0.9}, {AssetID: "theme-b", Score: 0.8}},
 	}}
@@ -78,7 +83,7 @@ func TestRecomputeAll_TripAndThemeKinds(t *testing.T) {
 
 	moments, err := store.ListMoments()
 	require.NoError(t, err)
-	require.Len(t, moments, 2, "trip + theme 各产出一个时刻")
+	require.Len(t, moments, 2, "trip + theme should each produce one moment")
 
 	var kinds []string
 	for _, m := range moments {
@@ -113,16 +118,17 @@ func TestRecomputeAll_LLMSuccessOverwritesTitle(t *testing.T) {
 	moments, err := store.ListMoments()
 	require.NoError(t, err)
 	require.Len(t, moments, 1)
-	require.True(t, moments[0].NamedByLLM, "LLM 命名成功应置 named_by_llm=1")
+	require.True(t, moments[0].NamedByLLM, "successful LLM naming should set named_by_llm=1")
 	require.Equal(t, "Cozy Spring Days", moments[0].Title)
 	require.Equal(t, 1, namer.calls)
 
-	// 第二轮重算:named_by_llm=1 的 title 不应被模板结果覆盖,也不应再次调用 LLM。
+	// Second recompute round: a title with named_by_llm=1 must not be overwritten
+	// by the template result, nor should the LLM be called again.
 	require.NoError(t, svc.RecomputeAll(context.Background()))
 	moments2, err := store.ListMoments()
 	require.NoError(t, err)
-	require.Equal(t, "Cozy Spring Days", moments2[0].Title, "已 LLM 命名的时刻标题应保持不变")
-	require.Equal(t, 1, namer.calls, "已命名的时刻不应重复调用 LLM")
+	require.Equal(t, "Cozy Spring Days", moments2[0].Title, "a moment already named by LLM should keep its title unchanged")
+	require.Equal(t, 1, namer.calls, "an already-named moment should not call the LLM again")
 }
 
 func TestRecomputeAll_NamerFailureDoesNotBlock(t *testing.T) {
@@ -147,19 +153,21 @@ func TestRecomputeAll_NamerFailureDoesNotBlock(t *testing.T) {
 	svc := NewMomentsService(db, store, fakeThemeSearcher{}, noVecLoader, namer)
 
 	err := svc.RecomputeAll(context.Background())
-	require.NoError(t, err, "LLM 失败必须是 best-effort,绝不阻塞重算")
+	require.NoError(t, err, "LLM failure must be best-effort and never block recompute")
 
 	moments, err := store.ListMoments()
 	require.NoError(t, err)
 	require.Len(t, moments, 1)
-	require.False(t, moments[0].NamedByLLM, "命名失败不应置 named_by_llm")
-	require.Equal(t, "Nara Trip", moments[0].Title, "命名失败应保留模板打底标题")
+	require.False(t, moments[0].NamedByLLM, "naming failure should not set named_by_llm")
+	require.Equal(t, "Nara Trip", moments[0].Title, "naming failure should keep the template fallback title")
 }
 
-// TestRecomputeAll_HiddenMomentSkippedInNamingLoop:命名循环的候选来源是
-// store.ListMoments(),该方法已按 hidden=0 过滤(momentstore.go),所以隐藏
-// 时刻天然不会被喂给 LLM——这里补一个断言测试锁定该行为,防止未来有人改动
-// 候选来源(比如换成直接查 moments 表)时悄悄漏了 hidden 过滤。
+// TestRecomputeAll_HiddenMomentSkippedInNamingLoop: the naming loop's
+// candidate source is store.ListMoments(), which already filters by hidden=0
+// (momentstore.go), so hidden moments are naturally never fed to the LLM —
+// this adds an assertion test pinning down that behavior, to catch it if
+// someone later changes the candidate source (e.g. to query the moments table
+// directly) and silently drops the hidden filter.
 func TestRecomputeAll_HiddenMomentSkippedInNamingLoop(t *testing.T) {
 	db := makeTestDB(t)
 	store := NewMomentStore(db)
@@ -178,8 +186,9 @@ func TestRecomputeAll_HiddenMomentSkippedInNamingLoop(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	// 第一轮:namer 失败,时刻产出但仍是模板打底(named_by_llm=0),
-	// 保证后面隐藏它时还处于"命名循环本会挑中"的状态。
+	// First round: namer fails, the moment is produced but still on the
+	// template fallback (named_by_llm=0), ensuring that when we later hide it,
+	// it's still in the state the naming loop would otherwise pick up.
 	failingNamer := &fakeNamer{err: errors.New("ai unavailable")}
 	svc := NewMomentsService(db, store, fakeThemeSearcher{}, noVecLoader, failingNamer)
 	require.NoError(t, svc.RecomputeAll(context.Background()))
@@ -192,17 +201,19 @@ func TestRecomputeAll_HiddenMomentSkippedInNamingLoop(t *testing.T) {
 
 	require.NoError(t, store.HideMoment(moments[0].ID))
 
-	// 第二轮:namer 换成会成功的,但命名循环取候选走 ListMoments(已过滤
-	// hidden=0),隐藏的时刻不应再被喂给 LLM——calls 应保持 0(全新 namer)。
+	// Second round: swap in a namer that would succeed, but the naming loop
+	// draws candidates from ListMoments() (already filtered by hidden=0), so
+	// the hidden moment must not be fed to the LLM again — calls should stay 0
+	// (a brand-new namer).
 	successNamer := &fakeNamer{title: "Should Not Apply"}
 	svc2 := NewMomentsService(db, store, fakeThemeSearcher{}, noVecLoader, successNamer)
 	require.NoError(t, svc2.RecomputeAll(context.Background()))
 
-	require.Equal(t, 0, successNamer.calls, "隐藏的时刻不应进入 LLM 命名循环")
+	require.Equal(t, 0, successNamer.calls, "a hidden moment must not enter the LLM naming loop")
 
 	stillHidden, err := store.ListMoments()
 	require.NoError(t, err)
-	require.Len(t, stillHidden, 0, "隐藏语义应在重算后保持(SyncRecipeMoments 不清 hidden 列)")
+	require.Len(t, stillHidden, 0, "hidden state must persist across recompute (SyncRecipeMoments doesn't clear the hidden column)")
 }
 
 func TestRecomputeAll_ReentrancyReturnsNilImmediately(t *testing.T) {
@@ -215,8 +226,9 @@ func TestRecomputeAll_ReentrancyReturnsNilImmediately(t *testing.T) {
 	namer := &fakeNamer{title: "irrelevant"}
 	svc := NewMomentsService(db, store, fakeThemeSearcher{}, noVecLoader, namer)
 
-	// 手动置位 CAS 标志,模拟"已有一轮重算在跑"——同包白盒测试可以直接摸
-	// 内部字段。
+	// Manually set the CAS flag to simulate "a recompute round is already
+	// running" — same-package white-box tests can reach into internal fields
+	// directly.
 	svc.running.Store(true)
 	defer svc.running.Store(false)
 
@@ -225,13 +237,15 @@ func TestRecomputeAll_ReentrancyReturnsNilImmediately(t *testing.T) {
 
 	moments, err := store.ListMoments()
 	require.NoError(t, err)
-	require.Empty(t, moments, "CAS 重入应直接返回,不做任何重算工作")
+	require.Empty(t, moments, "CAS re-entrancy should return immediately, doing no recompute work")
 }
 
-// TestRecomputeAll_PerRecipeFailureIsolation:theme 引擎依赖的 CLIP 检索(ML)
-// 掉线时,单个 recipe 失败必须 Warn + 跳过、继续处理下一个 recipe——不阻塞
-// 不依赖 ML 的 trip、也不清空该 theme recipe 上一轮产出的旧时刻(不调用
-// SyncRecipeMoments 意味着旧时刻原样保留)。RecomputeAll 整体仍返回 nil。
+// TestRecomputeAll_PerRecipeFailureIsolation: when the CLIP search (ML) the
+// theme engine depends on is offline, a single recipe failing must Warn +
+// skip and continue processing the next recipe — must not block the
+// ML-independent trip, nor clear that theme recipe's moments from the
+// previous round (not calling SyncRecipeMoments means old moments are left
+// as-is). RecomputeAll overall still returns nil.
 func TestRecomputeAll_PerRecipeFailureIsolation(t *testing.T) {
 	db := makeTestDB(t)
 	store := NewMomentStore(db)
@@ -258,7 +272,7 @@ func TestRecomputeAll_PerRecipeFailureIsolation(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	// 第一轮:ML 正常,trip + theme 都应产出。
+	// First round: ML healthy, both trip + theme should produce moments.
 	workingSearcher := fakeThemeSearcher{hits: map[string][]AssetScore{
 		"a photo of a dog": {{AssetID: "theme-a", Score: 0.9}, {AssetID: "theme-b", Score: 0.8}},
 	}}
@@ -267,24 +281,25 @@ func TestRecomputeAll_PerRecipeFailureIsolation(t *testing.T) {
 
 	before, err := store.ListMoments()
 	require.NoError(t, err)
-	require.Len(t, before, 2, "ML 正常时 trip+theme 都应产出")
+	require.Len(t, before, 2, "with ML healthy, both trip+theme should produce moments")
 	var themeBefore Moment
 	for _, m := range before {
 		if m.RecipeKey == "theme:pets" {
 			themeBefore = m
 		}
 	}
-	require.NotEmpty(t, themeBefore.ID, "第一轮应已产出 theme:pets 时刻")
+	require.NotEmpty(t, themeBefore.ID, "the first round should have produced a theme:pets moment")
 
-	// 第二轮:ML 掉线(searcher 报错),theme:pets 应被跳过,trip 仍正常重算。
-	failingSearcher := fakeThemeSearcher{err: errors.New("clip search: connection refused (ML 掉线)")}
+	// Second round: ML is offline (searcher errors), theme:pets should be
+	// skipped, trip still recomputes normally.
+	failingSearcher := fakeThemeSearcher{err: errors.New("clip search: connection refused (ML offline)")}
 	secondRun := NewMomentsService(db, store, failingSearcher, noVecLoader, &fakeNamer{title: "irrelevant"})
 	err = secondRun.RecomputeAll(context.Background())
-	require.NoError(t, err, "单个 recipe(theme)失败必须 best-effort 跳过,不阻塞整轮、不向上传播 error")
+	require.NoError(t, err, "a single recipe (theme) failing must be skipped best-effort, without blocking the round or propagating an error")
 
 	after, err := store.ListMoments()
 	require.NoError(t, err)
-	require.Len(t, after, 2, "theme 失败应保留旧时刻不被清空;trip 仍应正常重算产出")
+	require.Len(t, after, 2, "theme failing should keep its old moments uncleared; trip should still recompute normally")
 
 	var themeAfter Moment
 	for _, m := range after {
@@ -294,27 +309,30 @@ func TestRecomputeAll_PerRecipeFailureIsolation(t *testing.T) {
 	}
 	require.Equal(t, themeBefore.ID, themeAfter.ID)
 	require.Equal(t, themeBefore.UpdatedAt, themeAfter.UpdatedAt,
-		"ML 闪断跳过的 recipe 不应调用 SyncRecipeMoments,updated_at 不变")
+		"a recipe skipped due to an ML blip must not call SyncRecipeMoments, updated_at unchanged")
 }
 
-// TestCleanLLMTitle_TruncatesOverlongOutput:模型不守"至多 4 个单词"约束、
-// 附赠一段长解释时,cleanLLMTitle 必须按 rune 安全截断到
-// maxLLMTitleRunes,防止长文原样落库展示给用户。
+// TestCleanLLMTitle_TruncatesOverlongOutput: when the model doesn't respect
+// the "at most 4 words" constraint and tacks on a long explanation,
+// cleanLLMTitle must do a rune-safe truncation to maxLLMTitleRunes, to
+// prevent the long text from being persisted and shown to the user as-is.
 func TestCleanLLMTitle_TruncatesOverlongOutput(t *testing.T) {
-	long := strings.Repeat("汉字标题超长测试", 20) // 160 个 rune,远超 80 上限
+	long := strings.Repeat("汉字标题超长测试", 20) // 160 runes, well past the 80 cap
 	got := cleanLLMTitle(long)
 	require.Len(t, []rune(got), maxLLMTitleRunes)
 	require.Equal(t, string([]rune(long)[:maxLLMTitleRunes]), got)
 
-	// 短标题不受影响。
+	// Short titles are unaffected.
 	require.Equal(t, "Sunset Beach", cleanLLMTitle(`  "Sunset Beach"  `+"\nsome trailing explanation"))
 }
 
-// TestRecomputeAll_ThemeMomentsNeverGoThroughLLMNaming:真机验收发现 LLM
-// 会把 theme 策划好的标题(recipe.Title,如"Pet Moments")改差(如误改成
-// "Sunset on Highway"),故 theme 时刻必须永不进 LLM 命名循环;trip 时刻仍
-// 应正常尝试 LLM 命名。用同一个 fakeNamer 记录调用次数,断言最终只有 trip
-// 那一次调用,且 theme 标题原样是 recipe.Title、未被 fakeNamer 的固定值覆盖。
+// TestRecomputeAll_ThemeMomentsNeverGoThroughLLMNaming: real-device testing
+// found the LLM would make a theme's curated title (recipe.Title, e.g. "Pet
+// Moments") worse (e.g. mistakenly changing it to "Sunset on Highway"), so
+// theme moments must never enter the LLM naming loop; trip moments should
+// still try LLM naming normally. Uses the same fakeNamer to record the call
+// count, asserting only the trip call happens, and the theme title stays
+// exactly recipe.Title, not overwritten by fakeNamer's fixed value.
 func TestRecomputeAll_ThemeMomentsNeverGoThroughLLMNaming(t *testing.T) {
 	db := makeTestDB(t)
 	store := NewMomentStore(db)
@@ -345,12 +363,12 @@ func TestRecomputeAll_ThemeMomentsNeverGoThroughLLMNaming(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	namer := &fakeNamer{title: "Sunset On Highway"} // 模拟 LLM 会瞎改名的场景
+	namer := &fakeNamer{title: "Sunset On Highway"} // simulates the LLM mangling the name
 	svc := NewMomentsService(db, store, searcher, noVecLoader, namer)
 
 	require.NoError(t, svc.RecomputeAll(context.Background()))
 
-	require.Equal(t, 1, namer.calls, "只有 trip 时刻应触发 LLM 命名,theme 一次都不该调用")
+	require.Equal(t, 1, namer.calls, "only the trip moment should trigger LLM naming, theme should never call it")
 
 	moments, err := store.ListMoments()
 	require.NoError(t, err)
@@ -365,37 +383,40 @@ func TestRecomputeAll_ThemeMomentsNeverGoThroughLLMNaming(t *testing.T) {
 			theme = m
 		}
 	}
-	require.True(t, trip.NamedByLLM, "trip 时刻应正常走 LLM 命名")
+	require.True(t, trip.NamedByLLM, "trip moments should go through LLM naming normally")
 	require.Equal(t, "Sunset On Highway", trip.Title)
-	require.False(t, theme.NamedByLLM, "theme 时刻永不应被标记为 LLM 命名")
-	require.Equal(t, "Pet Moments", theme.Title, "theme 标题必须保持 recipe.Title 策划好的名字,不被 LLM 篡改")
+	require.False(t, theme.NamedByLLM, "theme moments should never be marked as LLM-named")
+	require.Equal(t, "Pet Moments", theme.Title, "the theme title must keep recipe.Title's curated name, not be tampered with by the LLM")
 }
 
-// TestBuildNamingPrompt_NoPhotoAppEchoAndHasHardenedConstraints:真机验收
-// 发现弱本地模型会把旧 prompt 里的 "photo app" 措辞回声进标题(如"Nighttime
-// Las Vegas Photo App."),故新 prompt 必须不含这个措辞,且显式列出
-// Title Case/English only/≤4 words/无标点引号/不要复述指令等加固约束,并
-// 带上 few-shot 示例。
+// TestBuildNamingPrompt_NoPhotoAppEchoAndHasHardenedConstraints: real-device
+// testing found weak local models would echo the old prompt's "photo app"
+// wording into the title (e.g. "Nighttime Las Vegas Photo App."), so the new
+// prompt must not contain that wording, and must explicitly list the
+// hardening constraints Title Case/English only/≤4 words/no punctuation or
+// quotes/don't repeat the instructions, plus few-shot examples.
 func TestBuildNamingPrompt_NoPhotoAppEchoAndHasHardenedConstraints(t *testing.T) {
 	m := Moment{Place: "Kyoto, JP", TimeFrom: time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)}
 	prompt := buildNamingPrompt(m, []string{"a photo of a temple"})
 
-	require.NotContains(t, prompt, "photo app", "prompt 不应再出现会被模型回声进标题的 'photo app' 措辞")
+	require.NotContains(t, prompt, "photo app", "the prompt must no longer contain the 'photo app' wording that gets echoed into the title")
 	require.Contains(t, prompt, "Title Case")
 	require.Contains(t, prompt, "English only")
 	require.Contains(t, prompt, "at most 4 words")
 	require.Contains(t, prompt, "no punctuation or quotes")
 	require.Contains(t, prompt, "do not repeat or explain these instructions")
-	require.Contains(t, prompt, "Golden Gate Evenings", "应带 few-shot 示例")
-	require.Contains(t, prompt, "Alpine Ski Days", "应带第二条 few-shot 示例")
+	require.Contains(t, prompt, "Golden Gate Evenings", "should include a few-shot example")
+	require.Contains(t, prompt, "Alpine Ski Days", "should include a second few-shot example")
 }
 
-// TestRecomputeAll_PetEntitiesReplaceConceptThemePets:替换规则正向——
-// profile:pets 挖掘出 ≥1 个达标宠物实体时,概念版 theme:pets 时刻必须被
-// 清空(即使 theme 引擎本身的判据也能命中同一批照片,产出的是"用户自己的
-// 那只狗"而不是"全库搜索含狗元素")。recipe key 字典序 profile:pets <
-// theme:pets(p<t),ListRecipes 按 key 升序,故本轮循环处理到 theme:pets 时
-// petEntitiesProduced 标志已经就位。
+// TestRecomputeAll_PetEntitiesReplaceConceptThemePets: the replacement rule,
+// positive case — when profile:pets mines ≥1 qualifying pet entity, the
+// concept-version theme:pets moment must be cleared (even though the theme
+// engine's own criterion could match the same photos, what should be
+// produced is "the user's own dog", not "a library-wide search for dog
+// elements"). Recipe key lexical order profile:pets < theme:pets (p<t),
+// ListRecipes sorts by key ascending, so by the time this round's loop
+// reaches theme:pets, the petEntitiesProduced flag is already set.
 func TestRecomputeAll_PetEntitiesReplaceConceptThemePets(t *testing.T) {
 	db := makeTestDB(t)
 	store := NewMomentStore(db)
@@ -417,9 +438,10 @@ func TestRecomputeAll_PetEntitiesReplaceConceptThemePets(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	// 若替换规则不生效,theme 引擎凭 caption_keywords "dog" 命中这 3 张也足以
-	// 达标(min_assets=2)产出概念版——本用例要证明它被清空,而不是"本来就没
-	// 有候选"。
+	// If the replacement rule didn't kick in, the theme engine matching these 3
+	// photos via caption_keywords "dog" would also be enough to qualify
+	// (min_assets=2) and produce the concept version — this test case must
+	// prove it gets cleared, not that "there were never any candidates".
 	searcher := fakeThemeSearcher{hits: map[string][]AssetScore{
 		"a photo of a dog": {
 			{AssetID: "pet-a", Score: 0.9}, {AssetID: "pet-b", Score: 0.9}, {AssetID: "pet-c", Score: 0.9},
@@ -436,8 +458,8 @@ func TestRecomputeAll_PetEntitiesReplaceConceptThemePets(t *testing.T) {
 	for _, m := range moments {
 		recipeKeys = append(recipeKeys, m.RecipeKey)
 	}
-	require.NotContains(t, recipeKeys, "theme:pets", "已产出个人化宠物实体时刻应替换掉概念版")
-	require.Contains(t, recipeKeys, "profile:pets", "应产出 Your Beagle 实体时刻")
+	require.NotContains(t, recipeKeys, "theme:pets", "once a personalized pet entity moment is produced it should replace the concept version")
+	require.Contains(t, recipeKeys, "profile:pets", "should produce a Your Beagle entity moment")
 
 	var petMoment Moment
 	for _, m := range moments {
@@ -448,14 +470,16 @@ func TestRecomputeAll_PetEntitiesReplaceConceptThemePets(t *testing.T) {
 	require.Equal(t, "Your Beagle", petMoment.Title)
 }
 
-// TestRecomputeAll_NoPetEntitiesFallsBackToConceptThemePets:替换规则反向——
-// 全库无达标宠物实体时,概念版 theme:pets 照常产出(回退语义)。
+// TestRecomputeAll_NoPetEntitiesFallsBackToConceptThemePets: the replacement
+// rule, negative case — when the library has no qualifying pet entity, the
+// concept-version theme:pets is produced as usual (fallback semantics).
 func TestRecomputeAll_NoPetEntitiesFallsBackToConceptThemePets(t *testing.T) {
 	db := makeTestDB(t)
 	store := NewMomentStore(db)
 	require.NoError(t, store.UpsertRecipes([]MomentRecipe{
-		// min_photos 故意设得远高于本轮实际张数,确保 profile:pets 本轮无
-		// 达标实体产出。
+		// min_photos is deliberately set far higher than this round's actual
+		// photo count, to ensure profile:pets produces no qualifying entity this
+		// round.
 		{Key: "profile:pets", Kind: "pet_entities", Title: "Pet Entities", Enabled: true,
 			ParamsJSON: `{"lexicon":["labrador"],"min_photos":50,"min_months":5}`},
 		{Key: "theme:pets", Kind: "theme", Title: "Pet Moments", Enabled: true,
@@ -493,14 +517,16 @@ func TestRecomputeAll_NoPetEntitiesFallsBackToConceptThemePets(t *testing.T) {
 			found = true
 		}
 	}
-	require.True(t, found, "无达标宠物实体时,概念版 theme:pets 应照常产出(回退)")
+	require.True(t, found, "with no qualifying pet entity, the concept-version theme:pets should be produced as usual (fallback)")
 	require.Equal(t, "Pet Moments", themeMoment.Title)
 }
 
-// TestRecomputeAll_OverlongLLMTitleRejectedKeepsTemplate:端到端确认
-// RecomputeAll 面对远超词数守卫的长句 LLM 输出时,不会原样(或截断后)存进
-// moments.title——cleanLLMTitle 的 rune 截断仍在(见 maxLLMTitleRunes),但
-// 截断后词数依旧 > maxLLMTitleWords,词数守卫会整条拒收、保留模板打底标题。
+// TestRecomputeAll_OverlongLLMTitleRejectedKeepsTemplate: an end-to-end check
+// that when RecomputeAll faces an LLM output far past the word-count guard,
+// it doesn't store it into moments.title as-is (or truncated) — cleanLLMTitle's
+// rune truncation still applies (see maxLLMTitleRunes), but the word count
+// after truncation is still > maxLLMTitleWords, so the word-count guard
+// rejects the whole title outright, keeping the template fallback title.
 func TestRecomputeAll_OverlongLLMTitleRejectedKeepsTemplate(t *testing.T) {
 	db := makeTestDB(t)
 	store := NewMomentStore(db)
@@ -529,14 +555,17 @@ func TestRecomputeAll_OverlongLLMTitleRejectedKeepsTemplate(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, moments, 1)
 	require.LessOrEqual(t, len([]rune(moments[0].Title)), maxLLMTitleRunes)
-	require.False(t, moments[0].NamedByLLM, "超词数应被词数守卫拒收,不算 LLM 命名成功")
-	require.Equal(t, "Sapporo Trip", moments[0].Title, "拒收应保留模板打底标题")
+	require.False(t, moments[0].NamedByLLM, "exceeding the word count should be rejected by the word-count guard, not counted as successful LLM naming")
+	require.Equal(t, "Sapporo Trip", moments[0].Title, "a rejection should keep the template fallback title")
 }
 
-// TestRecomputeAll_LLMTitleWordGuardRejectsOverSixWords:真机实证的核心场景——
-// 本地弱模型不守"至多 4 词"指令、吐出 7 词整句(如 "May 28 2011 Overcast Sky
-// Somewhere" 这类日期+天气拼接),词数守卫应整条拒收、保留模板打底标题、且
-// 不置 named_by_llm,同时留一条 Debug 日志供观测(被拒标题)。
+// TestRecomputeAll_LLMTitleWordGuardRejectsOverSixWords: the core scenario
+// confirmed on real devices — a weak local model doesn't follow the "at most
+// 4 words" instruction and spits out a 7-word sentence (e.g. a
+// date+weather mashup like "May 28 2011 Overcast Sky Somewhere"); the
+// word-count guard should reject the whole title outright, keep the template
+// fallback title, not set named_by_llm, and leave a Debug log entry for
+// observability (the rejected title).
 func TestRecomputeAll_LLMTitleWordGuardRejectsOverSixWords(t *testing.T) {
 	db := makeTestDB(t)
 	store := NewMomentStore(db)
@@ -555,7 +584,7 @@ func TestRecomputeAll_LLMTitleWordGuardRejectsOverSixWords(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	rejected := "May 28 2011 Overcast Sky Somewhere Nearby" // 7 词,超过 6 词上限
+	rejected := "May 28 2011 Overcast Sky Somewhere Nearby" // 7 words, over the 6-word cap
 	namer := &fakeNamer{title: rejected}
 	svc := NewMomentsService(db, store, fakeThemeSearcher{}, noVecLoader, namer)
 
@@ -568,21 +597,23 @@ func TestRecomputeAll_LLMTitleWordGuardRejectsOverSixWords(t *testing.T) {
 	moments, err := store.ListMoments()
 	require.NoError(t, err)
 	require.Len(t, moments, 1)
-	require.False(t, moments[0].NamedByLLM, "超 6 词应被拒收,不算 LLM 命名成功")
-	require.Equal(t, "Naha Trip", moments[0].Title, "拒收应保留模板打底标题不变")
+	require.False(t, moments[0].NamedByLLM, "over 6 words should be rejected, not counted as successful LLM naming")
+	require.Equal(t, "Naha Trip", moments[0].Title, "a rejection should leave the template fallback title unchanged")
 
 	found := false
 	for _, entry := range logs.All() {
-		if strings.Contains(entry.Message, "词数超限") {
+		if strings.Contains(entry.Message, "exceeded word limit") {
 			found = true
 			break
 		}
 	}
-	require.True(t, found, "被拒标题应走 Debug 日志留痕")
+	require.True(t, found, "a rejected title should leave a Debug log entry")
 }
 
-// TestRecomputeAll_LLMTitleWordGuardAcceptsUpToSixWords:恰好 6 词的标题应正常
-// 收下、覆盖模板名、置 named_by_llm=1——守卫只拒收超过 6 词的,不误伤边界值。
+// TestRecomputeAll_LLMTitleWordGuardAcceptsUpToSixWords: a title with exactly
+// 6 words should be accepted normally, overwriting the template name and
+// setting named_by_llm=1 — the guard only rejects titles over 6 words, not
+// misfiring on the boundary value.
 func TestRecomputeAll_LLMTitleWordGuardAcceptsUpToSixWords(t *testing.T) {
 	db := makeTestDB(t)
 	store := NewMomentStore(db)
@@ -601,7 +632,7 @@ func TestRecomputeAll_LLMTitleWordGuardAcceptsUpToSixWords(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	accepted := "One Two Three Four Five Six" // 恰好 6 词
+	accepted := "One Two Three Four Five Six" // exactly 6 words
 	namer := &fakeNamer{title: accepted}
 	svc := NewMomentsService(db, store, fakeThemeSearcher{}, noVecLoader, namer)
 
@@ -610,6 +641,6 @@ func TestRecomputeAll_LLMTitleWordGuardAcceptsUpToSixWords(t *testing.T) {
 	moments, err := store.ListMoments()
 	require.NoError(t, err)
 	require.Len(t, moments, 1)
-	require.True(t, moments[0].NamedByLLM, "6 词应正常收下,置 named_by_llm=1")
+	require.True(t, moments[0].NamedByLLM, "6 words should be accepted normally, setting named_by_llm=1")
 	require.Equal(t, accepted, moments[0].Title)
 }

@@ -10,53 +10,66 @@ import (
 	"go.uber.org/zap"
 )
 
-// captionLister 是 Puller 依赖的最小接口,只取 ListCaptions 一个方法,方便
-// 测试注入 fake(见 captionpull_test.go 的 fakeLister),避免直接依赖
-// parserclient.Client 具体类型。
+// captionLister is the minimal interface Puller depends on, taking only the
+// ListCaptions method so tests can inject a fake (see captionpull_test.go's
+// fakeLister) without depending directly on the concrete parserclient.Client
+// type.
 type captionLister interface {
 	ListCaptions(ctx context.Context, offset string) ([]parserclient.CaptionItem, string, error)
 }
 
-// captionDeleter 是孤儿回删的最小接口(parserclient.Client 满足)。
+// captionDeleter is the minimal interface for orphan cleanup (satisfied by
+// parserclient.Client).
 type captionDeleter interface {
 	DeleteAsset(ctx context.Context, assetID string) error
 }
 
-// Puller 周期性从 NimoOS-Parser 拉取 caption 全量并 diff-upsert 进本地
-// asset_caption 表(照片知识库子项目二的回流侧;caption 消费/检索是后续
-// 子项目,这里只负责把数据落到本地)。
+// Puller periodically pulls the full caption set from NimoOS-Parser and
+// diff-upserts it into the local asset_caption table (the flow-back side of
+// photo knowledge-base sub-project 2; caption consumption/retrieval is a
+// later sub-project — this package is only responsible for landing the data
+// locally).
 //
-// 全部 best-effort:Parser 未部署 / 网络失败 / 503(qdrant 不可用)都只是
-// 本轮 PullOnce 直接返回 err,调用方挂点仅记日志,不向上传播,不影响
-// Photos 索引/搜索等主流程。
+// Everything is best-effort: Parser not deployed / network failure / 503
+// (qdrant unavailable) all just make this round's PullOnce return err
+// directly; the caller's hook only logs it, never propagates it upward, and
+// it never affects the Photos indexing/search main flow.
 //
-// 生命周期自洽:
-//   - Parser 侧 caption 更新(重新生成)→ mtime_ms 变大,下一轮回流据此
-//     覆盖本地旧文本;mtime 未变则跳过,避免无意义写盘。
-//   - 资产被删除 → asset_caption 靠 asset_id 外键 ON DELETE CASCADE 自动
-//     级联清理,本包无需关心。
-//   - 资产被恢复(回收站恢复等)→ 只要资产行还在(级联未触发),旧 caption
-//     行原样保留;Parser 侧后续若有更新,mtime 覆盖会自然生效。
-//   - 孤儿(Parser 已生成 caption,但本地 assets 表暂无该 id,比如两侧删除
-//     通知有时间差,或删除通知是 fire-and-forget、Parser 当时不可达导致
-//     永久漏删)→ 外键约束下 INSERT 失败,跳过继续处理下一条,不中断整轮
-//     拉取;同时 best-effort 回删 Parser 侧向量,补上这条对账兜底。
+// Lifecycle is self-consistent:
+//   - Parser-side caption update (regenerated) → mtime_ms increases, and the
+//     next flow-back round overwrites the old local text accordingly; if
+//     mtime hasn't changed it's skipped, avoiding a pointless write.
+//   - Asset deleted → asset_caption is automatically cascade-cleaned via the
+//     asset_id foreign key's ON DELETE CASCADE, this package doesn't need to
+//     care.
+//   - Asset restored (e.g. from trash) → as long as the asset row still
+//     exists (cascade never fired), the old caption row is kept as-is; if
+//     Parser has an update later, the mtime overwrite naturally takes effect.
+//   - Orphan (Parser already generated a caption, but the local assets table
+//     has no such id yet — e.g. the two sides' delete notifications are out
+//     of sync in time, or the delete notification is fire-and-forget and
+//     Parser was unreachable at the time, causing a permanent missed
+//     delete) → the INSERT fails under the foreign key constraint, so it's
+//     skipped and processing continues with the next item without
+//     interrupting the whole pull; it also best-effort deletes the vector on
+//     Parser's side as reconciliation backstop for that miss.
 type Puller struct {
 	db      *sql.DB
 	lister  captionLister
 	deleter captionDeleter
 }
 
-// NewPuller 构造 Puller。lister 通常是 parserclient.New(cfg.RuntimePath)
-// (与 CaptionFeeder 共用同一个 parserclient.Client 实例即可,ListCaptions
-// 与 IngestAsset/DeleteAsset 走同一份 discoveryFile/http.Client)。deleter
-// 用于孤儿回删,可为 nil(退化为只跳过,不回删)。
+// NewPuller constructs a Puller. lister is usually
+// parserclient.New(cfg.RuntimePath) (sharing the same parserclient.Client
+// instance as CaptionFeeder is fine — ListCaptions and IngestAsset/
+// DeleteAsset go through the same discoveryFile/http.Client). deleter is used
+// for orphan cleanup and may be nil (degrades to skip-only, no cleanup).
 func NewPuller(db *sql.DB, lister captionLister, deleter captionDeleter) *Puller {
 	return &Puller{db: db, lister: lister, deleter: deleter}
 }
 
-// localMtime 查询本地 asset_caption 表中某资产当前记录的 mtime_ms;
-// 若尚无记录,ok=false。
+// localMtime looks up the mtime_ms currently recorded for an asset in the
+// local asset_caption table; ok=false if there's no record yet.
 func (p *Puller) localMtime(ctx context.Context, assetID string) (mtime int64, ok bool, err error) {
 	err = p.db.QueryRowContext(ctx, `SELECT mtime_ms FROM asset_caption WHERE asset_id=?`, assetID).Scan(&mtime)
 	if err == sql.ErrNoRows {
@@ -68,15 +81,20 @@ func (p *Puller) localMtime(ctx context.Context, assetID string) (mtime int64, o
 	return mtime, true, nil
 }
 
-// PullOnce 拉取 Parser 侧全量 caption 并 diff-upsert 进本地表:分页游标
-// 循环拉到底,每条与本地 mtime_ms 比对,本地缺失或 Parser 侧 mtime 更大
-// 才写入(ON CONFLICT 覆盖);写入失败时精确区分:仅 SQLITE_CONSTRAINT_
-// FOREIGNKEY(真孤儿资产)跳过继续,其它错误(SQLITE_BUSY 超时、磁盘 I/O
-// 等真实故障)整轮直接返回 err,避免把故障误记为孤儿而静默吞掉。
+// PullOnce pulls the full set of Parser-side captions and diff-upserts them
+// into the local table: loops the pagination cursor to the end, comparing
+// each item against the local mtime_ms, writing only when the local record is
+// missing or Parser's mtime is larger (ON CONFLICT overwrite); on write
+// failure it distinguishes precisely: only SQLITE_CONSTRAINT_FOREIGNKEY (a
+// genuine orphan asset) is skipped and continues, any other error (SQLITE_BUSY
+// timeout, disk I/O, other real failures) makes the whole round return err
+// directly, avoiding misfiling a real failure as an orphan and silently
+// swallowing it.
 //
-// lister 出错(Parser 未部署 / 网络失败 / 非 2xx)同样整轮直接返回 err、
-// 已写入的 upserted 计数原样返回——调用方(挂点)按 best-effort 语义仅
-// 记日志,不向上传播致命错误。
+// A lister error (Parser not deployed / network failure / non-2xx) likewise
+// makes the whole round return err directly, with the upserted count so far
+// returned as-is — the caller (the hook) follows best-effort semantics and
+// only logs it, never propagating a fatal error upward.
 func (p *Puller) PullOnce(ctx context.Context) (upserted int, err error) {
 	offset := ""
 	for {
@@ -90,7 +108,7 @@ func (p *Puller) PullOnce(ctx context.Context) (upserted int, err error) {
 				return upserted, qerr
 			}
 			if ok && it.MtimeMs <= localMs {
-				continue // 本地已是同版本或更新,跳过,避免无意义写盘
+				continue // local is already the same version or newer, skip to avoid a pointless write
 			}
 			_, werr := p.db.ExecContext(ctx, `
 				INSERT INTO asset_caption(asset_id, text, mtime_ms, fetched_at)
@@ -103,22 +121,28 @@ func (p *Puller) PullOnce(ctx context.Context) (upserted int, err error) {
 			if werr != nil {
 				var sqliteErr sqlite3.Error
 				if errors.As(werr, &sqliteErr) && sqliteErr.ExtendedCode == sqlite3.ErrConstraintForeignKey {
-					// 真孤儿:本地 assets 无此 id。除跳过外,回删 Parser 侧向量——
-					// 删除通知是 fire-and-forget(captionfeed.go DeleteRemote),
-					// Parser 当时不可达会永久漏删,这里是唯一的对账兜底。
-					// best-effort:失败仅 Warn,不中断整轮。
-					zap.L().Debug("caption pull: 写入跳过(孤儿资产,外键约束失败)",
+					// Genuine orphan: local assets has no such id. Besides
+					// skipping, also delete the vector on Parser's side —
+					// the delete notification is fire-and-forget
+					// (captionfeed.go DeleteRemote), and Parser being
+					// unreachable at the time causes a permanent missed
+					// delete; this is the only reconciliation backstop for
+					// that. best-effort: failure only gets a Warn, doesn't
+					// interrupt the round.
+					zap.L().Debug("caption pull: write skipped (orphan asset, foreign key constraint failed)",
 						zap.String("asset_id", it.AssetID), zap.Error(werr))
 					if p.deleter != nil {
 						if derr := p.deleter.DeleteAsset(ctx, it.AssetID); derr != nil && !errors.Is(derr, parserclient.ErrParserUnavailable) {
-							zap.L().Warn("caption pull: 孤儿向量回删失败", zap.String("asset_id", it.AssetID), zap.Error(derr))
+							zap.L().Warn("caption pull: orphan vector cleanup failed", zap.String("asset_id", it.AssetID), zap.Error(derr))
 						}
 					}
 					continue
 				}
-				// 非外键错误(SQLITE_BUSY 超时、磁盘 I/O 等真实故障)不能当孤儿
-				// 静默吞掉,否则会抹平故障信号——整轮直接返回 err,交给挂点的
-				// 既有 Warn 日志路径处理。
+				// A non-foreign-key error (SQLITE_BUSY timeout, disk I/O,
+				// other real failures) must not be silently swallowed as an
+				// orphan — that would erase the failure signal. Return err
+				// directly for the whole round and let the hook's existing
+				// Warn-logging path handle it.
 				return upserted, werr
 			}
 			upserted++

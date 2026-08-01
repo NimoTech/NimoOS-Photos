@@ -17,14 +17,15 @@ import (
 	"go.uber.org/zap/zaptest/observer"
 )
 
-// recordingSink 是供测试注入的 captionSink 假实现：记录每次调用的完整载荷，
-// 并可注入 failWith 模拟投喂失败（含 ErrParserUnavailable 静默场景)。
+// recordingSink is a captionSink fake for test injection: it records the full
+// payload of every call, and can inject failWith to simulate a feed failure
+// (including the ErrParserUnavailable silent scenario).
 type recordingSink struct {
 	mu          sync.Mutex
 	ingests     []string
 	deletes     []string
-	deleteCalls int   // 无论成败都计数,供测试判定 DeleteAsset 是否已被调用过(fire-and-forget 场景下 deletes 在失败注入时不会追加)
-	failWith    error // 注入 ErrParserUnavailable / 一般错误
+	deleteCalls int   // counted regardless of success/failure, so tests can tell whether DeleteAsset was ever called (in the fire-and-forget path, deletes isn't appended to when a failure is injected)
+	failWith    error // injects ErrParserUnavailable / a generic error
 }
 
 func (r *recordingSink) IngestAsset(_ context.Context, id, path, mime, takenAt, place string) error {
@@ -48,9 +49,10 @@ func (r *recordingSink) DeleteAsset(_ context.Context, id string) error {
 	return nil
 }
 
-// sequenceSink 按调用顺序消费一串预设错误（nil 表示成功），用于测试需要
-// 区分"第几次调用 sink"的场景（比如首次 feedInfo 失败、真正命中
-// ErrParserUnavailable 的其实是第二次 sink 调用)。
+// sequenceSink consumes a preset list of errors in call order (nil means
+// success), used for tests that need to distinguish "which call number to
+// sink" scenarios (e.g. the first feedInfo fails and the call that actually
+// hits ErrParserUnavailable is really the second sink call).
 type sequenceSink struct {
 	mu      sync.Mutex
 	results []error
@@ -70,8 +72,8 @@ func (s *sequenceSink) IngestAsset(_ context.Context, id, _, _, _, _ string) err
 
 func (s *sequenceSink) DeleteAsset(context.Context, string) error { return nil }
 
-// insertCaptionCandidate 插入一条 Backfill 会选中的资产：已索引、未软删、
-// 不在离线盘上、caption_synced=0。
+// insertCaptionCandidate inserts an asset that Backfill will select: indexed,
+// not soft-deleted, not on an offline drive, caption_synced=0.
 func insertCaptionCandidate(t *testing.T, db *sql.DB, id string) {
 	t.Helper()
 	_, err := db.Exec(`INSERT INTO assets(id, file_path, mime_type, status, caption_synced)
@@ -79,7 +81,8 @@ func insertCaptionCandidate(t *testing.T, db *sql.DB, id string) {
 	require.NoError(t, err)
 }
 
-// FeedOne：成功投喂后载荷含 large.jpg 路径/mime/taken_at/geo place，且置 synced=1。
+// FeedOne: after a successful feed, the payload contains the large.jpg
+// path/mime/taken_at/geo place, and synced is set to 1.
 func TestFeedOnePayloadAndMark(t *testing.T) {
 	db := makeTestDB(t)
 	thumbDir := t.TempDir()
@@ -106,9 +109,10 @@ func TestFeedOnePayloadAndMark(t *testing.T) {
 	require.Equal(t, 1, synced)
 }
 
-// FeedOne：sink 失败时 synced 留 0；一般错误产生 Warn 日志，ErrParserUnavailable 完全静默。
+// FeedOne: when sink fails, synced stays 0; a generic error produces a Warn
+// log, ErrParserUnavailable is completely silent.
 func TestFeedOneFailureLeavesUnsynced(t *testing.T) {
-	t.Run("一般错误留痕", func(t *testing.T) {
+	t.Run("generic error is logged", func(t *testing.T) {
 		db := makeTestDB(t)
 		thumbDir := t.TempDir()
 		insertIndexedAsset(t, db, "a1")
@@ -124,10 +128,10 @@ func TestFeedOneFailureLeavesUnsynced(t *testing.T) {
 		var synced int
 		require.NoError(t, db.QueryRow(`SELECT caption_synced FROM assets WHERE id='a1'`).Scan(&synced))
 		require.Equal(t, 0, synced)
-		require.NotEmpty(t, logs.All(), "一般错误应产生日志留痕")
+		require.NotEmpty(t, logs.All(), "a generic error should produce a log trace")
 	})
 
-	t.Run("ErrParserUnavailable 完全静默", func(t *testing.T) {
+	t.Run("ErrParserUnavailable is completely silent", func(t *testing.T) {
 		db := makeTestDB(t)
 		thumbDir := t.TempDir()
 		insertIndexedAsset(t, db, "a1")
@@ -143,15 +147,16 @@ func TestFeedOneFailureLeavesUnsynced(t *testing.T) {
 		var synced int
 		require.NoError(t, db.QueryRow(`SELECT caption_synced FROM assets WHERE id='a1'`).Scan(&synced))
 		require.Equal(t, 0, synced)
-		require.Empty(t, logs.All(), "ErrParserUnavailable 不应产生任何日志")
+		require.Empty(t, logs.All(), "ErrParserUnavailable should not produce any log")
 	})
 }
 
-// FeedOne：caption_synced=1 短路——已交接资产不应再次调用 sink（防
-// ForceReprocess/rebuild/CLIP 补跑等强制重跑路径重复烧 35s VLM）；
-// synced=0 时照常投喂。
+// FeedOne: caption_synced=1 short-circuits — an already-handed-off asset must
+// not call sink again (guards against ForceReprocess/rebuild/CLIP catch-up
+// runs and other forced-rerun paths re-burning 35s of VLM time); synced=0
+// still feeds as normal.
 func TestFeedOneSyncedShortCircuit(t *testing.T) {
-	t.Run("已同步不再投喂", func(t *testing.T) {
+	t.Run("already synced does not feed again", func(t *testing.T) {
 		db := makeTestDB(t)
 		thumbDir := t.TempDir()
 		assetID := "a1"
@@ -166,10 +171,10 @@ func TestFeedOneSyncedShortCircuit(t *testing.T) {
 		sink.mu.Lock()
 		got := append([]string(nil), sink.ingests...)
 		sink.mu.Unlock()
-		require.Empty(t, got, "已同步资产不应再次调用 sink")
+		require.Empty(t, got, "an already-synced asset should not call sink again")
 	})
 
-	t.Run("未同步照常投喂", func(t *testing.T) {
+	t.Run("unsynced asset feeds as normal", func(t *testing.T) {
 		db := makeTestDB(t)
 		thumbDir := t.TempDir()
 		insertIndexedAsset(t, db, "a1")
@@ -181,7 +186,7 @@ func TestFeedOneSyncedShortCircuit(t *testing.T) {
 		sink.mu.Lock()
 		got := append([]string(nil), sink.ingests...)
 		sink.mu.Unlock()
-		require.Len(t, got, 1, "未同步资产应照常投喂")
+		require.Len(t, got, 1, "an unsynced asset should feed as normal")
 
 		var synced int
 		require.NoError(t, db.QueryRow(`SELECT caption_synced FROM assets WHERE id='a1'`).Scan(&synced))
@@ -189,25 +194,26 @@ func TestFeedOneSyncedShortCircuit(t *testing.T) {
 	})
 }
 
-// Backfill：只投 synced=0 且可见的资产；成功逐个置 1；CAS 防重入；
-// 首张遇 ErrParserUnavailable 时整轮静默短路。
+// Backfill: only feeds visible assets with synced=0; sets 1 on each success;
+// CAS guards against reentrancy; short-circuits the whole round silently
+// when the first asset hits ErrParserUnavailable.
 func TestBackfillSelectionAndCAS(t *testing.T) {
-	t.Run("选集正确且逐个置位", func(t *testing.T) {
+	t.Run("correct selection and per-asset marking", func(t *testing.T) {
 		db := makeTestDB(t)
 		thumbDir := t.TempDir()
 
 		insertCaptionCandidate(t, db, "e1")
 		insertCaptionCandidate(t, db, "e2")
-		// 不入选：已同步过。
+		// Not selected: already synced.
 		_, err := db.Exec(`INSERT INTO assets(id,file_path,status,caption_synced) VALUES('s1','/g/s1.jpg','indexed',1)`)
 		require.NoError(t, err)
-		// 不入选：尚未索引完。
+		// Not selected: not yet fully indexed.
 		_, err = db.Exec(`INSERT INTO assets(id,file_path,status,caption_synced) VALUES('p1','/g/p1.jpg','pending',0)`)
 		require.NoError(t, err)
-		// 不入选：已软删。
+		// Not selected: soft-deleted.
 		_, err = db.Exec(`INSERT INTO assets(id,file_path,status,caption_synced,deleted_at) VALUES('d1','/g/d1.jpg','indexed',0,CURRENT_TIMESTAMP)`)
 		require.NoError(t, err)
-		// 不入选：源文件在离线盘上。
+		// Not selected: source file is on an offline drive.
 		_, err = db.Exec(`INSERT INTO assets(id,file_path,status,caption_synced,offline) VALUES('o1','/g/o1.jpg','indexed',0,1)`)
 		require.NoError(t, err)
 
@@ -226,16 +232,16 @@ func TestBackfillSelectionAndCAS(t *testing.T) {
 		for _, id := range []string{"e1", "e2"} {
 			var synced int
 			require.NoError(t, db.QueryRow(`SELECT caption_synced FROM assets WHERE id=?`, id).Scan(&synced))
-			require.Equal(t, 1, synced, "入选资产应置 synced=1")
+			require.Equal(t, 1, synced, "a selected asset should be set to synced=1")
 		}
 		for _, id := range []string{"p1", "d1", "o1"} {
 			var synced int
 			require.NoError(t, db.QueryRow(`SELECT caption_synced FROM assets WHERE id=?`, id).Scan(&synced))
-			require.Equal(t, 0, synced, "不入选资产不应被动到")
+			require.Equal(t, 0, synced, "a non-selected asset should not be touched")
 		}
 	})
 
-	t.Run("首张ErrParserUnavailable整轮静默短路", func(t *testing.T) {
+	t.Run("first asset hitting ErrParserUnavailable short-circuits the whole round silently", func(t *testing.T) {
 		db := makeTestDB(t)
 		thumbDir := t.TempDir()
 		insertCaptionCandidate(t, db, "e1")
@@ -257,10 +263,10 @@ func TestBackfillSelectionAndCAS(t *testing.T) {
 			require.NoError(t, db.QueryRow(`SELECT caption_synced FROM assets WHERE id=?`, id).Scan(&synced))
 			require.Equal(t, 0, synced)
 		}
-		require.Empty(t, logs.All(), "Parser 未部署时整轮应静默,不留日志")
+		require.Empty(t, logs.All(), "the whole round should be silent when Parser isn't deployed, no logs")
 	})
 
-	t.Run("并发调用CAS安全", func(t *testing.T) {
+	t.Run("concurrent calls are CAS-safe", func(t *testing.T) {
 		db := makeTestDB(t)
 		thumbDir := t.TempDir()
 		insertCaptionCandidate(t, db, "e1")
@@ -283,11 +289,15 @@ func TestBackfillSelectionAndCAS(t *testing.T) {
 		require.Equal(t, 1, synced)
 	})
 
-	// 回归用例：短路判断此前死绑下标 0，若列表首条的 feedInfo 先失败（资产
-	// 被并发删除等良性竞态），真正命中 ErrParserUnavailable 的是下标 1，短
-	// 路会失效，整轮空遍历后仍打一条汇总 Info，违背"未部署机器零日志"诉
-	// 求。用 feedBatch 直接注入一个不存在的 id 在前，模拟这种竞态。
-	t.Run("首条feedInfo失败不掩盖首次sink短路", func(t *testing.T) {
+	// Regression test: the short-circuit check used to be hard-wired to index
+	// 0. If the first entry's feedInfo fails (a benign race such as the asset
+	// being concurrently deleted), the real ErrParserUnavailable hit is at
+	// index 1, so the short-circuit would fail to fire and a summary Info
+	// would still be printed after a whole round of empty iteration —
+	// violating the "zero logs on an undeployed machine" requirement. Uses
+	// feedBatch to directly inject a nonexistent id up front to simulate this
+	// race.
+	t.Run("a failed feedInfo on the first entry does not mask the first-sink short-circuit", func(t *testing.T) {
 		db := makeTestDB(t)
 		thumbDir := t.TempDir()
 		insertCaptionCandidate(t, db, "e2")
@@ -303,17 +313,19 @@ func TestBackfillSelectionAndCAS(t *testing.T) {
 		sink.mu.Lock()
 		gotCalls := append([]string(nil), sink.calls...)
 		sink.mu.Unlock()
-		require.Equal(t, []string{"e2"}, gotCalls, "sink 应只被真正调用一次（ghost 的 feedInfo 失败不算 sink 尝试）")
+		require.Equal(t, []string{"e2"}, gotCalls, "sink should only be really called once (ghost's feedInfo failure doesn't count as a sink attempt)")
 
 		var synced int
 		require.NoError(t, db.QueryRow(`SELECT caption_synced FROM assets WHERE id='e2'`).Scan(&synced))
 		require.Equal(t, 0, synced)
-		require.Empty(t, logs.All(), "Parser 未部署时整轮应静默，不留汇总日志")
+		require.Empty(t, logs.All(), "the whole round should be silent when Parser isn't deployed, no summary log")
 	})
 
-	// 非首次命中 Unavailable：Parser 曾经可用（e1 投喂成功），本轮途中才掉
-	// 线，属正常运维场景，应中断循环但保留汇总日志。
-	t.Run("非首次命中Unavailable保留汇总日志", func(t *testing.T) {
+	// Unavailable hit on a call that isn't the first: Parser was available at
+	// one point (e1 fed successfully) and only went offline partway through
+	// this round — a normal ops scenario, so the loop should break but the
+	// summary log should be kept.
+	t.Run("a non-first Unavailable hit keeps the summary log", func(t *testing.T) {
 		db := makeTestDB(t)
 		thumbDir := t.TempDir()
 		insertCaptionCandidate(t, db, "e1")
@@ -334,18 +346,19 @@ func TestBackfillSelectionAndCAS(t *testing.T) {
 
 		var synced int
 		require.NoError(t, db.QueryRow(`SELECT caption_synced FROM assets WHERE id='e1'`).Scan(&synced))
-		require.Equal(t, 1, synced, "e1 投喂成功应置 synced=1")
+		require.Equal(t, 1, synced, "e1 fed successfully so synced should be set to 1")
 		require.NoError(t, db.QueryRow(`SELECT caption_synced FROM assets WHERE id='e2'`).Scan(&synced))
-		require.Equal(t, 0, synced, "e2 命中 Unavailable 不应置位")
+		require.Equal(t, 0, synced, "e2 hit Unavailable so it should not be marked")
 
 		entries := logs.All()
-		require.Len(t, entries, 1, "中途掉线属正常运维场景，应保留一条汇总日志")
-		require.Equal(t, "caption 补扫完成", entries[0].Message)
+		require.Len(t, entries, 1, "going offline mid-round is a normal ops scenario, the summary log should be kept")
+		require.Equal(t, "caption backfill sweep complete", entries[0].Message)
 	})
 }
 
-// SetOnIndexed：索引流水线把资产写为 status='indexed' 后，钩子应异步被调用一次，
-// 携带正确的 asset id。
+// SetOnIndexed: once the indexing pipeline writes an asset as
+// status='indexed', the hook should be called asynchronously exactly once,
+// carrying the correct asset id.
 func TestOnIndexedHookFires(t *testing.T) {
 	db := makeTestDB(t)
 	thumbDir := t.TempDir()
@@ -368,7 +381,7 @@ func TestOnIndexedHookFires(t *testing.T) {
 	select {
 	case <-done:
 	case <-time.After(2 * time.Second):
-		t.Fatal("onIndexed 钩子未在超时内触发")
+		t.Fatal("onIndexed hook did not fire within the timeout")
 	}
 
 	var id string
@@ -379,9 +392,10 @@ func TestOnIndexedHookFires(t *testing.T) {
 	require.Equal(t, []string{id}, got)
 }
 
-// concurrencySink 是供 DeleteRemote 并发上限测试用的假 sink：DeleteAsset 阻塞
-// 在 release 上直到测试放行，同时记录进行中的最大并发数，用来断言包级信号量
-// （容量 4）确实生效。
+// concurrencySink is a fake sink for testing DeleteRemote's concurrency cap:
+// DeleteAsset blocks on release until the test lets it go, while recording
+// the peak in-flight concurrency, used to assert the package-level semaphore
+// (capacity 4) is actually in effect.
 type concurrencySink struct {
 	mu         sync.Mutex
 	current    int
@@ -415,9 +429,11 @@ func (s *concurrencySink) snapshot() (current, max int) {
 	return s.current, s.maxCurrent
 }
 
-// DeleteRemote：并发上限锁死在 4——同时甩出 10 个 DeleteRemote，进行中的
-// DeleteAsset 调用数应顶到 4 就不再往上涨（包级信号量生效），全部放行后应
-// 归零（无 goroutine 泄漏/死锁)。
+// DeleteRemote: the concurrency cap is locked at 4 — firing off 10
+// DeleteRemote calls at once, the number of in-flight DeleteAsset calls
+// should climb to 4 and go no further (the package-level semaphore is in
+// effect), and drop back to zero once everything is released (no goroutine
+// leak/deadlock).
 func TestDeleteRemoteConcurrencyLimit(t *testing.T) {
 	db := makeTestDB(t)
 	thumbDir := t.TempDir()
@@ -432,25 +448,27 @@ func TestDeleteRemoteConcurrencyLimit(t *testing.T) {
 	require.Eventually(t, func() bool {
 		cur, _ := sink.snapshot()
 		return cur == 4
-	}, 2*time.Second, 10*time.Millisecond, "并发数应顶到信号量上限 4")
+	}, 2*time.Second, 10*time.Millisecond, "concurrency should climb to the semaphore limit of 4")
 
-	// 顶住上限一小段时间，确认第 5 个及之后确实被卡住而非意外多放行了几个。
+	// Hold at the limit for a short while to confirm the 5th call and beyond
+	// really are stuck, rather than accidentally letting a few more through.
 	time.Sleep(100 * time.Millisecond)
 	cur, max := sink.snapshot()
-	require.Equal(t, 4, cur, "在全部放行前，进行中的调用数不应超过信号量容量")
-	require.Equal(t, 4, max, "10 个并发请求应把信号量用满到 4")
+	require.Equal(t, 4, cur, "before everything is released, in-flight calls should not exceed the semaphore capacity")
+	require.Equal(t, 4, max, "10 concurrent requests should saturate the semaphore at 4")
 
 	close(sink.release)
 	require.Eventually(t, func() bool {
 		cur, _ := sink.snapshot()
 		return cur == 0
-	}, 2*time.Second, 10*time.Millisecond, "全部放行后进行中的调用数应归零")
+	}, 2*time.Second, 10*time.Millisecond, "in-flight calls should drop to zero once everything is released")
 }
 
-// DeleteRemote：ErrParserUnavailable 完全静默（Parser 未部署是常态），一般
-// 错误仅产生一条 Warn 留痕——均为 fire-and-forget，不影响调用方。
+// DeleteRemote: ErrParserUnavailable is completely silent (Parser not being
+// deployed is the common case); a generic error produces exactly one Warn as
+// a trace — both are fire-and-forget and don't affect the caller.
 func TestDeleteRemoteFailureSemantics(t *testing.T) {
-	t.Run("ErrParserUnavailable静默", func(t *testing.T) {
+	t.Run("ErrParserUnavailable is silent", func(t *testing.T) {
 		db := makeTestDB(t)
 		thumbDir := t.TempDir()
 
@@ -466,14 +484,15 @@ func TestDeleteRemoteFailureSemantics(t *testing.T) {
 			sink.mu.Lock()
 			defer sink.mu.Unlock()
 			return sink.deleteCalls == 1
-		}, 2*time.Second, 10*time.Millisecond, "DeleteRemote 应异步调用一次 sink")
-		// sink 调用后 goroutine 只剩一次 errors.Is 判断即返回，留出极短余量
-		// 让其跑完，再确认全程零日志。
+		}, 2*time.Second, 10*time.Millisecond, "DeleteRemote should call sink asynchronously exactly once")
+		// After the sink call, the goroutine has only one errors.Is check left
+		// before returning; leave a short margin for it to finish, then
+		// confirm zero logs the whole way through.
 		time.Sleep(50 * time.Millisecond)
-		require.Empty(t, logs.All(), "ErrParserUnavailable 不应产生任何日志")
+		require.Empty(t, logs.All(), "ErrParserUnavailable should not produce any log")
 	})
 
-	t.Run("一般错误仅Warn一条", func(t *testing.T) {
+	t.Run("a generic error produces exactly one Warn", func(t *testing.T) {
 		db := makeTestDB(t)
 		thumbDir := t.TempDir()
 
@@ -487,7 +506,7 @@ func TestDeleteRemoteFailureSemantics(t *testing.T) {
 
 		require.Eventually(t, func() bool {
 			return len(logs.All()) >= 1
-		}, 2*time.Second, 10*time.Millisecond, "一般错误应产生 Warn 日志")
-		require.Len(t, logs.All(), 1, "一般错误应仅产生一条 Warn 日志")
+		}, 2*time.Second, 10*time.Millisecond, "a generic error should produce a Warn log")
+		require.Len(t, logs.All(), 1, "a generic error should produce exactly one Warn log")
 	})
 }

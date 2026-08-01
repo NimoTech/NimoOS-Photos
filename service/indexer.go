@@ -129,14 +129,17 @@ func resolveMimeType(data []byte, ext string) string {
 	return http.DetectContentType(data)
 }
 
-// mimeSniffBytes 是未知扩展名回退到内容嗅探时最多读取的文件头部字节数。
-// http.DetectContentType 本身只看前 512B，这里留一点冗余；已知扩展名
-// （canonicalMime 命中）完全不受这个常量影响，压根不会读文件。
+// mimeSniffBytes is the max number of header bytes read when an unknown
+// extension falls back to content sniffing. http.DetectContentType itself
+// only looks at the first 512B; this leaves a bit of headroom. Known
+// extensions (canonicalMime hits) are unaffected by this constant at all —
+// they never read the file.
 const mimeSniffBytes = 4096
 
-// readHeader 最多读取 path 的前 n 个字节，用于只需要文件头部信息的场景（如
-// MIME 内容嗅探），避免像 os.ReadFile 那样把整个文件读入内存。文件本身小于
-// n 字节是正常情况（返回已读到的部分，不算错误）。
+// readHeader reads at most the first n bytes of path, for cases that only
+// need the file's header (e.g. MIME content sniffing), avoiding reading the
+// whole file into memory the way os.ReadFile would. The file being smaller
+// than n bytes is normal (returns whatever was read, not an error).
 func readHeader(path string, n int) ([]byte, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -151,10 +154,12 @@ func readHeader(path string, n int) ([]byte, error) {
 	return buf[:nr], nil
 }
 
-// detectMimeType 是 processFileInternal 里实际调用的 MIME 探测入口：已知扩展
-// 名直接查 canonicalMime 表、完全不碰磁盘；只有未识别的扩展名才读文件头部
-// （mimeSniffBytes）做内容嗅探——取代原来"先把整个文件读进内存，再嗅探"的
-// 做法（视频文件哪怕几个 GB，MIME 探测阶段现在最多只读 4KB）。
+// detectMimeType is the actual MIME-detection entry point called from
+// processFileInternal: known extensions go straight to the canonicalMime
+// table without touching disk at all; only unrecognized extensions read the
+// file header (mimeSniffBytes) for content sniffing — replacing the old
+// "read the whole file into memory, then sniff" approach (even a multi-GB
+// video now reads at most 4KB during MIME detection).
 func detectMimeType(path, ext string) string {
 	if m, ok := canonicalMime[strings.ToLower(ext)]; ok {
 		return m
@@ -166,17 +171,21 @@ func detectMimeType(path, ext string) string {
 	return resolveMimeType(header, ext)
 }
 
-// maxImageReadBytes 是索引阶段把图片原图整个读入内存（供 ML faceData 与
-// image.DecodeConfig 尺寸兜底使用）的字节上限，防止异常超大/伪装的图片文件
-// 把 Go 进程常驻内存打爆。注意这和 oversizedForML（mlinput.go，178.9MP 像素
-// 上限，管的是喂给 immich-ml /predict 的输入尺寸）是两码事，不要混用：那个
-// 判定图片"能不能喂给 ML"，这个判定图片"要不要整图读进内存"。
-// 声明成 var 而不是 const 是为了让测试能注入一个更小的阈值，不必真的在测试
-// 里落地一个 100MB+ 的文件。
+// maxImageReadBytes is the byte cap on reading an image's original file
+// fully into memory during indexing (used for ML faceData and as a fallback
+// for image.DecodeConfig dimensions), to keep an abnormally huge/disguised
+// image file from blowing up the Go process's resident memory. Note this is
+// a different concern from oversizedForML (mlinput.go, the 178.9MP pixel cap
+// on what gets fed to immich-ml /predict) — don't conflate the two: that one
+// decides whether an image "can be fed to ML", this one decides whether an
+// image "should be read into memory whole".
+// Declared as a var rather than const so tests can inject a smaller
+// threshold without actually having to create a 100MB+ file in a test.
 var maxImageReadBytes int64 = 100 * 1024 * 1024 // 100MB
 
-// imageExceedsReadLimit 是纯函数判定：文件大小是否超过 maxImageReadBytes。
-// 抽出来单独测试边界值，不需要构造真实的大文件。
+// imageExceedsReadLimit is a pure predicate: whether the file size exceeds
+// maxImageReadBytes. Pulled out so boundary values can be tested without
+// constructing a real large file.
 func imageExceedsReadLimit(size int64) bool {
 	return size > maxImageReadBytes
 }
@@ -198,9 +207,11 @@ type Indexer struct {
 	queue    chan ingestQueueItem
 	seen     sync.Map // in-flight dedup: path -> struct{}
 
-	// scanDirInFlight 对整目录级补扫做去重：watcher 挂载轮询(followMounts)与
-	// MountGuard 插回恢复都可能对同一挂载触发补扫，同一 dir 只允许一份
-	// ScanDirectory 在跑，避免重复全量扫描徒耗 IO（见 ScanDirectoryOnce）。
+	// scanDirInFlight dedups whole-directory rescans: both the watcher's
+	// mount polling (followMounts) and MountGuard's replug recovery can
+	// trigger a rescan for the same mount, so only one ScanDirectory is
+	// allowed to run per dir at a time, avoiding a redundant full scan
+	// wasting IO (see ScanDirectoryOnce).
 	scanDirInFlight sync.Map // dir -> struct{}
 
 	taskReg    *TaskRegistry
@@ -216,9 +227,12 @@ type Indexer struct {
 	// injectable so tests don't depend on the real /proc/mounts.
 	mountRoots func() []string
 
-	// lastActivity 记录最近一次入队/处理完成的时刻(UnixNano)。人脸聚类的「安全网」
-	// 触发(scheduler 每分钟那条)据此去抖:仅在索引活动安静一段时间后才触发,
-	// 避免大上传途中索引队列出现 pending==0 空档时被误判为「上传结束」而提前聚类。
+	// lastActivity records the time (UnixNano) of the most recent enqueue or
+	// processed result. The face-clustering "safety net" trigger (the
+	// scheduler's once-a-minute check) debounces off this: it only fires
+	// once index activity has been quiet for a while, so a pending==0 gap
+	// mid-upload isn't mistaken for "upload finished" and clustering doesn't
+	// fire prematurely.
 	lastActivity atomic.Int64
 
 	// pendingAlbum maps a gallery path to the album the upload requested.
@@ -232,38 +246,50 @@ type Indexer struct {
 	// with the asset's DB id and the album id from pendingAlbum.
 	albumAssigner func(assetID, albumID string)
 
-	// doc 分类的提示词向量进程内缓存(见 docverdict.go loadPromptVecs)。
+	// In-process cache of doc-classification prompt vectors (see
+	// docverdict.go loadPromptVecs).
 	promptMu    sync.Mutex
 	promptDoc   [][]float32
 	promptPhoto [][]float32
 
-	// aestheticHead 非 nil 时,writeClipEmbedding 成功后内联计算美学分写库
-	// (纯本地矩阵乘,微秒级)。经 SetAestheticHead 注入,AestheticEnabled=false 时为 nil。
+	// aestheticHead, when non-nil, makes writeClipEmbedding compute and store
+	// the aesthetic score inline after a successful write (pure local matrix
+	// multiply, microsecond-scale). Injected via SetAestheticHead; nil when
+	// AestheticEnabled=false.
 	aestheticHead *aesthetic.Head
 
-	// sprites 是进程内共享的悬浮预览雪碧图生成器：索引管线内联预生成、启动
-	// 补跑（BackfillSprites）与 /sprite 路由的现场生成必须共用同一实例，
-	// 其 in-flight 去重才能防止并发 ffmpeg 写同一输出文件。
+	// sprites is the process-wide shared hover-preview sprite generator: the
+	// indexing pipeline's inline pregeneration, the startup backfill
+	// (BackfillSprites), and the /sprite route's on-demand generation must
+	// all share this one instance so its in-flight dedup can prevent
+	// concurrent ffmpeg runs writing the same output file.
 	sprites *SpriteGenerator
 
-	// spriteBackfillRunning 是 BackfillSprites 的 CAS 重入门闩：一次只允许
-	// 一轮存量补跑在跑，避免服务重启风暴或误触发导致多轮并发扫同一批候选。
+	// spriteBackfillRunning is BackfillSprites' CAS re-entrancy latch: only
+	// one backfill pass over existing assets is allowed to run at a time,
+	// preventing a service-restart storm or a spurious trigger from scanning
+	// the same candidate batch concurrently.
 	spriteBackfillRunning atomic.Bool
 
-	// previewPregen 对应 photos.PreviewPregen 配置（经 SetPreviewPregen 注入）：
-	// false（缺省）时索引期内联生成与 BackfillSprites 启动补跑都跳过
-	// preview.mp4，只保留 /preview 路由端的懒生成；sprite.jpg 不受影响。
+	// previewPregen mirrors the photos.PreviewPregen config (injected via
+	// SetPreviewPregen): false (the default) skips preview.mp4 generation
+	// both in the inline indexing path and in BackfillSprites' startup
+	// backfill, leaving only the /preview route's lazy generation;
+	// sprite.jpg is unaffected.
 	previewPregen bool
 
-	// onIndexed 在资产写为 status='indexed'（唯一写入点，见 processFileInternal
-	// 末尾）成功后异步调用一次，供 CaptionFeeder.FeedOne 内联投喂钩子使用。
-	// 函数字段注入（同 albumAssigner/onBatchDone 模式），避免 Indexer 直接依赖
-	// CaptionFeeder 类型；为 nil 时（未接线 / 测试）安全跳过。
+	// onIndexed is called once, asynchronously, after an asset is
+	// successfully written as status='indexed' (the single write point, see
+	// the end of processFileInternal), for CaptionFeeder.FeedOne's inline
+	// feed hook. Injected as a function field (same pattern as
+	// albumAssigner/onBatchDone) so Indexer doesn't depend directly on the
+	// CaptionFeeder type; safely skipped when nil (not wired up / tests).
 	onIndexed func(assetID string)
 
-	// onCaptionDelete 在硬删除资产（RemoveByPath/pruneMissingUnder，紧邻
-	// dropClipVector 调用点）成功后调用，供 CaptionFeeder.DeleteRemote 联动使
-	// 用（Task 4）。函数字段注入，同 onIndexed；为 nil 时安全跳过。
+	// onCaptionDelete is called after an asset is hard-deleted
+	// (RemoveByPath/pruneMissingUnder, right next to the dropClipVector call
+	// site) succeeds, for CaptionFeeder.DeleteRemote to hook into (Task 4).
+	// Injected as a function field, same as onIndexed; safely skipped when nil.
 	onCaptionDelete func(assetID string)
 }
 
@@ -285,7 +311,7 @@ func (ix *Indexer) IdleFor() time.Duration {
 // guard ensures only one full scan runs at a time: concurrent triggers
 // (startup, periodic ticker, manual rescan) arriving while a scan is already
 // in progress return immediately instead of spawning a duplicate scan — which
-// is what previously surfaced as two identical "索引照片" tasks at once.
+// is what previously surfaced as two identical "Indexing photos" tasks at once.
 // Callers run this in their own goroutine; it blocks until all roots are done.
 func (ix *Indexer) ScanAllRoots() {
 	if !atomic.CompareAndSwapInt32(&ix.scanActive, 0, 1) {
@@ -326,10 +352,13 @@ func (ix *Indexer) pruneSystemMountAssets() {
 // pruneRcloneMountAssets removes any indexed asset living under an rclone
 // FUSE cloud-drive mount. Cloud drives are excluded from scanning/watching
 // (see parseScanRoots) — this startup purge self-heals whatever an earlier,
-// broader scan may have indexed. mounts 由调用方传 enumerateRcloneMounts(),
-// 注入参数便于测试;未挂载的云盘不猜路径模式、不动。
-// 挂载点名含 `_`(rclone 命名 /mnt/<user>_<provider>_<id>)是 LIKE 单字符
-// 通配,必须用 substr 前缀比较,不能用 LIKE。
+// broader scan may have indexed. mounts is passed in by the caller as
+// enumerateRcloneMounts(); injected as a parameter for testability. An
+// unmounted cloud drive is left untouched — we don't guess at its path
+// pattern.
+// Mount point names contain `_` (rclone names them
+// /mnt/<user>_<provider>_<id>), which is a LIKE single-char wildcard, so a
+// substr prefix compare must be used instead of LIKE.
 func (ix *Indexer) pruneRcloneMountAssets(mounts []string) {
 	for _, mp := range mounts {
 		prefix := strings.TrimRight(mp, "/") + "/"
@@ -374,7 +403,7 @@ const taskCleanupDelay = 6 * time.Second
 // tusEchoSuppress is how long a TUS-ingested file's seen reservation is held
 // after the worker finishes, to swallow the watcher's late fsnotify Create echo
 // of the just-renamed file (which would otherwise spawn a stray batches[""]
-// "索引照片" task). Generous enough to cover inotify delivery backlog under load.
+// "Indexing photos" task). Generous enough to cover inotify delivery backlog under load.
 const tusEchoSuppress = 30 * time.Second
 
 // ingestBatch tracks the progress of a single logical batch of files.
@@ -510,7 +539,7 @@ func (t *ingestTracker) publishRunningLocked(b *ingestBatch) {
 	t.reg.Upsert(Task{
 		ID:        b.taskID,
 		Type:      "index",
-		Label:     "索引照片",
+		Label:     "Indexing photos",
 		Current:   b.current,
 		Total:     b.total,
 		Progress:  progress,
@@ -528,9 +557,9 @@ func (t *ingestTracker) onIdle(batchID string) {
 		t.mu.Unlock()
 		return
 	}
-	label := "索引照片"
+	label := "Indexing photos"
 	if b.failed > 0 {
-		label = fmt.Sprintf("索引照片（失败 %d 张）", b.failed)
+		label = fmt.Sprintf("Indexing photos (%d failed)", b.failed)
 	}
 	taskID := b.taskID
 	final := Task{
@@ -576,9 +605,10 @@ func NewIndexer(db *sql.DB, ml MLProvider, thumbDir string, workers int) *Indexe
 	}
 }
 
-// Sprites 返回进程内共享的雪碧图生成器：索引内联预生成、启动补跑与
-// /sprite 路由必须共用同一实例，其 in-flight 去重才能防止并发 ffmpeg
-// 写同一输出文件。
+// Sprites returns the process-wide shared sprite generator: the indexing
+// pipeline's inline pregeneration, the startup backfill, and the /sprite
+// route must all share this one instance so its in-flight dedup can prevent
+// concurrent ffmpeg runs writing the same output file.
 func (ix *Indexer) Sprites() *SpriteGenerator { return ix.sprites }
 
 // SetPendingAlbum registers that the file at path should be added to albumID
@@ -611,8 +641,9 @@ func (ix *Indexer) SetAlbumAssigner(fn func(assetID, albumID string)) {
 	ix.albumAssigner = fn
 }
 
-// SetPreviewPregen 注入 photos.PreviewPregen 配置:false(缺省)时索引期与
-// 启动补跑都不预生成 preview.mp4,只保留路由端懒生成。
+// SetPreviewPregen injects the photos.PreviewPregen config: false (the
+// default) skips preview.mp4 pregeneration in both the indexing pipeline and
+// the startup backfill, leaving only the route's lazy generation.
 func (ix *Indexer) SetPreviewPregen(on bool) { ix.previewPregen = on }
 
 // SetTaskRegistry injects a TaskRegistry so ScanDirectory can report progress.
@@ -735,8 +766,9 @@ func (ix *Indexer) SetOnIndexed(fn func(assetID string)) {
 	ix.onIndexed = fn
 }
 
-// SetCaptionDelete 注入硬删除资产成功后的 caption 删除回调（通常是
-// CaptionFeeder.DeleteRemote），供 RemoveByPath/pruneMissingUnder 调用（Task 4）。
+// SetCaptionDelete injects the caption-delete callback invoked after an asset
+// is hard-deleted (typically CaptionFeeder.DeleteRemote), called from
+// RemoveByPath/pruneMissingUnder (Task 4).
 func (ix *Indexer) SetCaptionDelete(fn func(assetID string)) {
 	ix.onCaptionDelete = fn
 }
@@ -760,13 +792,18 @@ func (ix *Indexer) Start(ctx context.Context) {
 					ix.ingest.noteResultWithBatch(item.batchID, success)
 					ix.touch()
 					if item.batchID != "" {
-						// TUS 上传的文件:rename 落地会让 watcher 迟发一个 Create 事件。
-						// 大批量 + inotify 压力下,该事件常常晚于 worker 处理完成才到达,
-						// 此时若立即释放 seen,watcher 的 Enqueue 会把这个「已索引」文件
-						// 当成 legacy "" 累积批次重新入队 → 冒出第二个「索引照片」任务(dedup
-						// 秒完→闪 100%),并连带在下一次 settle 触发又一次聚类。
-						// 延迟释放 seen 以吸收这个回声;普通 watcher 新文件(batchID="")
-						// 维持立即释放,不影响正常落盘检测。
+						// For TUS-uploaded files: landing the rename makes the watcher
+						// fire a late Create event. Under heavy batches + inotify
+						// pressure, that event routinely arrives after the worker has
+						// already finished processing — if seen were released
+						// immediately, the watcher's Enqueue would re-enqueue this
+						// already-indexed file into the legacy "" accumulate batch,
+						// spawning a second "Indexing photos" task (dedup
+						// completes instantly → flashes to 100%), and triggering another
+						// clustering pass on the next settle. Delay releasing seen to
+						// absorb this echo; ordinary watcher-discovered new files
+						// (batchID="") still release immediately, which doesn't affect
+						// normal on-disk detection.
 						p := item.path
 						time.AfterFunc(tusEchoSuppress, func() { ix.seen.Delete(p) })
 					} else {
@@ -818,9 +855,10 @@ func (ix *Indexer) processFileInternal(path string, opts processOpts) (success b
 	// leave a stale entry in the map.
 	pendingAlbumID := ix.takePendingAlbum(path)
 
-	// 1. 先 stat，不读一个字节。size+mtime 既是下面 P2 快速跳过判断的依据，也
-	// 直接复用为 INSERT 阶段需要的 file_size/mtime，避免处理期间文件被替换导
-	// 致前后两次 stat 结果不一致。
+	// 1. stat first, without reading a single byte. size+mtime are both the
+	// basis for the P2 fast-skip check below and reused directly as the
+	// file_size/mtime the INSERT stage needs, avoiding the file being
+	// replaced mid-processing causing two stats to disagree.
 	fi, err := os.Stat(path)
 	if err != nil {
 		return false
@@ -828,12 +866,16 @@ func (ix *Indexer) processFileInternal(path string, opts processOpts) (success b
 	fileSize := fi.Size()
 	mtime := fi.ModTime().UnixNano()
 
-	// 2. stat 快速跳过（P2）：已经 status='indexed' 且 file_size+mtime 都没变
-	// 的文件，不读一个字节就能确认"这份内容早就处理过"——这是打破"重启→整读
-	// 全部 pending 行→再次 OOM→再被杀重启"死循环的关键一步。旧数据（升级前
-	// 入库、mtime 列还是 NULL）在这里必然 miss，会往下走一遍流式哈希 + checksum
-	// 判重，并在第 4 步命中 checksum 短路时就地把 mtime 回填到本 file_path，
-	// 下次重启/续扫即可直接命中这里、彻底免读。
+	// 2. stat fast-skip (P2): a file that's already status='indexed' with
+	// unchanged file_size+mtime can be confirmed as "already processed"
+	// without reading a single byte — this is the key step that breaks the
+	// "restart → read every pending row in full → OOM again → killed and
+	// restarted again" death loop. Legacy rows (written before this
+	// upgrade, mtime column still NULL) necessarily miss here and fall
+	// through to the streaming-hash + checksum dedup below; when that hits
+	// the checksum short-circuit at step 4, it backfills mtime onto this
+	// file_path in place, so the next restart/rescan hits this check
+	// directly and skips the read entirely.
 	if !opts.force {
 		var existingID string
 		if err := ix.db.QueryRow(
@@ -847,17 +889,21 @@ func (ix *Indexer) processFileInternal(path string, opts processOpts) (success b
 		}
 	}
 
-	// 3. 流式计算 SHA-256（os.Open + io.Copy）：边读边算，不把整个文件驻留到
-	// 内存里——几十 KB 的图片和几个 GB 的视频走的是同一份常量级内存开销。
+	// 3. Streaming SHA-256 (os.Open + io.Copy): compute while reading, never
+	// holding the whole file in memory — a few dozen KB image and a
+	// multi-GB video pay the same constant-size memory cost.
 	checksum, err := sha256FileStream(path)
 	if err != nil {
 		return false
 	}
 
-	// 4. checksum 命中已索引记录时短路。这条判重逻辑和改动前语义完全一致，
-	// 只是不再要求"整个文件已经读进内存"——它是上面 stat 快速路径的兜底：
-	// mtime 还没回填的存量数据、或者文件被"touch"过但内容没变的场景，都靠它
-	// 兜底识别成"其实早就处理过"。
+	// 4. Short-circuit when the checksum matches an already-indexed record.
+	// This dedup logic is semantically identical to before the change —
+	// it just no longer requires "the whole file has been read into
+	// memory". It's the fallback for the stat fast-path above: legacy data
+	// whose mtime hasn't been backfilled yet, or a file that's been
+	// "touched" without its content changing, both get recognized here as
+	// "actually already processed".
 	// Records with status='pending' (e.g. left by a crash) are intentionally
 	// re-processed so they can reach 'indexed' status.
 	// When opts.force is set, bypass this short-circuit entirely.
@@ -865,18 +911,23 @@ func (ix *Indexer) processFileInternal(path string, opts processOpts) (success b
 		var existingID string
 		err = ix.db.QueryRow(`SELECT id FROM assets WHERE checksum=? AND status='indexed'`, checksum).Scan(&existingID)
 		if err == nil {
-			// 关键回填：升级前入库的存量行 mtime 为 NULL，第 2 步的 stat 快速
-			// 路径永远 miss、每次续扫都要在这里重新流式读一遍整文件。既然已经
-			// 确认这条路径的内容没变（checksum 命中 indexed），就把 size+mtime
-			// 写回本 file_path，下次续扫第 2 步即可零读取命中，彻底摆脱"存量行
-			// 每次重启都被整库重读一遍"。仅当本路径确有 indexed 行时才更新
-			// （纯内容去重——同内容的另一个新路径此处无对应行——是 0 行 no-op，
-			// 那种情况本就没有自己的行可回填，与本次修复无关）。
+			// Critical backfill: rows written before this upgrade have
+			// mtime=NULL, so step 2's stat fast path will always miss and
+			// every rescan has to stream-read the whole file again here.
+			// Now that we've confirmed this path's content hasn't changed
+			// (checksum hit an indexed row), write size+mtime back onto
+			// this file_path so the next rescan hits step 2 with zero
+			// reads, fully escaping "legacy rows get the whole file
+			// re-read on every restart". Only updates when this exact path
+			// actually has an indexed row (pure content dedup — a
+			// different new path with the same content has no
+			// corresponding row here — is a 0-row no-op; that case has no
+			// row of its own to backfill and is unrelated to this fix).
 			if _, uerr := ix.db.Exec(
 				`UPDATE assets SET mtime=?, file_size=? WHERE file_path=? AND status='indexed' AND (mtime IS NULL OR mtime<>?)`,
 				mtime, fileSize, path, mtime,
 			); uerr != nil {
-				fmt.Fprintf(os.Stderr, "[indexer] mtime 回填失败 %s: %v\n", path, uerr)
+				fmt.Fprintf(os.Stderr, "[indexer] mtime backfill failed %s: %v\n", path, uerr)
 			}
 			// already fully indexed — assign to album if requested, then short-circuit
 			if pendingAlbumID != "" && ix.albumAssigner != nil {
@@ -886,8 +937,9 @@ func (ix *Indexer) processFileInternal(path string, opts processOpts) (success b
 		}
 	}
 
-	// 5. Detect MIME type and decide image vs. video. 已知扩展名直查表，不碰
-	// 磁盘；只有未知扩展名才读文件头部做内容嗅探（detectMimeType）。
+	// 5. Detect MIME type and decide image vs. video. Known extensions go
+	// straight to the table without touching disk; only unknown extensions
+	// read the file header for content sniffing (detectMimeType).
 	ext := strings.ToLower(filepath.Ext(path))
 	mime := detectMimeType(path, ext)
 	isVideo := strings.HasPrefix(mime, "video/") || videoExts[ext]
@@ -899,8 +951,10 @@ func (ix *Indexer) processFileInternal(path string, opts processOpts) (success b
 	var mediaInfo *ffmpeg.MediaInfo
 	var keyframePath string
 	var keyframeTmpDir string
-	// data 只在图片路径、且文件不超过 maxImageReadBytes 时才会被填充；视频
-	// 路径全程保持 nil——关键帧/probe 都按路径走 ffmpeg，一个字节都不碰 data。
+	// data is only populated on the image path, and only when the file
+	// doesn't exceed maxImageReadBytes; the video path leaves it nil
+	// throughout — keyframe extraction/probing both go through ffmpeg by
+	// path, never touching data.
 	var data []byte
 
 	if isVideo {
@@ -933,12 +987,15 @@ func (ix *Indexer) processFileInternal(path string, opts processOpts) (success b
 			}
 		}
 
-		// 超过 maxImageReadBytes 的图片跳过整图读入内存：ML faceData 置空
-		// （下面第 9 步 CLIP 会退化成只用缩略图、没有缩略图就跳过；OCR 直接
-		// 跳过），但 EXIF（已流式解析）、缩略图（thumb.Generate 按路径读）、
-		// 入库都照常完成——异常超大图不应该拖累基础索引。
+		// Images larger than maxImageReadBytes skip reading the whole image
+		// into memory: ML faceData stays empty (step 9's CLIP below falls
+		// back to the thumbnail only, and skips entirely if there's no
+		// thumbnail; OCR is skipped outright), but EXIF (already parsed
+		// via streaming), thumbnails (thumb.Generate reads by path), and
+		// the DB write all complete as usual — an abnormally huge image
+		// shouldn't hold back basic indexing.
 		if imageExceedsReadLimit(fileSize) {
-			zap.L().Warn("图片超过索引读取上限，跳过依赖原图字节的 ML（人脸检测/OCR），CLIP 仍走缩略图，基础索引照常",
+			zap.L().Warn("image exceeds indexing read limit, skipping ML that depends on original bytes (face detection/OCR); CLIP still uses the thumbnail, basic indexing proceeds as usual",
 				zap.String("path", path),
 				zap.Int64("file_size", fileSize),
 				zap.Int64("limit_bytes", maxImageReadBytes))
@@ -957,7 +1014,7 @@ func (ix *Indexer) processFileInternal(path string, opts processOpts) (success b
 	}
 
 	// 7. INSERT into assets with status='pending'.
-	// fileSize/mtime 复用第 1 步的 stat 结果，不再重复 os.Stat。
+	// fileSize/mtime reuse step 1's stat result, no repeat os.Stat.
 	assetID := uuid.NewString()
 	// Fall back to file mtime when no embedded capture time was found.
 	// Without this, files lacking EXIF DateTime or video creation_time would
@@ -982,12 +1039,18 @@ func (ix *Indexer) processFileInternal(path string, opts processOpts) (success b
 		  mtime         = excluded.mtime,
 		  face_scanned  = CASE WHEN excluded.checksum <> checksum THEN 0 ELSE face_scanned END,
 		  caption_synced = CASE WHEN excluded.checksum <> checksum THEN 0 ELSE caption_synced END`,
-		// face_scanned 只在内容真的变了(checksum 变化)才置回 0，交给 RunPipeline
-		// 重新检测；纯粹的 force 重跑(如 Embedder/Rebuilder 对未变内容的 CLIP
-		// 补跑,同一 checksum)不应清掉已完成的人脸检测标记——否则每轮 CLIP 补跑
-		// 都会把同一批资产重新扔回人脸检测队列,产生重复的 face_detections 行。
-		// caption_synced 同款语义：只在内容真的变了才置回 0，交给照片知识库
-		// 投喂管线重新交接给 Parser；未变内容的补跑不清掉已交接标记，避免重复投喂。
+		// face_scanned is only reset to 0 when the content actually changed
+		// (checksum differs), handing it back to RunPipeline for
+		// re-detection; a pure force rerun (e.g. Embedder/Rebuilder's CLIP
+		// backfill over unchanged content, same checksum) must not clear an
+		// already-completed face-detection flag — otherwise every CLIP
+		// backfill pass would throw the same batch of assets back into the
+		// face-detection queue, producing duplicate face_detections rows.
+		// caption_synced follows the same semantics: only reset to 0 when
+		// content actually changed, handing it back to the photo-knowledge
+		// feed pipeline to re-hand off to Parser; a backfill over unchanged
+		// content doesn't clear the already-handed-off flag, avoiding
+		// duplicate feeds.
 		assetID, path, fileSize, mime, originalName,
 		nullTime(takenAt), sqlNullInt64(durationMs),
 		checksum, mtime,
@@ -1088,15 +1151,20 @@ func (ix *Indexer) processFileInternal(path string, opts processOpts) (success b
 		thumb.Generate(imagePath, assetID, ix.thumbDir) //nolint:errcheck
 	}
 
-	// 视频入库即异步预生成雪碧图(sprite.jpg,数百 KB):消除首次 hover 的现场
-	// 生成空窗。preview.mp4(低码率预览视频,单个可达数十 MB)默认改为纯懒
-	// 生成——仅当 photos.PreviewPregen=true 时才在此一并预生成,缺省交给
-	// /preview 路由端现场生成(见 route/v1/assets.go Preview),不为从不
-	// 预览的视频付出磁盘。best-effort,goroutine 阻塞在生成器信号量(并发
-	// ≤2,两类产物共享)上排队,失败只记日志;ensure 核心幂等(已存在秒退)
-	// 且 in-flight 去重,与 /sprite、/preview 路由及启动补跑并发安全。
-	// sprite 仍以 dur>0 为前提(fps 表达式需要时长);preview 无此依赖,启动
-	// 条件放宽为 isVideo。
+	// A video pregenerates its hover-preview sprite (sprite.jpg, a few
+	// hundred KB) asynchronously as soon as it's indexed, eliminating the
+	// on-demand generation gap on first hover. preview.mp4 (a low-bitrate
+	// preview video, tens of MB apiece) defaults to pure lazy generation —
+	// only pregenerated here when photos.PreviewPregen=true; otherwise left
+	// to the /preview route's on-demand generation (see route/v1/assets.go
+	// Preview), so disk isn't spent on videos that are never previewed.
+	// Best-effort: the goroutine blocks queuing on the generator's
+	// semaphore (concurrency ≤2, shared by both artifact kinds); failures
+	// are only logged. The Ensure core is idempotent (returns instantly if
+	// already present) and dedups in-flight, safe to run concurrently with
+	// the /sprite, /preview routes and the startup backfill. sprite still
+	// requires dur>0 (the fps expression needs a duration); preview has no
+	// such dependency, so its trigger condition is relaxed to just isVideo.
 	if isVideo {
 		previewPath := filepath.Join(ix.thumbDir, assetID, "preview.mp4")
 		spritePath := filepath.Join(ix.thumbDir, assetID, "sprite.jpg")
@@ -1104,12 +1172,12 @@ func (ix *Indexer) processFileInternal(path string, opts processOpts) (success b
 		go func(src, previewOut, spriteOut string, dur int64, id string) {
 			if dur > 0 {
 				if _, err := ix.sprites.Ensure(src, spriteOut, dur); err != nil {
-					zap.L().Warn("sprite 预生成失败", zap.String("asset_id", id), zap.Error(err))
+					zap.L().Warn("sprite pregeneration failed", zap.String("asset_id", id), zap.Error(err))
 				}
 			}
 			if pregen {
 				if err := ix.sprites.EnsurePreview(src, previewOut); err != nil {
-					zap.L().Warn("preview 预生成失败", zap.String("asset_id", id), zap.Error(err))
+					zap.L().Warn("preview pregeneration failed", zap.String("asset_id", id), zap.Error(err))
 				}
 			}
 		}(path, previewPath, spritePath, durationMs, assetID)
@@ -1131,39 +1199,51 @@ func (ix *Indexer) processFileInternal(path string, opts processOpts) (success b
 		// sees and photos/videos share one resize pipeline. Embedding the full-
 		// resolution source biased rankings: high-detail video keyframes could
 		// outrank better photo matches.
-		// CLIP embedding（ScenesEnabled 关闭时跳过——注意嵌入同时是语义搜索的基础，
-		// 关闭后新照片不参与语义搜索）。
+		// CLIP embedding (skipped when ScenesEnabled is off — note the
+		// embedding also underpins semantic search, so new photos won't
+		// participate in semantic search once it's off).
 		if config.Cfg == nil || config.Cfg.ScenesEnabled {
-			// 失败不阻断入库(缩略图/EXIF 照常),但必须留痕:缺向量的资产
-			// 语义搜索完全搜不到,靠批次末尾/ML 恢复链的 Backfill 兜底补齐。
+			// A failure doesn't block ingestion (thumbnail/EXIF proceed as
+			// usual), but it must leave a trace: an asset missing its
+			// vector is completely unreachable by semantic search, relying
+			// on the end-of-batch/ML-recovery-chain Backfill to fill it in.
 			if err := ix.embedClip(assetID, faceData); err != nil {
-				zap.L().Warn("CLIP 嵌入失败,待 Backfill 兜底",
+				zap.L().Warn("CLIP embedding failed, relying on Backfill",
 					zap.String("asset_id", assetID), zap.Error(err))
 			}
 		}
 
 		if len(faceData) > 0 {
-			// Face detection + recognition 已移交独立任务 FaceService.RunPipeline
-			// （检测 0→95% + 聚类尾段 95→100%，真实进度）：新照片先入库可见，
-			// 人物筛选晚几秒~几分钟，换真实进度与更快入库。此处不再内联检测。
+			// Face detection + recognition has been handed off to the
+			// independent FaceService.RunPipeline task (detection 0→95% +
+			// clustering tail 95→100%, real progress): new photos land in
+			// the library first and are visible, with person tagging
+			// arriving seconds to minutes later, trading a faster
+			// ingestion for real progress reporting. No inline detection
+			// here anymore.
 
 			// OCR uses the same full-detail input as faces (original photo or
 			// full keyframe) — small text on receipts/documents is lost at
 			// thumbnail resolution.
-			// 视频不跑 OCR:对视频关键帧做 OCR 没有实际意义,还会把「录屏/含文字画面」的
-			// 视频误判进「OCR/文档」分类(asset_ocr 命中即归类)。视频只保留 CLIP 用于
-			// 视觉检索;真正的视频理解(分段 embedding)是后续工作。
-			// OCR（OCREnabled 关闭或视频时跳过）。
+			// Videos don't run OCR: running OCR on a video keyframe is
+			// meaningless, and would misclassify "screen recording /
+			// contains text" videos into the "OCR/document" category
+			// (asset_ocr having a hit is what triggers that category).
+			// Videos only get CLIP for visual search; true video
+			// understanding (segmented embedding) is future work.
+			// OCR (skipped when OCREnabled is off, or for videos).
 			if !isVideo && (config.Cfg == nil || config.Cfg.OCREnabled) {
 				ocrData := faceData
 				if oversizedForML(ocrData) {
-					// 原图超过 immich-ml/PIL 的 178.9MP 硬上限的安全边际
-					// (maxMLInputPixels),/predict 请求必然 500——降级用已在
-					// 上面第 8 步生成好的 large.jpg 缩略图代替原图。
+					// The original image exceeds immich-ml/PIL's 178.9MP
+					// hard cap safety margin (maxMLInputPixels), so a
+					// /predict request would necessarily 500 — fall back to
+					// the large.jpg thumbnail already generated in step 8
+					// above instead of the original.
 					if thumb := readLargeOrSmallThumb(ix.thumbDir, assetID); len(thumb) > 0 {
 						ocrData = thumb
 					} else {
-						zap.L().Warn("原图超过 ML 像素上限且缩略图不可用，跳过 OCR",
+						zap.L().Warn("original image exceeds ML pixel limit and no thumbnail is available, skipping OCR",
 							zap.String("asset_id", assetID))
 						ocrData = nil
 					}
@@ -1188,7 +1268,7 @@ func (ix *Indexer) processFileInternal(path string, opts processOpts) (success b
 		return false
 	}
 	if ix.onIndexed != nil {
-		go ix.onIndexed(assetID) // 异步旁路：投喂失败不影响索引结果
+		go ix.onIndexed(assetID) // async side channel: a feed failure doesn't affect the indexing result
 	}
 	return true
 }
@@ -1369,7 +1449,8 @@ func (ix *Indexer) writeClipEmbedding(assetID string, vec []float32) error {
 		return err
 	}
 	if n, _ := res.RowsAffected(); n > 0 {
-		// 向量已落库:内联美学打分。失败只记日志不影响向量写入结果。
+		// Vector is now persisted: score aesthetics inline. A failure is
+		// only logged and doesn't affect the vector write result.
 		ix.scoreAesthetic(assetID, vec)
 		return nil
 	}
@@ -1377,15 +1458,18 @@ func (ix *Indexer) writeClipEmbedding(assetID string, vec []float32) error {
 		fmt.Fprintf(os.Stderr, "[indexer] insert clip_embeddings %s: %v\n", assetID, err)
 		return err
 	}
-	// 向量已落库:内联美学打分。失败只记日志不影响向量写入结果。
+	// Vector is now persisted: score aesthetics inline. A failure is only
+	// logged and doesn't affect the vector write result.
 	ix.scoreAesthetic(assetID, vec)
 	return nil
 }
 
-// SetAestheticHead 注入美学评分头;nil 表示关闭内联打分。
+// SetAestheticHead injects the aesthetic-scoring head; nil disables inline scoring.
 func (ix *Indexer) SetAestheticHead(h *aesthetic.Head) { ix.aestheticHead = h }
 
-// scoreAesthetic 对已写入向量的资产计算美学分。头未注入 / 维度不符(NaN)时静默跳过。
+// scoreAesthetic computes the aesthetic score for an asset whose vector has
+// already been written. Silently skipped when the head isn't injected or the
+// dimension doesn't match (NaN).
 func (ix *Indexer) scoreAesthetic(assetID string, vec []float32) {
 	if ix.aestheticHead == nil {
 		return
@@ -1395,21 +1479,25 @@ func (ix *Indexer) scoreAesthetic(assetID string, vec []float32) {
 		return
 	}
 	if _, err := ix.db.Exec(`UPDATE assets SET aesthetic_score=? WHERE id=?`, s, assetID); err != nil {
-		zap.L().Warn("aesthetic: 写分失败", zap.String("asset_id", assetID), zap.Error(err))
+		zap.L().Warn("aesthetic: failed to write score", zap.String("asset_id", assetID), zap.Error(err))
 	}
 }
 
-// sha256File returns the hex-encoded SHA-256 hash of data. processFileInternal
-// 的判重主路径已经改用下面的 sha256FileStream（不要求整文件读进内存）；这个
-// 版本仍保留给已经拿到内存字节的场景（如测试里与流式哈希结果做交叉验证）。
+// sha256File returns the hex-encoded SHA-256 hash of data. processFileInternal's
+// main dedup path has switched to sha256FileStream below (which doesn't
+// require the whole file to be read into memory); this version is kept for
+// cases that already have the bytes in memory (e.g. cross-checking against
+// the streaming hash result in tests).
 func sha256File(data []byte) string {
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:])
 }
 
-// sha256FileStream 边读边算文件的 SHA-256（os.Open + io.Copy），不需要把整个
-// 文件驻留到内存——8GB 的视频和几十 KB 的缩略图走的是同一份常量级（io.Copy
-// 内部缓冲区大小）常驻内存，这是 processFileInternal 消除 OOM 的核心手段。
+// sha256FileStream computes the file's SHA-256 while reading (os.Open +
+// io.Copy), without needing to hold the whole file in memory — an 8GB video
+// and a few dozen KB thumbnail pay the same constant-size (io.Copy's
+// internal buffer size) resident memory; this is the core mechanism by which
+// processFileInternal eliminates OOM.
 func sha256FileStream(path string) (string, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -1444,13 +1532,17 @@ func walkSupported(ctx context.Context, dir string, fn func(path string)) error 
 	return filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
 		select {
 		case <-ctx.Done():
-			return ctx.Err() // WalkDir 收到非 SkipDir 错误即整体终止
+			return ctx.Err() // WalkDir aborts the whole walk on any non-SkipDir error
 		default:
 		}
 		if err != nil {
-			// 2026-07-06 plan02 审查并入:单个条目不可读(权限/竞态删除/悬空链接)
-			// 只跳过该子树,不中止整棵遍历——此前 return err 会让排在坏条目之后的
-			// 全部文件错过本轮扫描/实时索引;根目录本身出错仍上抛让调用方知晓。
+			// Merged in from the 2026-07-06 plan02 review: an unreadable
+			// single entry (permissions / raced deletion / dangling
+			// symlink) only skips that subtree, it doesn't abort the whole
+			// walk — previously `return err` here made every file sorted
+			// after the bad entry miss this scan/live-indexing pass; an
+			// error on the root directory itself is still propagated so
+			// the caller is aware.
 			if path == dir {
 				return err
 			}
@@ -1505,7 +1597,7 @@ func (ix *Indexer) ScanDirectory(dir string) error {
 		ix.taskReg.Upsert(Task{
 			ID:        taskID,
 			Type:      "index",
-			Label:     "索引照片",
+			Label:     "Indexing photos",
 			Current:   0,
 			Total:     total,
 			Progress:  0,
@@ -1521,7 +1613,7 @@ func (ix *Indexer) ScanDirectory(dir string) error {
 		ix.taskReg.Upsert(Task{
 			ID:        taskID,
 			Type:      "index",
-			Label:     "索引照片",
+			Label:     "Indexing photos",
 			Current:   processed,
 			Total:     total,
 			Progress:  1,
@@ -1555,7 +1647,7 @@ func (ix *Indexer) ScanDirectory(dir string) error {
 			reg.Upsert(Task{
 				ID:        taskID,
 				Type:      "index",
-				Label:     "索引照片",
+				Label:     "Indexing photos",
 				Current:   processed,
 				Total:     total,
 				Progress:  progress,
@@ -1569,8 +1661,9 @@ func (ix *Indexer) ScanDirectory(dir string) error {
 }
 
 // ScanDirectoryOnce runs ScanDirectory(dir) unless a scan for the same dir is
-// already in flight (watcher 挂载轮询与 MountGuard 插回恢复可能同时对同一
-// 挂载触发补扫)。返回 started=false 表示因去重而跳过。
+// already in flight (the watcher's mount polling and MountGuard's replug
+// recovery can both trigger a rescan for the same mount at the same time).
+// Returns started=false to indicate it was skipped due to dedup.
 func (ix *Indexer) ScanDirectoryOnce(dir string) (bool, error) {
 	if _, loaded := ix.scanDirInFlight.LoadOrStore(dir, struct{}{}); loaded {
 		return false, nil
@@ -1612,9 +1705,12 @@ func pruneOrphanClipVectors(db *sql.DB) {
 	_, _ = db.Exec(`DELETE FROM clip_embeddings WHERE rowid NOT IN (SELECT rowid FROM asset_clip_idx)`)
 }
 
-// pruneVideoOCR 删除视频的 OCR 行。视频不再跑 OCR(关键帧 OCR 无意义,还会把含文字
-// 画面的视频误判进「OCR/文档」分类);这里在启动时清掉历史遗留的视频 OCR 行,使已索引
-// 的视频也立即退出 OCR 分类。幂等:之后视频不再产生 asset_ocr 行。
+// pruneVideoOCR deletes OCR rows for videos. Videos no longer run OCR
+// (keyframe OCR is meaningless, and would misclassify videos with on-screen
+// text into the "OCR/document" category); this cleans up legacy video OCR
+// rows at startup so already-indexed videos also drop out of the OCR
+// category immediately. Idempotent: videos no longer produce asset_ocr rows
+// going forward.
 func pruneVideoOCR(db *sql.DB) {
 	_, _ = db.Exec(`DELETE FROM asset_ocr WHERE asset_id IN
 		(SELECT id FROM assets WHERE mime_type LIKE 'video/%')`)
@@ -1633,7 +1729,7 @@ func (ix *Indexer) RemoveByPath(path string) {
 	}
 	dropClipVector(ix.db, id) // before the cascade drops asset_clip_idx
 	if ix.onCaptionDelete != nil {
-		ix.onCaptionDelete(id) // caption 联动：防 agent 检索到幽灵结果
+		ix.onCaptionDelete(id) // caption hook: keeps the agent from retrieving ghost results
 	}
 	if _, err := ix.db.Exec(`DELETE FROM assets WHERE id = ?`, id); err != nil {
 		return
@@ -1697,7 +1793,7 @@ func (ix *Indexer) pruneMissingUnder(dir string) error {
 	for _, r := range gone {
 		dropClipVector(ix.db, r.id) // before the cascade drops asset_clip_idx
 		if ix.onCaptionDelete != nil {
-			ix.onCaptionDelete(r.id) // caption 联动：防 agent 检索到幽灵结果
+			ix.onCaptionDelete(r.id) // caption hook: keeps the agent from retrieving ghost results
 		}
 		if _, err := ix.db.Exec(`DELETE FROM assets WHERE id = ?`, r.id); err != nil {
 			continue
@@ -1711,14 +1807,19 @@ func (ix *Indexer) pruneMissingUnder(dir string) error {
 }
 
 // pruneDeleteAllowed re-validates right before the destructive pass:
-// stat 循环期间可移动盘可能被拔出,届时所有文件都 stat 失败,若不复核
-// 会把整棵子树的资产/向量/缩略图批量误删。
+// A removable drive can be unplugged during the stat loop, at which point
+// every file fails stat; without this re-check, an entire subtree's assets/
+// vectors/thumbnails would be mass-deleted by mistake.
 //
-// 复核对象是 dir 所属的**挂载根**,而不是 dir 本身:dir 被整体删除(Files
-// 删除相册文件夹)正是需要 prune 的合法场景,stat dir 必然失败,拿它当判据
-// 会把合法删除误判成拔盘、永久滞留索引。真正的拔盘由两道检查兜住——挂载
-// 从 /proc/mounts 消失时 containingRoot 拿不到根;死挂载残留在挂载表里时
-// stat 挂载根会报错(EIO 等)。
+// The re-check target is the **mount root** dir belongs to, not dir itself:
+// dir being deleted wholesale (Files deleting an album folder) is exactly
+// the legitimate case prune is meant to handle, and stat dir would
+// necessarily fail — using that as the criterion would misjudge a
+// legitimate deletion as a drive unplug and leave it stuck in the index
+// forever. A genuine unplug is caught by two checks instead — containingRoot
+// can't find a root once the mount has vanished from /proc/mounts; stat on
+// the mount root errors out (EIO, etc.) when a dead mount lingers in the
+// mount table.
 func pruneDeleteAllowed(dir string, containingRoot func(string) (string, bool)) bool {
 	root, ok := containingRoot(dir)
 	if !ok {
@@ -1806,8 +1907,9 @@ func spriteBackfillCandidates(db *sql.DB) ([]spriteCandidate, error) {
 	return out, rows.Err()
 }
 
-// pendingBackfill 返回缺失悬浮预览产物的候选。includePreview=false(即
-// PreviewPregen 关闭)时只按 sprite.jpg 缺失判定,preview.mp4 交给懒生成。
+// pendingBackfill returns candidates missing a hover-preview artifact.
+// When includePreview=false (i.e. PreviewPregen off), only sprite.jpg's
+// presence is checked; preview.mp4 is left to lazy generation.
 func pendingBackfill(candidates []spriteCandidate, thumbDir string, includePreview bool) []spriteCandidate {
 	var pending []spriteCandidate
 	for _, c := range candidates {
@@ -1824,27 +1926,42 @@ func pendingBackfill(candidates []spriteCandidate, thumbDir string, includePrevi
 	return pending
 }
 
-// BackfillSprites 为存量视频补雪碧图,以及(仅当 photos.PreviewPregen=true 时)
-// 补预览视频(启动时调用一次,批次完成钩子也会追加触发)。CAS 防重入;顺序逐个
-// 生成(生成器信号量另有并发≤2 的全局上限,两类产物共享);ffmpeg 不存在
-// (exec.ErrNotFound)时立即放弃整轮,避免逐条刷错误日志。候选查询仍以
-// duration_ms>0 过滤(时长未知的破损视频极罕见,交由路由端惰性兜底),两类产物
-// 在循环体内各自 os.Stat 判存在跳过(省函数调用,与 sprite 既有写法对齐;
-// preview 侧 ensure 核心本身也天然幂等)。PreviewPregen=false(缺省)时 preview
-// 完全交给 /preview 路由端懒生成,本函数只补 sprite。
+// BackfillSprites backfills sprites for existing videos, and (only when
+// photos.PreviewPregen=true) preview videos too (called once at startup,
+// also re-triggered by the batch-done hook). CAS-guarded against
+// re-entrancy; generates one at a time (the generator's semaphore also
+// imposes a global concurrency≤2 cap, shared by both artifact kinds);
+// gives up on the whole pass immediately when ffmpeg is missing
+// (exec.ErrNotFound), instead of spamming an error log per item. The
+// candidate query still filters on duration_ms>0 (a broken video with
+// unknown duration is extremely rare, and is left to the route's lazy
+// fallback); both artifact kinds are checked for existence in the loop body
+// via their own os.Stat (saves a function call, matches sprite's existing
+// style; the preview side's ensure core is also naturally idempotent).
+// When PreviewPregen=false (the default), preview is left entirely to the
+// /preview route's lazy generation, and this function only backfills sprite.
 //
-// 任务栏接入(沿用 faces.go RunPipeline 的生命周期模式):先对候选逐条预扫描
-// sprite.jpg/preview.mp4 是否缺失,只有真正有欠账(total>0)才发「生成视频
-// 预览」任务——单条上传的内联预生成秒级完成,不会被这里捕获(prescan 时已经
-// 齐备),维持不发任务的现状。current 每处理完一条候选(无论生成、跳过还是
-// join 复用)就 +1 并 Upsert,由 registry 自身节流发布频率。ffmpeg 缺失时整
-// 轮放弃并把任务标为 error 终态;个别视频生成失败不中断整轮,对齐 BackfillOCR
-// 的既有惯例(见 embedder.go backfillOCROnce):只有全部候选都处理失败才把任务
-// 终态标为 error(TaskErrPreviewPartialFailed),否则(含部分失败)终态为 done、
-// 失败数计入汇总日志——一条永久损坏的视频每轮补跑都会失败,若按"出现失败就
-// error"处理,任务栏会持续弹 Failed 造成噪音。ctx 取消时不发任何终态,任务留在
-// running,交给 registry 的停滞清扫器兜底收尾——与 faces.go RunPipeline 对中断
-// 的处理方式一致。
+// Task-bar integration (following faces.go RunPipeline's lifecycle
+// pattern): first pre-scans each candidate for missing sprite.jpg/
+// preview.mp4, and only fires the "Generating video previews" task when
+// there's real backlog (total>0) — a single upload's inline pregeneration
+// completes in seconds and won't be caught here (already complete by
+// prescan time), preserving the existing behavior of not firing a task for
+// that case. current is incremented and Upserted after each candidate is
+// processed (whether generated, skipped, or reused via join), with the
+// registry throttling its own publish rate. When ffmpeg is missing, the
+// whole pass gives up and marks the task's terminal state as error;
+// individual video failures don't abort the pass, matching BackfillOCR's
+// existing convention (see embedder.go backfillOCROnce): the terminal state
+// is only marked error (TaskErrPreviewPartialFailed) when every candidate
+// failed, otherwise (including partial failures) the terminal state is
+// done, with the failure count folded into the summary log — a
+// permanently-corrupt video would fail every single backfill pass, and
+// treating "any failure occurred" as error would make the task bar flash
+// Failed every round as noise. No terminal state is published when ctx is
+// cancelled; the task is left running, for the registry's stale-task sweep
+// to clean up — consistent with how faces.go RunPipeline handles
+// interruption.
 func (ix *Indexer) BackfillSprites(ctx context.Context) {
 	if !ix.spriteBackfillRunning.CompareAndSwap(false, true) {
 		return
@@ -1853,14 +1970,17 @@ func (ix *Indexer) BackfillSprites(ctx context.Context) {
 
 	candidates, err := spriteBackfillCandidates(ix.db)
 	if err != nil {
-		zap.L().Warn("sprite 补跑候选查询失败", zap.Error(err))
+		zap.L().Warn("sprite backfill candidate query failed", zap.Error(err))
 		return
 	}
 
-	// 预扫描:逐条候选判 sprite.jpg(以及 PreviewPregen 开启时的 preview.mp4)
-	// 是否缺失,只有任一缺失的才算一个待处理项,得到 total。两者都已齐备(或
-	// PreviewPregen 关闭下 sprite 已齐备)的候选不计入 total、也不进入下面的
-	// 处理循环(本轮它无事可做)。total==0 直接返回,不发任务。
+	// Pre-scan: for each candidate, check whether sprite.jpg (and
+	// preview.mp4, when PreviewPregen is on) is missing; only counts as a
+	// pending item if either is missing, giving us total. Candidates where
+	// both are already present (or sprite alone, when PreviewPregen is off)
+	// aren't counted in total and don't enter the processing loop below
+	// (there's nothing to do for them this round). Returns immediately
+	// without firing a task when total==0.
 	pending := pendingBackfill(candidates, ix.thumbDir, ix.previewPregen)
 	total := int64(len(pending))
 	if total == 0 {
@@ -1888,8 +2008,9 @@ func (ix *Indexer) BackfillSprites(ctx context.Context) {
 		}
 		ix.taskReg.Upsert(t)
 	}
-	// scheduleRemove 是终态收尾:沿用 faces.go 的模式,done/error 后延迟
-	// taskCleanupDelay 再从注册表摘除,给前端留出展示终态的窗口。
+	// scheduleRemove handles terminal-state cleanup: following faces.go's
+	// pattern, wait taskCleanupDelay after done/error before removing from
+	// the registry, giving the frontend a window to display the terminal state.
 	scheduleRemove := func() {
 		go func() {
 			time.Sleep(taskCleanupDelay)
@@ -1901,9 +2022,11 @@ func (ix *Indexer) BackfillSprites(ctx context.Context) {
 
 	pub(0, "running", "", nil)
 
-	// sourceMissing 仅统计"源视频文件缺失"（os.Stat 失败）而整条候选被跳过的
-	// 数量；sprite.jpg / preview.mp4 是否已存在则各自在下面独立 os.Stat 判断，
-	// 不计入这个计数器（对应 spritesGenerated / previewsGenerated 未增长的隐含语义）。
+	// sourceMissing only counts candidates skipped entirely because the
+	// "source video file is missing" (os.Stat failed); whether sprite.jpg /
+	// preview.mp4 already exist is checked independently via os.Stat below
+	// and isn't counted in this counter (corresponding to the implicit
+	// semantics of spritesGenerated / previewsGenerated not incrementing).
 	var spritesGenerated, previewsGenerated, sourceMissing int
 	var current, failed int64
 	for _, c := range pending {
@@ -1923,12 +2046,12 @@ func (ix *Indexer) BackfillSprites(ctx context.Context) {
 		if _, statErr := os.Stat(spritePath); statErr != nil {
 			if _, err := ix.sprites.Ensure(c.filePath, spritePath, c.durationMs); err != nil {
 				if errors.Is(err, exec.ErrNotFound) {
-					zap.L().Warn("ffmpeg 不可用,放弃本轮 sprite/preview 补跑", zap.Error(err))
+					zap.L().Warn("ffmpeg unavailable, giving up on this sprite/preview backfill pass", zap.Error(err))
 					pub(current, "error", TaskErrPreviewFfmpegMissing, nil)
 					scheduleRemove()
 					return
 				}
-				zap.L().Warn("sprite 补跑失败", zap.String("asset_id", c.id), zap.Error(err))
+				zap.L().Warn("sprite backfill failed", zap.String("asset_id", c.id), zap.Error(err))
 				itemFailed = true
 			} else {
 				spritesGenerated++
@@ -1940,12 +2063,12 @@ func (ix *Indexer) BackfillSprites(ctx context.Context) {
 			if _, statErr := os.Stat(previewPath); statErr != nil {
 				if err := ix.sprites.EnsurePreview(c.filePath, previewPath); err != nil {
 					if errors.Is(err, exec.ErrNotFound) {
-						zap.L().Warn("ffmpeg 不可用,放弃本轮 sprite/preview 补跑", zap.Error(err))
+						zap.L().Warn("ffmpeg unavailable, giving up on this sprite/preview backfill pass", zap.Error(err))
 						pub(current, "error", TaskErrPreviewFfmpegMissing, nil)
 						scheduleRemove()
 						return
 					}
-					zap.L().Warn("preview 补跑失败", zap.String("asset_id", c.id), zap.Error(err))
+					zap.L().Warn("preview backfill failed", zap.String("asset_id", c.id), zap.Error(err))
 					itemFailed = true
 				} else {
 					previewsGenerated++
@@ -1960,7 +2083,7 @@ func (ix *Indexer) BackfillSprites(ctx context.Context) {
 		pub(current, "running", "", nil)
 	}
 	if spritesGenerated > 0 || previewsGenerated > 0 || failed > 0 {
-		zap.L().Info("sprite/preview 补跑完成",
+		zap.L().Info("sprite/preview backfill complete",
 			zap.Int("sprites_generated", spritesGenerated),
 			zap.Int("previews_generated", previewsGenerated),
 			zap.Int("source_missing", sourceMissing),
@@ -1968,9 +2091,12 @@ func (ix *Indexer) BackfillSprites(ctx context.Context) {
 	}
 
 	if failed > 0 && failed == total {
-		// 对齐 BackfillOCR 惯例(backfillOCROnce):只有全部候选都失败才判整批
-		// error;个别失败(哪怕反复出现,例如一条永久损坏的视频)只记日志,任务
-		// 终态照常 done,避免任务栏每轮都弹 Failed 造成噪音。
+		// Matches BackfillOCR's convention (backfillOCROnce): the whole
+		// batch is only judged error when every candidate failed;
+		// individual failures (even recurring ones, e.g. a permanently
+		// corrupt video) are only logged, and the terminal state stays
+		// done as usual, avoiding the task bar flashing Failed every round
+		// as noise.
 		pub(current, "error", TaskErrPreviewPartialFailed, map[string]string{"failed": strconv.FormatInt(failed, 10)})
 	} else {
 		pub(current, "done", "", nil)

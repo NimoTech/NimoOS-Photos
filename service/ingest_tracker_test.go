@@ -15,7 +15,7 @@ import (
 )
 
 // TestIngestTracker_SingleEnqueueLifecycle:
-// Enqueue 1 个，processFile 跑完，6 秒空闲后发 done。
+// Enqueue 1 file, processFile runs to completion, done is emitted after 6s idle.
 func TestIngestTracker_SingleEnqueueLifecycle(t *testing.T) {
 	db := makeTestDB(t)
 	thumbDir := t.TempDir()
@@ -36,7 +36,7 @@ func TestIngestTracker_SingleEnqueueLifecycle(t *testing.T) {
 
 	idx := NewIndexer(db, &mockML{}, thumbDir, 1)
 	idx.SetTaskRegistry(reg)
-	idx.SetIngestIdleTimeout(200 * time.Millisecond) // 测试用更短的 idle
+	idx.SetIngestIdleTimeout(200 * time.Millisecond) // shorter idle for testing
 	go idx.Start(ctx)
 
 	idx.Enqueue(imgPath)
@@ -54,7 +54,7 @@ func TestIngestTracker_SingleEnqueueLifecycle(t *testing.T) {
 }
 
 // TestIngestTracker_ReEnqueueWithinIdleCancelsTimer:
-// idle 计时未到时新 Enqueue 不应该让 task 提前 done。
+// a new Enqueue before the idle timer fires should not let the task go done early.
 func TestIngestTracker_ReEnqueueWithinIdleCancelsTimer(t *testing.T) {
 	db := makeTestDB(t)
 	thumbDir := t.TempDir()
@@ -97,7 +97,7 @@ func TestIngestTracker_ReEnqueueWithinIdleCancelsTimer(t *testing.T) {
 	time.Sleep(500 * time.Millisecond)
 	mu.Lock()
 	defer mu.Unlock()
-	require.Equal(t, 1, doneCount, "两次 Enqueue 应合并为一条 task、只发一次 done")
+	require.Equal(t, 1, doneCount, "two Enqueues should merge into one task and emit done only once")
 }
 
 // TestIngestTracker_HundredEnqueuesProduceSingleTask
@@ -129,10 +129,12 @@ func TestIngestTracker_HundredEnqueuesProduceSingleTask(t *testing.T) {
 		idx.Enqueue(makeTestJPEGNamed(t, imgDir, fmt.Sprintf("f%d.jpg", i)))
 	}
 
-	// 等待至少一个 done task 出现（所有文件处理完 + idle 超时后发送）。
-	// 注意：100 个文件内容相同（checksum 相同），processFile 会在第一个 indexed 后
-	// 对其余 99 个快速短路返回，ingest.current 仍会计到 100，idle timer 触发后
-	// 发出 done。不依赖 SELECT COUNT(*) 是因为相同 checksum 只写 1 行。
+	// Wait for at least one done task to appear (sent after all files are
+	// processed + idle timeout). Note: all 100 files have identical content
+	// (same checksum), so processFile short-circuits the other 99 right
+	// after the first is indexed; ingest.current still counts up to 100, and
+	// done is emitted once the idle timer fires. Not relying on
+	// SELECT COUNT(*) because the same checksum only writes 1 row.
 	require.Eventually(t, func() bool {
 		count := 0
 		doneSeen.Range(func(k, v any) bool { count++; return true })
@@ -141,11 +143,11 @@ func TestIngestTracker_HundredEnqueuesProduceSingleTask(t *testing.T) {
 
 	count := 0
 	taskIDs.Range(func(k, v any) bool { count++; return true })
-	require.Equal(t, 1, count, "100 次 Enqueue 应只产生 1 个 ingest task ID")
+	require.Equal(t, 1, count, "100 Enqueues should produce only 1 ingest task ID")
 }
 
 // TestIngestTracker_BatchFixedTotal:
-// EnqueueWithBatch(path, "b1", 10) 第一次进来，task.Total 立刻 = 10、Progress = 0/10。
+// on the first EnqueueWithBatch(path, "b1", 10) call, task.Total is immediately = 10, Progress = 0/10.
 func TestIngestTracker_BatchFixedTotal(t *testing.T) {
 	db := makeTestDB(t)
 	thumbDir := t.TempDir()
@@ -171,7 +173,7 @@ func TestIngestTracker_BatchFixedTotal(t *testing.T) {
 
 	idx.EnqueueWithBatch(imgPath, "b1", 10)
 
-	// 第一次 publish running 时 total 必须已是 10，current 为 0。
+	// On the first "running" publish, total must already be 10 and current 0.
 	require.Eventually(t, func() bool {
 		mu.Lock()
 		defer mu.Unlock()
@@ -181,12 +183,12 @@ func TestIngestTracker_BatchFixedTotal(t *testing.T) {
 			}
 		}
 		return false
-	}, 2*time.Second, 20*time.Millisecond, "第一次 publish 时 Total 应立即为 10")
+	}, 2*time.Second, 20*time.Millisecond, "Total should be 10 immediately on the first publish")
 }
 
 // TestIngestTracker_BatchCompletesAtFixedTotal:
-// 10 张 EnqueueWithBatch("b1", 10)，全部 noteResultWithBatch 后 current==total，
-// idle 后发出 done 且 onBatchDone 被调用。
+// 10 EnqueueWithBatch("b1", 10) calls; after all are noteResultWithBatch'd,
+// current==total, done is emitted after idle, and onBatchDone is called.
 func TestIngestTracker_BatchCompletesAtFixedTotal(t *testing.T) {
 	db := makeTestDB(t)
 	thumbDir := t.TempDir()
@@ -228,7 +230,7 @@ func TestIngestTracker_BatchCompletesAtFixedTotal(t *testing.T) {
 		idx.EnqueueWithBatch(p, "b1", int64(total))
 	}
 
-	// 等待 onBatchDone 被调用（最多 5 秒）。
+	// Wait for onBatchDone to be called (up to 5 seconds).
 	doneCh := make(chan struct{})
 	go func() {
 		doneCalled.Wait()
@@ -237,21 +239,22 @@ func TestIngestTracker_BatchCompletesAtFixedTotal(t *testing.T) {
 	select {
 	case <-doneCh:
 	case <-time.After(5 * time.Second):
-		t.Fatal("onBatchDone 未在超时内被调用")
+		t.Fatal("onBatchDone was not called within the timeout")
 	}
 
-	// 验证 done task 的 Total 和 Current。
+	// Verify the done task's Total and Current.
 	mu.Lock()
 	defer mu.Unlock()
-	require.NotEmpty(t, doneTasks, "应发出至少一个 done task")
+	require.NotEmpty(t, doneTasks, "at least one done task should be emitted")
 	last := doneTasks[len(doneTasks)-1]
 	require.Equal(t, int64(total), last.Total)
 	require.Equal(t, int64(total), last.Current)
 }
 
 // TestIngestTracker_MultipleBatchesParallel:
-// 同时跑 batch "b1"(total=3) 和 "b2"(total=2)，断言产生 2 个独立 task ID，
-// 且各自 progress 互不干扰。
+// runs batch "b1" (total=3) and "b2" (total=2) concurrently, asserting 2
+// independent task IDs are produced, and their progress doesn't interfere
+// with each other.
 func TestIngestTracker_MultipleBatchesParallel(t *testing.T) {
 	db := makeTestDB(t)
 	thumbDir := t.TempDir()
@@ -297,22 +300,22 @@ func TestIngestTracker_MultipleBatchesParallel(t *testing.T) {
 		idx.EnqueueWithBatch(p, "b2", 2)
 	}
 
-	// 等到两个 batch 都完成。
+	// Wait for both batches to complete.
 	require.Eventually(t, func() bool {
 		count := 0
 		taskIDs.Range(func(k, v any) bool { count++; return true })
 		return count >= 2
-	}, 6*time.Second, 50*time.Millisecond, "应观察到 2 个独立 task ID")
+	}, 6*time.Second, 50*time.Millisecond, "should observe 2 independent task IDs")
 
-	// 确认各自的 current 最大值不超过各自的 total。
+	// Confirm each one's max current does not exceed its own total.
 	mu.Lock()
 	defer mu.Unlock()
 	idCount := 0
 	taskIDs.Range(func(k, v any) bool { idCount++; return true })
-	require.Equal(t, 2, idCount, "b1 和 b2 应产生 2 个独立 task ID")
+	require.Equal(t, 2, idCount, "b1 and b2 should produce 2 independent task IDs")
 }
 
-// makeTestJPEGNamed 是 makeTestJPEG 的命名变体（已有 makeTestJPEG 在 indexer_test.go）。
+// makeTestJPEGNamed is a named variant of makeTestJPEG (makeTestJPEG already exists in indexer_test.go).
 func makeTestJPEGNamed(t *testing.T, dir, name string) string {
 	t.Helper()
 	img := image.NewRGBA(image.Rect(0, 0, 50, 50))

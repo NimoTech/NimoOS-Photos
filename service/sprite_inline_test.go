@@ -11,20 +11,24 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestProcessFileInternal_InlineSpritePregen 通过真实索引管线（Enqueue→Start
-// 的完整异步流程）验证 processFileInternal 第 8 步后触发的悬浮预览预生成
-// goroutine：视频入库后应异步落地 <thumbDir>/<assetID>/sprite.jpg 与
-// <thumbDir>/<assetID>/preview.mp4，不必等到 /sprite、/preview 路由的首次
-// hover 现场生成，也不依赖 BackfillSprites 补跑。
+// TestProcessFileInternal_InlineSpritePregen verifies, via the real
+// indexing pipeline (the full Enqueue→Start async flow), the hover-preview
+// pregeneration goroutine triggered after processFileInternal's step 8:
+// once a video is ingested, <thumbDir>/<assetID>/sprite.jpg and
+// <thumbDir>/<assetID>/preview.mp4 should land asynchronously, without
+// waiting for the /sprite, /preview routes' first-hover on-demand
+// generation, and without depending on the BackfillSprites backfill.
 //
-// 这条路径此前完全没有测试覆盖——sprite_backfill_test.go 只测 BackfillSprites
-// 补跑逻辑，sprite_test.go 只测生成器本身；indexer.go 里 fire-and-forget 的
-// 内联 goroutine 从未被真实索引管线（Enqueue/Start）触发过。
+// This path previously had zero test coverage — sprite_backfill_test.go
+// only tests BackfillSprites' backfill logic, sprite_test.go only tests the
+// generator itself; the fire-and-forget inline goroutine in indexer.go was
+// never triggered by the real indexing pipeline (Enqueue/Start).
 //
-// 用 require.Eventually 轮询落地断言，确保测试在 goroutine 真正完成（或
-// deadline 超时失败）之前不会返回——这样规避了 fire-and-forget 设计在 TempDir
-// 测试环境下的已知竞态：若不等待就返回，t.TempDir() 清理可能先于 goroutine
-// 写文件发生。
+// Uses require.Eventually to poll for the artifact, ensuring the test
+// doesn't return until the goroutine has genuinely finished (or fails at
+// the deadline timeout) — this sidesteps a known race in the fire-and-forget
+// design under a TempDir test environment: returning without waiting could
+// let t.TempDir() cleanup happen before the goroutine writes its file.
 func TestProcessFileInternal_InlineSpritePregen(t *testing.T) {
 	if _, err := exec.LookPath("ffmpeg"); err != nil {
 		t.Skip("ffmpeg not found")
@@ -32,7 +36,7 @@ func TestProcessFileInternal_InlineSpritePregen(t *testing.T) {
 	db := makeTestDB(t)
 	thumbDir := t.TempDir()
 	ix := NewIndexer(db, &mockML{}, thumbDir, 1)
-	ix.SetPreviewPregen(true) // 本测试专测内联 preview.mp4 预生成,需显式开启(默认纯懒生成)
+	ix.SetPreviewPregen(true) // this test specifically covers the inline preview.mp4 pregeneration, needs explicit enabling (default is pure lazy generation)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -48,36 +52,39 @@ func TestProcessFileInternal_InlineSpritePregen(t *testing.T) {
 	var assetID string
 	require.Eventually(t, func() bool {
 		return db.QueryRow(`SELECT id FROM assets WHERE file_path=? AND status='indexed'`, src).Scan(&assetID) == nil
-	}, 10*time.Second, 100*time.Millisecond, "视频应被索引管线处理完成")
+	}, 10*time.Second, 100*time.Millisecond, "video should be fully processed by the indexing pipeline")
 	require.NotEmpty(t, assetID)
 
 	spritePath := filepath.Join(thumbDir, assetID, "sprite.jpg")
 	require.Eventually(t, func() bool {
 		fi, err := os.Stat(spritePath)
 		return err == nil && fi.Size() > 0
-	}, 10*time.Second, 100*time.Millisecond, "视频入库应异步预生成悬浮雪碧图 sprite.jpg")
+	}, 10*time.Second, 100*time.Millisecond, "ingesting a video should asynchronously pregenerate the hover sprite sprite.jpg")
 
 	previewPath := filepath.Join(thumbDir, assetID, "preview.mp4")
 	require.Eventually(t, func() bool {
 		fi, err := os.Stat(previewPath)
 		return err == nil && fi.Size() > 0
-	}, 10*time.Second, 100*time.Millisecond, "视频入库应异步预生成悬浮预览视频 preview.mp4")
+	}, 10*time.Second, 100*time.Millisecond, "ingesting a video should asynchronously pregenerate the hover preview video preview.mp4")
 }
 
-// TestProcessFileInternal_InlineSpriteLazyByDefault 验证纯懒生成默认行为:
-// 不调用 SetPreviewPregen(即 photos.PreviewPregen 缺省 false)时,视频入库
-// 仍异步预生成 sprite.jpg,但 preview.mp4 不应被预生成——它交给 /preview
-// 路由端在用户真正悬浮时现场生成。sprite/preview 在同一 goroutine 内顺序
-// 执行(先 Ensure 雪碧图,再判 pregen 开关),故 sprite.jpg 落地即代表该
-// goroutine 已跑过 preview 开关判断这一步,此时断言 preview.mp4 不存在
-// 是确定性的,不依赖额外等待。
+// TestProcessFileInternal_InlineSpriteLazyByDefault verifies the default
+// pure-lazy-generation behavior: without calling SetPreviewPregen (i.e.
+// photos.PreviewPregen defaults to false), ingesting a video still
+// asynchronously pregenerates sprite.jpg, but preview.mp4 should not be
+// pregenerated — it's left to the /preview route to generate on demand when
+// the user actually hovers. sprite/preview execute sequentially within the
+// same goroutine (Ensure the sprite first, then check the pregen flag), so
+// sprite.jpg landing means that goroutine has already run past the preview
+// flag check — asserting preview.mp4 doesn't exist at that point is
+// deterministic and doesn't need extra waiting.
 func TestProcessFileInternal_InlineSpriteLazyByDefault(t *testing.T) {
 	if _, err := exec.LookPath("ffmpeg"); err != nil {
 		t.Skip("ffmpeg not found")
 	}
 	db := makeTestDB(t)
 	thumbDir := t.TempDir()
-	ix := NewIndexer(db, &mockML{}, thumbDir, 1) // 未调用 SetPreviewPregen，缺省 false
+	ix := NewIndexer(db, &mockML{}, thumbDir, 1) // SetPreviewPregen not called, defaults to false
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -93,16 +100,16 @@ func TestProcessFileInternal_InlineSpriteLazyByDefault(t *testing.T) {
 	var assetID string
 	require.Eventually(t, func() bool {
 		return db.QueryRow(`SELECT id FROM assets WHERE file_path=? AND status='indexed'`, src).Scan(&assetID) == nil
-	}, 10*time.Second, 100*time.Millisecond, "视频应被索引管线处理完成")
+	}, 10*time.Second, 100*time.Millisecond, "video should be fully processed by the indexing pipeline")
 	require.NotEmpty(t, assetID)
 
 	spritePath := filepath.Join(thumbDir, assetID, "sprite.jpg")
 	require.Eventually(t, func() bool {
 		fi, err := os.Stat(spritePath)
 		return err == nil && fi.Size() > 0
-	}, 10*time.Second, 100*time.Millisecond, "PreviewPregen 关闭时雪碧图仍应预生成")
+	}, 10*time.Second, 100*time.Millisecond, "the sprite should still be pregenerated when PreviewPregen is off")
 
 	previewPath := filepath.Join(thumbDir, assetID, "preview.mp4")
 	_, err := os.Stat(previewPath)
-	require.True(t, os.IsNotExist(err), "PreviewPregen 缺省 false 时 preview.mp4 不应被预生成")
+	require.True(t, os.IsNotExist(err), "preview.mp4 should not be pregenerated when PreviewPregen defaults to false")
 }

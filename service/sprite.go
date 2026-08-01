@@ -11,8 +11,8 @@ import (
 )
 
 const (
-	SpriteFrameW = 240 // 固定帧宽（2026-06-23 由 120 提升至 240 提画质）
-	SpriteFrameH = 135 // 16:9 名义帧高，仅作默认/回退；实际帧高按原始比例自适应、从文件读
+	SpriteFrameW = 240 // fixed frame width (raised from 120 to 240 on 2026-06-23 for better quality)
+	SpriteFrameH = 135 // nominal 16:9 frame height, default/fallback only; the real frame height adapts to the original aspect ratio and is read from the file
 
 	spriteMinFrames     = 5
 	spriteMaxFrames     = 120
@@ -34,11 +34,11 @@ func SpriteFrameCount(durationMs int64) int {
 	var n int64
 	switch {
 	case durS <= 30:
-		n = durS // 1 帧/秒
+		n = durS // 1 frame/second
 	case durS <= 120:
-		n = durS / 2 // 1 帧/2 秒
+		n = durS / 2 // 1 frame/2 seconds
 	default:
-		n = durS / 4 // 1 帧/4 秒
+		n = durS / 4 // 1 frame/4 seconds
 	}
 	if n < spriteMinFrames {
 		return spriteMinFrames

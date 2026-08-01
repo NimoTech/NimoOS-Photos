@@ -1,4 +1,4 @@
-// Package parserclient 的测试:用 httptest 假 Parser 服务验证薄客户端行为。
+// Tests for package parserclient: uses an httptest fake Parser service to verify the thin client's behavior.
 package parserclient
 
 import (
@@ -37,7 +37,7 @@ func TestIngestAssetPostsCorrectBody(t *testing.T) {
 	require.Equal(t, "Yosemite, US", meta["place"])
 }
 
-// TestMetaOmitsEmptyFields: takenAt/place 传空串时,meta 里不应出现该键。
+// TestMetaOmitsEmptyFields: when takenAt/place are passed empty strings, that key should not appear in meta.
 func TestMetaOmitsEmptyFields(t *testing.T) {
 	var got map[string]any
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -58,7 +58,7 @@ func TestMetaOmitsEmptyFields(t *testing.T) {
 	require.False(t, hasPlace)
 }
 
-// TestDeleteAssetPath: DELETE /v1/parser/visual/assets/photos/a1,200 → nil。
+// TestDeleteAssetPath: DELETE /v1/parser/visual/assets/photos/a1, 200 -> nil.
 func TestDeleteAssetPath(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		require.Equal(t, "DELETE", r.Method)
@@ -75,12 +75,12 @@ func TestDeleteAssetPath(t *testing.T) {
 }
 
 func TestDiscoveryFileMissing(t *testing.T) {
-	c := New(t.TempDir()) // 无 parser.url
+	c := New(t.TempDir()) // no parser.url
 	err := c.IngestAsset(context.Background(), "a1", "/x", "image/jpeg", "", "")
 	require.ErrorIs(t, err, ErrParserUnavailable)
 }
 
-// TestNon2xxIsError: 假 Parser 回 400 → err != nil 且非 ErrParserUnavailable。
+// TestNon2xxIsError: fake Parser returns 400 -> err != nil and not ErrParserUnavailable.
 func TestNon2xxIsError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(400)
@@ -95,8 +95,9 @@ func TestNon2xxIsError(t *testing.T) {
 	require.NotErrorIs(t, err, ErrParserUnavailable)
 }
 
-// TestListCaptionsFirstPageOmitsOffsetParam: offset 为空串时,GET 请求不应
-// 携带 offset 查询参数(首页语义靠"缺省"表达,而非空字符串值)。
+// TestListCaptionsFirstPageOmitsOffsetParam: when offset is an empty string,
+// the GET request should not carry an offset query parameter (first-page
+// semantics are expressed via "absent," not an empty string value).
 func TestListCaptionsFirstPageOmitsOffsetParam(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		require.Equal(t, "GET", r.Method)
@@ -104,7 +105,7 @@ func TestListCaptionsFirstPageOmitsOffsetParam(t *testing.T) {
 		require.Equal(t, "photos", r.URL.Query().Get("source"))
 		require.Equal(t, "512", r.URL.Query().Get("limit"))
 		_, hasOffset := r.URL.Query()["offset"]
-		require.False(t, hasOffset, "首页请求不应携带 offset 参数")
+		require.False(t, hasOffset, "the first-page request should not carry an offset parameter")
 		w.Write([]byte(`{"items":[{"asset_id":"a1","text":"一只猫","mtime_ms":100}],"next_offset":"c2"}`))
 	}))
 	defer srv.Close()
@@ -118,8 +119,9 @@ func TestListCaptionsFirstPageOmitsOffsetParam(t *testing.T) {
 	require.Equal(t, []CaptionItem{{AssetID: "a1", Text: "一只猫", MtimeMs: 100}}, items)
 }
 
-// TestListCaptionsPassesOffsetAndNullNextBecomesEmpty: 非首页请求应携带
-// offset 参数;next_offset 为 JSON null 时应转成空字符串(表示最后一页)。
+// TestListCaptionsPassesOffsetAndNullNextBecomesEmpty: a non-first-page
+// request should carry the offset parameter; a JSON null next_offset should
+// convert to an empty string (meaning the last page).
 func TestListCaptionsPassesOffsetAndNullNextBecomesEmpty(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		require.Equal(t, "c2", r.URL.Query().Get("offset"))
@@ -132,12 +134,12 @@ func TestListCaptionsPassesOffsetAndNullNextBecomesEmpty(t *testing.T) {
 	c := New(rt)
 	items, next, err := c.ListCaptions(context.Background(), "c2")
 	require.NoError(t, err)
-	require.Equal(t, "", next, "next_offset 为 null 应转成空字符串,表示最后一页")
+	require.Equal(t, "", next, "a null next_offset should convert to an empty string, meaning the last page")
 	require.Equal(t, []CaptionItem{{AssetID: "a2", Text: "一片海", MtimeMs: 200}}, items)
 }
 
-// TestListCaptionsNon2xxIsError: 非 2xx(如 503 qdrant 不可用)应返回 error,
-// 调用方(Puller)据此静默跳过本轮。
+// TestListCaptionsNon2xxIsError: a non-2xx (e.g. 503 qdrant unavailable)
+// should return an error, and the caller (Puller) silently skips this round based on it.
 func TestListCaptionsNon2xxIsError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(503)
@@ -152,8 +154,9 @@ func TestListCaptionsNon2xxIsError(t *testing.T) {
 	require.NotErrorIs(t, err, ErrParserUnavailable)
 }
 
-// TestListCaptionsDiscoveryFileMissing: Parser 未部署(discoveryFile 不存在)
-// 应返回 ErrParserUnavailable,供 Puller 静默跳过整轮。
+// TestListCaptionsDiscoveryFileMissing: Parser not deployed (discoveryFile
+// doesn't exist) should return ErrParserUnavailable, letting Puller silently
+// skip the whole round.
 func TestListCaptionsDiscoveryFileMissing(t *testing.T) {
 	c := New(t.TempDir())
 	_, _, err := c.ListCaptions(context.Background(), "")

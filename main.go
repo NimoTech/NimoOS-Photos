@@ -52,8 +52,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	// 暂存跟随 DataPath(见 common.StagingDir 注释);必须在任何使用方(路由
-	// 初始化、PruneStaging)之前完成重设。
+	// Staging follows DataPath (see common.StagingDir comment); this reset
+	// must happen before any consumer (route init, PruneStaging).
 	common.StagingDir = filepath.Join(config.Cfg.DataPath, "tus-staging")
 
 	// Create required data directories
@@ -69,9 +69,11 @@ func main() {
 		}
 	}
 
-	// 暂存目录含未完成上传的原始文件,权限收紧为 0700(与 route/v1/tus.go 的
-	// 防御性建目录一致;MkdirAll 不会修改已存在目录的权限,故必须在这里就以
-	// 0700 创建,不能进上面的 0755 共享列表)。
+	// The staging directory holds raw files from in-progress uploads, so
+	// permissions are tightened to 0700 (matching the defensive mkdir in
+	// route/v1/tus.go; MkdirAll does not change permissions on an existing
+	// directory, so it must be created with 0700 here rather than folded
+	// into the shared 0755 list above).
 	if err := os.MkdirAll(common.StagingDir, 0700); err != nil {
 		fmt.Fprintf(os.Stderr, "failed to create staging directory %s: %v\n", common.StagingDir, err)
 		os.Exit(1)
@@ -91,12 +93,15 @@ func main() {
 	go svc.Rebuilder().MaybeAutoRebuild(svc.Indexer().MLReady)
 	go svc.MountGuard().Run(ctx)
 
-	// 存量视频悬浮预览雪碧图补跑(启动一次,CAS 防重入):覆盖升级前索引、
-	// 未走新版内联预生成的历史视频。
+	// One-time backfill of video hover-preview sprites on startup (CAS guards
+	// against re-entry): covers historical videos indexed before the upgrade
+	// that never went through the new inline pre-generation path.
 	go svc.Indexer().BackfillSprites(ctx)
 
-	// 启动时一次性清理孤儿 TUS 暂存文件(新旧两个目录都扫,旧目录只在启动时
-	// 兜底扫一轮);此后每日清理由下方 ticker 负责(仅扫新目录)。
+	// One-time cleanup of orphaned TUS staging files on startup (scans both
+	// the new and legacy directories; the legacy directory is only ever
+	// swept once, on startup, as a fallback). Daily cleanup after that is
+	// handled by the ticker below (new directory only).
 	go func() {
 		for _, dir := range []string{common.StagingDir, common.LegacyStagingDir} {
 			if n, err := service.PruneStaging(dir, time.Duration(common.StagingMaxAge)*time.Hour); err != nil {
@@ -107,8 +112,9 @@ func main() {
 		}
 	}()
 
-	// 每日全量缓存清理:孤儿缩略图目录 + face-thumbs 孤儿 + 过期暂存,
-	// 与设置页手动按钮(POST /cache/prune)同一实现。
+	// Daily full cache cleanup: orphaned thumbnail directories + orphaned
+	// face-thumbs + expired staging, same implementation as the manual
+	// button on the settings page (POST /cache/prune).
 	go func() {
 		ticker := time.NewTicker(24 * time.Hour)
 		defer ticker.Stop()

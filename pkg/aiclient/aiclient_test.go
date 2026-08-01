@@ -1,5 +1,6 @@
-// Package aiclient 的测试:用 httptest 假 NimoOS-AI _internal 服务验证路径/
-// header/模型选择策略/超时行为,不接触真实 AI 服务。
+// Tests for package aiclient: uses an httptest fake NimoOS-AI _internal
+// service to verify path/header/model-selection strategy/timeout behavior,
+// without touching a real AI service.
 package aiclient
 
 import (
@@ -17,7 +18,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// writeAIURL 把假 AI 服务地址写进发现文件,返回该文件路径。
+// writeAIURL writes the fake AI service address into the discovery file, returning that file's path.
 func writeAIURL(t *testing.T, url string) string {
 	t.Helper()
 	p := filepath.Join(t.TempDir(), "ai.url")
@@ -25,11 +26,13 @@ func writeAIURL(t *testing.T, url string) string {
 	return p
 }
 
-// stubEmptyUsersDB 把包级 usersDBPath 指向一个必然不存在的路径,使
-// resolveUserID 必然兜底 "system"——这台开发机本身跑着真实 NimoOS
-// user-service,默认路径 /var/lib/nimoos/db/user.db 可能真实存在,测试必须
-// 显式指向空路径才是确定性的("无 user.db"场景),而不是依赖跑测试的机器
-// 上没有装 NimoOS。
+// stubEmptyUsersDB points the package-level usersDBPath at a path guaranteed
+// not to exist, so resolveUserID is guaranteed to fall back to "system" —
+// this dev machine may itself be running a real NimoOS user-service, so the
+// default path /var/lib/nimoos/db/user.db might genuinely exist; the test
+// must explicitly point at an empty path to be deterministic (the "no
+// user.db" scenario), rather than depending on the test machine not having
+// NimoOS installed.
 func stubEmptyUsersDB(t *testing.T) {
 	t.Helper()
 	orig := usersDBPath
@@ -37,8 +40,9 @@ func stubEmptyUsersDB(t *testing.T) {
 	usersDBPath = filepath.Join(t.TempDir(), "no-such-user.db")
 }
 
-// TestCompletePicksLocalModelAndPostsChat:local 非空时优先本地模型,chat
-// 请求路径/header 正确,且不带 X-NimoOS-Force-Cloud。
+// TestCompletePicksLocalModelAndPostsChat: when local is non-empty, prefers
+// the local model; the chat request path/headers are correct, and
+// X-NimoOS-Force-Cloud is not set.
 func TestCompletePicksLocalModelAndPostsChat(t *testing.T) {
 	stubEmptyUsersDB(t)
 	var gotModelsPath, gotChatPath string
@@ -49,7 +53,7 @@ func TestCompletePicksLocalModelAndPostsChat(t *testing.T) {
 		switch r.URL.Path {
 		case "/v1/ai/_internal/models":
 			gotModelsPath = r.URL.Path
-			require.Equal(t, "system", r.URL.Query().Get("user_id"), "无 user.db 时应兜底 system")
+			require.Equal(t, "system", r.URL.Query().Get("user_id"), "should fall back to system when there's no user.db")
 			w.Write([]byte(`{"local":[{"name":"qwen2.5:7b"}],"cloud":[{"default_model":"gpt-4o"}]}`))
 		case "/v1/ai/_internal/chat/completions":
 			gotChatPath = r.URL.Path
@@ -70,15 +74,16 @@ func TestCompletePicksLocalModelAndPostsChat(t *testing.T) {
 
 	require.Equal(t, "/v1/ai/_internal/models", gotModelsPath)
 	require.Equal(t, "/v1/ai/_internal/chat/completions", gotChatPath)
-	require.Equal(t, "system", gotUserIDHeader, "无 user.db 时兜底常量 system")
-	require.Empty(t, gotForceCloudHeader, "本地有模型时不应强制云端")
+	require.Equal(t, "system", gotUserIDHeader, "falls back to the constant system when there's no user.db")
+	require.Empty(t, gotForceCloudHeader, "should not force cloud when a local model is available")
 	require.Equal(t, "qwen2.5:7b", gotBody["model"])
 }
 
-// TestCompleteChatBodyCapsMaxTokensAndTemperature:请求体必须带
-// max_tokens/temperature 约束(对照 wiki_summary_worker/llm.py 同款防御)——
-// NimoOS-AI 云端适配层 max_tokens 缺省高达 16000,起名这种短输出调用不加
-// 约束会放大云端调用的成本/延迟。
+// TestCompleteChatBodyCapsMaxTokensAndTemperature: the request body must
+// carry the max_tokens/temperature constraints (mirroring the same defensive
+// pattern in wiki_summary_worker/llm.py) — NimoOS-AI's cloud adapter layer
+// defaults max_tokens as high as 16000, and a short-output call like naming
+// would inflate cloud call cost/latency without this cap.
 func TestCompleteChatBodyCapsMaxTokensAndTemperature(t *testing.T) {
 	stubEmptyUsersDB(t)
 	var gotBody map[string]any
@@ -101,8 +106,8 @@ func TestCompleteChatBodyCapsMaxTokensAndTemperature(t *testing.T) {
 	require.Equal(t, 0.2, gotBody["temperature"])
 }
 
-// TestCompleteFallsBackToCloudModel:local 为空、cloud 非空时选云端默认模型,
-// 且带上 X-NimoOS-Force-Cloud: true。
+// TestCompleteFallsBackToCloudModel: when local is empty and cloud is
+// non-empty, picks the cloud default model and sets X-NimoOS-Force-Cloud: true.
 func TestCompleteFallsBackToCloudModel(t *testing.T) {
 	stubEmptyUsersDB(t)
 	var gotForceCloudHeader string
@@ -130,8 +135,8 @@ func TestCompleteFallsBackToCloudModel(t *testing.T) {
 	require.Equal(t, "gpt-4o-mini", gotBody["model"])
 }
 
-// TestCompleteNoModelAvailableIsError:local/cloud 都为空时返回 error,不发起
-// chat 请求。
+// TestCompleteNoModelAvailableIsError: when both local/cloud are empty,
+// returns an error and doesn't issue a chat request.
 func TestCompleteNoModelAvailableIsError(t *testing.T) {
 	stubEmptyUsersDB(t)
 	chatCalled := false
@@ -146,10 +151,10 @@ func TestCompleteNoModelAvailableIsError(t *testing.T) {
 	c := New(writeAIURL(t, srv.URL))
 	_, err := c.Complete(context.Background(), "x")
 	require.Error(t, err)
-	require.False(t, chatCalled, "没有可用模型时不应发 chat 请求")
+	require.False(t, chatCalled, "should not issue a chat request when no model is available")
 }
 
-// TestCompleteChatNon2xxIsError: chat completions 返回非 2xx → error。
+// TestCompleteChatNon2xxIsError: chat completions returning non-2xx -> error.
 func TestCompleteChatNon2xxIsError(t *testing.T) {
 	stubEmptyUsersDB(t)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -167,8 +172,8 @@ func TestCompleteChatNon2xxIsError(t *testing.T) {
 	require.Error(t, err)
 }
 
-// TestCompleteAIURLFileMissingIsError:发现文件不存在(AI 未部署)→ error,
-// 不 panic。
+// TestCompleteAIURLFileMissingIsError: discovery file doesn't exist (AI not
+// deployed) -> error, no panic.
 func TestCompleteAIURLFileMissingIsError(t *testing.T) {
 	c := New(filepath.Join(t.TempDir(), "no-such-ai.url"))
 	_, err := c.Complete(context.Background(), "x")
@@ -176,16 +181,18 @@ func TestCompleteAIURLFileMissingIsError(t *testing.T) {
 	require.ErrorIs(t, err, ErrAIUnavailable)
 }
 
-// TestCompleteTimesOutWithin10Seconds:models 端点挂起不回应时,Complete 应在
-// completeTimeout(10s)左右超时返回,而不是无限等待。
+// TestCompleteTimesOutWithin10Seconds: when the models endpoint hangs without
+// responding, Complete should time out and return around completeTimeout
+// (10s), not wait forever.
 func TestCompleteTimesOutWithin10Seconds(t *testing.T) {
 	stubEmptyUsersDB(t)
 	block := make(chan struct{})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		<-block // 永远不回应,逼 Complete 走 ctx 超时路径
+		<-block // never responds, forcing Complete down the ctx timeout path
 	}))
-	// 关闭顺序很关键:必须先放行还挂着的 handler(close(block))再
-	// srv.Close(),否则 Close() 会等待那条连接收尾,和 <-block 死锁。
+	// Shutdown order matters: the still-hanging handler must be released
+	// (close(block)) before srv.Close(), otherwise Close() waits for that
+	// connection to finish and deadlocks against <-block.
 	defer srv.Close()
 	defer close(block)
 
@@ -194,13 +201,14 @@ func TestCompleteTimesOutWithin10Seconds(t *testing.T) {
 	_, err := c.Complete(context.Background(), "x")
 	elapsed := time.Since(start)
 	require.Error(t, err)
-	require.Less(t, elapsed, 12*time.Second, "10s 超时应生效,不应显著超出")
-	require.GreaterOrEqual(t, elapsed, 9*time.Second, "不应远早于 10s 超时就返回")
+	require.Less(t, elapsed, 12*time.Second, "the 10s timeout should take effect and not be significantly exceeded")
+	require.GreaterOrEqual(t, elapsed, 9*time.Second, "should not return well before the 10s timeout")
 }
 
-// TestResolveUserIDPrefersAdminThenAnyThenSystem:user.db 存在且有 admin 用户
-// 时,header 携带该 admin 的最小 id;无 admin 但有其它用户时取最小 id;
-// user.db 不存在时兜底 "system"(顶部测试已覆盖这一支)。
+// TestResolveUserIDPrefersAdminThenAnyThenSystem: when user.db exists and has
+// an admin user, the header carries that admin's smallest id; with no admin
+// but other users, takes the smallest id; when user.db doesn't exist, falls
+// back to "system" (already covered by the test above).
 func TestResolveUserIDPrefersAdminThenAnyThenSystem(t *testing.T) {
 	orig := usersDBPath
 	defer func() { usersDBPath = orig }()
@@ -231,5 +239,5 @@ func TestResolveUserIDPrefersAdminThenAnyThenSystem(t *testing.T) {
 	c := New(writeAIURL(t, srv.URL))
 	_, err = c.Complete(context.Background(), "x")
 	require.NoError(t, err)
-	require.Equal(t, "2", gotUserID, "应取 role=admin 中最小的 id")
+	require.Equal(t, "2", gotUserID, "should take the smallest id among role=admin rows")
 }

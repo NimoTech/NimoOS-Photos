@@ -89,7 +89,7 @@ ORDER BY cnt DESC, p.rowid`)
 	return out, rows.Err()
 }
 
-// GetPerson 返回单个 person 富对象（含 count/首末次出现/地点数）。
+// GetPerson returns a single rich person object (with count/first-last-seen/places count).
 func (s *PersonService) GetPerson(id string) (*Person, error) {
 	var p Person
 	var fav int
@@ -138,7 +138,7 @@ WHERE fp.person_id=? AND a.deleted_at IS NULL AND a.offline=0 AND a.is_live_phot
 		p.LastSeen = tt
 	}
 
-	// placesCount：distinct 粗粒度 GPS cell（0.5° ≈ 城市级聚合），过滤 0,0 与软删/live video。
+	// placesCount: distinct coarse-grained GPS cell (0.5° ≈ city-level aggregation), filters out 0,0 and soft-deleted/live video.
 	var places int
 	if err := s.db.QueryRow(`
 SELECT COUNT(DISTINCT (CAST(e.latitude*2 AS INT) || ',' || CAST(e.longitude*2 AS INT)))
@@ -158,9 +158,9 @@ WHERE fp.person_id=? AND a.deleted_at IS NULL AND a.offline=0 AND a.is_live_phot
 // A nil pointer means "leave unchanged". HeroAssetID uses a pointer-to-string
 // so that empty string can be used to clear the field (set to NULL).
 type PersonPatch struct {
-	Name        *string
-	Favorite    *bool
-	Relation    *string
+	Name     *string
+	Favorite *bool
+	Relation *string
 	// HeroAssetID: non-nil means update; empty string clears the field.
 	// The asset must contain at least one excluded=0 face for this person;
 	// otherwise UpdatePerson returns ErrNotFound.
@@ -394,10 +394,10 @@ func (s *PersonService) PurgePerson(id string) error {
 	return nil
 }
 
-// HidePerson 软删除（hidden=1）。
+// HidePerson soft-deletes the person (hidden=1).
 func (s *PersonService) HidePerson(id string) error { return s.setHidden(id, true) }
 
-// RestorePerson 恢复（hidden=0）。
+// RestorePerson restores the person (hidden=0).
 func (s *PersonService) RestorePerson(id string) error { return s.setHidden(id, false) }
 
 func (s *PersonService) setHidden(id string, hidden bool) error {
@@ -415,7 +415,7 @@ func (s *PersonService) setHidden(id string, hidden bool) error {
 	return nil
 }
 
-// PersonRelations 返回与该 person 在同一 asset 共同出镜的其他 person，按共现次数降序。
+// PersonRelations returns other persons who co-appear with this person in the same asset, ordered by co-occurrence count descending.
 func (s *PersonService) PersonRelations(id string) ([]PersonRelation, error) {
 	rows, err := s.db.Query(`
 SELECT fp2.person_id, COALESCE(p.name,''), COALESCE(p.cover_face_id,''), COUNT(DISTINCT a.id) AS cnt
@@ -461,7 +461,7 @@ SELECT MAX(a.indexed_at) FROM face_detections fd JOIN assets a ON a.id=fd.asset_
 	return &v, nil
 }
 
-// PersonPlaces 返回该 person 照片的 GPS 点（前端做国家/城市级聚合）。
+// PersonPlaces returns the GPS points from this person's photos (the frontend does country/city-level aggregation).
 // Each point is enriched with a human-readable PlaceName from asset_geo using
 // the same rule as enrichPlaceNames: "City, Country" when both are available,
 // "City" when only city is known, or empty string otherwise.
@@ -510,8 +510,9 @@ type personCentroid struct {
 	centroid []float32
 }
 
-// MergeSuggestions 返回质心距离落在 (dbscanEpsilon, suggestEpsilon) 带内、
-// 且未被拒绝的 person 配对，confidence=1-dist，按 confidence 降序。
+// MergeSuggestions returns person pairs whose centroid distance falls within
+// the (dbscanEpsilon, suggestEpsilon) band and that haven't been rejected,
+// with confidence=1-dist, ordered by confidence descending.
 func (s *PersonService) MergeSuggestions() ([]MergeSuggestion, error) {
 	rows, err := s.db.Query(`
 SELECT id, COALESCE(name,''), COALESCE(cover_face_id,''), centroid
@@ -553,15 +554,16 @@ FROM persons WHERE hidden=0 AND centroid IS NOT NULL`)
 			if rejected[pairKey(a.id, b.id)] {
 				continue
 			}
-			// 目标取有名的一方；都无名/都有名则按 id 稳定。
+			// The target is the named side; if both are named or both are
+			// unnamed, break ties by id for stability.
 			from, into := a, b
 			switch {
 			case a.name != "" && b.name == "":
-				from, into = b, a // a 有名 → 取 a 为 into
+				from, into = b, a // a is named → take a as into
 			case a.name == "" && b.name == "" && a.id > b.id:
-				from, into = b, a // 都无名 → 按 id 稳定
+				from, into = b, a // both unnamed → stable by id
 			case a.name != "" && b.name != "" && a.id > b.id:
-				from, into = b, a // 都有名 → 按 id 稳定
+				from, into = b, a // both named → stable by id
 			}
 			conf := 1.0 - d
 			out = append(out, MergeSuggestion{
@@ -580,7 +582,7 @@ FROM persons WHERE hidden=0 AND centroid IS NOT NULL`)
 	return out, nil
 }
 
-// RejectMerge 记住被拒绝的配对（方向无关）。
+// RejectMerge remembers a rejected pair (direction-independent).
 func (s *PersonService) RejectMerge(a, b string) error {
 	pa, pb := orderPair(a, b)
 	_, err := s.db.Exec(`INSERT OR IGNORE INTO merge_rejections(person_a, person_b) VALUES(?,?)`, pa, pb)
@@ -630,11 +632,14 @@ func parseSQLiteTime(s sql.NullString) *time.Time {
 	return nil
 }
 
-// DetachAssetsFromPerson 把若干 asset 中所有属于该 person 的脸从该 person 移除，
-// 同时把这些脸标记为 excluded=1（不再参与未来聚类/吸附/列表）。
-// 自动 person（非锚定）若移除后剩 0 脸则连带删除。
+// DetachAssetsFromPerson removes all faces belonging to this person across
+// the given assets from that person, marking those faces as excluded=1 (so
+// they no longer participate in future clustering/attachment/lists).
+// An automatic (non-anchored) person is deleted along with its faces if 0
+// faces remain after removal.
 //
-// 返回值 affected 为本次实际移除的 face 数。如果 person 不存在返回 ErrNotFound。
+// The return value affected is the number of faces actually removed in this
+// call. Returns ErrNotFound if the person doesn't exist.
 func (s *PersonService) DetachAssetsFromPerson(personID string, assetIDs []string) (int, error) {
 	if personID == "" {
 		return 0, ErrNotFound
@@ -649,7 +654,7 @@ func (s *PersonService) DetachAssetsFromPerson(personID string, assetIDs []strin
 	}
 	defer tx.Rollback()
 
-	// 校验 person 存在
+	// Verify the person exists.
 	var exists int
 	if err := tx.QueryRow(`SELECT 1 FROM persons WHERE id=?`, personID).Scan(&exists); err != nil {
 		if err == sql.ErrNoRows {
@@ -658,7 +663,7 @@ func (s *PersonService) DetachAssetsFromPerson(personID string, assetIDs []strin
 		return 0, fmt.Errorf("DetachAssetsFromPerson check: %w", err)
 	}
 
-	// 找出该 person 在指定 asset 中已绑定且未被 excluded 的脸
+	// Find the faces of this person on the given assets that are still bound and not yet excluded.
 	placeholders := make([]string, len(assetIDs))
 	args := make([]any, 0, len(assetIDs)+1)
 	args = append(args, personID)
@@ -693,7 +698,7 @@ WHERE fp.person_id = ? AND fd.excluded = 0 AND fd.asset_id IN (%s)`, strings.Joi
 		return 0, nil
 	}
 
-	// 标 excluded + 解绑
+	// Mark excluded + unbind.
 	fph := make([]string, len(faceIDs))
 	fargs := make([]any, len(faceIDs))
 	for i, fid := range faceIDs {
@@ -780,9 +785,9 @@ func pairKey(a, b string) string {
 
 func suggestionReason(name string, conf float64) string {
 	if name != "" {
-		return fmt.Sprintf("两个集群的人脸高度相似（%.0f%%），可能都是 %s。", conf*100, name)
+		return fmt.Sprintf("Two clusters look %.0f%% alike — likely both %s.", conf*100, name)
 	}
-	return fmt.Sprintf("两个集群的人脸高度相似（%.0f%%），可能是同一个人。", conf*100)
+	return fmt.Sprintf("Two clusters look %.0f%% alike — likely the same person.", conf*100)
 }
 
 // recomputeOneCentroidTx recomputes centroid and confidence for a person within a
@@ -792,9 +797,11 @@ func suggestionReason(name string, conf float64) string {
 // is no longer in the person's excluded=0 face set (e.g. it was detached), the lock
 // is cleared and cover is reselected by centroid distance.
 func recomputeOneCentroidTx(tx *sql.Tx, personID string) error {
-	// Load all active (excluded=0) faces for centroid computation，同时取封面混合分
-	// 所需的 asset 美学分与 EXIF 宽高（JOIN assets 取分，LEFT JOIN asset_exif 取宽高，
-	// 缺失时 hybridCoverScore 会记该脸为不可比）。
+	// Load all active (excluded=0) faces for centroid computation, and at the
+	// same time fetch the asset aesthetic score and EXIF width/height needed
+	// for the hybrid cover score (JOIN assets for the score, LEFT JOIN
+	// asset_exif for width/height — when missing, hybridCoverScore marks that
+	// face as incomparable).
 	rows, err := tx.Query(`
 SELECT fd.id, fd.asset_id, fd.embedding, fd.bbox,
        a.aesthetic_score, e.width, e.height
@@ -867,8 +874,11 @@ WHERE fp.person_id=? AND fd.excluded=0`, personID)
 			return err
 		}
 	}
-	// 混合分选优:整图美学分 × 脸面积占比;不可比(无分/无 EXIF/bbox 退化)记 -1。
-	// 全部不可比时退回质心最近(原行为,也覆盖存量库尚未打分的过渡期)。
+	// Hybrid-score selection: whole-image aesthetic score × face area ratio;
+	// incomparable (no score / no EXIF / degenerate bbox) is recorded as -1.
+	// When all faces are incomparable, fall back to nearest-centroid (the
+	// original behavior, which also covers the transition period for
+	// existing libraries that haven't been scored yet).
 	best, bestHybrid := -1, -1.0
 	for i := range vecs {
 		if h := hybridCoverScore(scores[i], bboxes[i], ws[i], hs[i]); h > bestHybrid {
@@ -877,8 +887,11 @@ WHERE fp.person_id=? AND fd.excluded=0`, personID)
 		}
 	}
 	if bestHybrid < 0 {
-		// best 先置 0 兜底：理论边界下若所有脸 cosDist 恰好等于初始 bestDist(2.0)（严格小于判断永不成立），
-		// 循环体不会再更新 best，此时仍需落在合法脸索引上，避免下方 faceIDs[best] 越界 panic。
+		// best defaults to 0 as a fallback: in the theoretical edge case where
+		// every face's cosDist exactly equals the initial bestDist (2.0) (the
+		// strict less-than check never fires), the loop body never updates
+		// best, so it must still land on a valid face index to avoid an
+		// out-of-bounds panic on faceIDs[best] below.
 		best = 0
 		bestDist := 2.0
 		for i, v := range vecs {
@@ -894,8 +907,10 @@ WHERE fp.person_id=? AND fd.excluded=0`, personID)
 	return err
 }
 
-// hybridCoverScore 计算人物封面混合分(整图美学分 × 脸面积占比);不可比返回 -1。
-// 不可比场景:asset 未打分、EXIF 缺失宽高、bbox 无法解析或退化(面积<=0)。
+// hybridCoverScore computes a person's cover hybrid score (whole-image
+// aesthetic score × face area ratio); returns -1 when incomparable.
+// Incomparable scenarios: the asset hasn't been scored, EXIF is missing
+// width/height, or the bbox is unparseable or degenerate (area<=0).
 func hybridCoverScore(score sql.NullFloat64, bboxJSON string, w, h sql.NullInt64) float64 {
 	if !score.Valid || !w.Valid || !h.Valid || w.Int64 <= 0 || h.Int64 <= 0 {
 		return -1
@@ -915,7 +930,7 @@ func hybridCoverScore(score sql.NullFloat64, bboxJSON string, w, h sql.NullInt64
 	}
 	ratio := area / float64(w.Int64*h.Int64)
 	if ratio > 1 {
-		ratio = 1 // 视频 bbox 基于关键帧、EXIF 是原视频尺寸,比例可能溢出,截断即可
+		ratio = 1 // video bbox is based on the keyframe, EXIF is the original video size, so the ratio can overflow — clamping is enough
 	}
 	aest := (score.Float64 - 1) / 9
 	if aest < 0 {
@@ -926,10 +941,13 @@ func hybridCoverScore(score sql.NullFloat64, bboxJSON string, w, h sql.NullInt64
 	return aest * ratio
 }
 
-// FaceThumbnail 按 cover_face 的 bbox 从原图裁出方形人脸缓存到 cacheDir，返回文件路径。
-// 已缓存则直接返回。person 无 cover_face 或不存在返回 ErrNotFound。
-// 视频源用已生成的 large.jpg 缩略图（face detection 时也是对关键帧做的，bbox 归一化后与
-// 缩略图比例一致）；图片源仍用原始文件以保留清晰度。
+// FaceThumbnail crops a square face out of the original image using
+// cover_face's bbox, caches it in cacheDir, and returns the file path.
+// Returns the cached path directly if already cached. Returns ErrNotFound if
+// the person has no cover_face or doesn't exist. Video sources use the
+// already-generated large.jpg thumbnail (face detection also ran on the
+// keyframe, so the bbox, once normalized, is consistent with the thumbnail's
+// ratio); image sources still use the original file to preserve sharpness.
 func (s *PersonService) FaceThumbnail(personID, cacheDir, thumbDir string) (string, error) {
 	var faceID, bbox, srcPath, mimeType, assetID string
 	var origW, origH sql.NullInt64
@@ -971,16 +989,20 @@ WHERE p.id=? AND p.hidden=0`, personID).Scan(&faceID, &bbox, &srcPath, &mimeType
 	img, err := imaging.Open(srcPath, imaging.AutoOrientation(true))
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return "", ErrNotFound // 源文件已不在（拔盘/被删）：对外是 404 不是 500
+			return "", ErrNotFound // source file is gone (drive unplugged/deleted): externally this is a 404, not a 500
 		}
 		return "", fmt.Errorf("FaceThumbnail open: %w", err)
 	}
 	w := img.Bounds().Dx()
 	h := img.Bounds().Dy()
 
-	// bbox 是基于 ML 输入图（视频关键帧或原图）的绝对像素坐标。
-	// 视频被压成 thumb large.jpg（max 长边 1280px）后，bbox 必须按 thumb/原 比例缩放。
-	// 图片源就是原图，sx=sy=1（除非缺 EXIF W/H，此时回退到 1:1，bbox 当作就是当前图的像素）。
+	// bbox is in absolute pixel coordinates on the ML input image (video
+	// keyframe or original image). Once a video is compressed into the
+	// large.jpg thumbnail (max long side 1280px), the bbox must be scaled by
+	// the thumb/original ratio. For an image source the source is the
+	// original, so sx=sy=1 (unless EXIF W/H is missing, in which case it
+	// falls back to 1:1 and the bbox is treated as pixels of the current
+	// image).
 	sx, sy := 1.0, 1.0
 	if origW.Valid && origH.Valid && origW.Int64 > 0 && origH.Int64 > 0 {
 		sx = float64(w) / float64(origW.Int64)

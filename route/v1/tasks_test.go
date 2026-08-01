@@ -23,7 +23,7 @@ func (s stubServices) Tasks() *service.TaskRegistry { return s.registry }
 func TestTasksHandler_Returns200WithSchema(t *testing.T) {
 	reg := service.NewTaskRegistry(nil)
 	reg.Upsert(service.Task{
-		ID: "idx_1", Type: "index", Label: "索引照片",
+		ID: "idx_1", Type: "index", Label: "Indexing photos",
 		Current: 100, Total: 200, Progress: 0.5,
 		Status: "running", StartedAt: time.Now(),
 	})

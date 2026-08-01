@@ -49,9 +49,9 @@ func TestMountGuard_UnplugMarksOfflineReplugRestoresAndTriggersRecovery(t *testi
 	// Unplug: /media/RAID_X disappears from the mount snapshot.
 	mounts = []string{}
 	mg.checkOnce(context.Background())
-	require.True(t, offlineFlag(mediaAsset), "/media/RAID_X 资产应被标记 offline")
-	require.False(t, offlineFlag(dataAsset), "/DATA 资产不受影响")
-	require.Equal(t, int32(0), watcherCalls.Load(), "拔出时不应触发恢复回调")
+	require.True(t, offlineFlag(mediaAsset), "/media/RAID_X asset should be marked offline")
+	require.False(t, offlineFlag(dataAsset), "/DATA asset should be unaffected")
+	require.Equal(t, int32(0), watcherCalls.Load(), "unplugging should not trigger recovery callbacks")
 	require.Equal(t, int32(0), scanCalls.Load())
 	require.Equal(t, int32(0), backfillCalls.Load())
 	require.Equal(t, int32(0), ocrCalls.Load())
@@ -59,12 +59,12 @@ func TestMountGuard_UnplugMarksOfflineReplugRestoresAndTriggersRecovery(t *testi
 	// Replug: /media/RAID_X reappears.
 	mounts = []string{"/media/RAID_X"}
 	mg.checkOnce(context.Background())
-	require.False(t, offlineFlag(mediaAsset), "重新插入后应恢复 offline=0")
+	require.False(t, offlineFlag(mediaAsset), "replugging should restore offline=0")
 	require.False(t, offlineFlag(dataAsset))
 	require.Eventually(t, func() bool {
 		return watcherCalls.Load() == 1 && scanCalls.Load() == 1 &&
 			backfillCalls.Load() == 1 && ocrCalls.Load() == 1
-	}, 5*time.Second, 10*time.Millisecond, "重新插入应各触发一次 watcher 重启/rescan/CLIP/OCR 补跑")
+	}, 5*time.Second, 10*time.Millisecond, "replugging should each trigger one watcher restart/rescan/CLIP/OCR backfill")
 	require.Equal(t, "/media/RAID_X", scannedMount.Load())
 }
 
@@ -80,13 +80,13 @@ func TestMountGuard_AlignOnStartupCatchesUnplugWhileServiceWasDown(t *testing.T)
 	assetID := insertAsset(t, db, "/media/Y/photo.jpg", "indexed")
 
 	mg := NewMountGuard(db)
-	mg.currentMounts = func() []string { return nil } // /media/Y 挂载点在启动时不存在
+	mg.currentMounts = func() []string { return nil } // /media/Y mount point does not exist at startup
 
 	mg.AlignOnStartup()
 
 	var offline int
 	require.NoError(t, db.QueryRow(`SELECT offline FROM assets WHERE id=?`, assetID).Scan(&offline))
-	require.Equal(t, 1, offline, "服务停机期间拔出的盘应在启动对齐时被标记 offline")
+	require.Equal(t, 1, offline, "a drive unplugged while the service was down should be marked offline during startup alignment")
 }
 
 // TestMountGuard_AlignOnStartupTwoSegmentMountStaysOnline is the other half of
@@ -108,7 +108,7 @@ func TestMountGuard_AlignOnStartupTwoSegmentMountStaysOnline(t *testing.T) {
 	for _, id := range []string{shallow, deep} {
 		var offline int
 		require.NoError(t, db.QueryRow(`SELECT offline FROM assets WHERE id=?`, id).Scan(&offline))
-		require.Equal(t, 0, offline, "二级挂载点在位时其资产不得被启动对齐误标 offline")
+		require.Equal(t, 0, offline, "assets under a present 2-level mount must not be falsely flagged offline by startup alignment")
 	}
 
 	// And the inverse: once /media/RAID_0 is really absent, both go offline.
@@ -117,7 +117,7 @@ func TestMountGuard_AlignOnStartupTwoSegmentMountStaysOnline(t *testing.T) {
 	for _, id := range []string{shallow, deep} {
 		var offline int
 		require.NoError(t, db.QueryRow(`SELECT offline FROM assets WHERE id=?`, id).Scan(&offline))
-		require.Equal(t, 1, offline, "二级挂载点缺席时其资产必须被标 offline")
+		require.Equal(t, 1, offline, "assets under an absent 2-level mount must be marked offline")
 	}
 }
 
@@ -138,7 +138,7 @@ func TestMountGuard_AlignOnStartupRestoresOnlineWhenMountPresent(t *testing.T) {
 
 	var offline int
 	require.NoError(t, db.QueryRow(`SELECT offline FROM assets WHERE id=?`, assetID).Scan(&offline))
-	require.Equal(t, 0, offline, "挂载点在启动时已存在,应恢复 offline=0")
+	require.Equal(t, 0, offline, "mount point already present at startup, offline=0 should be restored")
 }
 
 // TestMountGuard_LikeMetacharSiblingMountsUnaffected: `_` is a LIKE wildcard,
@@ -162,9 +162,9 @@ func TestMountGuard_LikeMetacharSiblingMountsUnaffected(t *testing.T) {
 
 	var offline int
 	require.NoError(t, db.QueryRow(`SELECT offline FROM assets WHERE id=?`, aAsset).Scan(&offline))
-	require.Equal(t, 1, offline, "disk_A 资产应被标 offline")
+	require.Equal(t, 1, offline, "disk_A asset should be marked offline")
 	require.NoError(t, db.QueryRow(`SELECT offline FROM assets WHERE id=?`, xAsset).Scan(&offline))
-	require.Equal(t, 0, offline, "拔出 disk_A 不得波及仅 `_` 位不同的兄弟挂载 diskXA")
+	require.Equal(t, 0, offline, "unplugging disk_A must not affect the sibling mount diskXA that differs only at the `_` position")
 
 	// Same for the startup alignment direction: only disk_A absent.
 	_, err := db.Exec(`UPDATE assets SET offline=0`)
@@ -174,7 +174,7 @@ func TestMountGuard_LikeMetacharSiblingMountsUnaffected(t *testing.T) {
 	require.NoError(t, db.QueryRow(`SELECT offline FROM assets WHERE id=?`, aAsset).Scan(&offline))
 	require.Equal(t, 1, offline)
 	require.NoError(t, db.QueryRow(`SELECT offline FROM assets WHERE id=?`, xAsset).Scan(&offline))
-	require.Equal(t, 0, offline, "启动对齐同样不得因 LIKE 元字符误伤兄弟挂载")
+	require.Equal(t, 0, offline, "startup alignment must likewise not falsely affect a sibling mount due to LIKE metacharacters")
 }
 
 // TestMountGuard_RecoveryIsAsyncAndDeduped: a long recovery (ScanDirectory can
@@ -213,7 +213,7 @@ func TestMountGuard_RecoveryIsAsyncAndDeduped(t *testing.T) {
 	select {
 	case <-done: // checkOnce must return without waiting for scanDir
 	case <-time.After(5 * time.Second):
-		t.Fatal("checkOnce 被恢复序列阻塞:恢复必须在独立 goroutine 中执行")
+		t.Fatal("checkOnce was blocked by the recovery sequence: recovery must run in its own goroutine")
 	}
 	<-scanStarted // recovery for X is now in flight and blocked
 
@@ -223,7 +223,7 @@ func TestMountGuard_RecoveryIsAsyncAndDeduped(t *testing.T) {
 	mg.checkOnce(context.Background())
 	var offline int
 	require.NoError(t, db.QueryRow(`SELECT offline FROM assets WHERE id=?`, yAsset).Scan(&offline))
-	require.Equal(t, 1, offline, "X 的恢复阻塞期间,Y 拔出仍须被标记 offline")
+	require.Equal(t, 1, offline, "while X's recovery is blocked, Y unplugging must still get marked offline")
 
 	// X bounces (unplug+replug) while its recovery is still in flight — the
 	// re-trigger must be deduped, not stacked.
@@ -232,7 +232,7 @@ func TestMountGuard_RecoveryIsAsyncAndDeduped(t *testing.T) {
 	mounts = []string{"/media/X"}
 	mg.checkOnce(context.Background())
 	time.Sleep(50 * time.Millisecond) // give a would-be duplicate goroutine time to run
-	require.Equal(t, int32(1), scanCalls.Load(), "恢复进行中同一挂载点的重复触发必须被去重")
+	require.Equal(t, int32(1), scanCalls.Load(), "a repeated trigger for the same mount while recovery is in progress must be deduped")
 
 	// Release the first recovery and wait for its goroutine to fully retire
 	// (in-flight flag cleared) — only then can a fresh bounce trigger again.
@@ -241,14 +241,14 @@ func TestMountGuard_RecoveryIsAsyncAndDeduped(t *testing.T) {
 		mg.mu.Lock()
 		defer mg.mu.Unlock()
 		return len(mg.recovering) == 0
-	}, 5*time.Second, 5*time.Millisecond, "释放后上一轮恢复应退场")
+	}, 5*time.Second, 5*time.Millisecond, "the previous recovery should retire after release")
 
 	mounts = []string{}
 	mg.checkOnce(context.Background())
 	mounts = []string{"/media/X"}
 	mg.checkOnce(context.Background())
 	require.Eventually(t, func() bool { return scanCalls.Load() == 2 },
-		5*time.Second, 10*time.Millisecond, "上一轮恢复结束后,新的插回应能再次触发恢复")
+		5*time.Second, 10*time.Millisecond, "after the previous recovery finishes, a fresh replug should be able to trigger recovery again")
 }
 
 // TestMountGuard_DevmonMountsIgnoredEntirely covers the product decision to
@@ -284,14 +284,14 @@ func TestMountGuard_DevmonMountsIgnoredEntirely(t *testing.T) {
 	// as an online mount (it's excluded), and markOfflineOutside's blanket
 	// /media/* sweep must not flip it offline either.
 	mg.AlignOnStartup()
-	require.False(t, offlineFlag(), "devmon 挂载点存在时资产不应被启动对齐波及")
+	require.False(t, offlineFlag(), "asset should be unaffected by startup alignment while the devmon mount is present")
 	mg.lastMounts = toMountSet(mg.currentMounts())
-	require.Empty(t, mg.lastMounts, "devmon 挂载点不应进入 MountGuard 的快照")
+	require.Empty(t, mg.lastMounts, "devmon mount point should not enter MountGuard's snapshot")
 
 	// "Unplug": devmon mount disappears from the raw enumeration.
 	mounts = []string{}
 	mg.checkOnce(context.Background())
-	require.False(t, offlineFlag(), "devmon 拔出不应标记 offline(清理后本不应存在此类资产,防御性排除)")
+	require.False(t, offlineFlag(), "devmon unplugging should not mark offline (such assets shouldn't exist after the purge; this is a defensive exclusion)")
 	require.Equal(t, int32(0), watcherCalls.Load())
 	require.Equal(t, int32(0), scanCalls.Load())
 	require.Equal(t, int32(0), backfillCalls.Load())
@@ -302,7 +302,7 @@ func TestMountGuard_DevmonMountsIgnoredEntirely(t *testing.T) {
 	mg.checkOnce(context.Background())
 	require.False(t, offlineFlag())
 	time.Sleep(50 * time.Millisecond) // give a would-be async recovery goroutine a chance to fire
-	require.Equal(t, int32(0), watcherCalls.Load(), "devmon 挂载点重新出现不应触发任何恢复回调")
+	require.Equal(t, int32(0), watcherCalls.Load(), "devmon mount point reappearing should not trigger any recovery callback")
 	require.Equal(t, int32(0), scanCalls.Load())
 	require.Equal(t, int32(0), backfillCalls.Load())
 	require.Equal(t, int32(0), ocrCalls.Load())
@@ -324,5 +324,5 @@ func TestMountGuard_AlignOnStartupNeverFlagsDevmonAssetsOffline(t *testing.T) {
 
 	var offline int
 	require.NoError(t, db.QueryRow(`SELECT offline FROM assets WHERE id=?`, asset).Scan(&offline))
-	require.Equal(t, 0, offline, "devmon 资产不应被启动对齐标记 offline")
+	require.Equal(t, 0, offline, "devmon assets should not be marked offline by startup alignment")
 }

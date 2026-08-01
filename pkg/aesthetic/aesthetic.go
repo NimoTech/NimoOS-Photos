@@ -1,5 +1,7 @@
-// Package aesthetic 在现成 CLIP(SigLIP2)图向量上跑一个小线性头计算美学分。
-// 纯本地矩阵乘、微秒级/张,不依赖 ML 服务。权重格式见 LoadFrom 函数注释。
+// Package aesthetic computes an aesthetic score by running a small linear
+// head on top of an existing CLIP (SigLIP2) image vector.
+// Pure local matrix multiply, microsecond-scale per image, no dependency on
+// the ML service. See the LoadFrom function comment for the weight format.
 package aesthetic
 
 import (
@@ -10,23 +12,28 @@ import (
 )
 
 const (
-	// maxVerLen 是版本字符串长度的防御性上限,字节数,远大于任何真实版本号(如 "v-test"、"v2.5")。
+	// maxVerLen is a defensive cap on the version string length in bytes,
+	// far larger than any real version string (e.g. "v-test", "v2.5").
 	maxVerLen = 128
-	// maxLayers 是线性头层数的防御性上限,远大于真实结构(1152→1024→128→64→16→1,共 5 层)。
+	// maxLayers is a defensive cap on the number of layers in the linear
+	// head, far larger than the real structure (1152->1024->128->64->16->1, 5 layers).
 	maxLayers = 16
-	// maxDim 是单层输入/输出维度的防御性上限。真实头维度链为 1152→1024→128→64→16→1,
-	// 远小于此值;设上限是为了在读取权重字节前挡住畸形/截断文件声明的超大维度,
-	// 避免 make([]float32, in*out) 触发单层 GiB 级内存分配。
+	// maxDim is a defensive cap on the input/output dimension of a single
+	// layer. The real head's dimension chain is 1152->1024->128->64->16->1,
+	// well below this value; the cap exists to reject an oversized dimension
+	// declared by a malformed/truncated file before reading the weight bytes,
+	// preventing make([]float32, in*out) from allocating GiB-scale memory
+	// for a single layer.
 	maxDim = 4096
 )
 
 type layer struct {
 	in, out int
-	w       []float32 // 行主序 [out][in]
+	w       []float32 // row-major [out][in]
 	b       []float32
 }
 
-// Head 是加载完成的美学评分头。并发只读安全。
+// Head is a fully loaded aesthetic scoring head. Safe for concurrent read-only use.
 type Head struct {
 	ver    string
 	layers []layer
@@ -35,21 +42,22 @@ type Head struct {
 func (h *Head) Version() string { return h.ver }
 func (h *Head) InDim() int      { return h.layers[0].in }
 
-// LoadFrom 解析权重字节流。任何结构不符都返回错误。
+// LoadFrom parses the weight byte stream. Returns an error on any structural mismatch.
 //
-// 权重文件格式(小端):
+// Weight file format (little-endian):
 //
-//	magic   [4]byte   固定 "NAES"
-//	verLen  uint32    版本字符串字节数,上限 maxVerLen
-//	ver     [verLen]byte  版本字符串,如 "v2.5"
-//	nLayers uint32    层数,范围 [1, maxLayers]
-//	layers  按 nLayers 重复:
-//	    in      uint32        本层输入维度,范围 (0, maxDim]
-//	    out     uint32        本层输出维度,范围 (0, maxDim]
-//	    weights [in*out]float32  行主序 [out][in]
+//	magic   [4]byte   fixed "NAES"
+//	verLen  uint32    version string length in bytes, capped at maxVerLen
+//	ver     [verLen]byte  version string, e.g. "v2.5"
+//	nLayers uint32    layer count, range [1, maxLayers]
+//	layers  repeated nLayers times:
+//	    in      uint32        this layer's input dimension, range (0, maxDim]
+//	    out     uint32        this layer's output dimension, range (0, maxDim]
+//	    weights [in*out]float32  row-major [out][in]
 //	    bias    [out]float32
 //
-// 约束:相邻层 in/out 必须首尾衔接(前一层 out == 下一层 in),末层 out 必须为 1。
+// Constraint: adjacent layers' in/out must chain (previous layer's out ==
+// next layer's in), and the final layer's out must be 1.
 func LoadFrom(r io.Reader) (*Head, error) {
 	var magic [4]byte
 	if _, err := io.ReadFull(r, magic[:]); err != nil {
@@ -107,8 +115,9 @@ func LoadFrom(r io.Reader) (*Head, error) {
 	return h, nil
 }
 
-// Score 对图向量打分:先 L2 归一化(v2.5 推理惯例),再逐层 y=Wx+b。
-// 维度不符返回 NaN(调用侧跳过该资产)。
+// Score scores an image vector: L2-normalize first (v2.5 inference
+// convention), then apply y=Wx+b layer by layer.
+// Returns NaN on a dimension mismatch (the caller skips that asset).
 func (h *Head) Score(vec []float32) float64 {
 	if len(vec) != h.layers[0].in {
 		return math.NaN()

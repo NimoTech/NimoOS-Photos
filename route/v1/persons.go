@@ -10,7 +10,7 @@ import (
 	"github.com/labstack/echo/v4"
 )
 
-// PersonsHandler 提供 People 相关 HTTP 端点。
+// PersonsHandler provides People-related HTTP endpoints.
 type PersonsHandler struct {
 	svc          service.Services
 	faceThumbDir string
@@ -189,8 +189,8 @@ func (h *PersonsHandler) FaceThumbnail(c echo.Context) error {
 
 // POST /v1/photos/persons/:id/detach  { assetIds: [...] }
 //
-// 把 assetIds 里所有属于该 person 的脸移除，并标记 excluded=1 永久不再聚回。
-// 返回 { removed: N }。person 不存在返回 404；空 assetIds 返回 { removed: 0 }。
+// Removes all faces belonging to this person among assetIds, and marks them excluded=1 so they never re-cluster back.
+// Returns { removed: N }. Returns 404 if the person doesn't exist; returns { removed: 0 } for an empty assetIds.
 func (h *PersonsHandler) Detach(c echo.Context) error {
 	var req struct {
 		AssetIDs []string `json:"assetIds"`

@@ -6,12 +6,14 @@ import (
 	"github.com/NimoTech/NimoOS-Photos/pkg/config"
 )
 
-// OCR「文档」分类混合判据的纯计算部分。密度候选闸(coverage/line_count)之上,
-// 用 CLIP 零样本语义边际 + 行几何规整度做加权否决,消灭「文字密集的照片被误判
-// 成 OCR」。规格:docs/superpowers/specs/2026-07-09-ocr-doc-classify-design.md。
+// Pure computation for the OCR "document" classification hybrid criterion.
+// On top of the density candidate gate (coverage/line_count), a weighted veto
+// combining CLIP zero-shot semantic margin + line geometry regularity kills
+// the "text-dense photo misclassified as OCR document" failure mode.
 //
-// 提示词写死为代码常量(算法实现细节,不进用户配置);其文本嵌入按
-// common.MLModelGen 缓存在 clip_text_cache 表(见 docverdict.go)。
+// Prompts are hardcoded as code constants (an algorithm implementation detail,
+// not user config); their text embeddings are cached in the clip_text_cache
+// table keyed by common.MLModelGen (see docverdict.go).
 var docPrompts = []string{
 	"a scan of a document",
 	"a photo of a receipt",
@@ -29,14 +31,17 @@ var photoPrompts = []string{
 	"a natural photograph of people or scenery",
 }
 
-// 权重/阈值默认值(photos.conf 可覆盖)。初始值为经验值,现网 91 图校准后
-// 如有调整须同步更新这里与配置注释。
+// Default weight/threshold values (overridable via photos.conf). Initial values
+// are empirical; if adjusted after calibrating against the 91-photo production
+// set, update both here and the config comments in sync.
 const (
 	defaultDocWSem       = 0.65
 	defaultDocWGeo       = 0.35
 	defaultDocScoreFloor = 0.5
-	// SigLIP2 图文余弦本身量级很小(强相关 ~0.09-0.13,见 scan.go 标定注释),
-	// 文档组-照片组的边际更小,[-0.01, 0.05] 是线性归一的初始标定区间。
+	// SigLIP2 image-text cosine similarity itself has a small magnitude (strong
+	// correlation ~0.09-0.13, see the calibration comment in scan.go), so the
+	// doc-group vs photo-group margin is even smaller; [-0.01, 0.05] is the
+	// initial calibration range for linear normalization.
 	defaultDocSemFloor = -0.01
 	defaultDocSemCeil  = 0.05
 )
@@ -76,8 +81,10 @@ func docSemCeil() float64 {
 	return defaultDocSemCeil
 }
 
-// docSemMargin 返回图向量对「文档组」与「照片组」提示词的最大余弦相似度之差。
-// 正 = 语义上更像平面文字载体;负 = 更像自然照片。空组返回 0(中性)。
+// docSemMargin returns the difference between the image vector's max cosine
+// similarity against the "document group" prompts and against the "photo
+// group" prompts. Positive = semantically more like a flat text carrier;
+// negative = more like a natural photo. Returns 0 (neutral) for an empty group.
 func docSemMargin(imgVec []float32, docVecs, photoVecs [][]float32) float64 {
 	maxSim := func(vecs [][]float32) (float64, bool) {
 		best, ok := -2.0, false
@@ -85,8 +92,9 @@ func docSemMargin(imgVec []float32, docVecs, photoVecs [][]float32) float64 {
 			if len(v) != len(imgVec) {
 				continue
 			}
-			// cosDist 返回余弦距离(调用方惯例 1-cosDist=相似度,见 faces.go
-			// ClusterConfidence);实现前请以 faces.go 实读为准。
+			// cosDist returns cosine distance (caller convention: 1-cosDist =
+			// similarity, see faces.go ClusterConfidence); check faces.go's
+			// actual implementation before relying on this.
 			sim := 1.0 - cosDist(imgVec, v)
 			if sim > best {
 				best, ok = sim, true
@@ -102,11 +110,15 @@ func docSemMargin(imgVec []float32, docVecs, photoVecs [][]float32) float64 {
 	return d - p
 }
 
-// docGeoScore 从保留行的归一化四角坐标(TL,TR,BR,BL 顺序)计算版面规整度 [0,1]:
-// 水平度(上边缘角度)、等高性(行高 CV)、对齐性(左缘/中心 std 取小)三特征均值。
-// 行数 < 3 时统计不可靠,返回 0.5(中性,不投票)。
-// 注意:在归一化坐标系下计算,非方图会使角度值有畸变,但水平行(dy≈0)在任何
-// 宽高比下角度都≈0,判别方向不受影响。
+// docGeoScore computes layout regularity [0,1] from the retained lines'
+// normalized four-corner coordinates (TL,TR,BR,BL order): the mean of three
+// features — horizontality (top-edge angle), uniform height (line-height CV),
+// and alignment (min of left-edge/center std).
+// With fewer than 3 lines the statistics are unreliable, so it returns 0.5
+// (neutral, doesn't vote).
+// Note: computed in normalized coordinate space — a non-square image distorts
+// the angle value, but a horizontal line (dy≈0) has angle≈0 under any aspect
+// ratio, so the discriminating direction is unaffected.
 func docGeoScore(boxes [][]float64) float64 {
 	type line struct{ angle, height, left, center float64 }
 	lines := make([]line, 0, len(boxes))
@@ -119,7 +131,7 @@ func docGeoScore(boxes [][]float64) float64 {
 			continue
 		}
 		angle := math.Abs(math.Atan2(topDy, topDx)) * 180 / math.Pi
-		if angle > 90 { // 归到 [0,90]
+		if angle > 90 { // fold into [0,90]
 			angle = 180 - angle
 		}
 		hL := math.Hypot(b[6]-b[0], b[7]-b[1]) // TL→BL
@@ -156,15 +168,16 @@ func docGeoScore(boxes [][]float64) float64 {
 	}
 	clamp01 := func(x float64) float64 { return math.Max(0, math.Min(1, x)) }
 
-	// 水平度:平均角度 0° → 1 分;>=15° → 0 分。
+	// Horizontality: mean angle 0° → score 1; >=15° → score 0.
 	horiz := clamp01(1 - mean(func(l line) float64 { return l.angle })/15)
-	// 等高性:行高变异系数 0 → 1 分;>=0.75 → 0 分。
+	// Uniform height: line-height coefficient of variation 0 → score 1; >=0.75 → score 0.
 	mh := mean(func(l line) float64 { return l.height })
 	uniform := 0.0
 	if mh > 0 {
 		uniform = clamp01(1 - (std(func(l line) float64 { return l.height }, mh)/mh)/0.75)
 	}
-	// 对齐性:左缘与中心的 std 取小(兼容左对齐文档与居中收据),0 → 1 分;>=0.15 → 0 分。
+	// Alignment: min of left-edge/center std (works for both left-aligned documents
+	// and centered receipts), 0 → score 1; >=0.15 → score 0.
 	ml := mean(func(l line) float64 { return l.left })
 	mc := mean(func(l line) float64 { return l.center })
 	align := clamp01(1 - math.Min(
@@ -174,29 +187,41 @@ func docGeoScore(boxes [][]float64) float64 {
 	return (horiz + uniform + align) / 3
 }
 
-// docVerdict 把语义边际线性归一后与几何规整度加权,过 docScoreFloor 判为文档。
-// 对所有有 OCR 行的资产都会计算——密度候选闸由查询层 hasOcrExpr 把守,本函数
-// 不重复判密度。
+// docVerdict linearly normalizes the semantic margin, weights it against the
+// geometry regularity score, and classifies as a document once past
+// docScoreFloor. Computed for every asset with OCR lines — the density
+// candidate gate is enforced by the query layer's hasOcrExpr; this function
+// does not re-check density.
 func docVerdict(semMargin, geo float64) bool {
 	floor, ceil := docSemFloor(), docSemCeil()
 	sem := 0.5
 	if ceil > floor {
 		sem = math.Max(0, math.Min(1, (semMargin-floor)/(ceil-floor)))
 	}
-	// 1e-9 容差:抵消浮点除法/加权在临界值(如中性档正好等于 floor)上的舍入误差,
-	// 不改变判定语义——真正明确低于 floor 的分数差距远超此容差。
+	// 1e-9 tolerance: offsets floating-point division/weighting rounding error at
+	// boundary values (e.g. the neutral tier landing exactly on floor); doesn't
+	// change the classification semantics — a score genuinely below floor differs
+	// by far more than this tolerance.
 	return docWSem()*sem+docWGeo()*geo >= docScoreFloor()-1e-9
 }
 
-// hasOcrExpr 是「OCR/文档」分类的唯一判据 SQL 片段(SELECT 列位置,依赖外层
-// 别名 a)。密度闸(coverage/line_count)在外层、无条件生效,is_doc 只做否决,
-// 不能绕过闸(无拯救路径):
-//   - 密度闸不过 → 恒 false,不看 is_doc。
-//   - 密度闸过 + is_doc IS NULL(未算/补算中/ML 长期离线)→ 回退旧密度双阈值
-//     (此时密度闸已保证 text 非空、coverage、line_count 达标,等价于旧判据本身),
-//     行为与本功能上线前逐张一致,平滑降级。
-//   - 密度闸过 + is_doc=0 → 被混合判据否决,不算 OCR 类。
-//   - 密度闸过 + is_doc=1 → 混合判据确认,算 OCR 类。
+// hasOcrExpr is the single SQL fragment criterion for "OCR/document"
+// classification (used at a SELECT column position, depends on the outer
+// alias a). The density gate (coverage/line_count) is enforced unconditionally
+// at the outer level; is_doc only vetoes, and can never bypass the gate (no
+// rescue path):
+//   - Density gate fails → always false, is_doc is never consulted.
+//   - Density gate passes + is_doc IS NULL (not computed yet / backfilling /
+//     ML has been offline for a long time) → falls back to the old dual
+//     density thresholds (the density gate already guarantees non-empty text,
+//     coverage and line_count met, which is equivalent to the old criterion
+//     itself), matching per-asset behavior before this feature shipped — a
+//     smooth degradation.
+//   - Density gate passes + is_doc=0 → vetoed by the hybrid criterion, not
+//     counted as an OCR document.
+//   - Density gate passes + is_doc=1 → confirmed by the hybrid criterion,
+//     counted as an OCR document.
 //
-// 11 处查询共用本常量;调阈值只改 docscore.go 一处。
+// Shared by 11 query call sites; adjust thresholds in only this one place in
+// docscore.go.
 const hasOcrExpr = `EXISTS(SELECT 1 FROM asset_ocr ocr WHERE ocr.asset_id=a.id AND ocr.text<>'' AND COALESCE(ocr.coverage,1)>=0.05 AND COALESCE(ocr.line_count,0)>=8 AND COALESCE(ocr.is_doc,1)=1)`

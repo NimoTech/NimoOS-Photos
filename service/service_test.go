@@ -10,7 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestServicesExposesGeo 断言 NewService 构造的 Services 能通过 Geo() 拿到非 nil 的 GeoService。
+// TestServicesExposesGeo asserts that Services built by NewService can get a non-nil GeoService via Geo().
 func TestServicesExposesGeo(t *testing.T) {
 	tmp := t.TempDir()
 	cfg := &config.Config{
@@ -27,13 +27,13 @@ func TestServicesExposesGeo(t *testing.T) {
 	require.NotNil(t, svc.Geo())
 }
 
-// TestNewService_TaskPublisherWired 断言 NewService 把 publisher 接到 TaskRegistry
-// 上，registry.Upsert 走通后回调被触发。
+// TestNewService_TaskPublisherWired asserts NewService wires the publisher
+// into TaskRegistry, so the callback fires once registry.Upsert goes through.
 func TestNewService_TaskPublisherWired(t *testing.T) {
 	tmp := t.TempDir()
 	cfg := &config.Config{
 		DataPath:   tmp,
-		MLEndpoint: "http://127.0.0.1:0", // 不会真的连
+		MLEndpoint: "http://127.0.0.1:0", // won't actually connect
 		Workers:    1,
 		WatchDirs:  nil,
 	}
@@ -51,7 +51,7 @@ func TestNewService_TaskPublisherWired(t *testing.T) {
 	svc := NewService(ctx, cfg, pub)
 
 	svc.Tasks().Upsert(Task{
-		ID: "t1", Type: "index", Label: "索引照片",
+		ID: "t1", Type: "index", Label: "Indexing photos",
 		Status: "running", Progress: 0.1, StartedAt: time.Now(),
 	})
 
@@ -62,12 +62,14 @@ func TestNewService_TaskPublisherWired(t *testing.T) {
 	}, time.Second, 10*time.Millisecond)
 }
 
-// TestNewService_BatchDoneTriggersFacePipeline 断言批次完成钩子(SetOnBatchDone)
-// 触发的是 FaceService.RunPipeline 而非旧的 RunClustering：跑一个真实的单文件
-// 批次，asset 落地后 face_scanned=0（人脸检测已移出索引流水线），RunClustering
-// 面对 0 条 face_detections 会完全不发任务；只有 RunPipeline 会因为存在
-// face_scanned=0 的待检测资产而发出一个 "face" 任务（哪怕 ML 端点不可用，检测
-// 逐张失败也不影响任务照常创建/完成——可判定区分二者）。
+// TestNewService_BatchDoneTriggersFacePipeline asserts that the batch-done
+// hook (SetOnBatchDone) triggers FaceService.RunPipeline rather than the old
+// RunClustering: runs a real single-file batch; once the asset lands,
+// face_scanned=0 (face detection has been moved out of the indexing
+// pipeline), so RunClustering, facing 0 face_detections rows, won't emit any
+// task at all; only RunPipeline emits a "face" task because a
+// face_scanned=0 pending-detection asset exists (even if the ML endpoint is
+// unavailable and per-image detection fails, the task is still created/completed as normal — this lets us tell the two apart).
 func TestNewService_BatchDoneTriggersFacePipeline(t *testing.T) {
 	tmp := t.TempDir()
 	imgDir := t.TempDir()
@@ -75,7 +77,7 @@ func TestNewService_BatchDoneTriggersFacePipeline(t *testing.T) {
 
 	cfg := &config.Config{
 		DataPath:   tmp,
-		MLEndpoint: "http://127.0.0.1:0", // 不会真的连上，检测阶段逐张失败但不影响任务创建
+		MLEndpoint: "http://127.0.0.1:0", // won't actually connect; per-image detection fails but doesn't block task creation
 		Workers:    1,
 		WatchDirs:  nil,
 	}
@@ -105,14 +107,17 @@ func TestNewService_BatchDoneTriggersFacePipeline(t *testing.T) {
 			}
 		}
 		return false
-	}, 10*time.Second, 50*time.Millisecond, "批次完成后应由 RunPipeline 发出 face 任务(RunClustering 面对 0 条 face_detections 会静默不发任务)")
+	}, 10*time.Second, 50*time.Millisecond, "after batch completion, RunPipeline should emit a face task (RunClustering silently emits nothing when facing 0 face_detections)")
 }
 
-// TestNewService_BatchDoneTriggersEmbedBackfill 断言批次完成钩子同时触发
-// Embedder.Backfill 兜底:索引期间 ML 冷加载/worker 回收会让 embedClip 偶发
-// 失败且被吞,恢复链只在 ML 掉线→恢复跳变时触发——ML 全程在线就没人补,
-// 资产无限期缺向量、语义搜索搜不到(真实故障:两张鱼图)。本用例里 ML 端点
-// 不可达,embedClip 必然失败,批次完成后必须出现 "embedding" 补跑任务。
+// TestNewService_BatchDoneTriggersEmbedBackfill asserts the batch-done hook
+// also triggers the Embedder.Backfill backstop: during indexing, ML
+// cold-loading/worker reclamation can cause embedClip to occasionally fail
+// and get swallowed, and the recovery chain only triggers on an ML
+// offline→recovered transition — if ML stays online the whole time, nobody
+// catches up, leaving assets permanently missing vectors and unsearchable by
+// semantic search (real incident: two fish photos). In this test case the ML
+// endpoint is unreachable, so embedClip is bound to fail, and an "embedding" catch-up task must appear after the batch completes.
 func TestNewService_BatchDoneTriggersEmbedBackfill(t *testing.T) {
 	tmp := t.TempDir()
 	imgDir := t.TempDir()
@@ -150,5 +155,5 @@ func TestNewService_BatchDoneTriggersEmbedBackfill(t *testing.T) {
 			}
 		}
 		return false
-	}, 10*time.Second, 50*time.Millisecond, "批次完成后应触发 CLIP 补跑(embedding 任务),兜住索引期间被吞的 embedClip 失败")
+	}, 10*time.Second, 50*time.Millisecond, "batch completion should trigger a CLIP catch-up (embedding task), covering embedClip failures swallowed during indexing")
 }

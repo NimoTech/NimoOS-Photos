@@ -122,7 +122,7 @@ func TestWatcherHandleEventPrunesDirectoryDelete(t *testing.T) {
 	require.Eventually(t, func() bool {
 		return !assetExists(t, idx, fileA) && !assetExists(t, idx, fileB)
 	}, 5*time.Second, 100*time.Millisecond,
-		"目录删除事件(event.Name 为无扩展名的目录路径)必须清理该目录下所有 asset,而不是被 isSupportedMedia 白名单静默丢弃")
+		"a directory-delete event (event.Name is an extensionless directory path) must clean up every asset under that directory, not be silently dropped by the isSupportedMedia allowlist")
 }
 
 // TestWatcherRemovesAssetOnFileDelete is a regression guard for the existing
@@ -142,13 +142,13 @@ func TestWatcherRemovesAssetOnFileDelete(t *testing.T) {
 	require.Eventually(t, func() bool {
 		writeFile(t, file, "data")
 		return assetIndexed(t, idx, file)
-	}, 5*time.Second, 100*time.Millisecond, "文件应先被索引")
+	}, 5*time.Second, 100*time.Millisecond, "file should be indexed first")
 
 	require.NoError(t, os.Remove(file))
 
 	require.Eventually(t, func() bool {
 		return !assetExists(t, idx, file)
-	}, 5*time.Second, 100*time.Millisecond, "删除单个文件后,对应 asset 记录应被清理")
+	}, 5*time.Second, 100*time.Millisecond, "after deleting a single file, its asset record should be cleaned up")
 }
 
 // TestWatcherRecursiveNestedSubdir verifies the core bug fix: a file written
@@ -216,9 +216,10 @@ func TestWatcherDynamicNewDirectory(t *testing.T) {
 		"a directory moved in with a file already inside it must be caught up by the scan")
 }
 
-// TestWatcherSkipsSnapshotsDirectory 是 TestWatcherSkipsHiddenDirectories 的
-// .snapshots 版本:真实场景是 btrbk/snapper 每小时快照,目录形态为
-// <root>/.snapshots/<ts>/Image/xxx.jpg——两层嵌套也不能被实时监控/索引到。
+// TestWatcherSkipsSnapshotsDirectory is the .snapshots counterpart of
+// TestWatcherSkipsHiddenDirectories: the real-world scenario is btrbk/snapper
+// hourly snapshots, shaped like <root>/.snapshots/<ts>/Image/xxx.jpg — even
+// two levels of nesting must not be watched/indexed in real time.
 func TestWatcherSkipsSnapshotsDirectory(t *testing.T) {
 	root := t.TempDir()
 	snapDir := filepath.Join(root, ".snapshots", "20260716T200714Z_auto-hourly", "Image")
@@ -247,11 +248,12 @@ func TestWatcherSkipsSnapshotsDirectory(t *testing.T) {
 		"files inside a .snapshots tree must never be indexed by the watcher")
 }
 
-// TestWatcherAutoModeSkipsRootNestedInSnapshots 覆盖真实事故的根因:自动模式
-// 下 enumerateRoots 直接返回一个"根本身已经在 .snapshots 里面"的路径——这正是
-// btrbk/snapper 把每个快照子卷单独挂载成一条 /proc/mounts 记录时,
-// EnumerateScanRoots 曾经会产出的根。哪怕这种根被交给 Watcher,也绝不能监控
-// 或索引任何东西。
+// TestWatcherAutoModeSkipsRootNestedInSnapshots covers the root cause of a
+// real incident: in auto mode, enumerateRoots can directly return a path
+// whose root is "already nested inside .snapshots" — exactly what
+// EnumerateScanRoots used to produce when btrbk/snapper mounts each snapshot
+// subvolume as its own /proc/mounts entry. Even when such a root is handed to
+// Watcher, it must never watch or index anything.
 func TestWatcherAutoModeSkipsRootNestedInSnapshots(t *testing.T) {
 	base := t.TempDir()
 	snapRoot := filepath.Join(base, ".snapshots", "20260716T200714Z_auto-hourly")
@@ -261,7 +263,7 @@ func TestWatcherAutoModeSkipsRootNestedInSnapshots(t *testing.T) {
 
 	db := makeTestDB(t)
 	ix := NewIndexer(db, &mockML{}, t.TempDir(), 1)
-	w := NewWatcher(db, nil, ix, "") // 空 watchDirs = 自动模式
+	w := NewWatcher(db, nil, ix, "") // empty watchDirs = auto mode
 	w.enumerateRoots = func() []string { return []string{snapRoot} }
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -460,14 +462,16 @@ func TestWatcherRestartSwitchesWatchDirs(t *testing.T) {
 		"oldDir must not be watched after Restart")
 }
 
-// TestWatcherAutoModeWatchesEnumeratedRoots:WatchDirs 为空 ⇒ 根集合来自
-// enumerateRoots(生产=EnumerateScanRoots)。往枚举出的根里丢照片必须被
-// 实时 Enqueue 索引——这是"NAS 全空间实时监控"的核心行为。
+// TestWatcherAutoModeWatchesEnumeratedRoots: WatchDirs empty ⇒ the root set
+// comes from enumerateRoots (production = EnumerateScanRoots). Dropping a
+// photo into an enumerated root must be Enqueue'd for indexing in real
+// time — this is the core behavior of "NAS whole-storage real-time
+// monitoring".
 func TestWatcherAutoModeWatchesEnumeratedRoots(t *testing.T) {
 	db := makeTestDB(t)
 	root := t.TempDir()
 	ix := NewIndexer(db, &mockML{}, t.TempDir(), 1)
-	w := NewWatcher(db, nil, ix, "") // 空 watchDirs = 自动模式
+	w := NewWatcher(db, nil, ix, "") // empty watchDirs = auto mode
 	w.enumerateRoots = func() []string { return []string{root} }
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -481,7 +485,7 @@ func TestWatcherAutoModeWatchesEnumeratedRoots(t *testing.T) {
 		writeFile(t, newFile, "new")
 		return assetIndexed(t, ix, newFile)
 	}, 5*time.Second, 100*time.Millisecond,
-		"auto 模式下,enumerateRoots 枚举出的根必须被实时监控")
+		"in auto mode, a root enumerated by enumerateRoots must be watched in real time")
 }
 
 // TestHandleWatchErrorOverflowTriggersRescan verifies fsnotify.ErrEventOverflow
@@ -522,7 +526,7 @@ func TestWalkSupportedHonorsCtxCancel(t *testing.T) {
 		require.NoError(t, os.WriteFile(filepath.Join(dir, fmt.Sprintf("f%02d.jpg", i)), []byte("x"), 0o644))
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // 进入前已取消:一个文件都不应回调
+	cancel() // already cancelled before entry: not a single file should be callback'd
 	calls := 0
 	err := walkSupported(ctx, dir, func(string) { calls++ })
 	require.ErrorIs(t, err, context.Canceled)
@@ -542,7 +546,7 @@ func TestWalkSupportedSkipsUnreadableEntry(t *testing.T) {
 
 	var got []string
 	err := walkSupported(context.Background(), dir, func(p string) { got = append(got, p) })
-	require.NoError(t, err) // 坏子目录被跳过,不再中止整树
+	require.NoError(t, err) // the bad subdirectory is skipped, no longer aborts the whole walk
 	require.Equal(t, []string{filepath.Join(dir, "z-ok.jpg")}, got)
 }
 
@@ -552,10 +556,10 @@ func TestWalkSupportedSkipsUnreadableEntry(t *testing.T) {
 // "every fw.Add failed on ENOSPC" (files still exist and must be indexed;
 // only future-change tracking is degraded until the inotify quota is raised).
 func TestSkipCatchupScan(t *testing.T) {
-	require.True(t, skipCatchupScan(0, false))  // 目录被排除/已消失:跳过
-	require.False(t, skipCatchupScan(0, true))  // 全因 ENOSPC 失败:不得跳过
-	require.False(t, skipCatchupScan(3, false)) // 正常:不跳过
-	require.False(t, skipCatchupScan(3, true))  // 部分 ENOSPC:不跳过
+	require.True(t, skipCatchupScan(0, false))  // directory excluded/vanished: skip
+	require.False(t, skipCatchupScan(0, true))  // all failures were ENOSPC: must not skip
+	require.False(t, skipCatchupScan(3, false)) // normal: don't skip
+	require.False(t, skipCatchupScan(3, true))  // partial ENOSPC: don't skip
 }
 
 // TestTrackNewDirDedup pins down walkCovered's semantics: a recursive walk
@@ -570,11 +574,11 @@ func TestTrackNewDirDedup(t *testing.T) {
 	child := filepath.Join(root, "a", "b")
 	require.NoError(t, os.MkdirAll(child, 0o755))
 
-	// 手动占位:root 的 walk 在途
+	// Manually stake out: root's walk is in flight.
 	w.walkInFlight.Store(withSep(root), struct{}{})
-	require.True(t, w.walkCovered(child))        // 祖先在途 → 覆盖
-	require.True(t, w.walkCovered(root))         // 自身在途 → 覆盖
-	require.False(t, w.walkCovered(t.TempDir())) // 无关目录 → 不覆盖
+	require.True(t, w.walkCovered(child))        // ancestor in flight → covered
+	require.True(t, w.walkCovered(root))         // self in flight → covered
+	require.False(t, w.walkCovered(t.TempDir())) // unrelated directory → not covered
 }
 
 // TestTrackNewDirWatchesDespiteAncestorCoverage is the regression test for
@@ -661,12 +665,15 @@ func TestTrackNewDirWatchesDespiteAncestorCoverage(t *testing.T) {
 		"child directory must still be watched even though an ancestor scan is in flight (walkCovered must gate only the catch-up scan, not addRecursiveWatch)")
 }
 
-// TestWatcherFollowsMountChanges:自动模式下根集合快照变化(新盘挂上)必须
-// 在一个轮询周期内触发重启纳入监控,且对新根做一次补扫让存量文件入库。
+// TestWatcherFollowsMountChanges: in auto mode, a change in the root-set
+// snapshot (a new disk mounted) must trigger a restart within one polling
+// cycle to bring it under watch, and the new root must get a one-time
+// rescan so existing files get indexed.
 func TestWatcherFollowsMountChanges(t *testing.T) {
 	db := makeTestDB(t)
 	rootA, rootB := t.TempDir(), t.TempDir()
-	// rootB 里预置一张"存量"照片:只有补扫才会发现它(inotify 只看未来事件)。
+	// Seed a pre-existing photo in rootB: only a rescan will discover it
+	// (inotify only sees future events).
 	seedPhotoFile(t, filepath.Join(rootB, "existing.jpg"))
 
 	var phase atomic.Int32
@@ -683,39 +690,41 @@ func TestWatcherFollowsMountChanges(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// 启动方式照抄 TestWatcherAutoModeWatchesEnumeratedRoots。
+	// Startup mirrors TestWatcherAutoModeWatchesEnumeratedRoots.
 	go ix.Start(ctx)
 	go w.Start(ctx)
 
-	// warmup:先证明 watcher 已经用 phase=0 的快照跑起来(rootA 已被实时监
-	// 控),排除"phase.Store(1) 抢在 Start 首次 enumerateRoots() 之前执行"
-	// 的时序竞争——手法与 TestWatcherRestartSwitchesWatchDirs 的 warmup 一致。
+	// warmup: first prove the watcher is already running with the phase=0
+	// snapshot (rootA is being watched in real time), ruling out the race
+	// where "phase.Store(1) beats Start's first enumerateRoots() call" —
+	// same technique as TestWatcherRestartSwitchesWatchDirs's warmup.
 	warmFile := filepath.Join(rootA, "warmup.jpg")
 	require.Eventually(t, func() bool {
 		writeFile(t, warmFile, "warm")
 		return assetIndexed(t, ix, warmFile)
-	}, 5*time.Second, 100*time.Millisecond, "rootA 的 warmup 文件必须先被索引,证明 watcher 已用初始快照跑起来")
+	}, 5*time.Second, 100*time.Millisecond, "rootA's warmup file must be indexed first, proving the watcher is running on the initial snapshot")
 
-	// 模拟新盘挂载:下一轮询周期起,enumerateRoots 会枚举出 rootB。
+	// Simulate a new disk mount: from the next polling cycle, enumerateRoots
+	// will enumerate rootB.
 	phase.Store(1)
 
-	// 断言 1:existing.jpg 在超时内入库(补扫生效)。
+	// Assertion 1: existing.jpg gets indexed within the timeout (rescan took effect).
 	existingFile := filepath.Join(rootB, "existing.jpg")
 	require.Eventually(t, func() bool {
 		return assetIndexed(t, ix, existingFile)
 	}, 5*time.Second, 100*time.Millisecond,
-		"新挂载的根里预置的存量文件必须被补扫入库")
+		"a pre-existing file in the newly mounted root must be indexed by the rescan")
 
-	// 断言 2:再往 rootB 丢 new.jpg 也在超时内入库(重启后已在监控)。
+	// Assertion 2: dropping new.jpg into rootB afterward is also indexed within the timeout (watched after restart).
 	newFile := filepath.Join(rootB, "new.jpg")
 	require.Eventually(t, func() bool {
 		writeFile(t, newFile, "new")
 		return assetIndexed(t, ix, newFile)
 	}, 5*time.Second, 100*time.Millisecond,
-		"新挂载的根必须在重启后被实时监控")
+		"the newly mounted root must be watched in real time after the restart")
 }
 
-// TestDiffNewRoots:集合差集,顺序无关。
+// TestDiffNewRoots: set difference, order does not matter.
 func TestDiffNewRoots(t *testing.T) {
 	require.Equal(t, []string{"/b"}, diffNewRoots([]string{"/a"}, []string{"/b", "/a"}))
 	require.Empty(t, diffNewRoots([]string{"/a", "/b"}, []string{"/b", "/a"}))

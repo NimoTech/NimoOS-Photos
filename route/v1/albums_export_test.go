@@ -18,14 +18,17 @@ import (
 	"github.com/NimoTech/NimoOS-Photos/service"
 )
 
-// 手动相册 ZIP 下载端点测试。与 favorites 的 Export 同构：
-// GET + token query 参数（浏览器 window.location.href 导航发不出 Authorization
-// 头，photos.go router 的 JWT Skipper 靠"/albums/:id/export"后缀放行，handler
-// 内部自行校验 token），runtimePath=="" 时为测试/单机直连场景，跳过真实 JWT
-// 校验（同 favorites_test.go 的 newFavHarness 约定）。
+// Tests for the manual album ZIP download endpoint. Mirrors favorites'
+// Export: GET + token query parameter (browser window.location.href
+// navigation can't send an Authorization header, so photos.go router's JWT
+// Skipper lets the "/albums/:id/export" suffix through and the handler
+// validates the token itself); when runtimePath=="" it's a test/standalone
+// scenario, skipping real JWT validation (same convention as
+// favorites_test.go's newFavHarness).
 
-// TestAlbumExportZipHandler 验证成功路径：相册下全部成员流式打包进 zip，
-// Content-Type/Content-Disposition 与文件内容均正确。
+// TestAlbumExportZipHandler verifies the happy path: all members of the
+// album are streamed into a zip, and Content-Type/Content-Disposition and
+// file contents are all correct.
 func TestAlbumExportZipHandler(t *testing.T) {
 	dir := t.TempDir()
 	fileA := filepath.Join(dir, "alpha.jpg")
@@ -79,7 +82,7 @@ func TestAlbumExportZipHandler(t *testing.T) {
 	}
 }
 
-// TestAlbumExportZipNotFound 相册不存在应 404。
+// TestAlbumExportZipNotFound expects 404 when the album doesn't exist.
 func TestAlbumExportZipNotFound(t *testing.T) {
 	db, err := sqlite.Open(filepath.Join(t.TempDir(), "test.db"))
 	require.NoError(t, err)
@@ -98,7 +101,8 @@ func TestAlbumExportZipNotFound(t *testing.T) {
 	require.Equal(t, http.StatusNotFound, httpErr.Code)
 }
 
-// TestAlbumExportZipEmpty 相册存在但无(可见)成员应 400。
+// TestAlbumExportZipEmpty expects 400 when the album exists but has no
+// (visible) members.
 func TestAlbumExportZipEmpty(t *testing.T) {
 	db, err := sqlite.Open(filepath.Join(t.TempDir(), "test.db"))
 	require.NoError(t, err)
@@ -119,8 +123,9 @@ func TestAlbumExportZipEmpty(t *testing.T) {
 	require.Equal(t, http.StatusBadRequest, httpErr.Code)
 }
 
-// TestAlbumExportZipMissingToken 缺 token query 参数应 401(与 favorites 同款
-// 校验:浏览器导航无法带 Authorization 头,只能靠 query token 兜底)。
+// TestAlbumExportZipMissingToken expects 401 when the token query
+// parameter is missing (same validation as favorites: browser navigation
+// can't carry an Authorization header, so it falls back to a query token).
 func TestAlbumExportZipMissingToken(t *testing.T) {
 	db, err := sqlite.Open(filepath.Join(t.TempDir(), "test.db"))
 	require.NoError(t, err)
@@ -141,8 +146,9 @@ func TestAlbumExportZipMissingToken(t *testing.T) {
 	require.Equal(t, http.StatusUnauthorized, httpErr.Code)
 }
 
-// TestAlbumExportZipDeduplicatesNames 两个成员同 original_name 时,zip 内条目
-// 名照 favorites 既有 dedupZipEntryName 规则加 "-2" 后缀去重。
+// TestAlbumExportZipDeduplicatesNames: when two members share the same
+// original_name, the zip entry names are deduplicated with a "-2" suffix
+// per favorites' existing dedupZipEntryName rule.
 func TestAlbumExportZipDeduplicatesNames(t *testing.T) {
 	dir := t.TempDir()
 	fileA := filepath.Join(dir, "sub1", "photo.jpg")
@@ -179,8 +185,9 @@ func TestAlbumExportZipDeduplicatesNames(t *testing.T) {
 	require.Contains(t, names, "photo-2.jpg")
 }
 
-// TestAlbumExportZipExcludesSoftDeleted 软删/离线成员不应出现在导出的 zip 里
-// (复用 AlbumService.ListAssets 既有的可见性过滤,与网格读路径一致)。
+// TestAlbumExportZipExcludesSoftDeleted: soft-deleted/offline members
+// should not appear in the exported zip (reuses AlbumService.ListAssets'
+// existing visibility filter, consistent with the grid read path).
 func TestAlbumExportZipExcludesSoftDeleted(t *testing.T) {
 	dir := t.TempDir()
 	fileA := filepath.Join(dir, "alpha.jpg")

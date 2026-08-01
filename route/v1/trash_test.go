@@ -18,7 +18,7 @@ type trashStubServices struct {
 
 func (s trashStubServices) Trash() *service.TrashService { return s.trash }
 
-// TestTrashListEmpty 验证空回收站时 List 返回 200 + JSON 数组。
+// TestTrashListEmpty verifies List returns 200 + a JSON array when trash is empty.
 func TestTrashListEmpty(t *testing.T) {
 	db, err := sqlite.Open(filepath.Join(t.TempDir(), "t.db"))
 	if err != nil {

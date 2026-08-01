@@ -9,7 +9,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// buildHead 按格式手工拼一个头的字节流。
+// buildHead hand-assembles a head's byte stream according to the format.
 func buildHead(t *testing.T, ver string, layers [][2][]float32, dims [][2]uint32) []byte {
 	var buf bytes.Buffer
 	buf.WriteString("NAES")
@@ -25,8 +25,8 @@ func buildHead(t *testing.T, ver string, layers [][2][]float32, dims [][2]uint32
 	return buf.Bytes()
 }
 
-// 2 维输入 → 单层 1 维输出的 golden:输入 (3,4) L2 归一化后为 (0.6,0.8),
-// W=[1,2] b=[0.5] ⇒ 0.6*1+0.8*2+0.5 = 2.7。
+// Golden case for a 2-dim input -> single-layer 1-dim output: input (3,4)
+// L2-normalizes to (0.6,0.8); W=[1,2] b=[0.5] => 0.6*1+0.8*2+0.5 = 2.7.
 func TestScoreGolden(t *testing.T) {
 	data := buildHead(t, "v-test",
 		[][2][]float32{{{1, 2}, {0.5}}},
@@ -39,7 +39,8 @@ func TestScoreGolden(t *testing.T) {
 	require.InDelta(t, 2.7, got, 1e-6)
 }
 
-// 两层链:2→2(W=单位阵,b=0)再 2→1(W=[1,1],b=0);输入 (0,5) 归一化 (0,1) ⇒ 1。
+// Two-layer chain: 2->2 (W=identity, b=0) then 2->1 (W=[1,1], b=0); input
+// (0,5) normalizes to (0,1) => 1.
 func TestScoreTwoLayers(t *testing.T) {
 	data := buildHead(t, "v",
 		[][2][]float32{
@@ -64,8 +65,9 @@ func TestLoadFromBadMagic(t *testing.T) {
 	require.Error(t, err)
 }
 
-// writeHeaderPrefix 写入 magic + 版本 + 层数,供下面几个只测头部字段校验、
-// 不关心具体权重数据的失败路径用例复用。
+// writeHeaderPrefix writes magic + version + layer count, reused by the
+// failure-path test cases below that only test header field validation and
+// don't care about the actual weight data.
 func writeHeaderPrefix(t *testing.T, buf *bytes.Buffer, ver string, nLayers uint32) {
 	buf.WriteString("NAES")
 	require.NoError(t, binary.Write(buf, binary.LittleEndian, uint32(len(ver))))
@@ -73,15 +75,17 @@ func writeHeaderPrefix(t *testing.T, buf *bytes.Buffer, ver string, nLayers uint
 	require.NoError(t, binary.Write(buf, binary.LittleEndian, nLayers))
 }
 
-// TestLoadFromHugeDimNoPanic 覆盖审查发现:声明维度 5000(超过 maxDim=4096)但
-// 权重/偏置字节缺失(模拟畸形/截断文件)。应在读取权重字节前就因维度超限返回错误,
-// 不应尝试 make([]float32, in*out) 导致巨量内存分配或 panic。
+// TestLoadFromHugeDimNoPanic covers a case found during review: a declared
+// dimension of 5000 (exceeding maxDim=4096) with missing weight/bias bytes
+// (simulating a malformed/truncated file). Should return an error due to the
+// dimension cap before reading any weight bytes, and must not attempt
+// make([]float32, in*out), which would cause a huge memory allocation or panic.
 func TestLoadFromHugeDimNoPanic(t *testing.T) {
 	var buf bytes.Buffer
 	writeHeaderPrefix(t, &buf, "v", 1)
-	require.NoError(t, binary.Write(&buf, binary.LittleEndian, uint32(5000))) // in,超过 maxDim
+	require.NoError(t, binary.Write(&buf, binary.LittleEndian, uint32(5000))) // in, exceeds maxDim
 	require.NoError(t, binary.Write(&buf, binary.LittleEndian, uint32(1)))    // out
-	// 故意不写任何权重/偏置字节,模拟截断文件。
+	// Deliberately write no weight/bias bytes, simulating a truncated file.
 	require.NotPanics(t, func() {
 		_, err := LoadFrom(bytes.NewReader(buf.Bytes()))
 		require.Error(t, err)
@@ -91,7 +95,7 @@ func TestLoadFromHugeDimNoPanic(t *testing.T) {
 func TestLoadFromVerLenTooLarge(t *testing.T) {
 	var buf bytes.Buffer
 	buf.WriteString("NAES")
-	require.NoError(t, binary.Write(&buf, binary.LittleEndian, uint32(200))) // 超过 maxVerLen(128)
+	require.NoError(t, binary.Write(&buf, binary.LittleEndian, uint32(200))) // exceeds maxVerLen (128)
 	_, err := LoadFrom(bytes.NewReader(buf.Bytes()))
 	require.Error(t, err)
 }
@@ -103,19 +107,20 @@ func TestLoadFromZeroLayers(t *testing.T) {
 	require.Error(t, err)
 }
 
-// TestLoadFromDimChainMismatch 覆盖层间维度不衔接:layer0 out=2,layer1 声明 in=3。
+// TestLoadFromDimChainMismatch covers a dimension mismatch between layers:
+// layer0 out=2, layer1 declares in=3.
 func TestLoadFromDimChainMismatch(t *testing.T) {
 	data := buildHead(t, "v",
 		[][2][]float32{
-			{{1, 0, 0, 1}, {0, 0}}, // layer0: in=2,out=2
-			{{1, 1, 1}, {0}},       // layer1: 声明 in=3,out=1,与前一层 out=2 不衔接
+			{{1, 0, 0, 1}, {0, 0}}, // layer0: in=2, out=2
+			{{1, 1, 1}, {0}},       // layer1: declares in=3, out=1, doesn't chain with previous out=2
 		},
 		[][2]uint32{{2, 2}, {3, 1}})
 	_, err := LoadFrom(bytes.NewReader(data))
 	require.Error(t, err)
 }
 
-// TestLoadFromFinalOutNotOne 覆盖末层输出维度必须为 1 的约束。
+// TestLoadFromFinalOutNotOne covers the constraint that the final layer's output dimension must be 1.
 func TestLoadFromFinalOutNotOne(t *testing.T) {
 	data := buildHead(t, "v",
 		[][2][]float32{{{1, 2, 3, 4}, {0, 0}}},

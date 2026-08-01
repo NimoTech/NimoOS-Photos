@@ -23,7 +23,7 @@ func searchCutAlpha() float64 {
 // stays in the best-match tier.
 //
 // Two independent signals feed the decision, but they are combined by
-// priority rather than by picking whichever cuts earlier ("取严"): a
+// priority rather than by picking whichever cuts earlier ("stricter wins"): a
 // significant cliff is a materially stronger relevance signal than the
 // relative threshold, because a cliff reflects an actual bimodal split in
 // the score distribution, whereas the relative threshold is a fixed

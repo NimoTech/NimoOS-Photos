@@ -19,16 +19,20 @@ import (
 	"github.com/NimoTech/NimoOS-Photos/service"
 )
 
-// 智能相册(SmartView)ZIP 下载端点测试。补 GET+token 端点是为了修一个真实
-// 断链:UI 的 runExport('zip') 用 window.location.href(浏览器导航,发不出
-// Authorization 头)打旧的 POST /export?format=zip,而该路径既未注册 GET、
-// 也不在 router.go 的 mediaGetSkip 白名单里,导致 JWT 中间件直接 401。
-// 新端点镜像 albums_export_test.go 的 albums GET /:id/export 实现:同 token
-// 校验、同 service.ExportZip 流式落地、同 404/400 语义;既有 POST /export
-// 保持不动,向后兼容。
+// Tests for the smart view (SmartView) ZIP download endpoint. The added
+// GET+token endpoint fixes a real broken link: the UI's runExport('zip')
+// uses window.location.href (browser navigation, which can't send an
+// Authorization header) to hit the old POST /export?format=zip, and that
+// path neither registers GET nor appears in router.go's mediaGetSkip
+// allowlist, so the JWT middleware 401s it outright. The new endpoint
+// mirrors albums_export_test.go's albums GET /:id/export implementation:
+// same token validation, same service.ExportZip streaming, same 404/400
+// semantics; the existing POST /export is left unchanged for backward
+// compatibility.
 
-// newSVExportTestEcho 起一个只挂 smart-views 路由组的 echo 实例，返回底层 db
-// 供用例直接插入 smart_views / assets / smart_view_matches 造数据。
+// newSVExportTestEcho spins up an echo instance with only the smart-views
+// route group mounted, and returns the underlying db so tests can insert
+// data directly into smart_views / assets / smart_view_matches.
 func newSVExportTestEcho(t *testing.T) (*echo.Echo, *sql.DB) {
 	t.Helper()
 	db, err := sqlite.Open(filepath.Join(t.TempDir(), "h.db"))
@@ -42,8 +46,9 @@ func newSVExportTestEcho(t *testing.T) (*echo.Echo, *sql.DB) {
 	return e, db
 }
 
-// TestSVExportZipGetHandler 验证成功路径：GET + token 直接流式下载 zip，
-// Content-Type/Content-Disposition/文件内容均正确。
+// TestSVExportZipGetHandler verifies the happy path: GET + token streams
+// the zip download directly, and Content-Type/Content-Disposition/file
+// contents are all correct.
 func TestSVExportZipGetHandler(t *testing.T) {
 	dir := t.TempDir()
 	fileA := filepath.Join(dir, "alpha.jpg")
@@ -90,7 +95,7 @@ func TestSVExportZipGetHandler(t *testing.T) {
 	}
 }
 
-// TestSVExportZipGetNotFound 智能相册不存在应 404。
+// TestSVExportZipGetNotFound expects 404 when the smart view doesn't exist.
 func TestSVExportZipGetNotFound(t *testing.T) {
 	e, _ := newSVExportTestEcho(t)
 
@@ -100,7 +105,7 @@ func TestSVExportZipGetNotFound(t *testing.T) {
 	require.Equal(t, http.StatusNotFound, rec.Code)
 }
 
-// TestSVExportZipGetNoMatches 智能相册存在但无匹配资产应 400。
+// TestSVExportZipGetNoMatches expects 400 when the smart view exists but has no matched assets.
 func TestSVExportZipGetNoMatches(t *testing.T) {
 	e, db := newSVExportTestEcho(t)
 	_, err := db.Exec(`INSERT INTO smart_views(id,name,conds_raw,conds_parsed,threshold,live) VALUES('sv-empty','Empty','[]','[]',70,0)`)
@@ -112,8 +117,10 @@ func TestSVExportZipGetNoMatches(t *testing.T) {
 	require.Equal(t, http.StatusBadRequest, rec.Code)
 }
 
-// TestSVExportZipGetMissingToken 缺 token query 参数应 401（浏览器 location.href
-// 导航发不出 Authorization 头，只能靠 query token 兜底，与 albums 的 Export 同款）。
+// TestSVExportZipGetMissingToken expects 401 when the token query
+// parameter is missing (browser location.href navigation can't send an
+// Authorization header, so it falls back to a query token, same as
+// albums' Export).
 func TestSVExportZipGetMissingToken(t *testing.T) {
 	e, db := newSVExportTestEcho(t)
 	_, err := db.Exec(`INSERT INTO smart_views(id,name,conds_raw,conds_parsed,threshold,live) VALUES('sv-1','V','[]','[]',70,0)`)
@@ -125,8 +132,9 @@ func TestSVExportZipGetMissingToken(t *testing.T) {
 	require.Equal(t, http.StatusUnauthorized, rec.Code)
 }
 
-// TestSVExportPostStillWorks 既有 POST /export?format=zip 保持不动，向后兼容
-// （旧调用方/未来 UI 修复前的兜底路径都不受影响）。
+// TestSVExportPostStillWorks: the existing POST /export?format=zip is left
+// unchanged for backward compatibility (old callers/the fallback path
+// before a future UI fix are both unaffected).
 func TestSVExportPostStillWorks(t *testing.T) {
 	dir := t.TempDir()
 	file := filepath.Join(dir, "gamma.jpg")

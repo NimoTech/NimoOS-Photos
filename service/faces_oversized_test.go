@@ -11,8 +11,9 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// recordingFaceML 记录 DetectAndRecognizeFaces 最近一次收到的字节，用于断言
-// detectFaceScanTarget 在原图超限时是否已经把输入换成了缩略图而不是原图。
+// recordingFaceML records the last bytes DetectAndRecognizeFaces received, so
+// tests can assert whether detectFaceScanTarget has swapped the input for a
+// thumbnail instead of the original when the original is oversized.
 type recordingFaceML struct {
 	lastData []byte
 }
@@ -30,23 +31,28 @@ func (m *recordingFaceML) DetectAndRecognizeFaces(data []byte) ([]mlclient.FaceR
 func (m *recordingFaceML) OCR(_ []byte) ([]mlclient.OCRLine, error) { return nil, nil }
 func (m *recordingFaceML) IsReady() bool                            { return true }
 
-// TestDetectFaceScanTarget_OversizedImageFallsBackToThumbnail 覆盖真实定位到的
-// bug：原图超过 immich-ml/PIL 的 178.9MP 硬上限（真实案例是库里
-// 16320x12240=199.8MP 的 Pexels 照片）时，detectFaceScanTarget 必须自动降级
-// 用已生成的 large.jpg 缩略图代替原图喂给人脸检测，否则请求必然 500、
-// face_scanned 永远置不上、RunPipeline 无限重试同一张图。
+// TestDetectFaceScanTarget_OversizedImageFallsBackToThumbnail covers a real
+// bug that was tracked down: when the original image exceeds immich-ml/PIL's
+// 178.9MP hard limit (a real case in the library was a
+// 16320x12240=199.8MP Pexels photo), detectFaceScanTarget must automatically
+// fall back to the already-generated large.jpg thumbnail in place of the
+// original when feeding face detection, or the request will always 500,
+// face_scanned will never get set, and RunPipeline will retry the same image
+// forever.
 func TestDetectFaceScanTarget_OversizedImageFallsBackToThumbnail(t *testing.T) {
 	db := makeTestDB(t)
 	srcDir := t.TempDir()
 	thumbDir := t.TempDir()
 	const assetID = "asset-oversized"
 
-	// 原文件只是一段手工构造的 JPEG 头，声明 16320x12240——探测阶段只靠
-	// image.DecodeConfig 读头部，不需要真的能解码出像素。
+	// The source file is just a hand-crafted JPEG header declaring
+	// 16320x12240 — the detection step only reads the header via
+	// image.DecodeConfig, no actual pixel decoding is needed.
 	oversizedPath := filepath.Join(srcDir, "big.jpg")
 	require.NoError(t, os.WriteFile(oversizedPath, fakeJPEGHeader(16320, 12240), 0o644))
 
-	// thumbs/<id>/large.jpg 放一张真实的小 JPEG，模拟索引流水线已经生成过缩略图。
+	// Put a real small JPEG at thumbs/<id>/large.jpg, simulating the index
+	// pipeline having already generated a thumbnail.
 	require.NoError(t, os.MkdirAll(filepath.Join(thumbDir, assetID), 0o755))
 	generatedThumb := makeTestJPEG(t, filepath.Join(thumbDir, assetID))
 	largePath := filepath.Join(thumbDir, assetID, "large.jpg")
@@ -61,17 +67,18 @@ func TestDetectFaceScanTarget_OversizedImageFallsBackToThumbnail(t *testing.T) {
 
 	err = s.detectFaceScanTarget(context.Background(), faceScanTarget{id: assetID, path: oversizedPath, isVideo: false})
 	require.NoError(t, err)
-	require.Equal(t, thumbBytes, ml.lastData, "超限原图应换成 large.jpg 缩略图字节喂给 ML，而不是原图字节")
+	require.Equal(t, thumbBytes, ml.lastData, "oversized original should be swapped for large.jpg thumbnail bytes when fed to ML, not the original bytes")
 }
 
-// TestDetectFaceScanTarget_OversizedImageWithoutThumbnailFails 覆盖降级也拿不到
-// 缩略图的情况：large.jpg/small.jpg 都不存在时，必须按现有失败路径处理（返回
-// error，face_scanned 保持 0，交给 RunPipeline 下一轮重试），而不是把超限原图
-// 硬塞给 ML。
+// TestDetectFaceScanTarget_OversizedImageWithoutThumbnailFails covers the
+// case where a fallback thumbnail isn't available either: when neither
+// large.jpg nor small.jpg exists, this must follow the existing failure path
+// (return error, face_scanned stays 0, leaving it for RunPipeline's next
+// retry) rather than forcing the oversized original onto ML.
 func TestDetectFaceScanTarget_OversizedImageWithoutThumbnailFails(t *testing.T) {
 	db := makeTestDB(t)
 	srcDir := t.TempDir()
-	thumbDir := t.TempDir() // 空目录：没有任何缩略图
+	thumbDir := t.TempDir() // empty dir: no thumbnails at all
 
 	oversizedPath := filepath.Join(srcDir, "big.jpg")
 	require.NoError(t, os.WriteFile(oversizedPath, fakeJPEGHeader(16320, 12240), 0o644))
@@ -83,5 +90,5 @@ func TestDetectFaceScanTarget_OversizedImageWithoutThumbnailFails(t *testing.T) 
 
 	err := s.detectFaceScanTarget(context.Background(), faceScanTarget{id: "asset-no-thumb", path: oversizedPath, isVideo: false})
 	require.Error(t, err)
-	require.Nil(t, ml.lastData, "缩略图不可用时不应把超限原图传给 ML")
+	require.Nil(t, ml.lastData, "should not pass the oversized original to ML when no thumbnail is available")
 }

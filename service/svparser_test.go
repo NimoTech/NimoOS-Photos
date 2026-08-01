@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/stretchr/testify/require"
 	"github.com/NimoTech/NimoOS-Photos/pkg/sqlite"
+	"github.com/stretchr/testify/require"
 )
 
 func parserDB(t *testing.T) *sql.DB {
@@ -50,12 +50,13 @@ func TestParseOCRCondition(t *testing.T) {
 	require.Equal(t, "TOTAL", got[0].Value)
 	require.Equal(t, "ocr", got[1].Kind)
 	require.Equal(t, "receipt | invoice", got[1].Value)
-	// 其余无 ocr: 前缀的旧建议词仍然是 unsupported
+	// The remaining legacy suggestion word without the ocr: prefix is still unsupported
 	require.Equal(t, "unsupported", got[2].Kind)
 }
 
-// 裸年份（如搜索框里的 "2024"）应当被理解为日期条件，
-// 与搜索链路的 "Nimo understood: date" 行为一致，而不是落到 CLIP 语义查询。
+// A bare year (e.g. "2024" typed in the search box) should be understood as
+// a date condition, consistent with the search pipeline's "Nimo understood:
+// date" behavior, rather than falling into a CLIP semantic query.
 func TestParseBareYear(t *testing.T) {
 	d := parserDB(t)
 	got := ParseConditions(d, []string{"2024", "1985", "3024"})
@@ -65,7 +66,7 @@ func TestParseBareYear(t *testing.T) {
 	require.Equal(t, 2024, got[0].End.Year())
 	require.Equal(t, time.December, got[0].End.Month())
 	require.Equal(t, "date", got[1].Kind)
-	// 不在合理年份范围内的四位数仍然走语义兜底
+	// A 4-digit number outside a reasonable year range still falls back to semantic search
 	require.Equal(t, "semantic", got[2].Kind)
 }
 
@@ -82,19 +83,19 @@ func TestParseScoreVariantsUnsupported(t *testing.T) {
 	d := parserDB(t)
 	for _, raw := range []string{
 		"score>=80", "score >= 80", "score≥80", "score>80", "score = 80", "SCORE>=80",
-		"score 80", // 无比较符的裸数字写法,曾在旧版 "score " 前缀枚举里被拦下
+		"score 80", // bare-number form with no operator, caught by the old "score " prefix enumeration
 	} {
 		got := ParseConditions(d, []string{raw})
 		require.Len(t, got, 1)
-		require.Equal(t, condUnsupported, got[0].Kind, "raw=%q 应被拦截为 unsupported 而非落入语义查询", raw)
+		require.Equal(t, condUnsupported, got[0].Kind, "raw=%q should be blocked as unsupported rather than falling into semantic query", raw)
 	}
-	// 反例:以 score 开头的正常语义词不应误伤
+	// Counter-examples: ordinary semantic words starting with "score" must not be falsely blocked
 	for _, raw := range []string{
 		"scoreboard at the stadium",
 		"score of the game",
 	} {
 		got := ParseConditions(d, []string{raw})
 		require.Len(t, got, 1)
-		require.NotEqual(t, condUnsupported, got[0].Kind, "raw=%q 不应被误伤为 unsupported", raw)
+		require.NotEqual(t, condUnsupported, got[0].Kind, "raw=%q should not be falsely blocked as unsupported", raw)
 	}
 }

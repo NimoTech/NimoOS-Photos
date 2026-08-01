@@ -14,8 +14,10 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// buildTestAestheticHead 手工拼一个美学头字节流(格式见 pkg/aesthetic 包注释):
-// 单层 CLIPDim→1,权重全 0、偏置=7,任何图向量都打分为常数 7,便于断言。
+// buildTestAestheticHead hand-assembles an aesthetic-head byte stream
+// (format documented in the pkg/aesthetic package comment): a single layer
+// CLIPDim→1, all weights 0, bias=7, so any image vector scores the constant
+// 7, making assertions easy.
 func buildTestAestheticHead(t *testing.T) *aesthetic.Head {
 	t.Helper()
 	var buf bytes.Buffer
@@ -23,7 +25,7 @@ func buildTestAestheticHead(t *testing.T) *aesthetic.Head {
 	ver := "v-test"
 	require.NoError(t, binary.Write(&buf, binary.LittleEndian, uint32(len(ver))))
 	buf.WriteString(ver)
-	require.NoError(t, binary.Write(&buf, binary.LittleEndian, uint32(1))) // nLayers
+	require.NoError(t, binary.Write(&buf, binary.LittleEndian, uint32(1)))              // nLayers
 	require.NoError(t, binary.Write(&buf, binary.LittleEndian, uint32(common.CLIPDim))) // in
 	require.NoError(t, binary.Write(&buf, binary.LittleEndian, uint32(1)))              // out
 	weights := make([]float32, common.CLIPDim)
@@ -34,7 +36,7 @@ func buildTestAestheticHead(t *testing.T) *aesthetic.Head {
 	return h
 }
 
-// insertAssetWithClipVec 插入一个 status='indexed' 的资产并写入 CLIPDim 维图向量。
+// insertAssetWithClipVec inserts a status='indexed' asset and writes a CLIPDim-sized image vector for it.
 func insertAssetWithClipVec(t *testing.T, db *sql.DB, id string) {
 	t.Helper()
 	_, err := db.Exec(`INSERT INTO assets(id,file_path,status) VALUES(?,?,'indexed')`, id, "/p/"+id+".jpg")
@@ -48,18 +50,19 @@ func insertAssetWithClipVec(t *testing.T, db *sql.DB, id string) {
 	require.NoError(t, err)
 }
 
-// TestBackfillAesthetic:有向量无分的资产被补分;无向量的跳过留 NULL;
-// 已有分的资产不应被重算;done 任务应出现在 TaskRegistry。
+// TestBackfillAesthetic: an asset with a vector but no score gets scored;
+// one without a vector is skipped and left NULL; an asset that already has
+// a score should not be recomputed; a done task should show up in the TaskRegistry.
 func TestBackfillAesthetic(t *testing.T) {
 	db := makeTestDB(t)
 	head := buildTestAestheticHead(t)
 
-	insertAssetWithClipVec(t, db, "a1") // 有向量、无分 → 应被补分
+	insertAssetWithClipVec(t, db, "a1") // has a vector, no score → should be scored
 
 	_, err := db.Exec(`INSERT INTO assets(id,file_path,status) VALUES('a2','/p/a2.jpg','indexed')`)
-	require.NoError(t, err) // 无向量 → 不入选,留 NULL
+	require.NoError(t, err) // no vector → not selected, stays NULL
 
-	insertAssetWithClipVec(t, db, "a3") // 有向量,手工先写已有分 → 不应重算
+	insertAssetWithClipVec(t, db, "a3") // has a vector, pre-set a score manually → should not be recomputed
 	_, err = db.Exec(`UPDATE assets SET aesthetic_score=? WHERE id='a3'`, 3.5)
 	require.NoError(t, err)
 
@@ -73,17 +76,17 @@ func TestBackfillAesthetic(t *testing.T) {
 
 	var s1 sql.NullFloat64
 	require.NoError(t, db.QueryRow(`SELECT aesthetic_score FROM assets WHERE id='a1'`).Scan(&s1))
-	require.True(t, s1.Valid, "a1 有向量无分,补跑后应有分")
+	require.True(t, s1.Valid, "a1 has a vector and no score, should have a score after backfill")
 	require.InDelta(t, 7, s1.Float64, 1e-6)
 
 	var s2 sql.NullFloat64
 	require.NoError(t, db.QueryRow(`SELECT aesthetic_score FROM assets WHERE id='a2'`).Scan(&s2))
-	require.False(t, s2.Valid, "a2 无向量,应留 NULL")
+	require.False(t, s2.Valid, "a2 has no vector, should stay NULL")
 
 	var s3 sql.NullFloat64
 	require.NoError(t, db.QueryRow(`SELECT aesthetic_score FROM assets WHERE id='a3'`).Scan(&s3))
 	require.True(t, s3.Valid)
-	require.InDelta(t, 3.5, s3.Float64, 1e-6, "a3 已有分,不应被重算")
+	require.InDelta(t, 3.5, s3.Float64, 1e-6, "a3 already has a score, should not be recomputed")
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -93,12 +96,15 @@ func TestBackfillAesthetic(t *testing.T) {
 			doneEv = &emitted[i]
 		}
 	}
-	require.NotNil(t, doneEv, "应有 type==aesthetic 的 done 任务")
+	require.NotNil(t, doneEv, "there should be a done task with type==aesthetic")
 }
 
-// TestBackfillAestheticCAS 验证并发防重:运行中收到第二次调用应立即返回 nil 且
-// 置 aestheticRerunPending;当前轮结束后自动消费 pending 再跑一轮,最终全部补齐,
-// 不 panic(照 embedder_test.go TestEmbedder_BackfillOCRRerunPendingConsumedAfterRun 样式)。
+// TestBackfillAestheticCAS verifies the concurrency guard: a second call
+// received while running should return nil immediately and set
+// aestheticRerunPending; once the current pass ends, pending is
+// automatically consumed and another pass runs, eventually filling
+// everything in, without panicking (following the style of
+// embedder_test.go's TestEmbedder_BackfillOCRRerunPendingConsumedAfterRun).
 func TestBackfillAestheticCAS(t *testing.T) {
 	db := makeTestDB(t)
 	head := buildTestAestheticHead(t)
@@ -107,22 +113,23 @@ func TestBackfillAestheticCAS(t *testing.T) {
 	e := NewEmbedder(db, &mockML{}, nil, NewTaskRegistry(nil))
 	e.SetAestheticHead(head)
 
-	// 模拟一轮美学补跑正在运行:此时的触发必须置 pending 而不是被吞。
+	// Simulate an aesthetic backfill round already running: a trigger arriving now must set pending, not be swallowed.
 	e.aestheticRunning.Store(true)
 	require.NoError(t, e.BackfillAesthetic(context.Background()))
-	require.True(t, e.aestheticRerunPending.Load(), "运行中收到的触发必须置 aestheticRerunPending")
+	require.True(t, e.aestheticRerunPending.Load(), "a trigger received while running must set aestheticRerunPending")
 	e.aestheticRunning.Store(false)
 
-	// 下一次真正运行结束时消费 pending 并再跑一轮(第二轮空库上是空跑)。
+	// The next actual run consumes pending and runs one more round (the second round is a no-op on an empty backlog).
 	require.NoError(t, e.BackfillAesthetic(context.Background()))
-	require.False(t, e.aestheticRerunPending.Load(), "补跑结束后 pending 应被消费")
+	require.False(t, e.aestheticRerunPending.Load(), "pending should be consumed once the backfill finishes")
 
 	var s1 sql.NullFloat64
 	require.NoError(t, db.QueryRow(`SELECT aesthetic_score FROM assets WHERE id='a1'`).Scan(&s1))
-	require.True(t, s1.Valid, "最终应全部补齐")
+	require.True(t, s1.Valid, "everything should be filled in eventually")
 }
 
-// TestEnsureAestheticHeadVer:版本不符时全库置 NULL 并盖章;版本一致时(幂等)不动分数。
+// TestEnsureAestheticHeadVer: on a version mismatch, the whole DB is set to
+// NULL and the new version stamped; when versions match (idempotent), scores are untouched.
 func TestEnsureAestheticHeadVer(t *testing.T) {
 	db := makeTestDB(t)
 	_, err := db.Exec(`INSERT INTO assets(id,file_path,status,aesthetic_score) VALUES('a1','/p/a1.jpg','indexed',5)`)
@@ -134,19 +141,19 @@ func TestEnsureAestheticHeadVer(t *testing.T) {
 
 	var score sql.NullFloat64
 	require.NoError(t, db.QueryRow(`SELECT aesthetic_score FROM assets WHERE id='a1'`).Scan(&score))
-	require.False(t, score.Valid, "版本不符应全库置 NULL")
+	require.False(t, score.Valid, "a version mismatch should NULL out the whole DB")
 
 	var ver string
 	require.NoError(t, db.QueryRow(`SELECT value FROM photos_meta WHERE key='aesthetic_head_ver'`).Scan(&ver))
 	require.Equal(t, "new", ver)
 
-	// 幂等:版本一致时不应再清分数。
+	// Idempotent: scores should not be cleared again when the version matches.
 	_, err = db.Exec(`UPDATE assets SET aesthetic_score=6 WHERE id='a1'`)
 	require.NoError(t, err)
 	require.NoError(t, EnsureAestheticHeadVer(db, "new"))
 
 	var score2 sql.NullFloat64
 	require.NoError(t, db.QueryRow(`SELECT aesthetic_score FROM assets WHERE id='a1'`).Scan(&score2))
-	require.True(t, score2.Valid, "版本一致时不应清分数")
+	require.True(t, score2.Valid, "scores should not be cleared when the version matches")
 	require.InDelta(t, 6, score2.Float64, 1e-6)
 }

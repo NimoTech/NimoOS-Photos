@@ -1,4 +1,4 @@
-# AMD 核显(ROCm)设备映射;gfx1151(AI Max+ 395 / Strix Halo)需 HSA override
+# AMD iGPU (ROCm) device mapping; gfx1151 (AI Max+ 395 / Strix Halo) needs an HSA override
 services:
   immich-machine-learning:
     devices:

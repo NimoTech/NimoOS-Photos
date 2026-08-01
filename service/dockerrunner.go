@@ -22,7 +22,7 @@ func (dockerRunner) IsRunning(ctx context.Context, name string) (bool, error) {
 		var ee *exec.ExitError
 		if errors.As(err, &ee) {
 			if bytes.Contains(ee.Stderr, []byte("No such object")) || bytes.Contains(ee.Stderr, []byte("No such container")) {
-				return false, nil // 容器不存在（ML 离线包未安装/未创建）：视作未运行，静默跳过
+				return false, nil // container doesn't exist (ML offline package not installed/created): treat as not running, skip silently
 			}
 			return false, fmt.Errorf("docker inspect %s: %w: %s", name, err, ee.Stderr)
 		}
@@ -32,7 +32,7 @@ func (dockerRunner) IsRunning(ctx context.Context, name string) (bool, error) {
 }
 
 func (dockerRunner) Restart(ctx context.Context, name string) error {
-	// 给足 90s:停容器 30s 宽限 + 冷启动拉起
+	// Allow 90s: 30s grace period to stop the container + cold-start bring-up
 	ctx, cancel := context.WithTimeout(ctx, 90*time.Second)
 	defer cancel()
 	out, err := exec.CommandContext(ctx, "docker", "restart", "-t", "30", name).CombinedOutput()

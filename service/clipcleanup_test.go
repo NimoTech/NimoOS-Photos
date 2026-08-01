@@ -64,9 +64,10 @@ func TestPurgeAssetDropsClipVector(t *testing.T) {
 	require.Equal(t, 0, clipN, "purged asset's CLIP vector removed")
 }
 
-// TestRemoveByPath_TriggersCaptionDelete：RemoveByPath 紧邻 dropClipVector 的
-// caption 联动调用点（Task 4），fsnotify 探测到文件被硬删时触发，应携带正确的
-// assetID 调用 SetCaptionDelete 注入的回调。
+// TestRemoveByPath_TriggersCaptionDelete: RemoveByPath's caption hook call
+// site right next to dropClipVector (Task 4), triggered when fsnotify
+// detects the file was hard-deleted, should call the callback injected via
+// SetCaptionDelete with the correct assetID.
 func TestRemoveByPath_TriggersCaptionDelete(t *testing.T) {
 	db, err := sqlite.Open(filepath.Join(t.TempDir(), "rmcap.db"))
 	require.NoError(t, err)

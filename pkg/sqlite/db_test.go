@@ -183,7 +183,7 @@ func TestMigrateAddsTrashColumns(t *testing.T) {
 	}
 	defer db.Close()
 
-	// 应能写入并读回 deleted_at / original_path
+	// Should be able to write and read back deleted_at / original_path
 	_, err = db.Exec(`INSERT INTO assets (id, file_path, status, deleted_at, original_path)
 		VALUES ('x1', '/DATA/Gallery/.trash/x1/a.jpg', 'indexed', CURRENT_TIMESTAMP, '/DATA/Gallery/a.jpg')`)
 	if err != nil {
@@ -250,7 +250,7 @@ func TestPersonsExtendedColumns(t *testing.T) {
 	}
 	rows.Close()
 	for _, c := range []string{"cover_face_id", "favorite", "relation", "hidden", "confidence", "centroid", "created_at", "updated_at"} {
-		require.True(t, cols[c], "persons 缺列 %s", c)
+		require.True(t, cols[c], "persons missing column %s", c)
 	}
 }
 
@@ -437,7 +437,7 @@ func TestMigrateClipDimUpgrade(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "photos.db")
 
-	// 手工造一个旧版 512 维库(sqlite_vec.Auto() 已在包 init 注册)
+	// Manually build a legacy 512-dim DB (sqlite_vec.Auto() is already registered in the package init)
 	raw, err := sql.Open("sqlite3", "file:"+path)
 	if err != nil {
 		t.Fatal(err)
@@ -453,7 +453,7 @@ func TestMigrateClipDimUpgrade(t *testing.T) {
 	}
 	raw.Close()
 
-	// Open 应识别维度不符,DROP 重建 + 清空映射表
+	// Open should recognize the dimension mismatch, DROP+rebuild, and clear the mapping table
 	db, err := sqlite.Open(path)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
@@ -565,7 +565,7 @@ func TestMigrateFaceScannedFreshDB(t *testing.T) {
 
 	var scanned int
 	require.NoError(t, db.QueryRow(`SELECT face_scanned FROM assets WHERE id='a1'`).Scan(&scanned))
-	require.Equal(t, 0, scanned, "face_scanned 新资产应默认为 0")
+	require.Equal(t, 0, scanned, "face_scanned should default to 0 for a new asset")
 }
 
 // TestMigrateFaceScannedBackfillOnUpgrade simulates a legacy DB created before
@@ -576,7 +576,7 @@ func TestMigrateFaceScannedFreshDB(t *testing.T) {
 func TestMigrateFaceScannedBackfillOnUpgrade(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "legacy.db")
 
-	// Phase 1: 手工建一份「旧库」——assets 表没有 face_scanned 列。
+	// Phase 1: manually build a "legacy DB" -- the assets table has no face_scanned column.
 	func() {
 		raw, err := sql.Open("sqlite3", dbPath)
 		require.NoError(t, err)
@@ -603,7 +603,7 @@ func TestMigrateFaceScannedBackfillOnUpgrade(t *testing.T) {
 		require.NoError(t, err)
 	}()
 
-	// Phase 2: sqlite.Open 触发迁移,应新增列并一次性回填 indexed 资产。
+	// Phase 2: sqlite.Open triggers the migration, which should add the column and backfill indexed assets in one shot.
 	db, err := sqlite.Open(dbPath)
 	require.NoError(t, err)
 	defer db.Close()
@@ -651,37 +651,39 @@ func TestMigrateFaceScannedBackfillIsIdempotent(t *testing.T) {
 		require.NoError(t, err)
 	}()
 
-	// 第一次打开:列不存在,触发一次性回填(indexed -> face_scanned=1)。
+	// First open: column doesn't exist, triggers a one-time backfill (indexed -> face_scanned=1).
 	func() {
 		db, err := sqlite.Open(dbPath)
 		require.NoError(t, err)
 		defer db.Close()
 	}()
 
-	// 模拟正常业务把 face_scanned 重置为 0(比如重新处理该资产)。
+	// Simulate normal business logic resetting face_scanned to 0 (e.g. reprocessing this asset).
 	raw2, err := sql.Open("sqlite3", dbPath)
 	require.NoError(t, err)
 	_, err = raw2.Exec(`UPDATE assets SET face_scanned=0 WHERE id='a1'`)
 	require.NoError(t, err)
 	require.NoError(t, raw2.Close())
 
-	// 再次打开:列已存在,不应重新触发回填,face_scanned 应保持业务写入的 0。
+	// Reopen: column already exists, should not re-trigger the backfill; face_scanned should keep the app-written 0.
 	db2, err := sqlite.Open(dbPath)
 	require.NoError(t, err)
 	defer db2.Close()
 
 	var fs int
 	require.NoError(t, db2.QueryRow(`SELECT face_scanned FROM assets WHERE id='a1'`).Scan(&fs))
-	require.Equal(t, 0, fs, "重复迁移不应重新触发回填")
+	require.Equal(t, 0, fs, "repeated migration should not re-trigger the backfill")
 }
 
-// TestMigrateOCRLinesUpgrade 验证:旧库(有 asset_ocr 无 boxes_ver 列、无
-// asset_ocr_lines 表)经 Open 迁移后,新列默认 0、新表可写,且删 assets 行
-// 时 asset_ocr_lines 随外键级联清除;重复 Open 幂等。
+// TestMigrateOCRLinesUpgrade verifies: after a legacy DB (asset_ocr exists
+// with no boxes_ver column, no asset_ocr_lines table) is migrated via Open,
+// the new column defaults to 0, the new table is writable, deleting an
+// assets row cascades to clear asset_ocr_lines via the foreign key, and
+// repeated Open is idempotent.
 func TestMigrateOCRLinesUpgrade(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "legacy.db")
 
-	// Phase 1: 手工造旧库——asset_ocr 只有旧列。
+	// Phase 1: manually build a legacy DB -- asset_ocr has only the old columns.
 	func() {
 		raw, err := sql.Open("sqlite3", dbPath)
 		require.NoError(t, err)
@@ -713,34 +715,35 @@ func TestMigrateOCRLinesUpgrade(t *testing.T) {
 		require.NoError(t, err)
 	}()
 
-	// Phase 2: Open 触发迁移。
+	// Phase 2: Open triggers the migration.
 	db, err := sqlite.Open(dbPath)
 	require.NoError(t, err)
 
 	var ver int
 	require.NoError(t, db.QueryRow(`SELECT boxes_ver FROM asset_ocr WHERE asset_id='a1'`).Scan(&ver))
-	require.Equal(t, 0, ver, "旧数据 boxes_ver 应默认 0(待补跑)")
+	require.Equal(t, 0, ver, "legacy data's boxes_ver should default to 0 (pending backfill)")
 
 	_, err = db.Exec(`INSERT INTO asset_ocr_lines(asset_id, line_no, text, box, score)
 		VALUES('a1', 0, 'hello world', '[0.1,0.1,0.5,0.1,0.5,0.2,0.1,0.2]', 0.97)`)
 	require.NoError(t, err)
 
-	// 外键级联:删 assets 行,行表应清空。
+	// Foreign key cascade: delete the assets row, the lines table should empty out.
 	_, err = db.Exec(`DELETE FROM assets WHERE id='a1'`)
 	require.NoError(t, err)
 	var n int
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM asset_ocr_lines`).Scan(&n))
-	require.Equal(t, 0, n, "删除资产后 asset_ocr_lines 应级联清除")
+	require.Equal(t, 0, n, "asset_ocr_lines should cascade-clear after deleting the asset")
 	db.Close()
 
-	// Phase 3: 二次 Open 幂等。
+	// Phase 3: a second Open is idempotent.
 	db2, err := sqlite.Open(dbPath)
 	require.NoError(t, err)
 	db2.Close()
 }
 
-// TestMigrateDocClassifyColumns 验证 doc 分类迁移:asset_ocr 新四列默认值、
-// clip_text_cache 可写、重复 Open 幂等。
+// TestMigrateDocClassifyColumns verifies the doc-classification migration:
+// asset_ocr's four new columns' defaults, clip_text_cache is writable, and
+// repeated Open is idempotent.
 func TestMigrateDocClassifyColumns(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "doc.db")
 	db, err := sqlite.Open(dbPath)
@@ -755,8 +758,8 @@ func TestMigrateDocClassifyColumns(t *testing.T) {
 	var isDoc sql.NullInt64
 	require.NoError(t, db.QueryRow(
 		`SELECT doc_ver, is_doc FROM asset_ocr WHERE asset_id='a1'`).Scan(&docVer, &isDoc))
-	require.Equal(t, 0, docVer, "doc_ver 默认 0(待算)")
-	require.False(t, isDoc.Valid, "is_doc 默认 NULL(未算,区别于 0=判非文档)")
+	require.Equal(t, 0, docVer, "doc_ver defaults to 0 (pending computation)")
+	require.False(t, isDoc.Valid, "is_doc defaults to NULL (not yet computed, distinct from 0=classified as non-document)")
 
 	_, err = db.Exec(`INSERT INTO clip_text_cache(key, gen, vec) VALUES('a scan of a document','3',x'00000000')`)
 	require.NoError(t, err)
@@ -767,8 +770,9 @@ func TestMigrateDocClassifyColumns(t *testing.T) {
 	db2.Close()
 }
 
-// TestMigrateAssetsAestheticScore 验证:assets 表带 aesthetic_score 列,新资产
-// 默认 NULL(未打分);重复 Open 幂等,不报错、不清空既有值。
+// TestMigrateAssetsAestheticScore verifies: the assets table carries an
+// aesthetic_score column, defaulting to NULL (not yet scored) for a new
+// asset; repeated Open is idempotent, doesn't error, and doesn't clear existing values.
 func TestMigrateAssetsAestheticScore(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "photos.db")
@@ -780,19 +784,21 @@ func TestMigrateAssetsAestheticScore(t *testing.T) {
 	require.NoError(t, err)
 	var score sql.NullFloat64
 	require.NoError(t, db.QueryRow(`SELECT aesthetic_score FROM assets WHERE id='a1'`).Scan(&score))
-	require.False(t, score.Valid, "新列默认应为 NULL")
+	require.False(t, score.Valid, "the new column should default to NULL")
 	require.NoError(t, db.Close())
 
-	// 重复打开应幂等,不报错、不清空既有 NULL 值。
+	// Repeated open should be idempotent, no error, no clearing of the existing NULL value.
 	db2, err := sqlite.Open(path)
 	require.NoError(t, err)
 	defer db2.Close()
 	require.NoError(t, db2.QueryRow(`SELECT aesthetic_score FROM assets WHERE id='a1'`).Scan(&score))
-	require.False(t, score.Valid, "重复迁移不应改变既有 NULL 值")
+	require.False(t, score.Valid, "repeated migration should not change the existing NULL value")
 }
 
-// TestMigrateAssetsCaptionSynced 验证:assets 表带 caption_synced 列(照片知识
-// 库投喂标记),新资产默认 0(未交接 Parser);重复 Open 幂等,不报错、不清空既有值。
+// TestMigrateAssetsCaptionSynced verifies: the assets table carries a
+// caption_synced column (photo knowledge-base ingestion marker), defaulting
+// to 0 (not handed off to Parser) for a new asset; repeated Open is
+// idempotent, doesn't error, and doesn't clear existing values.
 func TestMigrateAssetsCaptionSynced(t *testing.T) {
 	dir := t.TempDir()
 	db, err := sqlite.Open(filepath.Join(dir, "photos.db"))
@@ -801,19 +807,20 @@ func TestMigrateAssetsCaptionSynced(t *testing.T) {
 	require.NoError(t, err)
 	var v int
 	require.NoError(t, db.QueryRow(`SELECT caption_synced FROM assets WHERE id='a1'`).Scan(&v))
-	require.Equal(t, 0, v, "新列默认应为 0(未交接 Parser)")
+	require.Equal(t, 0, v, "the new column should default to 0 (not handed off to Parser)")
 	require.NoError(t, db.Close())
 
-	// 重复打开应幂等,不报错、不清空既有值。
+	// Repeated open should be idempotent, no error, no clearing of existing values.
 	db2, err := sqlite.Open(filepath.Join(dir, "photos.db"))
 	require.NoError(t, err)
 	defer db2.Close()
 	require.NoError(t, db2.QueryRow(`SELECT caption_synced FROM assets WHERE id='a1'`).Scan(&v))
-	require.Equal(t, 0, v, "重复迁移不应改变既有值")
+	require.Equal(t, 0, v, "repeated migration should not change existing values")
 }
 
-// TestMigrateSmartViewMatchesOrigin 验证:旧库升级应给 smart_view_matches 补
-// origin 列(0=自动匹配/1=手动钉住/2=手动排除),默认 0;二次 Open 幂等。
+// TestMigrateSmartViewMatchesOrigin verifies: upgrading a legacy DB should
+// add smart_view_matches' origin column (0=auto match/1=manual pin/2=manual
+// exclude), defaulting to 0; a second Open is idempotent.
 func TestMigrateSmartViewMatchesOrigin(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "photos.db")
@@ -828,13 +835,13 @@ func TestMigrateSmartViewMatchesOrigin(t *testing.T) {
 	require.NoError(t, err)
 	var origin int
 	require.NoError(t, db.QueryRow(`SELECT origin FROM smart_view_matches WHERE asset_id='a1'`).Scan(&origin))
-	require.Equal(t, 0, origin, "默认应为 0(自动匹配)")
+	require.Equal(t, 0, origin, "should default to 0 (auto match)")
 	require.NoError(t, db.Close())
 
-	// 重复打开应幂等,不报错、不清空既有值。
+	// Repeated open should be idempotent, no error, no clearing of existing values.
 	db2, err := sqlite.Open(path)
 	require.NoError(t, err)
 	defer db2.Close()
 	require.NoError(t, db2.QueryRow(`SELECT origin FROM smart_view_matches WHERE asset_id='a1'`).Scan(&origin))
-	require.Equal(t, 0, origin, "重复迁移不应改变既有值")
+	require.Equal(t, 0, origin, "repeated migration should not change existing values")
 }

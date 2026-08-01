@@ -1,30 +1,30 @@
 # NimoOS-Photos
 
-NimoOS 的相册服务，提供**照片/视频索引、EXIF 解析、缩略图生成、人脸识别、地理反编码、CLIP 语义搜索**。当前版本 `v1.9.0-alpha1`。
+NimoOS's photo album service, providing **photo/video indexing, EXIF parsing, thumbnail generation, face recognition, reverse geocoding, and CLIP semantic search**. Current version `v1.9.0-alpha1`.
 
-绑定 localhost 随机端口、由 Gateway 转发，API 前缀 `/v1/photos`；TUS 断点续传上传前缀 `/v1/upload-tus`。
+Binds to a random localhost port, forwarded by Gateway, API prefix `/v1/photos`; TUS resumable upload prefix `/v1/upload-tus`.
 
 ---
 
-## 整体架构
+## Overall architecture
 
 ```
-外部请求（Gateway 转发，/v1/photos/* 和 /v1/upload-tus/*）
+External request (forwarded by Gateway, /v1/photos/* and /v1/upload-tus/*)
                         │
                         ▼
         ┌───────────────────────────────────────┐
         │   nimoos-photos.service (Go, Echo)    │
-        │   - JWT 鉴权（含豁免规则）             │
-        │   - 资产 CRUD / 时间线 / 相册          │
-        │   - 收藏 / 回收站 / 人物 / 地点        │
-        │   - Smart View 语义自动相册           │
-        │   - TUS 断点续传上传（/DATA/Gallery） │
+        │   - JWT auth (with exemption rules)   │
+        │   - Asset CRUD / timeline / albums     │
+        │   - Favorites / trash / persons / places│
+        │   - Smart View semantic auto-albums    │
+        │   - TUS resumable upload (/DATA/Gallery)│
         └───────────────────────────────────────┘
                │           │            │
     ┌──────────▼──┐  ┌──────▼────────┐  │
     │  Watcher    │  │   Indexer     │  │
     │ (fsnotify)  │→─│ (3 workers)   │  │
-    │ /DATA/Gallery│  │ SHA-256去重   │  │
+    │ /DATA/Gallery│  │ SHA-256 dedup │  │
     │ /DATA/...   │  └──────┬────────┘  │
     └─────────────┘         │           │
                      ┌──────▼───────────▼──────────────┐
@@ -39,233 +39,233 @@ NimoOS 的相册服务，提供**照片/视频索引、EXIF 解析、缩略图�
                      ┌──────────────▼──────────────────────────┐
                      │  immich-machine-learning (Docker)       │
                      │  127.0.0.1:3003  /predict               │
-                     │  - CLIP ViT-SO400M-16-SigLIP2-384(1152维)│
-                     │  - 人脸检测+识别 antelopev2 (512-dim)     │
+                     │  - CLIP ViT-SO400M-16-SigLIP2-384 (1152-dim)│
+                     │  - Face detection+recognition antelopev2 (512-dim)│
                      │  - OCR PP-OCRv5_server                  │
                      └───────────────────────────────────────┘
 ```
 
-ML 后端为独立 Docker Compose 栈（`deploy/ml/docker-compose.yml`），绑定 `127.0.0.1:3003`，镜像离线捆绑、不联网拉取。
+The ML backend is an independent Docker Compose stack (`deploy/ml/docker-compose.yml`), bound to `127.0.0.1:3003`, with the image bundled offline (not pulled over the network).
 
 ---
 
-## API 路由（`/v1/photos`）
+## API routes (`/v1/photos`)
 
-| Method | Path | 用途 |
+| Method | Path | Purpose |
 |---|---|---|
-| GET | `/assets` | 列出资产（支持分页、地点/位置过滤） |
-| POST | `/assets/upload` | 普通上传（小文件） |
-| GET | `/assets/:id` | 获取单个资产 |
-| DELETE | `/assets/:id` | 删除资产 |
-| GET | `/assets/:id/thumbnail` | 获取缩略图（JWT 豁免） |
-| GET | `/assets/:id/original` | 获取原始文件（JWT 豁免） |
-| GET | `/assets/:id/live` | 获取 Live Photo 视频（JWT 豁免） |
-| GET | `/assets/:id/sprite` | 视频悬停预览雪碧图（JWT 豁免） |
-| GET | `/assets/:id/ocr` | OCR 行文本+归一化坐标（`?q=` 只返回命中行，规则与 /search/smart 的 OCR 匹配一致；前端搜索命中高亮用；受 JWT 保护） |
-| GET | `/timeline` | 按年月分组的时间线 |
-| POST | `/search/smart` | CLIP 语义搜索 + OCR 精确匹配（localhost MCP 调用免 JWT，见鉴权） |
-| GET | `/search/faces/:person_id` | 按人物查找资产 |
-| GET/POST/DELETE | `/albums[/:id]` | 相册 CRUD（`GET /albums` 对 localhost MCP 调用免 JWT，见鉴权） |
-| GET | `/albums/:id/summary` | 相册摘要 |
-| POST/DELETE | `/albums/:id/assets[/batch]` | 相册资产添加/删除 |
-| PATCH | `/albums/:id` | 相册元数据更新 |
-| PATCH | `/albums/:id/assets/order` | 手动排序 |
-| GET | `/places` | 地点列表（按城市聚合） |
-| GET | `/places/:key` | 指定地点详情 |
-| GET | `/places/:key/cover-candidates` | 封面候选 |
-| PUT/DELETE | `/places/:key/cover` | 设置/重置地点封面 |
-| PUT/DELETE | `/places/:key/spot-name` | 设置/重置打点名 |
-| POST | `/places/:key/album` | 以地点创建相册 |
-| POST/DELETE | `/favorites/:asset_id` | 收藏/取消收藏 |
-| GET | `/favorites[/ids/export/top]` | 收藏列表/ID/导出/Top |
-| GET | `/trash` | 回收站 |
-| POST | `/trash/restore` | 批量还原 |
-| POST | `/trash/empty` | 清空回收站 |
-| POST/DELETE | `/trash/:id/restore` | 单个还原/彻底删除 |
-| POST | `/views/:asset_id` | 记录浏览次数 |
-| GET | `/persons` | 人物（人脸聚类）列表 |
-| GET | `/persons/merge-suggestions` | 合并建议 |
-| POST | `/persons/merge-suggestions/reject` | 拒绝合并建议 |
-| POST | `/persons/merge` | 合并人物 |
-| POST | `/persons/recluster` | 重新聚类 |
-| GET/PUT/DELETE | `/persons/:id` | 人物详情/更新/删除 |
-| POST | `/persons/:id/restore` | 恢复已删人物 |
-| GET | `/persons/:id/assets` | 人物照片 |
-| GET | `/persons/:id/relations` | 关联人物 |
-| GET | `/persons/:id/places` | 人物出现的地点 |
-| GET | `/persons/:id/face-thumbnail` | 人物头像缩略图（JWT 豁免） |
-| POST | `/persons/:id/detach` | 从人物中移出特定脸 |
-| GET | `/status` | 索引状态（pending/indexed/queue 数） |
-| POST | `/scan` | 手动触发目录扫描 |
-| GET | `/tasks` | 当前任务列表（index/embedding/ocr） |
-| GET/PUT | `/config` | 相册配置（WatchDirs、功能开关等） |
-| GET | `/storage` | 存储统计 |
-| POST | `/cache/prune` | 清理孤儿缩略图 + face-thumbs 孤儿 + 过期上传暂存(与每日定时清理同一实现) |
-| POST | `/index/rebuild` | 重建向量索引 |
-| GET | `/about` | 版本/ML 状态信息 |
-| GET/POST/PUT/DELETE | `/smart-views[/:id]` | 语义自动相册 CRUD |
-| POST | `/smart-views/preview` | 预览 Smart View 结果 |
-| GET | `/smart-views/:id/assets` | Smart View 资产列表 |
-| GET | `/smart-views/:id/activity` | Smart View 动态 |
-| POST | `/smart-views/:id/export` | 导出 Smart View |
-| POST | `/smart-views/:id/duplicate` | 复制 Smart View |
+| GET | `/assets` | List assets (supports pagination, place/location filtering) |
+| POST | `/assets/upload` | Regular upload (small files) |
+| GET | `/assets/:id` | Get a single asset |
+| DELETE | `/assets/:id` | Delete an asset |
+| GET | `/assets/:id/thumbnail` | Get thumbnail (JWT-exempt) |
+| GET | `/assets/:id/original` | Get the original file (JWT-exempt) |
+| GET | `/assets/:id/live` | Get Live Photo video (JWT-exempt) |
+| GET | `/assets/:id/sprite` | Video hover-preview sprite (JWT-exempt) |
+| GET | `/assets/:id/ocr` | OCR line text + normalized coordinates (`?q=` returns only matching lines, using the same matching rules as /search/smart's OCR; used for front-end search-hit highlighting; JWT-protected) |
+| GET | `/timeline` | Timeline grouped by year/month |
+| POST | `/search/smart` | CLIP semantic search + OCR exact match (localhost MCP calls are JWT-exempt, see Authentication) |
+| GET | `/search/faces/:person_id` | Find assets by person |
+| GET/POST/DELETE | `/albums[/:id]` | Album CRUD (`GET /albums` is JWT-exempt for localhost MCP calls, see Authentication) |
+| GET | `/albums/:id/summary` | Album summary |
+| POST/DELETE | `/albums/:id/assets[/batch]` | Add/remove album assets |
+| PATCH | `/albums/:id` | Update album metadata |
+| PATCH | `/albums/:id/assets/order` | Manual reordering |
+| GET | `/places` | List of places (aggregated by city) |
+| GET | `/places/:key` | Details for a given place |
+| GET | `/places/:key/cover-candidates` | Cover candidates |
+| PUT/DELETE | `/places/:key/cover` | Set/reset place cover |
+| PUT/DELETE | `/places/:key/spot-name` | Set/reset spot name |
+| POST | `/places/:key/album` | Create an album from a place |
+| POST/DELETE | `/favorites/:asset_id` | Favorite/unfavorite |
+| GET | `/favorites[/ids/export/top]` | Favorites list/IDs/export/top |
+| GET | `/trash` | Trash |
+| POST | `/trash/restore` | Batch restore |
+| POST | `/trash/empty` | Empty trash |
+| POST/DELETE | `/trash/:id/restore` | Restore/permanently delete a single item |
+| POST | `/views/:asset_id` | Record a view |
+| GET | `/persons` | List of persons (face clusters) |
+| GET | `/persons/merge-suggestions` | Merge suggestions |
+| POST | `/persons/merge-suggestions/reject` | Reject a merge suggestion |
+| POST | `/persons/merge` | Merge persons |
+| POST | `/persons/recluster` | Re-cluster |
+| GET/PUT/DELETE | `/persons/:id` | Person detail/update/delete |
+| POST | `/persons/:id/restore` | Restore a deleted person |
+| GET | `/persons/:id/assets` | Person's photos |
+| GET | `/persons/:id/relations` | Related persons |
+| GET | `/persons/:id/places` | Places this person appears in |
+| GET | `/persons/:id/face-thumbnail` | Person face thumbnail (JWT-exempt) |
+| POST | `/persons/:id/detach` | Detach a specific face from this person |
+| GET | `/status` | Indexing status (pending/indexed/queue counts) |
+| POST | `/scan` | Manually trigger a directory scan |
+| GET | `/tasks` | Current task list (index/embedding/ocr) |
+| GET/PUT | `/config` | Album configuration (WatchDirs, feature toggles, etc.) |
+| GET | `/storage` | Storage stats |
+| POST | `/cache/prune` | Clean up orphaned thumbnails + orphaned face-thumbs + expired upload staging (same implementation as the daily scheduled cleanup) |
+| POST | `/index/rebuild` | Rebuild the vector index |
+| GET | `/about` | Version/ML status information |
+| GET/POST/PUT/DELETE | `/smart-views[/:id]` | Semantic auto-album CRUD |
+| POST | `/smart-views/preview` | Preview Smart View results |
+| GET | `/smart-views/:id/assets` | Smart View asset list |
+| GET | `/smart-views/:id/activity` | Smart View activity |
+| POST | `/smart-views/:id/export` | Export a Smart View |
+| POST | `/smart-views/:id/duplicate` | Duplicate a Smart View |
 
-**TUS 路由**（注册在 `/v1/upload-tus`，独立于上述 group）：
-- `ANY /v1/upload-tus` 和 `ANY /v1/upload-tus/*`：TUS v2 断点续传（POST/PATCH/HEAD/OPTIONS），单文件最大 20 GB，暂存目录 `<DataPath>/tus-staging`（跟随 `photos.conf` 的 `DataPath`，随派生数据同盘迁移；以 `0700` 权限创建，`main.go` 在 `config.Init` 之后、任何使用方之前完成重设），7 天自动清理。旧固定路径 `/DATA/.system_data/photos-tus-staging`（`common.LegacyStagingDir`）已弃用，仅在服务**启动时**兜底扫一轮清理历史遗留文件，此后不再使用；此后的周期清理只扫新目录（见下方「每日缓存清理」）。
+**TUS routes** (registered at `/v1/upload-tus`, independent of the group above):
+- `ANY /v1/upload-tus` and `ANY /v1/upload-tus/*`: TUS v2 resumable upload (POST/PATCH/HEAD/OPTIONS), 20 GB max per file, staging directory `<DataPath>/tus-staging` (follows `DataPath` in `photos.conf`, migrates with derived data onto the same disk; created with `0700` permissions, reset by `main.go` after `config.Init` and before any consumer), auto-cleaned after 7 days. The old fixed path `/DATA/.system_data/photos-tus-staging` (`common.LegacyStagingDir`) is deprecated — it's only swept once, at service **startup**, as a fallback for historical leftovers, and never used after that; subsequent periodic cleanup only scans the new directory (see "Daily cache cleanup" below).
 
 ---
 
-## 核心流程
+## Core flows
 
-### 1. 照片入库（扫描 / 监视）
+### 1. Photo ingestion (scan / watch)
 
 ```
 fsnotify (Watcher)
   Create/Write → isSupportedMedia → Indexer.Enqueue(path)
 
-MessageBus 订阅 nimoos:media:created (service/buscreated.go)
-  落盘即索引：文件直接 Enqueue（seen 去重幂等）、目录 walkSupported 递归展开
+MessageBus subscription to nimoos:media:created (service/buscreated.go)
+  Index as soon as data lands: files are enqueued directly (seen dedup is idempotent), directories are recursively expanded via walkSupported
 
-ScanDirectory (手动/启动) → walkSupported → processFile (串行)
+ScanDirectory (manual/startup) → walkSupported → processFile (serial)
 
-TUS 上传完成 → MarkAndReserve + rename → SubmitReserved
+TUS upload complete → MarkAndReserve + rename → SubmitReserved
 ```
 
-`media:created` 订阅用**独立 WS 连接**（主服务 NimoOS 未升级、事件未注册时该订阅被 400 拒绝并退避重试，不连累 `media:deleted` 那条连接）；事件处理 `go` 异步化——大目录 walk 可能跑数十秒，同步执行会停读连接，而 MessageBus 对读慢订阅者是非阻塞发送、直接丢事件。通用订阅循环在 `service/busdelete.go` 的 `runBusPathsSubscriber`。
+The `media:created` subscription uses a **separate WS connection** (if the main NimoOS service hasn't been upgraded and the event isn't registered, this subscription gets rejected with 400 and backs off/retries, without dragging down the `media:deleted` connection); event handling is asynchronous via `go` — walking a large directory can take tens of seconds, and running it synchronously would stall the read connection, while MessageBus sends non-blockingly to slow readers and just drops events. The generic subscription loop lives in `runBusPathsSubscriber` in `service/busdelete.go`.
 
-扫描范围是黑名单而非白名单（`service/scanroots.go` `isUserPartition`）：`/media` 或 `/mnt` 下任意挂载点默认都会被扫描，但 `/media/devmon/<卷标>`（devmon 自动挂载的可移动 U 盘/读卡器）被产品决策整体排除——不扫描、不被 MountGuard 追踪 offline，且启动时会硬删（含 CLIP 向量、缩略图）任何历史遗留的 devmon 资产；RAID（`/media/RAID_*`）、单盘 storage（`/mnt/Disk-*`）、MergerFS 等仍正常纳入。已知限制：若 devmon 被禁用/卸载，同一块 U 盘可能被 LocalStorage 抢挂到 `/mnt/Disk-*`，届时会被当作普通固定盘重新扫描。
+Scan scope is a blocklist rather than an allowlist (`service/scanroots.go` `isUserPartition`): any mount point under `/media` or `/mnt` is scanned by default, but `/media/devmon/<volume label>` (removable USB drives/card readers auto-mounted by devmon) is entirely excluded by product decision — not scanned, not tracked as offline by MountGuard, and any historical devmon assets (including CLIP vectors and thumbnails) are hard-deleted at startup. RAID (`/media/RAID_*`), single-disk storage (`/mnt/Disk-*`), MergerFS, etc. are still included normally. Known limitation: if devmon is disabled/unmounted, the same USB drive may get grabbed by LocalStorage and remounted at `/mnt/Disk-*`, at which point it will be re-scanned as an ordinary fixed disk.
 
-**processFile 流水线（`service/indexer.go`）：**
+**processFile pipeline (`service/indexer.go`):**
 
-1. 读取文件 → SHA-256 去重（`status='indexed'` 时跳过）
-2. MIME 检测 → 判断图片/视频
-3. **图片**：`goexif` 解析 EXIF（拍摄时间、GPS、相机型号、ISO、光圈、快门等）
-4. **视频**：`ffprobe` 提取时长、分辨率、编解码器、帧率、码率、旋转、创建时间、GPS；再用 `ffmpeg` 提取关键帧用于后续 ML
-5. INSERT/UPDATE `assets` + `asset_exif`（状态 `'pending'`）
-6. 生成缩略图（small 250px / large 1280px，`disintegration/imaging`）
-7. ML 推理（ML 服务就绪时）：
-   - **CLIP 图像嵌入**：`ViT-SO400M-16-SigLIP2-384__webli`（SigLIP2 SO400M，短词/中英混搜判别力优于旧 nllb-clip-large，见 `common/constants.go` 注释），1152 维，用 small.jpg 缩略图计算（与用户看到的帧一致），写入 `clip_embeddings`（sqlite-vec vec0 虚拟表）
-   - **人脸检测+识别**：`antelopev2`（InsightFace ResNet100@Glint360K），512 维，写入 `face_detections`
-   - **OCR**：`PP-OCRv5_server`，置信度 ≥0.5 的文字行写入 `asset_ocr`，并在同一事务把每行文本+归一化四角坐标写入 `asset_ocr_lines`（先删后插，`boxes_ver=1`；供搜索命中高亮）。随后 `computeDocVerdict` 计算「OCR/文档」分类混合判据（CLIP 零样本语义边际 + 行几何规整度，密度候选闸恒在查询层 `hasOcrExpr` 外层,is_doc 只做否决;权重与标定见 photos.conf 的 Doc* 五项,默认值经 2026-07-09 真实库校准）。**仅图片**——视频不跑 OCR（关键帧 OCR 无意义，还会把录屏/含文字画面误判进「OCR/文档」分类），启动时 `pruneVideoOCR` 清理历史遗留的视频 OCR 行
-8. 更新状态 `'indexed'`
+1. Read the file → SHA-256 dedup (skip if `status='indexed'`)
+2. MIME detection → determine image/video
+3. **Image**: `goexif` parses EXIF (capture time, GPS, camera model, ISO, aperture, shutter, etc.)
+4. **Video**: `ffprobe` extracts duration, resolution, codec, frame rate, bitrate, rotation, creation time, GPS; then `ffmpeg` extracts a key frame for downstream ML
+5. INSERT/UPDATE `assets` + `asset_exif` (status `'pending'`)
+6. Generate thumbnails (small 250px / large 1280px, via `disintegration/imaging`)
+7. ML inference (once the ML service is ready):
+   - **CLIP image embedding**: `ViT-SO400M-16-SigLIP2-384__webli` (SigLIP2 SO400M, better discrimination than the old nllb-clip-large on short-word/mixed CN-EN queries, see the comment in `common/constants.go`), 1152-dim, computed from the small.jpg thumbnail (matching what the user actually sees), written to `clip_embeddings` (sqlite-vec vec0 virtual table)
+   - **Face detection+recognition**: `antelopev2` (InsightFace ResNet100@Glint360K), 512-dim, written to `face_detections`
+   - **OCR**: `PP-OCRv5_server`, text lines with confidence ≥0.5 are written to `asset_ocr`, and in the same transaction each line's text + normalized four-corner coordinates are written to `asset_ocr_lines` (delete-then-insert, `boxes_ver=1`; used for search-hit highlighting). Afterward, `computeDocVerdict` computes the mixed criterion for "OCR/document" classification (CLIP zero-shot semantic margin + line geometric regularity; the density-candidate gate always sits outside `hasOcrExpr` at the query layer, `is_doc` only vetoes; weights and calibration are in the five `Doc*` settings in photos.conf, defaults calibrated against a real library on 2026-07-09). **Images only** — videos don't run OCR (OCR on key frames is meaningless and would misclassify screen recordings/frames containing text into "OCR/document"); `pruneVideoOCR` cleans up historical leftover video OCR lines at startup
+8. Update status to `'indexed'`
 
-### 2. 语义搜索（CLIP）
+### 2. Semantic search (CLIP)
 
 ```
 POST /search/smart
-  → CLIPTextEmbed(query) → 1152 维查询向量
+  → CLIPTextEmbed(query) → 1152-dim query vector
   → sqlite-vec KNN: "WHERE clip_embeddings MATCH ? AND k = ?"
-  → 按 cosine distance 排序
-  → （可选）OCR 精确匹配结果插队至顶部
-  → 附加人脸名 + 地理名称
+  → sort by cosine distance
+  → (optional) splice OCR exact-match results to the top
+  → attach face names + place names
 ```
 
-Smart View 也复用 `SmartSearch` 接口，按自然语言条件定义动态相册。
+Smart View also reuses the `SmartSearch` interface to define dynamic albums by natural-language conditions.
 
-### 3. 人脸聚类
+### 3. Face clustering
 
-`FaceService.StartScheduler` 定期/触发聚类：
-- DBSCAN（`epsilon=0.6, minPoints=1`），对 512 维余弦距离聚类
-- 孤立脸吸附到已有 person 质心（`assignEpsilon=0.55`）
-- 合并建议阈值 `suggestEpsilon=0.75`
-- 结果写入 `persons` + `face_person`
+`FaceService.StartScheduler` clusters periodically/on trigger:
+- DBSCAN (`epsilon=0.6, minPoints=1`), clustering 512-dim cosine distances
+- Isolated faces are attached to existing person centroids (`assignEpsilon=0.55`)
+- Merge-suggestion threshold `suggestEpsilon=0.75`
+- Results written to `persons` + `face_person`
 
-### 4. Embedder 补跑（Backfill）
+### 4. Embedder backfill
 
-`Embedder.Run` 每 30 秒检测 ML 就绪状态：
-- **false → true** 跳变时异步触发：
-  1. `Backfill`：为所有 `status='indexed'` 但缺 CLIP 向量的资产补跑嵌入
-  2. `reembedThumbnailsOnce`：一次性从缩略图重新计算所有已有嵌入（标记文件 `.clip_reembed_thumb_v1.done` 防止重复）
-  3. `BackfillOCR`：为所有缺 OCR 文本的资产补跑
+`Embedder.Run` checks ML readiness every 30 seconds:
+- On a **false → true** transition, triggers asynchronously:
+  1. `Backfill`: backfill embeddings for all assets with `status='indexed'` but missing a CLIP vector
+  2. `reembedThumbnailsOnce`: one-time recomputation of all existing embeddings from thumbnails (marker file `.clip_reembed_thumb_v1.done` prevents repeating this)
+  3. `BackfillOCR`: backfill for all assets missing OCR text
 
-### 5. 地理反编码
+### 5. Reverse geocoding
 
-`GeoService` 从 `asset_exif` 读取 GPS 坐标，用内嵌 Gazetteer（`pkg/geo/data/*.tsv.gz`：城市 15000+、国家、POI）做离线反编码，写入 `asset_geo`。Gazetteer 版本（`geoGazVersion`）变更时自动清空 `asset_geo` 并重跑。
+`GeoService` reads GPS coordinates from `asset_exif` and reverse-geocodes them offline using an embedded gazetteer (`pkg/geo/data/*.tsv.gz`: 15,000+ cities, countries, POIs), writing to `asset_geo`. When the gazetteer version (`geoGazVersion`) changes, `asset_geo` is automatically cleared and rerun.
 
-### 6. ML 模型代次自动重建
+### 6. Automatic rebuild on ML model generation change
 
-`common.MLModelGen`（当前 `"3"` = SigLIP2 SO400M + antelopev2 + PP-OCRv5_server；gen 2 为 nllb-clip-large 时代）标识当前二进制绑定的模型组合（CLIP/人脸/OCR 三个选型 + 维度）；成功重建后写入 `photos_meta.ml_model_gen`。服务启动时若检测到该键缺失（老库）或与当前 `MLModelGen` 不符，`Rebuilder.MaybeAutoRebuild`（`service/rebuild.go`）会轮询等待 ML 后端就绪（新模型缓存就位）后自动触发一次全量重建：清空 `clip_embeddings`/`asset_clip_idx`、对所有 `status='indexed'` 资产重跑 CLIP/人脸/OCR、重新聚类人脸并清理无脸的空 `persons`，最后写回新代次。空库（无资产）跳过 worker pool，直接完成重聚类并写代次，秒级完成。代次仅在重建成功收尾（`finalize()`）后写入，中途失败或断电会在下次启动时重试。
+`common.MLModelGen` (currently `"3"` = SigLIP2 SO400M + antelopev2 + PP-OCRv5_server; gen 2 was the nllb-clip-large era) identifies the model combination (CLIP/face/OCR selection + dimensions) bound to the current binary; it's written to `photos_meta.ml_model_gen` after a successful rebuild. At startup, if this key is missing (old DB) or doesn't match the current `MLModelGen`, `Rebuilder.MaybeAutoRebuild` (`service/rebuild.go`) polls until the ML backend is ready (new model cache in place) and then automatically triggers a full rebuild: clears `clip_embeddings`/`asset_clip_idx`, reruns CLIP/face/OCR on all `status='indexed'` assets, re-clusters faces and cleans up faceless empty `persons`, and finally writes back the new generation. An empty library (no assets) skips the worker pool, goes straight to re-clustering and writing the generation, completing in seconds. The generation is only written after the rebuild finishes successfully (`finalize()`); a mid-rebuild failure or power loss will retry on the next startup.
 
-### 7. 美学评分
+### 7. Aesthetic scoring
 
-`pkg/aesthetic` 是一个纯 Go 线性头：在现成 CLIP（SigLIP2）图向量上跑一个小 MLP（`NAES` 权重格式，`go:embed` 内嵌进二进制，见 `pkg/aesthetic/weights/head_v1.bin`），当前探针头版本串 `v25probe1`，维度链 1152→1024→128→64→16→1。`Score` 输入先做 L2 归一化再逐层 `y=Wx+b`；输入向量维度与头不符时返回 `NaN`（调用侧跳过该资产，不写脏分）。**探针性质**：该头基于 SigLIP v1 训练，与本机实际使用的 SigLIP2 向量空间不同，不保证打分效果——若人工验收（`scripts/aesthetic/report.py` 生成最高/最低分对比页）不合格，阶段二会转为在 AVA 数据集上自训一个对齐 SigLIP2 空间的线性头，复用同一份 NAES 格式与 `Load`/`LoadFrom` 接口，只换 `head_v1.bin` 不用改 Go 代码（详见 `scripts/aesthetic/README.md`，权重转换脚本 `convert_v25.py`）。
+`pkg/aesthetic` is a pure-Go linear head: it runs a small MLP on top of the existing CLIP (SigLIP2) image vector (`NAES` weight format, embedded into the binary via `go:embed`, see `pkg/aesthetic/weights/head_v1.bin`); the current probe head's version string is `v25probe1`, with dimension chain 1152→1024→128→64→16→1. `Score` first L2-normalizes the input, then applies `y=Wx+b` layer by layer; if the input vector's dimension doesn't match the head, it returns `NaN` (the caller skips that asset rather than writing a bad score). **Probe status**: this head is trained on SigLIP v1, a different vector space from the SigLIP2 vectors actually used here, so scoring quality is not guaranteed — if manual acceptance (via `scripts/aesthetic/report.py`'s top/bottom score comparison page) fails, stage two will train our own linear head on the AVA dataset aligned to the SigLIP2 space, reusing the same NAES format and `Load`/`LoadFrom` interface — only `head_v1.bin` changes, no Go code changes needed (see `scripts/aesthetic/README.md`, conversion script `convert_v25.py`).
 
-打分双路，互为补充：
-1. **内联**：`writeClipEmbedding`（`service/indexer.go`）成功写入 CLIP 向量后，若 `aestheticHead` 非空（由 `AestheticEnabled` 注入），当场算分写回 `assets.aesthetic_score`——纯本地矩阵乘，微秒级，不额外占 ML 调用。
-2. **补跑**：`Embedder.BackfillAesthetic`（`service/embedder.go`，CAS 防重入 + rerun-pending 语义同 `BackfillOCR`）扫描「有 CLIP 向量但 `aesthetic_score IS NULL`」的资产补算，登记任务 `type="aesthetic"`。三处触发：服务启动（`AestheticEnabled` 开启时，纯本地计算不等 ML 就绪，与 OCR 补跑的关键差异）、ML 恢复链尾（掉线→恢复跳变）、每个上传批次完成时（`SetOnBatchDone`）。**不依赖 ML 在线**（只读库内已存的 CLIP 向量，不碰原文件），**不过滤 offline** 资产。
+Scoring runs on two complementary paths:
+1. **Inline**: after `writeClipEmbedding` (`service/indexer.go`) successfully writes a CLIP vector, if `aestheticHead` is non-nil (injected via `AestheticEnabled`), the score is computed on the spot and written to `assets.aesthetic_score` — a pure local matrix multiply, microsecond-scale, no extra ML call.
+2. **Backfill**: `Embedder.BackfillAesthetic` (`service/embedder.go`, CAS re-entry guard + rerun-pending semantics same as `BackfillOCR`) scans assets that "have a CLIP vector but `aesthetic_score IS NULL`" and computes scores, registering a task with `type="aesthetic"`. Triggered from three places: service startup (when `AestheticEnabled` is on, this is a pure local computation that doesn't wait for ML readiness — the key difference from OCR backfill), at the tail of the ML-recovery chain (offline→recovered transition), and on completion of every upload batch (`SetOnBatchDone`). **Doesn't depend on ML being online** (only reads CLIP vectors already in the DB, doesn't touch original files), and **doesn't filter out offline** assets.
 
-`assets.aesthetic_score`（REAL，NULL=未打分）与 `photos_meta.aesthetic_head_ver` 独立于 `ml_model_gen` 管理版本：`EnsureAestheticHeadVer`（`service/embedder.go`）在头版本变化时，同一事务内把全库分数置 NULL 并盖章新版本——不同于 `ml_model_gen` 的「成功后盖章」，置 NULL 本身就是原子清除、无脏数据窗口，可以提前盖章，重打靠 `BackfillAesthetic` 的 NULL 查询自然收敛。ML 模型代次重建（`service/rebuild.go`，见上节）换向量时逐资产清分（`UPDATE assets SET aesthetic_score=NULL`），`ForceReprocess` 重写向量后由内联打分自动补回，不需要单独任务。
+`assets.aesthetic_score` (REAL, NULL = not yet scored) and `photos_meta.aesthetic_head_ver` manage versioning independently of `ml_model_gen`: `EnsureAestheticHeadVer` (`service/embedder.go`) sets scores to NULL for the whole library and stamps the new version in the same transaction when the head version changes — unlike `ml_model_gen`'s "stamp after success," setting to NULL is itself an atomic clear with no dirty-data window, so the version can be stamped up front, and rescoring naturally converges via `BackfillAesthetic`'s NULL query. The ML model generation rebuild (`service/rebuild.go`, see previous section) clears scores per-asset when vectors change (`UPDATE assets SET aesthetic_score=NULL`), and `ForceReprocess` rewriting vectors gets scores refilled automatically by inline scoring, with no separate task needed.
 
-**五处封面选优**（未手动指定时的隐式排序，`aesthetic_score IS NULL` 永远排最后，回退到旧有排序规则）：
-- 相册隐式封面（`service/album.go`：相册列表摘要与单相册详情两处查询，按 `aesthetic_score DESC` 取相册内最高分成员，`position`/`rowid` 兜底稳定排序）
-- 地点城市卡 + 打点（spot）封面候选（`service/places.go`：城市聚合卡与 spot 最佳照片查询）
-- 智能相册（Smart View）预览 seeds（`service/smartview.go`：预览取样按分排序）
-- 人物封面混合分（`service/persons.go` `hybridCoverScore`：整图美学分 × 该脸 bbox 占比，双因子都要求可比——资产未打分/EXIF 缺宽高/bbox 退化则记不可比；`cover_locked=1` 时不受影响，仍跳过自动重算）
-- 人物 hero 兜底（`service/persons.go`：无锁定封面时的列表/详情 hero 查询）
+**Five cover-selection sites** (implicit ranking when not manually specified; `aesthetic_score IS NULL` always sorts last, falling back to the previous ranking rule):
+- Album implicit cover (`service/album.go`: both the album-list summary query and the single-album detail query take the highest-scoring member in the album by `aesthetic_score DESC`, with `position`/`rowid` as a stable fallback)
+- Place city card + spot cover candidates (`service/places.go`: city-aggregation card and spot best-photo queries)
+- Smart View preview seeds (`service/smartview.go`: preview sampling sorted by score)
+- Person cover hybrid score (`service/persons.go` `hybridCoverScore`: whole-image aesthetic score × that face's bbox area ratio; both factors must be comparable — an unscored asset/missing EXIF width-height/degenerate bbox is marked incomparable; unaffected when `cover_locked=1`, which still skips automatic recomputation)
+- Person hero fallback (`service/persons.go`: list/detail hero query when there's no locked cover)
 
-手动指定的封面（`cover_asset_id`/`cover_face_id`/`cover_locked=1`）永远优先于美学分；全库分数为 NULL（如刚换头待重打期间）时上述五处均回退到各自原有的旧排序（时间/position 等）。
+A manually specified cover (`cover_asset_id`/`cover_face_id`/`cover_locked=1`) always takes priority over the aesthetic score; when the whole-library score is NULL (e.g. during a rescore right after switching heads), all five sites above fall back to their own previous ranking (time/position, etc.).
 
-配置开关 `AestheticEnabled`（`photos.conf`，默认 `true`），**非热重载**：关闭后仅停止新打分（内联跳过、`BackfillAesthetic` 不触发），已有分数不清除；重新打开需重启服务加载头。
+Config toggle `AestheticEnabled` (`photos.conf`, default `true`), **not hot-reloaded**: turning it off only stops new scoring (inline is skipped, `BackfillAesthetic` isn't triggered); existing scores aren't cleared. Turning it back on requires restarting the service to load the head.
 
 ---
 
-## 数据存储
+## Data storage
 
 ```
-/etc/nimoos/photos.conf          配置（INI，Viper 读取）
-/DATA/.system_data/photos/       DataPath（默认，可迁移；下方各派生数据目录均跟随它）
-  ├── photos.db                  SQLite 数据库（WAL 模式）
+/etc/nimoos/photos.conf          Config (INI, read via Viper)
+/DATA/.system_data/photos/       DataPath (default, relocatable; all derived data directories below follow it)
+  ├── photos.db                  SQLite database (WAL mode)
   ├── thumbs/<asset_id>/
-  │     ├── small.jpg            250px 缩略图（CLIP 嵌入来源）
-  │     ├── large.jpg            1280px 缩略图
-  │     ├── sprite.jpg           视频悬浮预览雪碧图（数百 KB），入库即异步预生成，恒定预生成不受开关影响
-  │     └── preview.mp4          视频低码率悬浮预览（单个可达数十 MB），默认纯懒生成（首次 GET /preview 时现场生成）；`photos.PreviewPregen=true` 时改为入库/补跑一并预生成
-  ├── face-thumbs/<face_id>.jpg  人脸缩略图；孤儿（`face_detections` 差集之外的文件）由 Prune 回收，无独立回收路径
-  ├── live/                      Live Photo 视频片段缓存
-  ├── ml-cache/                  immich-ml 模型缓存（bind-mount 进容器；容器侧挂载路径由 `deploy/ml/install.sh` 固化进 `.env` 的 `NIMOOS_PHOTOS_ML_CACHE`，随 DataPath 迁移自动跟随）
-  └── tus-staging/               TUS 上传暂存（0700 权限；7 天自动清理，见「暂存目录」）
-/DATA/.system_data/photos-tus-staging/   旧版固定暂存目录（已弃用），仅服务启动时兜底扫一轮清理
-/DATA/Gallery/                   默认照片主目录（可配置）
-/var/run/nimoos/photos.url       服务发现地址
-/var/log/nimoos/                 日志（zap）
+  │     ├── small.jpg            250px thumbnail (CLIP embedding source)
+  │     ├── large.jpg            1280px thumbnail
+  │     ├── sprite.jpg           Video hover-preview sprite (a few hundred KB), asynchronously pre-generated on ingest; pre-generation is always on, unaffected by any toggle
+  │     └── preview.mp4          Low-bitrate video hover preview (can reach tens of MB each); lazily generated by default (generated on first GET /preview); when `photos.PreviewPregen=true`, pre-generated alongside ingest/backfill instead
+  ├── face-thumbs/<face_id>.jpg  Face thumbnails; orphans (files outside the `face_detections` set) are reclaimed by Prune, no separate reclaim path
+  ├── live/                      Live Photo video segment cache
+  ├── ml-cache/                  immich-ml model cache (bind-mounted into the container; the container-side mount path is baked into `.env`'s `NIMOOS_PHOTOS_ML_CACHE` by `deploy/ml/install.sh`, automatically following DataPath if it's moved)
+  └── tus-staging/               TUS upload staging (0700 permissions; auto-cleaned after 7 days, see "Staging directory")
+/DATA/.system_data/photos-tus-staging/   Legacy fixed staging directory (deprecated), swept only once at service startup as a fallback
+/DATA/Gallery/                   Default photo home directory (configurable)
+/var/run/nimoos/photos.url       Service-discovery address
+/var/log/nimoos/                 Logs (zap)
 ```
 
-**每日缓存清理**：`main.go` 启动一个 24 小时 ticker，调用 `StorageService.Prune`（与设置页手动按钮 `POST /cache/prune` 同一实现），一次性清理三类孤儿/过期数据：`thumbs/` 下资产已不存在的缩略图目录、`face-thumbs/` 下 `face_detections` 已不存在的头像文件、`tus-staging/` 下超过 7 天（`common.StagingMaxAge`）的暂存文件。此前只能靠手动触发，现改为每日自动执行；启动时另有一次性清扫（新旧暂存目录都扫）。
+**Daily cache cleanup**: `main.go` starts a 24-hour ticker that calls `StorageService.Prune` (same implementation as the manual `POST /cache/prune` button on the settings page), cleaning up three kinds of orphaned/expired data in one pass: thumbnail directories under `thumbs/` whose asset no longer exists, avatar files under `face-thumbs/` whose `face_detections` row no longer exists, and staging files under `tus-staging/` older than 7 days (`common.StagingMaxAge`). Previously this could only be triggered manually; it's now run automatically every day. There's also a one-time sweep at startup (scanning both the new and legacy staging directories).
 
-### SQLite 主要表
+### Main SQLite tables
 
-| 表 | 用途 |
+| Table | Purpose |
 |---|---|
-| `assets` | 资产主表（路径、MIME、拍摄时间、checksum、状态、软删除、`aesthetic_score` 美学分 REAL/NULL=未打分） |
-| `asset_exif` | EXIF/视频元数据（分辨率、GPS、相机、ISO、编解码等） |
-| `clip_embeddings` | sqlite-vec **vec0** 虚拟表，1152 维 CLIP 向量 |
-| `asset_clip_idx` | rowid ↔ asset_id 映射（连接 clip_embeddings 与 assets） |
-| `face_detections` | 人脸检测结果（bbox、512 维嵌入、excluded 标志） |
-| `persons` | 人脸聚类结果（名称、封面、质心、置信度） |
-| `face_person` | 人脸 → 人物映射 |
-| `asset_ocr` | OCR 文本（coverage、line_count 密度候选闸；boxes_ver=0 表示逐行坐标未存;doc_sem/doc_geo/is_doc 为混合判据的语义边际/几何规整度/最终判定（NULL=未算,查询回退纯密度）,doc_ver=0 待补算,唯一写入口 computeDocVerdict()） |
-| `asset_ocr_lines` | OCR 逐行文本+归一化四角坐标（JSON 8 浮点，[0,1]），line_no 与 asset_ocr.text 拼接同序;唯一写入口 ocrAsset()，随 assets 外键级联删除;供 GET /assets/:id/ocr 搜索命中高亮与 doc 几何规整度 |
-| `clip_text_cache` | CLIP 文本提示词向量缓存（key=提示词, gen=MLModelGen）,doc 分类零样本判据用;换模型代次自动失效重嵌 |
-| `asset_geo` | 反编码地理信息（城市、国家、geonameid） |
-| `albums` + `album_assets` | 手动相册（支持排序） |
-| `asset_favorites` | 按用户收藏 |
-| `asset_views` | 按用户浏览计数 |
-| `smart_views` + `smart_view_matches` | 语义自动相册及其匹配结果 |
-| `merge_rejections` | 被拒绝的人脸合并建议对 |
-| `place_cover_overrides` | 用户自定义地点封面 |
-| `spot_name_overrides` | 用户自定义打点名称 |
-| `photos_meta` | 键值元数据（如 `index_last_rebuilt`、`ml_model_gen`、`aesthetic_head_ver`） |
+| `assets` | Main asset table (path, MIME, capture time, checksum, status, soft delete, `aesthetic_score` aesthetic score REAL/NULL=not yet scored) |
+| `asset_exif` | EXIF/video metadata (resolution, GPS, camera, ISO, codec, etc.) |
+| `clip_embeddings` | sqlite-vec **vec0** virtual table, 1152-dim CLIP vectors |
+| `asset_clip_idx` | rowid ↔ asset_id mapping (joins clip_embeddings and assets) |
+| `face_detections` | Face detection results (bbox, 512-dim embedding, excluded flag) |
+| `persons` | Face clustering results (name, cover, centroid, confidence) |
+| `face_person` | Face → person mapping |
+| `asset_ocr` | OCR text (coverage, line_count density-candidate gate; boxes_ver=0 means per-line coordinates aren't stored; doc_sem/doc_geo/is_doc are the semantic margin/geometric regularity/final verdict of the mixed criterion (NULL=not yet computed, query falls back to pure density), doc_ver=0 means pending computation; the single write path is computeDocVerdict()) |
+| `asset_ocr_lines` | OCR per-line text + normalized four-corner coordinates (JSON, 8 floats, [0,1]); line_no matches the concatenation order in asset_ocr.text; single write path is ocrAsset(); cascade-deletes with assets via foreign key; used for GET /assets/:id/ocr search-hit highlighting and doc geometric-regularity computation |
+| `clip_text_cache` | CLIP text-prompt vector cache (key=prompt, gen=MLModelGen); used for the doc-classification zero-shot criterion; auto-invalidated and re-embedded on a model generation change |
+| `asset_geo` | Reverse-geocoded location info (city, country, geonameid) |
+| `albums` + `album_assets` | Manual albums (supports ordering) |
+| `asset_favorites` | Per-user favorites |
+| `asset_views` | Per-user view counts |
+| `smart_views` + `smart_view_matches` | Semantic auto-albums and their match results |
+| `merge_rejections` | Rejected face-merge suggestion pairs |
+| `place_cover_overrides` | User-customized place covers |
+| `spot_name_overrides` | User-customized spot names |
+| `photos_meta` | Key-value metadata (e.g. `index_last_rebuilt`, `ml_model_gen`, `aesthetic_head_ver`) |
 
 ---
 
-## CGO 依赖
+## CGO dependencies
 
-| 依赖 | 用途 |
+| Dependency | Purpose |
 |---|---|
-| `mattn/go-sqlite3` | CGO SQLite3 驱动，需要系统 `gcc` + `sqlite3.h` |
-| `asg017/sqlite-vec-go-bindings/cgo` | sqlite-vec 扩展（`vec0` 虚拟表），注入 `init()` 自动注册 |
+| `mattn/go-sqlite3` | CGO SQLite3 driver, requires system `gcc` + `sqlite3.h` |
+| `asg017/sqlite-vec-go-bindings/cgo` | sqlite-vec extension (`vec0` virtual table), auto-registered via `init()` |
 
-构建必须 `CGO_ENABLED=1`，系统需安装 `gcc` 和 `libsqlite3-dev`（Debian/Ubuntu）或等价包。
+Building requires `CGO_ENABLED=1`, with `gcc` and `libsqlite3-dev` (Debian/Ubuntu) or the equivalent package installed on the system.
 
 ```bash
 CGO_ENABLED=1 go build -o nimoos-photos .
@@ -273,19 +273,19 @@ CGO_ENABLED=1 go build -o nimoos-photos .
 
 ---
 
-## 鉴权
+## Authentication
 
-JWT 校验（ECDSA P-256，公钥从 `/var/run/nimoos/` 读取），以下路径**豁免**：
-- OPTIONS 请求（CORS preflight，TUS 客户端发送）
-- `*/thumbnail`、`*/face-thumbnail`、`*/original`、`*/live`、`*/sprite`（媒体文件，`<img>` 标签无法附带 Authorization）
-- `*/favorites/export`（同上）
-- **MCP 只读豁免**（`mcpReadSkip`，`route/router.go`）：`POST /search/smart` 和 `GET /albums` 两条只读端点，供 NimoOS-AI（agent / MCP server）内部调用。**fail-closed + 精确匹配**：RealIP 必须 `127.*`（Gateway 会剥掉伪造的 XFF）、`X-NimoOS-User-ID` 头必须非空（缺失则不豁免 → 走 JWT → 401，绝不回落 default 用户）、路径与完整路由精确相等（不用 HasSuffix）
+JWT verification (ECDSA P-256, public key read from `/var/run/nimoos/`), with the following paths **exempt**:
+- OPTIONS requests (CORS preflight, sent by TUS clients)
+- `*/thumbnail`, `*/face-thumbnail`, `*/original`, `*/live`, `*/sprite` (media files — an `<img>` tag can't attach an Authorization header)
+- `*/favorites/export` (same reason)
+- **MCP read-only exemption** (`mcpReadSkip`, `route/router.go`): the two read-only endpoints `POST /search/smart` and `GET /albums`, for internal calls from NimoOS-AI (agent / MCP server). **Fail-closed + exact match**: RealIP must be `127.*` (Gateway strips any forged XFF), the `X-NimoOS-User-ID` header must be non-empty (if missing, no exemption → falls through to JWT → 401, never falls back to a default user), and the path must exactly match the full route (not HasSuffix)
 
-校验通过后，JWT Claims 的用户 ID 以 `X-NimoOS-User-ID` Header 注入后续处理。
+Once verification passes, the user ID from the JWT claims is injected into downstream handling via the `X-NimoOS-User-ID` header.
 
 ---
 
-## 配置样例（`/etc/nimoos/photos.conf`）
+## Sample configuration (`/etc/nimoos/photos.conf`)
 
 ```ini
 [common]
@@ -305,71 +305,71 @@ AestheticEnabled = true
 PreviewPregen = false
 ```
 
-- `WatchDirs`：逗号分隔，fsnotify 监视目录，默认三个；可运行时通过 `PUT /v1/photos/config` 热生效（`Watcher.Restart`）。
-- `Workers`：Indexer 并发 worker 数，默认 3。
-- `MLEndpoint`：immich-machine-learning 地址，默认 `http://127.0.0.1:3003`。
-- 各功能开关（`FacesEnabled/ScenesEnabled/OCREnabled/SmartViewEnabled/AestheticEnabled`）缺省均为 `true`；关闭 `ScenesEnabled` 后新照片不再生成 CLIP 向量，语义搜索将失效。`AestheticEnabled` 非热重载，关闭仅停止新打分（内联+补跑都跳过），已有 `aesthetic_score` 不清除，见「核心流程 § 7 美学评分」。
-- `PreviewPregen`：默认 `false`，视频 `preview.mp4` 纯懒生成（首次 `GET /preview` 现场生成），只有入库/启动补跑阶段跳过预生成；置 `true` 后与 `sprite.jpg` 一样在入库时异步预生成、`BackfillSprites` 补跑时一并覆盖存量视频。`sprite.jpg` 不受此开关影响，恒定预生成。
+- `WatchDirs`: comma-separated fsnotify watch directories, three by default; can be hot-applied at runtime via `PUT /v1/photos/config` (`Watcher.Restart`).
+- `Workers`: number of Indexer concurrent workers, default 3.
+- `MLEndpoint`: immich-machine-learning address, default `http://127.0.0.1:3003`.
+- Feature toggles (`FacesEnabled/ScenesEnabled/OCREnabled/SmartViewEnabled/AestheticEnabled`) all default to `true`; turning off `ScenesEnabled` means new photos no longer get CLIP vectors, disabling semantic search. `AestheticEnabled` is not hot-reloaded — turning it off only stops new scoring (both inline and backfill are skipped), existing `aesthetic_score` values aren't cleared; see "Core flows § 7 Aesthetic scoring".
+- `PreviewPregen`: default `false`, video `preview.mp4` is purely lazy-generated (generated on first `GET /preview`), with pre-generation skipped only during ingest/startup backfill. When set to `true`, it's asynchronously pre-generated on ingest just like `sprite.jpg`, and also covered by `BackfillSprites` for existing videos. `sprite.jpg` is unaffected by this toggle and is always pre-generated.
 
 ---
 
-## 与其他服务的依赖
+## Dependencies on other services
 
-| 服务 | 关系 |
+| Service | Relationship |
 |---|---|
-| **NimoOS-Gateway** | 启动时 `POST /v1/gateway/routes` 注册三个前缀（`/v1/photos`、`/doc/v1/photos`、`/v1/upload-tus`）；从 `RuntimePath` 读取 Gateway 地址 |
-| **NimoOS-UserService** | 从 `/var/run/nimoos/` 读取 ECDSA 公钥校验 JWT |
-| **NimoOS-MessageBus** | systemd `After=nimoos-message-bus.service`；`service/publisher.go` 向 MessageBus 发布事件（索引进度等）；订阅 `nimoos:media:created` / `nimoos:media:deleted`（落盘即索引 / 删除即清理，`service/buscreated.go` / `busdelete.go`，各自独立 WS 连接，周期全盘扫描仍是兜底） |
-| **immich-machine-learning** | Docker 容器，`127.0.0.1:3003`，`pkg/mlclient` 通过 `/predict` + multipart/form-data 调用；ML 不可用时 CLIP/人脸/OCR 步骤跳过，Embedder 检测到恢复后自动补跑；卡死态由内置看门狗 `docker restart`（见已知坑 2） |
-| **NimoOS-AI Agent / MCP server** | 可无 JWT 从 localhost 调用 `POST /search/smart`、`GET /albums`（`mcpReadSkip`，见鉴权），作为 `search_photos` / `list_albums` MCP 工具后端 |
+| **NimoOS-Gateway** | Registers three prefixes (`/v1/photos`, `/doc/v1/photos`, `/v1/upload-tus`) via `POST /v1/gateway/routes` at startup; reads the Gateway address from `RuntimePath` |
+| **NimoOS-UserService** | Reads the ECDSA public key from `/var/run/nimoos/` to verify JWTs |
+| **NimoOS-MessageBus** | systemd `After=nimoos-message-bus.service`; `service/publisher.go` publishes events (indexing progress, etc.) to MessageBus; subscribes to `nimoos:media:created` / `nimoos:media:deleted` (index-on-write / clean-up-on-delete, `service/buscreated.go` / `busdelete.go`, each with its own separate WS connection; periodic full scans remain a fallback) |
+| **immich-machine-learning** | Docker container, `127.0.0.1:3003`, called by `pkg/mlclient` via `/predict` + multipart/form-data; when ML is unavailable, the CLIP/face/OCR steps are skipped, and Embedder automatically backfills once it detects recovery; a hung state is handled with `docker restart` by the built-in watchdog (see Known issue 2) |
+| **NimoOS-AI Agent / MCP server** | Can call `POST /search/smart` and `GET /albums` from localhost without a JWT (`mcpReadSkip`, see Authentication), serving as the backend for the `search_photos` / `list_albums` MCP tools |
 
 ---
 
-## 已知坑
+## Known issues
 
-1. **inotify 配额放大**：NimoOS-Photos 的 Watcher、Wiki（`NimoOS/`）和 NimoOS-Search 三个 fsnotify 实例都监视 `/DATA/Gallery` 等目录。每个实例独立占用 inotify watches，导致 `/proc/sys/fs/inotify/max_user_watches` 压力叠加。若目录树超大，需手动调高配额（如 `echo 524288 > /proc/sys/fs/inotify/max_user_watches`）。当前维持各自独立监视（方案 A），统一共享监视层为后续待办。inotify **事件队列溢出**（`fsnotify.ErrEventOverflow`）时 Watcher 会触发全根恢复补扫（`service/watcher.go`），补扫单飞（`overflowRescanning`）且带 5 分钟冷却（`overflowRescanCooldown`），防止写入风暴期间连环补扫。
+1. **inotify quota amplification**: NimoOS-Photos's Watcher, Wiki (`NimoOS/`), and NimoOS-Search all run separate fsnotify instances watching directories like `/DATA/Gallery`. Each instance consumes its own inotify watches independently, so the pressure on `/proc/sys/fs/inotify/max_user_watches` stacks up. For very large directory trees, the quota may need to be raised manually (e.g. `echo 524288 > /proc/sys/fs/inotify/max_user_watches`). Each service currently keeps its own independent watcher (option A); a unified shared watch layer is a future TODO. On inotify **event queue overflow** (`fsnotify.ErrEventOverflow`), Watcher triggers a full-root recovery rescan (`service/watcher.go`); the rescan is single-flighted (`overflowRescanning`) with a 5-minute cooldown (`overflowRescanCooldown`) to prevent chained rescans during a write storm.
 
-2. **ML 服务离线**：ML 容器（immich-machine-learning）为离线镜像捆绑包，首次需通过安装脚本 `docker load`。容器未启动时 CLIP 嵌入、人脸识别、OCR 全部跳过（`ml.IsReady()` 返回 false）；Embedder 检测到 `false→true` 跳变时自动补跑历史资产。
+2. **ML service offline**: the ML container (immich-machine-learning) ships as an offline image bundle, requiring `docker load` via the install script the first time. While the container isn't running, CLIP embedding, face recognition, and OCR are all skipped (`ml.IsReady()` returns false); Embedder automatically backfills historical assets once it detects a `false→true` transition.
 
-   **ML 卡死自愈**：ML worker 可能陷入「端口在听、worker 空壳」的 hang 态（模型冷加载超时被 gunicorn 中途杀掉的后遗症，compose 的 `restart: unless-stopped` 只救进程退出、救不了 hang）。内置看门狗 `MLWatchdog`（`service/mlwatchdog.go`）每 30s 探测：`/ping` 连续 12 次失败（约 6 分钟，刻意排在 gunicorn 300s 自愈窗口之后，作为第二道防线）且 `docker inspect` 确认容器在运行时才 `docker restart`，10 分钟冷却；容器未运行（未装 ML 包/用户手动停）则静默跳过并清零计数。compose 侧另有 healthcheck，但仅供 `docker ps` / AppManagement 可观测，不驱动重启。
+   **ML hang self-healing**: the ML worker can get stuck in a "port listening, worker is an empty shell" hang state (an aftereffect of gunicorn killing the worker mid-load on a cold-load timeout; compose's `restart: unless-stopped` only rescues a process exit, not a hang). The built-in watchdog `MLWatchdog` (`service/mlwatchdog.go`) probes every 30s: only after 12 consecutive `/ping` failures (about 6 minutes, deliberately placed after gunicorn's 300s self-heal window as a second line of defense) and confirming via `docker inspect` that the container is running does it `docker restart`, with a 10-minute cooldown; if the container isn't running (ML package not installed / manually stopped by the user), it silently skips and resets the counter. Compose also has its own healthcheck, but that's only for observability via `docker ps` / AppManagement — it doesn't drive restarts.
 
-3. **视频缩略图用于 CLIP 嵌入**：视频用 ffmpeg 提取的关键帧生成 CLIP 嵌入（而非关键帧原图），与图片路径统一为 `small.jpg`；这是有意设计——避免高细节关键帧在语义搜索中不当排名高于图片。标记文件 `.clip_reembed_thumb_v1.done` 防止重建索引后的重复嵌入。
+3. **Video thumbnail used for CLIP embedding**: the CLIP embedding for a video is generated from the ffmpeg-extracted key frame (rather than the raw key frame), unified with the image path as `small.jpg`; this is intentional — it avoids a high-detail key frame ranking inappropriately high above photos in semantic search. The marker file `.clip_reembed_thumb_v1.done` prevents re-embedding after an index rebuild.
 
-4. **TUS 上传与 fsnotify 竞态**：TUS 上传完成后先 `MarkAndReserve` 占位，再 rename，最后 `SubmitReserved`，防止 Watcher 的 Create 事件抢先走匿名 batch 槽（`batches[""]`），导致前端进度报告错乱。
+4. **TUS upload vs. fsnotify race**: after a TUS upload completes, `MarkAndReserve` claims a placeholder first, then rename happens, then `SubmitReserved` — preventing the Watcher's Create event from racing ahead into the anonymous batch slot (`batches[""]`), which would garble front-end progress reporting.
 
-5. **caption 回流的孤儿对账**：`Puller`（`service/captionpull.go`）周期性从 NimoOS-Parser 拉取 caption 全量 diff-upsert 进本地 `asset_caption` 表（供 Smart Moments 主题匹配），若拉到的资产 ID 在本地 `assets` 已不存在（真孤儿，通常是删除通知丢失导致 Parser 侧未跟着清），除本地跳过写入外，还会 best-effort 回删 Parser 侧对应向量，补上「删除即清理」链路可能丢事件时的兜底对账；`asset_caption` 自身则靠 `asset_id` 外键 `ON DELETE CASCADE` 随 `assets` 删除自动清理，不需要单独的 Prune 逻辑。
+5. **Orphan reconciliation for caption backflow**: `Puller` (`service/captionpull.go`) periodically pulls the full caption diff-upsert from NimoOS-Parser into the local `asset_caption` table (used for Smart Moments topic matching). If a pulled asset ID no longer exists locally in `assets` (a true orphan, usually because a delete notification was lost and Parser-side data wasn't cleaned up accordingly), besides skipping the local write, it also best-effort deletes the corresponding vector back on the Parser side — a fallback reconciliation for cases where the "clean-up-on-delete" chain drops an event. `asset_caption` itself is cleaned up automatically via the `asset_id` foreign key's `ON DELETE CASCADE` when `assets` rows are deleted, so no separate Prune logic is needed.
 
 ---
 
-## 启动顺序与部署
+## Startup order and deployment
 
-systemd 依赖（见 `build/sysroot/usr/lib/systemd/system/nimoos-photos.service`）：
+systemd dependency (see `build/sysroot/usr/lib/systemd/system/nimoos-photos.service`):
 
 ```
 nimoos-message-bus.service ──▶ nimoos-photos.service
 ```
 
-`Type=notify`，`SdNotify(Ready)` 后才视为启动完成。
+`Type=notify`; considered started only after `SdNotify(Ready)`.
 
 ```bash
-# 构建
+# Build
 CGO_ENABLED=1 go build -o nimoos-photos .
 
-# 部署（替换二进制并重启）
+# Deploy (replace binary and restart)
 bash scripts/deploy.sh photos
 ```
 
-ML 后端独立部署（`deploy/ml/`），按核显厂商分 **openvino**（Intel）/ **rocm**（AMD，含 gfx1151 / AI Max+ 395 Strix Halo 的 `HSA_OVERRIDE_GFX_VERSION` 覆盖）两个离线分发包 flavor：
+The ML backend is deployed independently (`deploy/ml/`), split by iGPU vendor into two offline distribution bundle flavors, **openvino** (Intel) / **rocm** (AMD, including the `HSA_OVERRIDE_GFX_VERSION` override for gfx1151 / AI Max+ 395 Strix Halo):
 
-- **打包**（`script/package-photos-ml.sh <openvino|rocm|cpu> [输出目录]`，在有外网的机器上执行一次）：拉取对应 immich-machine-learning 官方镜像 tag 并重打本地标签、启动临时容器预热 CLIP 图/文塔、人脸、OCR 三个模型缓存（模型名从 `common/constants.go` 用正则抓取，保证打包与代码选型一致），再把镜像 tar、模型缓存 tar、`docker-compose.yml`、`install.sh`、`overrides/` 打成一个分发压缩包。
-- **安装**（`install.sh`，幂等，重复运行=更新到包内镜像版本）：读取包内 `FLAVOR` 文件，用 `/sys/class/drm/card*/device/vendor`（Intel=`0x8086`、AMD=`0x1002`）自动识别本机核显厂商并与 flavor 校验（不匹配则拒绝安装）；按 flavor 把 `overrides/<flavor>.yml` 拷贝为 `docker-compose.override.yml` 叠加设备直通（`/dev/dri`；AMD 再加 `/dev/kfd` + `HSA_OVERRIDE_GFX_VERSION`）；随包模型缓存解压进 `ml-cache`（已存在则跳过，`FORCE_MODELS=1` 强制覆盖）；`docker compose up -d` 后轮询 `/ping` 确认就绪。
-- **运行时环境变量**（`docker-compose.yml`）：`MACHINE_LEARNING_MODEL_TTL=300` 秒闲置自动卸载模型释放内存（SigLIP2 SO400M + PP-OCRv5_server 常驻内存/显存开销较大）、`MACHINE_LEARNING_MODEL_TTL_POLL_S=10`、`HF_HUB_OFFLINE=1` 禁止运行时联网查 HuggingFace（模型缓存已随包预置，离线/内网机器联网查询会卡超时）、`MACHINE_LEARNING_WORKER_TIMEOUT=300`（SigLIP2 冷加载在低端盘可能超过默认 120s，被 gunicorn 中途杀掉会留下「端口在听、worker 空壳」的卡死态）。另有 healthcheck（30s 探 `/ping`，`start_period: 300s` 对齐 WORKER_TIMEOUT）仅供可观测性，真正自愈由 nimoos-photos 内置看门狗负责（见已知坑 2）。
+- **Packaging** (`script/package-photos-ml.sh <openvino|rocm|cpu> [output dir]`, run once on a machine with internet access): pulls the matching official immich-machine-learning image tag and retags it locally, starts a temporary container to warm the CLIP image/text tower, face, and OCR model caches (model names are regex-extracted from `common/constants.go`, so packaging always matches the code's model selection), then bundles the image tar, model cache tar, `docker-compose.yml`, `install.sh`, and `overrides/` into a single distribution archive.
+- **Installation** (`install.sh`, idempotent, re-running it updates to the bundled image version): reads the `FLAVOR` file in the bundle, auto-detects the local iGPU vendor via `/sys/class/drm/card*/device/vendor` (Intel=`0x8086`, AMD=`0x1002`) and validates it against the flavor (refuses to install on a mismatch); copies `overrides/<flavor>.yml` to `docker-compose.override.yml` per flavor to layer in device passthrough (`/dev/dri`; AMD also adds `/dev/kfd` + `HSA_OVERRIDE_GFX_VERSION`); extracts the bundled model cache into `ml-cache` (skipped if already present, `FORCE_MODELS=1` forces an overwrite); runs `docker compose up -d` then polls `/ping` to confirm readiness.
+- **Runtime environment variables** (`docker-compose.yml`): `MACHINE_LEARNING_MODEL_TTL=300` seconds idle auto-unloads models to free memory (SigLIP2 SO400M + PP-OCRv5_server are fairly memory/VRAM-hungry when resident), `MACHINE_LEARNING_MODEL_TTL_POLL_S=10`, `HF_HUB_OFFLINE=1` forbids runtime network calls to HuggingFace (the model cache is already bundled; an offline/intranet machine would hang on the timeout), `MACHINE_LEARNING_WORKER_TIMEOUT=300` (SigLIP2's cold load can exceed the default 120s on slower disks; gunicorn killing it mid-load leaves a "port listening, worker is an empty shell" hang state). There's also a healthcheck (probes `/ping` every 30s, `start_period: 300s` aligned with WORKER_TIMEOUT) that's for observability only — actual self-healing is handled by the nimoos-photos built-in watchdog (see Known issue 2).
 
 ```bash
-# 打包（一次性，需要外网）
-script/package-photos-ml.sh openvino   # 或 rocm / cpu
+# Packaging (one-time, requires internet access)
+script/package-photos-ml.sh openvino   # or rocm / cpu
 
-# 目标机器：解压分发包后安装/更新（幂等）
+# Target machine: extract the distribution bundle then install/update (idempotent)
 tar -xzf photos-ml-openvino-v2.7.5.tar.gz -C /tmp/photos-ml
 /tmp/photos-ml/install.sh
 ```
