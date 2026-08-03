@@ -240,9 +240,13 @@ def main() -> None:
     out.mkdir(parents=True, exist_ok=True)
     manifest: dict = {}
 
-    files = [p for s in args.src for p in Path(s).rglob("*")
-             if p.suffix.lower() in IMG_SUFFIXES and p.is_file() and p.stat().st_size > 10_000
-             and not EXCLUDE_DIR_NAMES.intersection(p.parts)]
+    # Sorted so random.seed(42) yields a reproducible sample: rglob's traversal
+    # order is filesystem-dependent (inode/dirent order), not guaranteed
+    # stable across runs or machines, so the raw walk result must be sorted
+    # before it is ever fed to random.sample/choice.
+    files = sorted(p for s in args.src for p in Path(s).rglob("*")
+                    if p.suffix.lower() in IMG_SUFFIXES and p.is_file() and p.stat().st_size > 10_000
+                    and not EXCLUDE_DIR_NAMES.intersection(p.parts))
     print(f"discovered {len(files)} candidate images under {args.src}")
 
     # DB-aware special buckets first (deterministic, not subject to random sampling).
@@ -265,8 +269,12 @@ def main() -> None:
         print("no --db given: skipping faces-heavy/document/huge/video-keyframe buckets")
 
     # exif-rotated bucket: sample from a random subset of the filesystem walk.
+    # `files` is already sorted (see above); `rotated` inherits that
+    # deterministic order via the list-comprehension filter, but it is
+    # sorted again explicitly here since it is itself the direct input to a
+    # random.sample call.
     sample_pool = random.sample(files, min(3000, len(files)))
-    rotated = [p for p in sample_pool if orientation(p) != 1]
+    rotated = sorted(p for p in sample_pool if orientation(p) != 1)
     picked_rotated = random.sample(rotated, min(args.rotated, len(rotated)))
     n_rot = 0
     for p in picked_rotated:
