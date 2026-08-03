@@ -78,3 +78,9 @@ async def test_ocr_flat_normalized_box(client):
 async def test_unknown_task_is_400(client):
     r = await client.post("/predict", data={"entries": json.dumps({"nope": {}})})
     assert r.status_code == 400
+
+@pytest.mark.anyio
+async def test_docs_routes_are_disabled(client):
+    for path in ("/docs", "/redoc", "/openapi.json"):
+        r = await client.get(path)
+        assert r.status_code == 404, f"{path} should be disabled, got {r.status_code}"

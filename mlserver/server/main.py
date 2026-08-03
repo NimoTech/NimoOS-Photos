@@ -12,7 +12,7 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import PlainTextResponse
 
 def create_app(backends: dict[str, Any] | None = None) -> FastAPI:
-    app = FastAPI()
+    app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
     app.state.backends = backends if backends is not None else {}
 
     @app.get("/ping", response_class=PlainTextResponse)
