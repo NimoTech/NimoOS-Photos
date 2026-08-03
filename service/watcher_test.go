@@ -138,9 +138,21 @@ func TestWatcherRemovesAssetOnFileDelete(t *testing.T) {
 	w, idx := newWatcherTestHarness(t, ctx, []string{root})
 	go w.Start(ctx)
 
-	file := filepath.Join(root, "solo.jpg")
+	// Establish that the watch is live using a throwaway file, the same way
+	// TestWatcherSkipsSnapshotsDirectory does. The file under test then gets
+	// written exactly once: re-writing it inside the poll loop would queue an
+	// index job per write, and a job still in flight when the Remove event is
+	// handled re-inserts the row right after the delete removed it — which is
+	// what made this test flaky rather than any fault in the delete path.
+	warmFile := filepath.Join(root, "warmup.jpg")
 	require.Eventually(t, func() bool {
-		writeFile(t, file, "data")
+		writeFile(t, warmFile, "warm")
+		return assetIndexed(t, idx, warmFile)
+	}, 5*time.Second, 100*time.Millisecond, "warmup file must be indexed")
+
+	file := filepath.Join(root, "solo.jpg")
+	writeFile(t, file, "data")
+	require.Eventually(t, func() bool {
 		return assetIndexed(t, idx, file)
 	}, 5*time.Second, 100*time.Millisecond, "file should be indexed first")
 
