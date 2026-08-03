@@ -2,5 +2,8 @@ nimoos-photos
 *.test
 coverage.txt
 
+# golden dataset collection venv (local tooling, not project code)
+mlserver/.golden-venv/
+
 # Claude Code local guidance — not for upload
 CLAUDE.md
