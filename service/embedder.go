@@ -260,10 +260,14 @@ func (e *Embedder) backfillOnce(ctx context.Context) error {
 		processed++
 		pubRunning(processed)
 	}
-	// Environmental guard: an all-failed pass means the ML backend itself is
-	// down (same condition as TaskErrMLLostDuringBackfill below) — recording
-	// per-asset failures would walk healthy assets up the cooldown ladder.
-	if success > 0 || failed == 0 {
+	// Environmental guard: an all-failed pass with ML actually unreachable
+	// (IsReady()==false) means the ML backend itself is down (same condition
+	// as TaskErrMLLostDuringBackfill below) — recording per-asset failures
+	// would walk healthy assets up the cooldown ladder. But when ML is
+	// ready, an all-failed pass means the assets themselves are broken and
+	// MUST be recorded, or that corrupt set gets re-read every gate window
+	// forever and never converges.
+	if success > 0 || failed == 0 || e.ml.IsReady() {
 		now := time.Now()
 		for _, f := range failures {
 			recordBackfillFailure(e.db, backfillCLIP, f.tg.id, now,
@@ -499,8 +503,12 @@ func (e *Embedder) backfillOCROnce(ctx context.Context) error {
 	}
 
 	// Ledger write-back from the FINAL pass only; skip entirely when the
-	// pass is classified as ML-down (all processed failed via ocrFail).
-	if !(processed > 0 && failed == processed && ocrFail > 0) {
+	// pass is classified as ML-down (all processed failed via ocrFail AND
+	// ML is actually unreachable). When ML is ready, an all-failed pass
+	// means the assets themselves are broken and MUST be recorded, or that
+	// corrupt set gets re-read every gate window forever and never
+	// converges.
+	if !(processed > 0 && failed == processed && ocrFail > 0 && !e.ml.IsReady()) {
 		now := time.Now()
 		for id, cause := range passFailures {
 			recordBackfillFailure(e.db, backfillOCR, id, now, cause)

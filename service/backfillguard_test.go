@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"fmt"
 	"image"
 	_ "image/jpeg"
 	_ "image/png"
@@ -63,6 +64,16 @@ func (m *decodingML) OCR(b []byte) ([]mlclient.OCRLine, error) {
 type errAssert string
 
 func (e errAssert) Error() string { return string(e) }
+
+// mlDownML wraps countingML but reports IsReady()==false, simulating a
+// genuinely unreachable ML backend (as opposed to healthy-but-every-asset-
+// is-broken) — used to prove the environmental guard's original protection
+// survives the Task 7 fix.
+type mlDownML struct {
+	countingML
+}
+
+func (m *mlDownML) IsReady() bool { return false }
 
 func writeSmallThumb(t *testing.T, thumbDir, assetID, srcJPEG string) {
 	t.Helper()
@@ -151,9 +162,12 @@ func TestBackfill_RecordsFailureThenSkipsNextRound(t *testing.T) {
 	require.Equal(t, before, ml.clipCalls.Load()) // cooled-down asset not re-attempted
 }
 
-// Environmental guard: when the whole pass fails with zero successes (the
-// existing TaskErrMLLostDuringBackfill condition), no per-asset failures may
-// be recorded — a dead ML backend must not walk healthy assets up the ladder.
+// Environmental guard: when the whole pass fails with zero successes AND ML
+// is genuinely unreachable (the existing TaskErrMLLostDuringBackfill
+// condition), no per-asset failures may be recorded — a dead ML backend must
+// not walk healthy assets up the ladder. Uses mlDownML (IsReady()==false) to
+// simulate a genuinely dead backend, distinct from an all-corrupt asset set
+// on a healthy backend (see TestBackfill_AllCorruptPassConvergesWhenMLReady).
 func TestBackfill_AllFailedPassRecordsNothing(t *testing.T) {
 	db := makeTestDB(t)
 	tmp := t.TempDir()
@@ -161,7 +175,7 @@ func TestBackfill_AllFailedPassRecordsNothing(t *testing.T) {
 	id := insertAsset(t, db, src, "indexed")
 	thumbDir := filepath.Join(tmp, "thumbs")
 
-	ml := &countingML{failCLIP: true}
+	ml := &mlDownML{countingML: countingML{failCLIP: true}}
 	ix := NewIndexer(db, ml, thumbDir, 1)
 	e := NewEmbedder(db, ml, ix, NewTaskRegistry(nil))
 	_ = e.Backfill(context.Background())
@@ -238,6 +252,63 @@ func TestBackfill_ThumbPathMLErrorDoesNotFallThroughToSource(t *testing.T) {
 		"checksum must stay untouched — ForceReprocess (the only code path that rewrites it) must never run when a thumb is present")
 }
 
+// TestBackfill_AllCorruptPassConvergesWhenMLReady closes the convergence gap:
+// a pass where every asset fails (e.g. a folder of 100% corrupt recovery
+// artifacts) but the ML backend itself is healthy must still record each
+// failure, or the environmental (all-failed) guard mistakes "assets are
+// broken" for "ML is down" and the same corrupt set gets re-read every gate
+// window forever. decodingML reports IsReady()==true (inherited from
+// mockML) while still genuinely failing to decode the garbage bytes below.
+func TestBackfill_AllCorruptPassConvergesWhenMLReady(t *testing.T) {
+	db := makeTestDB(t)
+	tmp := t.TempDir()
+	thumbDir := filepath.Join(tmp, "thumbs")
+
+	const n = 3
+	var ids []string
+	for i := 0; i < n; i++ {
+		bad := filepath.Join(tmp, fmt.Sprintf("corrupt%d.jpg", i))
+		require.NoError(t, os.WriteFile(bad, []byte("not a jpeg"), 0o644))
+		ids = append(ids, insertAsset(t, db, bad, "indexed"))
+	}
+
+	ml := &decodingML{} // IsReady()==true; every asset genuinely fails to decode
+	ix := NewIndexer(db, ml, thumbDir, 1)
+	e := NewEmbedder(db, ml, ix, NewTaskRegistry(nil))
+
+	require.NoError(t, e.Backfill(context.Background()))
+	require.NoError(t, e.Backfill(context.Background()))
+
+	leftover, err := e.queryMissing(context.Background(), time.Now())
+	require.NoError(t, err)
+	require.Empty(t, leftover, "an all-corrupt pass on a healthy ML backend must still converge")
+
+	for _, id := range ids {
+		n, _ := readBackfillFailure(t, db, backfillCLIP, id)
+		require.Equal(t, 1, n, "%s: recorded once, not skipped by the environmental guard", id)
+	}
+}
+
+// TestBackfill_MLDownPassStillRecordsNothing preserves the original
+// protection: when the ML backend is genuinely unreachable (IsReady()==false)
+// an all-failed pass must NOT record per-asset failures, since that would
+// walk healthy assets up the cooldown ladder while ML is merely down.
+func TestBackfill_MLDownPassStillRecordsNothing(t *testing.T) {
+	db := makeTestDB(t)
+	tmp := t.TempDir()
+	src := makeTestJPEG(t, tmp)
+	id := insertAsset(t, db, src, "indexed")
+	thumbDir := filepath.Join(tmp, "thumbs")
+
+	ml := &mlDownML{countingML: countingML{failCLIP: true}}
+	ix := NewIndexer(db, ml, thumbDir, 1)
+	e := NewEmbedder(db, ml, ix, NewTaskRegistry(nil))
+	require.NoError(t, e.Backfill(context.Background()))
+
+	n, _ := readBackfillFailure(t, db, backfillCLIP, id)
+	require.Zero(t, n, "ML-down pass must not record any per-asset failure")
+}
+
 func TestQueryMissingOCR_SkipsAssetsInCooldown(t *testing.T) {
 	db := makeTestDB(t)
 	hot := insertAsset(t, db, "/hot.jpg", "indexed")
@@ -282,6 +353,44 @@ func TestBackfillOCR_RecordsFailureThenSkipsNextRound(t *testing.T) {
 	before := ml.ocrCalls.Load()
 	require.NoError(t, e.BackfillOCR(context.Background()))
 	require.Equal(t, before, ml.ocrCalls.Load())
+}
+
+// TestBackfillOCR_AllCorruptPassConvergesWhenMLReady mirrors
+// TestBackfill_AllCorruptPassConvergesWhenMLReady for the OCR chain: an
+// all-failed OCR pass with a healthy ML backend must still record each
+// asset's failure so the corrupt set converges after two rounds.
+func TestBackfillOCR_AllCorruptPassConvergesWhenMLReady(t *testing.T) {
+	prev := ocrBackfillRetryDelay
+	ocrBackfillRetryDelay = time.Millisecond
+	t.Cleanup(func() { ocrBackfillRetryDelay = prev })
+
+	db := makeTestDB(t)
+	tmp := t.TempDir()
+	thumbDir := filepath.Join(tmp, "thumbs")
+
+	const n = 3
+	var ids []string
+	for i := 0; i < n; i++ {
+		bad := filepath.Join(tmp, fmt.Sprintf("corrupt%d.jpg", i))
+		require.NoError(t, os.WriteFile(bad, []byte("not a jpeg"), 0o644))
+		ids = append(ids, insertAsset(t, db, bad, "indexed"))
+	}
+
+	ml := &decodingML{} // IsReady()==true; every asset genuinely fails to OCR
+	ix := NewIndexer(db, ml, thumbDir, 1)
+	e := NewEmbedder(db, ml, ix, NewTaskRegistry(nil))
+
+	require.NoError(t, e.BackfillOCR(context.Background()))
+	require.NoError(t, e.BackfillOCR(context.Background()))
+
+	leftover, err := e.queryMissingOCR(context.Background(), time.Now())
+	require.NoError(t, err)
+	require.Empty(t, leftover, "an all-corrupt OCR pass on a healthy ML backend must still converge")
+
+	for _, id := range ids {
+		n, _ := readBackfillFailure(t, db, backfillOCR, id)
+		require.Equal(t, 1, n, "%s: recorded once, not skipped by the environmental guard", id)
+	}
 }
 
 func TestBackfillOCR_ClearsFailureAfterSuccess(t *testing.T) {
