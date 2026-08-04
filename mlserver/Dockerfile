@@ -60,17 +60,30 @@ ARG LZ_TAG=v1.28.6
 ARG LZ_VER=1.28.6+u24.04
 ARG GMM_VER=22.10.0
 
+# sha256 of each .deb above, pinned by hand (downloaded once, `sha256sum`'d
+# locally, checked against this list here) -- verified with `sha256sum -c`
+# right after download, below, so a corrupted/tampered/silently-republished
+# release asset fails the build instead of getting `dpkg -i`'d unchecked.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         tini libgomp1 libglib2.0-0 ocl-icd-libopencl1 ca-certificates curl \
     && rm -rf /var/lib/apt/lists/* \
     && tmp="$(mktemp -d)" && cd "$tmp" \
-    && CURL="curl -fsSL --retry 5 --retry-all-errors --max-time 60 -O" \
+    && CURL="curl -fsSL --retry 5 --retry-all-errors --max-time 90 -O" \
     && $CURL "https://github.com/intel/intel-graphics-compiler/releases/download/${IGC_TAG}/intel-igc-core-2_${IGC_VER}_amd64.deb" \
     && $CURL "https://github.com/intel/intel-graphics-compiler/releases/download/${IGC_TAG}/intel-igc-opencl-2_${IGC_VER}_amd64.deb" \
     && $CURL "https://github.com/intel/compute-runtime/releases/download/${CR_TAG}/libigdgmm12_${GMM_VER}_amd64.deb" \
     && $CURL "https://github.com/intel/compute-runtime/releases/download/${CR_TAG}/intel-opencl-icd_${CR_VER}_amd64.deb" \
     && $CURL "https://github.com/intel/compute-runtime/releases/download/${CR_TAG}/libze-intel-gpu1_${CR_VER}_amd64.deb" \
     && $CURL "https://github.com/oneapi-src/level-zero/releases/download/${LZ_TAG}/libze1_${LZ_VER}_amd64.deb" \
+    && { \
+        echo "0ce1e715ec5bf30b1304b42acfbda34cc514a0f616dd48c6a31973c4075d8d09  intel-igc-core-2_${IGC_VER}_amd64.deb"; \
+        echo "09a71e8b6ad432ed0511b09fa4f580c1b44534a60ccb0545212507bf67dc0d1b  intel-igc-opencl-2_${IGC_VER}_amd64.deb"; \
+        echo "6031a63d6e8a12ce61c14efc15f2c8e727061286e3820b8594e6d00615e04d54  libigdgmm12_${GMM_VER}_amd64.deb"; \
+        echo "b2d0c924e56b3f9e5837774d68b0c67461b8633035d93ca18b1a8e3e5ead15fa  intel-opencl-icd_${CR_VER}_amd64.deb"; \
+        echo "12b8254e6d3415c32cee9cd13943030b991d91212445c79fe1cc27176a72eca4  libze-intel-gpu1_${CR_VER}_amd64.deb"; \
+        echo "8af9dc06d9684a20a3f43754fe109968fba2ba085cfa572a4cc6ef0272f9bcd1  libze1_${LZ_VER}_amd64.deb"; \
+    } > SHA256SUMS \
+    && sha256sum -c SHA256SUMS \
     && apt-get install -y ./*.deb \
     && cd / && rm -rf "$tmp" \
     && apt-get purge -y curl && apt-get autoremove -y && rm -rf /var/lib/apt/lists/*
