@@ -107,31 +107,39 @@ func (e *Embedder) SetPollInterval(d time.Duration) { e.pollInterval = d }
 // face detection backlog accumulated while ML was down.
 func (e *Embedder) SetOnRecovered(fn func(context.Context)) { e.onRecovered = fn }
 
-// queryMissing lists the file paths of assets that are status='indexed' but
-// have no row in asset_clip_idx.
-func (e *Embedder) queryMissing(ctx context.Context) ([]string, error) {
+// clipTarget is one CLIP backfill candidate.
+type clipTarget struct {
+	id   string
+	path string
+}
+
+// queryMissing lists the assets that are status='indexed' but have no row in
+// asset_clip_idx, excluding any currently in cooldown after a prior failure.
+func (e *Embedder) queryMissing(ctx context.Context, now time.Time) ([]clipTarget, error) {
 	// a.offline=0: an asset on a currently-unplugged removable drive can't be
 	// read, so retrying it here would just burn CPU on a guaranteed failure
 	// every poll interval. MountGuard re-triggers Backfill right after the
 	// drive is reinserted, so the gap is closed the moment the file is
 	// reachable again.
-	rows, err := e.db.QueryContext(ctx, `
-        SELECT a.file_path FROM assets a
+	q := `
+        SELECT a.id, a.file_path FROM assets a
         LEFT JOIN asset_clip_idx i ON i.asset_id = a.id
-        WHERE a.status = 'indexed' AND a.offline = 0 AND i.asset_id IS NULL`)
+        WHERE a.status = 'indexed' AND a.offline = 0 AND i.asset_id IS NULL` +
+		backfillCooldownSQL("a")
+	rows, err := e.db.QueryContext(ctx, q, string(backfillCLIP), now.UnixMilli())
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var paths []string
+	var out []clipTarget
 	for rows.Next() {
-		var p string
-		if err := rows.Scan(&p); err != nil {
+		var tg clipTarget
+		if err := rows.Scan(&tg.id, &tg.path); err != nil {
 			return nil, err
 		}
-		paths = append(paths, p)
+		out = append(out, tg)
 	}
-	return paths, rows.Err()
+	return out, rows.Err()
 }
 
 // hasEmbeddingForPath looks up whether the given path already has a row in
@@ -174,20 +182,34 @@ func (e *Embedder) Backfill(ctx context.Context) error {
 	}
 }
 
+// embedOne fills one asset's CLIP vector, preferring the thumbnail path.
+// When the thumb is present the original file is never opened; the full
+// ForceReprocess pipeline is only the fallback for assets without a thumb.
+// A light-path ML error does not fall through to ForceReprocess — that
+// would re-issue the same doomed ML call after reading gigabytes more.
+func (e *Embedder) embedOne(tg clipTarget) bool {
+	if hasSmallThumb(e.indexer.thumbDir, tg.id) {
+		_ = e.indexer.embedClip(tg.id, nil)
+		return e.hasEmbeddingForPath(tg.path)
+	}
+	e.indexer.ForceReprocess(tg.path, processOpts{force: true, skipExif: true, skipThumb: true})
+	return e.hasEmbeddingForPath(tg.path)
+}
+
 // backfillOnce is Backfill's single-pass body (query targets + backfill each
 // one + report task progress), without the concurrency guard or rerun loop.
 func (e *Embedder) backfillOnce(ctx context.Context) error {
-	paths, err := e.queryMissing(ctx)
+	targets, err := e.queryMissing(ctx, time.Now())
 	if err != nil {
 		return err
 	}
-	if len(paths) == 0 {
+	if len(targets) == 0 {
 		return nil
 	}
 
 	taskID := fmt.Sprintf("embedding_%d", time.Now().UnixNano())
 	started := time.Now()
-	total := int64(len(paths))
+	total := int64(len(targets))
 	pubRunning := func(processed int64) {
 		e.reg.Upsert(Task{
 			ID:        taskID,
@@ -203,18 +225,33 @@ func (e *Embedder) backfillOnce(ctx context.Context) error {
 	pubRunning(0)
 
 	var processed, success, failed int64
-	for _, p := range paths {
+	type failedTarget struct {
+		tg clipTarget
+	}
+	var failures []failedTarget
+	for _, tg := range targets {
 		if ctx.Err() != nil {
 			break
 		}
-		e.indexer.ForceReprocess(p, processOpts{force: true, skipExif: true, skipThumb: true})
-		processed++
-		if e.hasEmbeddingForPath(p) {
+		if e.embedOne(tg) {
 			success++
+			clearBackfillFailure(e.db, backfillCLIP, tg.id)
 		} else {
 			failed++
+			failures = append(failures, failedTarget{tg: tg})
 		}
+		processed++
 		pubRunning(processed)
+	}
+	// Environmental guard: an all-failed pass means the ML backend itself is
+	// down (same condition as TaskErrMLLostDuringBackfill below) — recording
+	// per-asset failures would walk healthy assets up the cooldown ladder.
+	if success > 0 || failed == 0 {
+		now := time.Now()
+		for _, f := range failures {
+			recordBackfillFailure(e.db, backfillCLIP, f.tg.id, now,
+				fmt.Errorf("clip backfill produced no embedding"))
+		}
 	}
 
 	// If ctx is already cancelled (user cancellation or service shutdown),

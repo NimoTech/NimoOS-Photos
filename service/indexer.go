@@ -1312,6 +1312,14 @@ func (ix *Indexer) embedClip(assetID string, fallback []byte) error {
 	return ix.writeClipEmbedding(assetID, vec)
 }
 
+// hasSmallThumb reports whether the display thumbnail exists for assetID —
+// the cheap backfill path reads it instead of re-reading (and re-hashing)
+// the potentially multi-GB original.
+func hasSmallThumb(thumbDir, assetID string) bool {
+	fi, err := os.Stat(filepath.Join(thumbDir, assetID, "small.jpg"))
+	return err == nil && fi.Size() > 0
+}
+
 // minOCRScore is the recognition-confidence floor below which OCR lines are
 // discarded as noise before being stored.
 const minOCRScore = 0.5
