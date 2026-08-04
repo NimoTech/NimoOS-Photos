@@ -115,6 +115,36 @@ def test_unload_idle_triggers_malloc_trim(tmp_path, monkeypatch):
     assert calls == [1]
 
 
+def test_sweeper_survives_unload_idle_exception(tmp_path, monkeypatch):
+    """A single bad sweep must not kill the daemon thread -- TTL eviction
+    should keep ticking on subsequent polls instead of silently dying."""
+    reg = ModelRegistry(cache_dir=tmp_path, ttl_s=0,   # idle immediately on the next tick
+                         factories={"clip_visual": (Dummy, "clip/{name}")},
+                         providers=["CPUExecutionProvider"])
+    Dummy.loads = 0
+    reg.get("clip_visual", "m")
+
+    real_unload_idle = reg.unload_idle
+    calls = {"n": 0}
+
+    def flaky_unload_idle(now):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("boom: simulated sweep failure")
+        return real_unload_idle(now)
+
+    monkeypatch.setattr(reg, "unload_idle", flaky_unload_idle)
+
+    reg.start_sweeper(poll_s=0.05)
+    deadline = time.monotonic() + 3.0
+    while calls["n"] < 2 and time.monotonic() < deadline:
+        time.sleep(0.05)
+
+    assert calls["n"] >= 2, "sweeper loop died after the first exception instead of retrying"
+    assert reg._entries["clip_visual:m"].model is None, \
+        "a later successful sweep should still have unloaded the idle model"
+
+
 def test_lazy_backend_different_calls_can_bind_different_models(tmp_path):
     reg = ModelRegistry(cache_dir=tmp_path, ttl_s=300,
                          factories={"clip_visual": (Dummy, "clip/{name}")},

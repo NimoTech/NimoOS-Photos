@@ -7,11 +7,14 @@ caller's (thread-pool) thread; the event loop and /ping are never blocked.
 """
 import ctypes
 import gc
+import logging
 import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
+
+_logger = logging.getLogger(__name__)
 
 
 def _release_freed_memory() -> None:
@@ -81,7 +84,19 @@ class ModelRegistry:
         def loop() -> None:
             while True:
                 time.sleep(poll_s)
-                self.unload_idle(time.monotonic())
+                try:
+                    self.unload_idle(time.monotonic())
+                except Exception:
+                    # A single bad sweep (e.g. a factory/eviction bug, or
+                    # _release_freed_memory hitting something unexpected)
+                    # must never kill this daemon thread -- there is no
+                    # supervisor to restart it, so an uncaught exception
+                    # here would silently disable TTL eviction forever,
+                    # which is exactly the kind of slow-drift OOM this
+                    # project has been bitten by before. Log and keep
+                    # ticking; the next poll_s cycle tries again.
+                    _logger.warning("ttl-sweeper: unload_idle failed; will retry next tick",
+                                     exc_info=True)
         threading.Thread(target=loop, daemon=True, name="ttl-sweeper").start()
 
 
