@@ -84,7 +84,7 @@ func TestEmbedder_QueryMissingOCRExcludesOffline(t *testing.T) {
 	require.NoError(t, err)
 
 	e := NewEmbedder(db, &mockML{}, nil, nil)
-	targets, err := e.queryMissingOCR(context.Background())
+	targets, err := e.queryMissingOCR(context.Background(), time.Now())
 	require.NoError(t, err)
 	ids := map[string]bool{}
 	for _, tg := range targets {
@@ -113,7 +113,7 @@ func TestQueryMissingOCRIncludesLegacyBoxless(t *testing.T) {
 	require.NoError(t, err)
 
 	e := NewEmbedder(db, &mockML{}, nil, nil)
-	targets, err := e.queryMissingOCR(context.Background())
+	targets, err := e.queryMissingOCR(context.Background(), time.Now())
 	require.NoError(t, err)
 
 	ids := make([]string, 0, len(targets))
@@ -134,7 +134,7 @@ func TestVideoOCRExcludedAndPruned(t *testing.T) {
 	require.NoError(t, err)
 
 	e := NewEmbedder(db, &mockML{}, nil, nil)
-	targets, err := e.queryMissingOCR(context.Background())
+	targets, err := e.queryMissingOCR(context.Background(), time.Now())
 	require.NoError(t, err)
 	ids := map[string]bool{}
 	for _, tg := range targets {

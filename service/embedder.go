@@ -297,16 +297,18 @@ func (e *Embedder) backfillOnce(ctx context.Context) error {
 // needs a rerun to fill it in), or boxes_ver=0 (an older run didn't store
 // per-line coordinates into asset_ocr_lines, needs a rerun for search-hit
 // highlighting).
-func (e *Embedder) queryMissingOCR(ctx context.Context) ([]ocrTarget, error) {
+func (e *Embedder) queryMissingOCR(ctx context.Context, now time.Time) ([]ocrTarget, error) {
 	// a.offline=0: same reasoning as queryMissing above — skip assets whose
 	// source is unreachable because their removable drive is unplugged.
-	rows, err := e.db.QueryContext(ctx, `
+	q := `
         SELECT a.id, a.file_path, COALESCE(a.mime_type,'') LIKE 'video/%'
         FROM assets a
         LEFT JOIN asset_ocr o ON o.asset_id = a.id
         WHERE a.status = 'indexed' AND a.deleted_at IS NULL AND a.offline = 0
           AND COALESCE(a.mime_type,'') NOT LIKE 'video/%'
-          AND (o.asset_id IS NULL OR o.coverage IS NULL OR COALESCE(o.boxes_ver,0) = 0)`)
+          AND (o.asset_id IS NULL OR o.coverage IS NULL OR COALESCE(o.boxes_ver,0) = 0)` +
+		backfillCooldownSQL("a")
+	rows, err := e.db.QueryContext(ctx, q, string(backfillOCR), now.UnixMilli())
 	if err != nil {
 		return nil, err
 	}
@@ -355,7 +357,7 @@ func (e *Embedder) BackfillOCR(ctx context.Context) error {
 // backfillOCROnce is BackfillOCR's single-pass body, without the concurrency
 // guard or rerun loop.
 func (e *Embedder) backfillOCROnce(ctx context.Context) error {
-	targets, err := e.queryMissingOCR(ctx)
+	targets, err := e.queryMissingOCR(ctx, time.Now())
 	if err != nil {
 		return err
 	}
@@ -380,10 +382,20 @@ func (e *Embedder) backfillOCROnce(ctx context.Context) error {
 	}
 	pubRunning(0)
 
+	// passFailures/passSuccess are captured by pass below and reset at the
+	// start of every call, so only the LAST call's results (the built-in
+	// ML-cold-start retry re-runs pass once) ever reach the ledger
+	// write-back after this function's final pass — see the retry block and
+	// the write-back below.
+	var passFailures map[string]error
+	var passSuccess []string
+
 	// pass runs through the given targets once, returning
 	// processed/failed counts (readFail = source file unreadable, ocrFail =
 	// ML call failed).
 	pass := func(ts []ocrTarget) (processed, failed, readFail, ocrFail int64) {
+		passFailures = map[string]error{}
+		passSuccess = nil
 		for _, t := range ts {
 			if ctx.Err() != nil {
 				break
@@ -395,10 +407,17 @@ func (e *Embedder) backfillOCROnce(ctx context.Context) error {
 			data, rerr := os.ReadFile(src)
 			if rerr != nil || len(data) == 0 {
 				// The original/thumbnail is unreadable (file deleted,
-				// thumbnail missing, etc.), unrelated to ML.
+				// thumbnail missing, etc.), unrelated to ML. Recorded in the
+				// ledger too: a corrupt/missing source is exactly what the
+				// cooldown exists to stop re-reading every pass.
 				readFail++
 				failed++
 				processed++
+				cause := rerr
+				if cause == nil {
+					cause = fmt.Errorf("source file empty: %s", src)
+				}
+				passFailures[t.id] = cause
 				pubRunning(processed)
 				continue
 			}
@@ -415,6 +434,7 @@ func (e *Embedder) backfillOCROnce(ctx context.Context) error {
 					readFail++
 					failed++
 					processed++
+					passFailures[t.id] = fmt.Errorf("oversized image with no thumbnail fallback available")
 					pubRunning(processed)
 					continue
 				}
@@ -422,8 +442,12 @@ func (e *Embedder) backfillOCROnce(ctx context.Context) error {
 			if oerr := e.indexer.ocrAsset(t.id, data); oerr != nil {
 				ocrFail++
 				failed++
-			} else if derr := e.indexer.computeDocVerdict(t.id); derr != nil {
-				zap.L().Warn("doc verdict after ocr backfill failed", zap.String("asset_id", t.id), zap.Error(derr))
+				passFailures[t.id] = oerr
+			} else {
+				if derr := e.indexer.computeDocVerdict(t.id); derr != nil {
+					zap.L().Warn("doc verdict after ocr backfill failed", zap.String("asset_id", t.id), zap.Error(derr))
+				}
+				passSuccess = append(passSuccess, t.id)
 			}
 			processed++
 			pubRunning(processed)
@@ -446,7 +470,7 @@ func (e *Embedder) backfillOCROnce(ctx context.Context) error {
 			return ctx.Err()
 		case <-time.After(ocrBackfillRetryDelay):
 		}
-		if ts2, qerr := e.queryMissingOCR(ctx); qerr == nil && len(ts2) > 0 {
+		if ts2, qerr := e.queryMissingOCR(ctx, time.Now()); qerr == nil && len(ts2) > 0 {
 			total = int64(len(ts2))
 			pubRunning(0)
 			processed, failed, readFail, ocrFail = pass(ts2)
@@ -455,6 +479,18 @@ func (e *Embedder) backfillOCROnce(ctx context.Context) error {
 
 	if ctx.Err() != nil {
 		return ctx.Err()
+	}
+
+	// Ledger write-back from the FINAL pass only; skip entirely when the
+	// pass is classified as ML-down (all processed failed via ocrFail).
+	if !(processed > 0 && failed == processed && ocrFail > 0) {
+		now := time.Now()
+		for id, cause := range passFailures {
+			recordBackfillFailure(e.db, backfillOCR, id, now, cause)
+		}
+	}
+	for _, id := range passSuccess {
+		clearBackfillFailure(e.db, backfillOCR, id)
 	}
 
 	final := Task{

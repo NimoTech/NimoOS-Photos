@@ -234,3 +234,65 @@ func TestBackfill_ThumbPathMLErrorDoesNotFallThroughToSource(t *testing.T) {
 	require.Equal(t, origChecksum, checksumAfter,
 		"checksum must stay untouched — ForceReprocess (the only code path that rewrites it) must never run when a thumb is present")
 }
+
+func TestQueryMissingOCR_SkipsAssetsInCooldown(t *testing.T) {
+	db := makeTestDB(t)
+	hot := insertAsset(t, db, "/hot.jpg", "indexed")
+	cold := insertAsset(t, db, "/cold.jpg", "indexed")
+	_ = hot
+	now := time.Now()
+	recordBackfillFailure(db, backfillOCR, cold, now, errAssert("x"))
+
+	e := NewEmbedder(db, &mockML{}, nil, NewTaskRegistry(nil))
+	ts, err := e.queryMissingOCR(context.Background(), now)
+	require.NoError(t, err)
+	require.Len(t, ts, 1)
+	ts, err = e.queryMissingOCR(context.Background(), now.Add(6*time.Minute))
+	require.NoError(t, err)
+	require.Len(t, ts, 2)
+}
+
+// OCR failure is recorded once from the FINAL pass only (the built-in
+// cold-start retry runs the pass twice); the next round skips the asset.
+// Needs one succeeding asset so the pass isn't classified as ML-down.
+func TestBackfillOCR_RecordsFailureThenSkipsNextRound(t *testing.T) {
+	prev := ocrBackfillRetryDelay
+	ocrBackfillRetryDelay = time.Millisecond
+	t.Cleanup(func() { ocrBackfillRetryDelay = prev })
+
+	db := makeTestDB(t)
+	tmp := t.TempDir()
+	good := makeUniqueJPEG(t, tmp, 1)
+	insertAsset(t, db, good, "indexed")
+	bad := filepath.Join(tmp, "bad.jpg")
+	require.NoError(t, os.WriteFile(bad, []byte("not a jpeg"), 0o644))
+	badID := insertAsset(t, db, bad, "indexed")
+	thumbDir := filepath.Join(tmp, "thumbs")
+
+	ml := &decodingML{}
+	ix := NewIndexer(db, ml, thumbDir, 1)
+	e := NewEmbedder(db, ml, ix, NewTaskRegistry(nil))
+	require.NoError(t, e.BackfillOCR(context.Background()))
+	n, _ := readBackfillFailure(t, db, backfillOCR, badID)
+	require.Equal(t, 1, n)
+
+	before := ml.ocrCalls.Load()
+	require.NoError(t, e.BackfillOCR(context.Background()))
+	require.Equal(t, before, ml.ocrCalls.Load())
+}
+
+func TestBackfillOCR_ClearsFailureAfterSuccess(t *testing.T) {
+	db := makeTestDB(t)
+	tmp := t.TempDir()
+	src := makeTestJPEG(t, tmp)
+	id := insertAsset(t, db, src, "indexed")
+	thumbDir := filepath.Join(tmp, "thumbs")
+	recordBackfillFailure(db, backfillOCR, id, time.Now().Add(-48*time.Hour), errAssert("stale"))
+
+	ml := &countingML{}
+	ix := NewIndexer(db, ml, thumbDir, 1)
+	e := NewEmbedder(db, ml, ix, NewTaskRegistry(nil))
+	require.NoError(t, e.BackfillOCR(context.Background()))
+	n, _ := readBackfillFailure(t, db, backfillOCR, id)
+	require.Zero(t, n)
+}
