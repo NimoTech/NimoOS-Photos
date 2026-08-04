@@ -28,6 +28,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from server.ocrmodel import OcrPipeline
+from server.providers import resolve_providers
 
 CACHE_FILE = Path(__file__).resolve().parent / "report_ocr_cache.json"
 GO_MIN_SCORE = 0.5  # mlclient's own textScore floor, see module docstring
@@ -42,6 +43,7 @@ def main() -> None:
     ap.add_argument("dataset")
     ap.add_argument("cache")
     ap.add_argument("--refresh", action="store_true", help="ignore per-image result cache")
+    ap.add_argument("--device", default="cpu", help="cpu|auto|gpu|gpu.N (default: cpu)")
     args = ap.parse_args()
 
     ds, mlcache = Path(args.dataset), Path(args.cache)
@@ -63,7 +65,14 @@ def main() -> None:
 
         if digest not in our_cache:
             if op is None:
-                op = OcrPipeline(mlcache / "ocr" / "PP-OCRv5_server", ["CPUExecutionProvider"])
+                providers = resolve_providers(args.device, mlcache)
+                print(f"device={args.device} providers={providers}")
+                op = OcrPipeline(mlcache / "ocr" / "PP-OCRv5_server", providers)
+                # rapidocr's TextDetector/TextRecognizer.session is an
+                # OrtInferSession wrapper; the raw ORT session (and its
+                # get_providers()) is one level deeper at .session.session.
+                print(f"det session providers: {op.det.session.session.get_providers()}")
+                print(f"rec session providers: {op.rec.session.session.get_providers()}")
             data = (ds / rec["file"]).read_bytes()
             our_cache[digest] = op.run(data)
             if total % 20 == 0:

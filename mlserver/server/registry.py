@@ -100,17 +100,6 @@ class ModelRegistry:
         threading.Thread(target=loop, daemon=True, name="ttl-sweeper").start()
 
 
-def default_providers(device: str) -> list[str]:
-    """Placeholder device -> ONNX Runtime providers mapping.
-
-    Always returns CPUExecutionProvider for now; Task 7 replaces this with
-    real device selection (CUDA/OpenVINO/etc based on `device`). Kept as a
-    standalone function so the registry's `providers` constructor argument
-    stays a real seam rather than a dead parameter.
-    """
-    return ["CPUExecutionProvider"]
-
-
 class LazyBackend:
     """Duck-type proxy standing in for a concrete backend (ClipVisual,
     FacePipeline, ...) behind a ModelRegistry.

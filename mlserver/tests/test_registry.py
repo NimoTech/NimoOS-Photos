@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from server.registry import LazyBackend, ModelRegistry, default_providers
+from server.registry import LazyBackend, ModelRegistry
 
 
 class Dummy:
@@ -62,11 +62,6 @@ def test_distinct_model_names_load_distinct_entries(tmp_path):
     assert Dummy.loads == 2
     assert a is a_again
     assert a is not b
-
-
-def test_default_providers_is_cpu_placeholder():
-    assert default_providers("auto") == ["CPUExecutionProvider"]
-    assert default_providers("gpu.0") == ["CPUExecutionProvider"]
 
 
 def test_lazy_backend_requires_with_model_before_use(tmp_path):

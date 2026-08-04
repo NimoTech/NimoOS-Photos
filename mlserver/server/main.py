@@ -15,7 +15,8 @@ from .clipmodel import ClipTextual, ClipVisual
 from .config import settings
 from .facemodel import FacePipeline
 from .ocrmodel import OcrPipeline
-from .registry import LazyBackend, ModelRegistry, default_providers
+from .providers import resolve_providers
+from .registry import LazyBackend, ModelRegistry
 
 _FACTORIES: dict[str, tuple[Any, str]] = {
     "clip_visual": (ClipVisual, "clip/{name}"),
@@ -33,7 +34,7 @@ def _build_default_backends() -> tuple[dict[str, Any], ModelRegistry]:
         cache_dir=settings.cache_dir,
         ttl_s=settings.model_ttl_s,
         factories=_FACTORIES,
-        providers=default_providers(settings.device),
+        providers=resolve_providers(settings.device, settings.cache_dir),
     )
     registry.start_sweeper(settings.ttl_poll_s)
     backends = {kind: LazyBackend(registry, kind) for kind in _FACTORIES}

@@ -9,6 +9,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from server.clipmodel import ClipTextual, ClipVisual
+from server.providers import resolve_providers
 
 
 def parse_vec(raw) -> np.ndarray:
@@ -18,11 +19,18 @@ def parse_vec(raw) -> np.ndarray:
 
 
 def main() -> None:
-    ds, cache = Path(sys.argv[1]), Path(sys.argv[2])  # dataset/, ml-cache root
+    # dataset/, ml-cache root, optional device (cpu|auto|gpu|gpu.N, default cpu
+    # -- matches every prior CPU-only golden run's behavior unchanged).
+    ds, cache = Path(sys.argv[1]), Path(sys.argv[2])
+    device = sys.argv[3] if len(sys.argv) > 3 else "cpu"
     base = json.load(gzip.open(Path(__file__).resolve().parent / "baseline.json.gz", "rt"))
     mdir = cache / "clip" / "ViT-SO400M-16-SigLIP2-384__webli"
-    vis = ClipVisual(mdir, ["CPUExecutionProvider"])
-    txt = ClipTextual(mdir, ["CPUExecutionProvider"])
+    providers = resolve_providers(device, cache)
+    print(f"device={device} providers={providers}")
+    vis = ClipVisual(mdir, providers)
+    txt = ClipTextual(mdir, providers)
+    print(f"visual session providers: {vis.session.get_providers()}")
+    print(f"textual session providers: {txt.session.get_providers()}")
     cos_i = [float(np.dot(parse_vec(rec["clip"]["clip"]),
                           np.asarray(vis.embed_image((ds / rec["file"]).read_bytes()))))
              for rec in base["images"].values()]

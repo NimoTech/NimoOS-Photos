@@ -18,6 +18,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from server.facemodel import FacePipeline
+from server.providers import resolve_providers
 
 CACHE_FILE = Path(__file__).resolve().parent / "report_faces_cache.json"
 
@@ -71,6 +72,7 @@ def main() -> None:
     ap.add_argument("dataset")
     ap.add_argument("cache")
     ap.add_argument("--refresh", action="store_true", help="ignore per-image result cache")
+    ap.add_argument("--device", default="cpu", help="cpu|auto|gpu|gpu.N (default: cpu)")
     args = ap.parse_args()
 
     ds, mlcache = Path(args.dataset), Path(args.cache)
@@ -94,7 +96,11 @@ def main() -> None:
         if digest not in our_cache:
             if fp is None:
                 mdir = mlcache / "facial-recognition" / "antelopev2"
-                fp = FacePipeline(mdir, ["CPUExecutionProvider"])
+                providers = resolve_providers(args.device, mlcache)
+                print(f"device={args.device} providers={providers}")
+                fp = FacePipeline(mdir, providers)
+                print(f"det session providers: {fp.det.session.get_providers()}")
+                print(f"rec session providers: {fp.rec.session.get_providers()}")
             data = (ds / rec["file"]).read_bytes()
             our_cache[digest] = fp.detect(data)
             # periodically flush so a crash mid-run doesn't lose progress

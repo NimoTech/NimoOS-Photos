@@ -43,12 +43,26 @@ independent implementation against rapidocr's public API):
    `providers=[...]` list, same `nproc`/thread defaults as the
    container) reproduced the *exact* same golden mismatches, byte for
    byte, on the full 207-image set -- so it was tested and ruled out,
-   not confirmed. `_build_session`'s custom-session injection (the
-   same "support custom session" extension point rapidocr's
-   `OrtInferSession` exposes, and the one immich itself uses) is kept
-   regardless: it makes the `providers` constructor argument a real,
-   respected choice for whoever wires up device selection in T7,
-   instead of the dead parameter the brief's skeleton left it as.
+   not confirmed, as a *fix* for the gap. `_build_session`'s
+   custom-session injection (the same "support custom session"
+   extension point rapidocr's `OrtInferSession` exposes, and the one
+   immich itself uses) is kept regardless: it makes the `providers`
+   constructor argument a real, respected choice for whoever wires up
+   device selection.
+
+   T7 update: with real device selection wired in (`server/providers.py`),
+   `resolve_providers("auto", ...)` hands this module a (name, options)
+   *tuple* for the OpenVINO entry, not a bare string -- `_build_session`'s
+   original availability filter (`p in available_providers_set`) raised
+   `TypeError: unhashable type: 'dict'` on that tuple; fixed by comparing
+   provider *names* only (`_provider_name` below). Once fixed, OCR's
+   det+rec sessions DO run on `OpenVINOExecutionProvider` under
+   `MLSERVER_DEVICE=auto`/`gpu*`, and the full 207-image golden re-run on
+   the GPU path reproduced the exact same 197/207 (95.17%) result, same
+   mismatched images, same recognized text -- i.e. still neutral, this
+   time confirmed on our own GPU rather than just immich's, so OCR is NOT
+   pinned to CPU: it rides whatever `providers` the registry hands every
+   pipeline.
 
 4. Bisecting the pipeline (dump detection boxes+scores in isolation,
    greedily IoU-pair them against a live immich-ml re-query, THEN
@@ -121,10 +135,11 @@ REC_MIN_SCORE = 0.9
 # 1/(0.5*255), i.e. norm = (px - 0.5) / 127.5.
 _NORM_MEAN = 0.5
 _NORM_STD_INV = 1.0 / (0.5 * 255.0)
-# Plain CPU by default -- OpenVINOExecutionProvider was tried and ruled
-# out as a fix for the golden-gate gap (see module docstring point 3);
-# device selection proper is T7's job. `providers` remains a real,
-# respected constructor argument via _build_session below.
+# Fallback only -- used when the caller passes no providers at all (e.g.
+# direct instantiation outside the registry). The registry always passes
+# resolve_providers(settings.device, ...), which for "auto"/"gpu"/"gpu.N"
+# includes the OpenVINO EP; see module docstring point 3's T7 update for
+# why that's safe (byte-identical golden result to CPU on this pipeline).
 _PREFERRED_PROVIDERS = ["CPUExecutionProvider"]
 
 _DEFAULT_CFG_PATH = Path(rapidocr.__file__).resolve().parent / "config.yaml"
@@ -160,9 +175,18 @@ def _det_input_tensor(img: np.ndarray) -> np.ndarray:
     return np.expand_dims(x, axis=0)
 
 
+def _provider_name(entry) -> str:
+    """A providers-list entry is either a bare name ("CPUExecutionProvider")
+    or a (name, options_dict) tuple (e.g. resolve_providers' OpenVINO
+    entry) -- extract just the name for availability filtering below.
+    Needed because a (name, dict) tuple is unhashable, so `entry in
+    available_set` raises TypeError instead of just being False."""
+    return entry[0] if isinstance(entry, tuple) else entry
+
+
 def _build_session(model_path: Path, providers: list) -> ort.InferenceSession:
     available = set(ort.get_available_providers())
-    chosen = [p for p in providers if p in available] or ["CPUExecutionProvider"]
+    chosen = [p for p in providers if _provider_name(p) in available] or ["CPUExecutionProvider"]
     return ort.InferenceSession(str(model_path), providers=chosen)
 
 
