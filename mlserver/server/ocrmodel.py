@@ -50,17 +50,41 @@ independent implementation against rapidocr's public API):
    respected choice for whoever wires up device selection in T7,
    instead of the dead parameter the brief's skeleton left it as.
 
-The remaining gap after exhausting the above (measured at 90.82% exact
-match on the golden set, see compare_ocr.py's output in the Task 5
-report) is, as far as this investigation could pin down, residual
-floating-point sensitivity in the recognition network: every single
-non-exact image was individually confirmed (including by re-querying
-the *live* immich-ml container with `minScore` overridden to 0 to see
-its raw, unfiltered scores) to be the same underlying text, correctly
-located and correctly read in substance, with a confidence score
-landing a few thousandths on one side or the other of the hard 0.9
-cutoff in point 2 -- never a dropped, hallucinated, or structurally
-misread line.
+4. Bisecting the pipeline (dump detection boxes+scores in isolation,
+   greedily IoU-pair them against a live immich-ml re-query, THEN
+   compare recognized text/score per matched box) showed detection was
+   already bit-for-bit exact -- IoU 1.0000 on every single matched box
+   across every mismatching image, same box count -- so 100% of the
+   golden-gate gap lived in recognition. immich's `TextRecognizer`
+   wrapper (`immich_ml/models/ocr/recognition.py`) does NOT crop lines
+   via rapidocr's public `get_rotate_crop_image` (cv2 `warpPerspective`,
+   `BORDER_REPLICATE`, `INTER_CUBIC`); it solves its own homography
+   (`_get_perspective_transform`, an SVD null-space solve) and samples
+   via PIL's `Image.transform(..., PERSPECTIVE, resample=BICUBIC)`
+   instead. `_crop_line` below is an independent implementation of the
+   same standard homography-crop math (`cv2.getPerspectiveTransform`'s
+   direct 4-point linear solve exactly agrees with an SVD null-space
+   solve for an exactly-determined 4-point system) feeding the same
+   PIL `PERSPECTIVE`/`BICUBIC` sampling step, rather than a copy of
+   immich's AGPL code. Swapping from rapidocr's crop to this one raised
+   the golden exact-match rate from 90.82% to 95.17% (188/207 ->
+   197/207) on the full 207-image set -- crossing the >=95% gate.
+
+The remaining ~5% gap (10/207 images) was individually confirmed, the
+same way as before, to be the same class of benign near-0.9-cutoff
+confidence noise on already-hard-to-read text/punctuation (e.g. a
+single dropped bank-slogan line, "Suite 322" vs "Suite322" spacing on a
+synthetic invoice) -- never a dropped, hallucinated, or word-level
+misread line. A further hypothesis (rapidocr/immich's recognizer
+batches crops `rec_batch_num` at a time, sorted and padded to the
+batch's max aspect ratio -- if batch *membership* differed, per-crop
+padding width would differ and could explain residual score drift) was
+tested directly: forcing batch size 1 on the two remaining
+Chinese-bank-photo mismatches changed several *other* lines' scores
+and even recognized text (proving batching does have a real, measurable
+effect in general), but left the two specific borderline lines
+responsible for those images' mismatch completely unchanged -- so
+batch composition was ruled out as the explanation for what's left.
 
 Contract quirks required by pkg/mlclient (per T2's duck-type contract):
 - box is a FLAT float array, 8 values per line, normalized to [0,1]
@@ -76,6 +100,7 @@ Contract quirks required by pkg/mlclient (per T2's duck-type contract):
 from io import BytesIO
 from pathlib import Path
 
+import cv2
 import numpy as np
 import onnxruntime as ort
 import rapidocr
@@ -83,7 +108,6 @@ from PIL import Image
 from rapidocr.ch_ppocr_det import TextDetector
 from rapidocr.ch_ppocr_rec import TextRecInput, TextRecognizer
 from rapidocr.utils.parse_parameters import ParseParams
-from rapidocr.utils.process_img import get_rotate_crop_image
 
 # immich TextDetector.max_resolution -- shorter side is scaled up to at
 # most this many pixels, but never upscaled past the original size.
@@ -142,6 +166,45 @@ def _build_session(model_path: Path, providers: list) -> ort.InferenceSession:
     return ort.InferenceSession(str(model_path), providers=chosen)
 
 
+def _crop_line(img: np.ndarray, box: np.ndarray) -> np.ndarray:
+    """Perspective-crop one detected text line out of the full image.
+
+    immich's own recognition wrapper does NOT use rapidocr's public
+    `get_rotate_crop_image` (cv2 warpPerspective, BORDER_REPLICATE,
+    INTER_CUBIC) -- it solves its own homography and samples via PIL's
+    `Image.transform(..., PERSPECTIVE, resample=BICUBIC)` instead (read
+    from the cached immich-ml image for behavior only; this is an
+    independent implementation of the same standard homography-crop
+    algorithm, using cv2.getPerspectiveTransform's direct 4-point
+    linear solve rather than immich's SVD -- both solve the same exactly-
+    determined system and agree up to floating point precision). Swapping
+    to this crop path (identical target width/height and the same
+    height/width>=1.5 -> rotate-90 rule) closed most of the golden-gate
+    gap (see module docstring point 4): rapidocr's cv2-based crop was
+    producing slightly different pixels than immich's PIL-based one on
+    the exact same box coordinates, which is what fed slightly
+    different pixels into the recognizer.
+    """
+    pts = box.astype(np.float32)
+    crop_w = int(max(np.linalg.norm(pts[0] - pts[1]), np.linalg.norm(pts[2] - pts[3])))
+    crop_h = int(max(np.linalg.norm(pts[0] - pts[3]), np.linalg.norm(pts[1] - pts[2])))
+    crop_w, crop_h = max(crop_w, 1), max(crop_h, 1)
+    std_rect = np.array([[0, 0], [crop_w, 0], [crop_w, crop_h], [0, crop_h]], dtype=np.float32)
+    # Homography mapping the standard output rectangle -> the box's
+    # quad in the original image -- exactly the output-to-input
+    # direction PIL's PERSPECTIVE transform data expects.
+    h_mat = cv2.getPerspectiveTransform(std_rect, pts)
+    h_mat = h_mat / h_mat[2, 2]
+    coeffs = tuple(h_mat[:2].reshape(-1)) + tuple(h_mat[2, :2])
+    cropped = Image.fromarray(img).transform(
+        (crop_w, crop_h), Image.Transform.PERSPECTIVE, data=coeffs, resample=Image.Resampling.BICUBIC
+    )
+    arr = np.asarray(cropped)
+    if arr.shape[0] * 1.0 / arr.shape[1] >= 1.5:
+        arr = np.rot90(arr)
+    return np.ascontiguousarray(arr)
+
+
 class OcrPipeline:
     def __init__(self, model_dir: Path, providers: list) -> None:
         # `providers` selects the ONNX Runtime execution provider list
@@ -187,7 +250,7 @@ class OcrPipeline:
             det_boxes, det_scores = self.det.postprocess_op(preds, (h, w))
 
             if len(det_boxes):
-                crops = [get_rotate_crop_image(img, box.astype(np.float32)) for box in det_boxes]
+                crops = [_crop_line(img, box) for box in det_boxes]
                 rec_out = self.rec(TextRecInput(img=crops))
                 for box, box_score, text, text_score in zip(det_boxes, det_scores, rec_out.txts, rec_out.scores):
                     if text_score <= REC_MIN_SCORE:
