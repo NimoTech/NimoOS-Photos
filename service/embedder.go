@@ -91,6 +91,11 @@ type Embedder struct {
 	// between Embedder and FaceService; service.go wires it to
 	// faces.RunPipeline. Safely skipped when nil (not wired up / tests).
 	onRecovered func(context.Context)
+
+	// gate throttles the ML-recovery chain (see runGated). Installed via
+	// SetGate; nil in tests and any caller that never sets one, meaning no
+	// throttling.
+	gate *backfillGate
 }
 
 func NewEmbedder(db *sql.DB, ml MLProvider, idx *Indexer, reg *TaskRegistry) *Embedder {
@@ -101,6 +106,18 @@ func NewEmbedder(db *sql.DB, ml MLProvider, idx *Indexer, reg *TaskRegistry) *Em
 }
 
 func (e *Embedder) SetPollInterval(d time.Duration) { e.pollInterval = d }
+
+// SetGate installs the shared backfill throttle. A nil gate (tests, callers
+// that never SetGate) means no throttling.
+func (e *Embedder) SetGate(g *backfillGate) { e.gate = g }
+
+func (e *Embedder) runGated(fn func()) {
+	if e.gate == nil {
+		fn()
+		return
+	}
+	e.gate.Run("ml-recovery", fn)
+}
 
 // SetOnRecovered injects the callback invoked once at the tail of the ML-ready
 // recovery chain (after Backfill/reembed/BackfillOCR), used to catch up on
@@ -722,7 +739,7 @@ func (e *Embedder) tick(ctx context.Context) {
 	ready := e.ml.IsReady()
 	prev := e.lastReady.Swap(ready)
 	if ready && !prev {
-		go func() {
+		go e.runGated(func() {
 			// Backfill first (fills assets that never got an embedding), then the
 			// one-time re-embed of all existing assets from their thumbnails,
 			// then OCR for assets indexed before OCR support existed, then doc
@@ -741,7 +758,7 @@ func (e *Embedder) tick(ctx context.Context) {
 			if e.onRecovered != nil {
 				e.onRecovered(ctx)
 			}
-		}()
+		})
 	}
 }
 

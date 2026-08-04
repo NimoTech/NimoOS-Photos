@@ -177,6 +177,11 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 	faces.SetThumbDir(thumbDir)           // used by RunPipeline for video keyframe thumbnails
 	rebuilder := NewRebuilder(parentCtx, db, idx, faces, taskReg, cfg.Workers)
 	embedder := NewEmbedder(db, ml, idx, taskReg)
+	// One shared gate throttles the heavy backfill chains; faces/geo/smart
+	// views/moments stay ungated (cheap or already self-limiting). Chain
+	// names are deliberately distinct — see backfillGate's doc comment.
+	backfillGateShared := newBackfillGate(defaultBackfillGateInterval)
+	embedder.SetGate(backfillGateShared)
 	// ML-recovery tail catches up on face detection (covers detection debt
 	// accrued while offline): injected as a function field to avoid Embedder
 	// depending directly on the FaceService type (same injection pattern as MountGuard).
@@ -290,7 +295,7 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 		// fish photos hit a model cold-load window). Catch up at the end of
 		// each batch; CAS+rerunPending already prevent re-entrancy, so both
 		// calls are a fast no-op when there's no debt.
-		go func() {
+		go backfillGateShared.Run("post-batch-backfill", func() {
 			if err := embedder.Backfill(parentCtx); err != nil {
 				zap.L().Warn("post-batch clip backfill failed", zap.Error(err))
 			}
@@ -314,7 +319,7 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 			if _, err := puller.PullOnce(parentCtx); err != nil && !errors.Is(err, parserclient.ErrParserUnavailable) {
 				zap.L().Warn("post-batch caption pull failed", zap.Error(err))
 			}
-		}()
+		})
 		go func() {
 			for {
 				n, err := geoSvc.BackfillPending(500)
@@ -334,9 +339,9 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 		// queued per-item during indexing, so most are ready by the end of
 		// the batch — this round only handles the remaining debt, and total
 		// reflects the true remaining count, exactly what the task bar should show.)
-		go func() {
+		go backfillGateShared.Run("sprite-backfill", func() {
 			idx.BackfillSprites(parentCtx)
-		}()
+		})
 		// Smart Moments tail: recompute moment at the end of a batch (trip
 		// time-window segmentation + theme CLIP/caption hits change as new
 		// assets arrive); CAS prevents re-entrancy against startup catch-up/
