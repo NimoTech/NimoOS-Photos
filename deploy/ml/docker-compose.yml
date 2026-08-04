@@ -1,13 +1,14 @@
 name: nimoos-photos-ml
 
-# Photos AI — the immich-machine-learning backend behind NimoOS Photos
-# (CLIP search + face recognition). Shipped as an OFFLINE bundle: the image is
-# docker-loaded from the tar packaged by script/package-photos-ml.sh, so the
-# device never contacts a registry (frozen version, works on isolated/intranet
-# installs). AppManagement auto-discovers this running stack and, via the labels
-# below, hides it from the user App grid and shows it as "Photos AI".
+# Photos AI — the NimoOS in-house mlserver backend behind NimoOS Photos
+# (CLIP search + face recognition + OCR). Shipped as an OFFLINE bundle: the
+# image is docker-loaded from the tar packaged by script/package-photos-ml.sh,
+# so the device never contacts a registry (frozen version, works on
+# isolated/intranet installs). AppManagement auto-discovers this running
+# stack and, via the labels below, hides it from the user App grid and shows
+# it as "Photos AI".
 services:
-  immich-machine-learning:
+  server:
     image: localhost/nimoos-photos-ml:bundled
     pull_policy: never
     ports:
@@ -21,8 +22,8 @@ services:
     restart: unless-stopped
     # The ML process (SigLIP2/OCR/faces) has repeatedly dragged the whole
     # 31G box into a global OOM in the past; the container needs a hard
-    # ceiling. MODEL_TTL=300 already unloads models when idle, and 8g ensures
-    # multiple co-resident models (CLIP+OCR+faces+translation) aren't killed
+    # ceiling. MLSERVER_TTL=300 already unloads models when idle, and 8g
+    # ensures multiple co-resident models (CLIP+OCR+faces) aren't killed
     # under normal load.
     mem_limit: 8g
     memswap_limit: 8g
@@ -34,23 +35,21 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 300s # aligned with MACHINE_LEARNING_WORKER_TIMEOUT, avoids false unhealthy on a slow cold load
+      start_period: 120s # no gunicorn cold-compile tax here (single uvicorn
+      # process, no worker timeout to race); OpenVINO EP compiles are cached
+      # under /cache/ov-cache across restarts, so only the very first run on a
+      # fresh cache pays the compile cost -- install.sh's readiness poll (up
+      # to 300s) covers that case, this start_period just avoids false
+      # "unhealthy" during ordinary restarts.
     labels:
       nimoos.system: "true"            # hide from the user-facing App grid
       nimoos.display_name: "Photos AI" # friendly name in UI / container stats
       icon: "/img/system-apps/photos.svg"
     environment:
-      MACHINE_LEARNING_WORKERS: "1"
-      # 300s: SigLIP2-SO400M cold load can exceed 120s on slower disks; if
-      # gunicorn kills the worker mid-load it leaves a stuck "port listening,
-      # worker is an empty shell" state (one cause of an actual 1.8-day outage
-      # in 2026-07).
-      MACHINE_LEARNING_WORKER_TIMEOUT: "300"
-      MACHINE_LEARNING_CACHE_FOLDER: "/cache"
-      # Auto-unload models after 5 minutes idle to free memory (nllb-large +
-      # PP-OCRv5_server are memory-hungry when resident).
-      MACHINE_LEARNING_MODEL_TTL: "300"
-      MACHINE_LEARNING_MODEL_TTL_POLL_S: "10"
-      # Model cache is preloaded with the bundle; forbid runtime network calls
-      # to HuggingFace (would hang on offline/intranet machines).
-      HF_HUB_OFFLINE: "1"
+      MLSERVER_CACHE: "/cache"
+      # Auto-unload models after 5 minutes idle to free memory.
+      MLSERVER_TTL: "300"
+      # auto: use OpenVINO GPU EP when an Intel iGPU is present (see
+      # docker-compose.override.yml, installed by install.sh when detected),
+      # fall back to CPU otherwise.
+      MLSERVER_DEVICE: "auto"
