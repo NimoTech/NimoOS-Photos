@@ -42,7 +42,16 @@ func (g *backfillGate) Run(name string, fn func()) {
 		g.chains[name] = c
 	}
 	now := g.now()
-	if !c.lastRun.IsZero() && now.Sub(c.lastRun) < g.min {
+	// A pending trailing timer must force-merge regardless of the wall-clock
+	// gap: c.timer is only cleared inside firePending's critical section,
+	// which also refreshes lastRun in the same section. So observing
+	// c.timer != nil here is strictly ordered before that clear — merging is
+	// always correct. Without this check, a Run racing the timer's fire
+	// could see a stale (pre-refresh) lastRun that already looks outside the
+	// window, take the immediate branch, and run fn concurrently with the
+	// about-to-fire trailing pendingFn — the exact double-run the gate
+	// exists to prevent.
+	if c.timer != nil || (!c.lastRun.IsZero() && now.Sub(c.lastRun) < g.min) {
 		c.pendingFn = fn // merge: keep only the latest
 		if c.timer == nil {
 			c.timer = time.AfterFunc(g.min-now.Sub(c.lastRun), func() { g.firePending(name) })

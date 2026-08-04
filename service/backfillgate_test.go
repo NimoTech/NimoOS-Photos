@@ -1,6 +1,7 @@
 package service
 
 import (
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -53,4 +54,59 @@ func TestBackfillGate_RunsAgainAfterWindowElapsed(t *testing.T) {
 	time.Sleep(80 * time.Millisecond)
 	g.Run("a", func() { ran.Add(1) })
 	require.EqualValues(t, 2, ran.Load())
+}
+
+// TestBackfillGate_NoConcurrentRunsAcrossWindowBoundary reproduces the
+// logic race where a fresh Run(name, fn2) races the trailing timer's
+// firePending goroutine for g.mu right at the window boundary: without the
+// "armed timer forces merge" check, Run can observe a stale (pre-refresh)
+// lastRun that already looks outside the window, take the immediate branch,
+// and run fn concurrently with the about-to-fire trailing pendingFn. This is
+// a pure interleaving/logic race — the data itself (an atomic gauge) is
+// race-detector-clean either way, so -race alone can't catch it; only the
+// concurrent-invocation count can.
+//
+// The exact race is a narrow timing window (the instant now.Sub(lastRun)
+// crosses g.min while firePending's goroutine is separately contending for
+// g.mu), so the stress needs to cross many window boundaries to have a
+// realistic chance of landing in it. An unbounded `select { default: ... }`
+// busy spin against a single mutex was tried first and observed to make
+// forward progress pathologically slowly under -race (goroutines starved on
+// g.mu for minutes) without ever exercising more than one window cycle — not
+// the interleaving under test. Pacing each call with a tiny sleep instead
+// avoids the livelock while still crossing dozens of ~20ms window boundaries
+// per run.
+func TestBackfillGate_NoConcurrentRunsAcrossWindowBoundary(t *testing.T) {
+	g := newBackfillGate(20 * time.Millisecond)
+	var inFlight atomic.Int32
+	var maxInFlight atomic.Int32
+	fn := func() {
+		n := inFlight.Add(1)
+		for {
+			old := maxInFlight.Load()
+			if n <= old || maxInFlight.CompareAndSwap(old, n) {
+				break
+			}
+		}
+		time.Sleep(500 * time.Microsecond) // widen the overlap window so a double-run is observable
+		inFlight.Add(-1)
+	}
+
+	deadline := time.Now().Add(400 * time.Millisecond)
+	const workers = 6
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for time.Now().Before(deadline) {
+				g.Run("a", fn)
+				time.Sleep(50 * time.Microsecond) // pace to avoid a CPU-pinned spin under -race
+			}
+		}()
+	}
+	wg.Wait()
+	time.Sleep(50 * time.Millisecond) // let any remaining trailing timer drain
+
+	require.LessOrEqual(t, maxInFlight.Load(), int32(1), "concurrent invocations of the same chain observed")
 }
