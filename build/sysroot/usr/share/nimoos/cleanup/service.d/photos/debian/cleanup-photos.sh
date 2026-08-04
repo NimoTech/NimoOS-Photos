@@ -48,7 +48,7 @@ fi
 Show 2 "Stopping ${CASA_SERVICE}..."
 systemctl disable --now "${CASA_SERVICE}" || Show 3 "Failed to disable ${CASA_SERVICE}"
 
-# Tear down the Photos AI (immich-machine-learning) system docker app.
+# Tear down the Photos AI (nimoos-photos-ml-server) system docker app.
 if command -v docker >/dev/null 2>&1; then
     Show 2 "Removing Photos AI ML container..."
     docker compose -p "${ML_APP_ID}" -f "${ML_APP_DIR}/docker-compose.yml" down 2>/dev/null || Show 3 "ML compose down failed (non-fatal)."

@@ -22,7 +22,7 @@ const (
 	// unresponsive after 6 minutes is genuinely wedged.
 	mlWatchdogFailLimit = 12
 	mlWatchdogCooldown  = 10 * time.Minute
-	mlContainerName     = "nimoos-photos-ml-immich-machine-learning-1"
+	mlContainerName     = "nimoos-photos-ml-server-1"
 )
 
 // ContainerRunner abstracts the docker CLI so tests can fake it.

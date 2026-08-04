@@ -37,7 +37,7 @@ External request (forwarded by Gateway, /v1/photos/* and /v1/upload-tus/*)
                      └───────────────────────────────────┘
                                     │
                      ┌──────────────▼──────────────────────────┐
-                     │  immich-machine-learning (Docker)       │
+                     │  nimoos-photos-ml-server (Docker)       │
                      │  127.0.0.1:3003  /predict               │
                      │  - CLIP ViT-SO400M-16-SigLIP2-384 (1152-dim)│
                      │  - Face detection+recognition antelopev2 (512-dim)│
@@ -307,7 +307,7 @@ PreviewPregen = false
 
 - `WatchDirs`: comma-separated fsnotify watch directories, three by default; can be hot-applied at runtime via `PUT /v1/photos/config` (`Watcher.Restart`).
 - `Workers`: number of Indexer concurrent workers, default 3.
-- `MLEndpoint`: immich-machine-learning address, default `http://127.0.0.1:3003`.
+- `MLEndpoint`: nimoos-photos-ml-server address, default `http://127.0.0.1:3003`.
 - Feature toggles (`FacesEnabled/ScenesEnabled/OCREnabled/SmartViewEnabled/AestheticEnabled`) all default to `true`; turning off `ScenesEnabled` means new photos no longer get CLIP vectors, disabling semantic search. `AestheticEnabled` is not hot-reloaded — turning it off only stops new scoring (both inline and backfill are skipped), existing `aesthetic_score` values aren't cleared; see "Core flows § 7 Aesthetic scoring".
 - `PreviewPregen`: default `false`, video `preview.mp4` is purely lazy-generated (generated on first `GET /preview`), with pre-generation skipped only during ingest/startup backfill. When set to `true`, it's asynchronously pre-generated on ingest just like `sprite.jpg`, and also covered by `BackfillSprites` for existing videos. `sprite.jpg` is unaffected by this toggle and is always pre-generated.
 
@@ -320,7 +320,7 @@ PreviewPregen = false
 | **NimoOS-Gateway** | Registers three prefixes (`/v1/photos`, `/doc/v1/photos`, `/v1/upload-tus`) via `POST /v1/gateway/routes` at startup; reads the Gateway address from `RuntimePath` |
 | **NimoOS-UserService** | Reads the ECDSA public key from `/var/run/nimoos/` to verify JWTs |
 | **NimoOS-MessageBus** | systemd `After=nimoos-message-bus.service`; `service/publisher.go` publishes events (indexing progress, etc.) to MessageBus; subscribes to `nimoos:media:created` / `nimoos:media:deleted` (index-on-write / clean-up-on-delete, `service/buscreated.go` / `busdelete.go`, each with its own separate WS connection; periodic full scans remain a fallback) |
-| **immich-machine-learning** | Docker container, `127.0.0.1:3003`, called by `pkg/mlclient` via `/predict` + multipart/form-data; when ML is unavailable, the CLIP/face/OCR steps are skipped, and Embedder automatically backfills once it detects recovery; a hung state is handled with `docker restart` by the built-in watchdog (see Known issue 2) |
+| **nimoos-photos-ml-server** | Docker container, `127.0.0.1:3003`, called by `pkg/mlclient` via `/predict` + multipart/form-data; when ML is unavailable, the CLIP/face/OCR steps are skipped, and Embedder automatically backfills once it detects recovery; a hung state is handled with `docker restart` by the built-in watchdog (see Known issue 2) |
 | **NimoOS-AI Agent / MCP server** | Can call `POST /search/smart` and `GET /albums` from localhost without a JWT (`mcpReadSkip`, see Authentication), serving as the backend for the `search_photos` / `list_albums` MCP tools |
 
 ---
@@ -329,7 +329,7 @@ PreviewPregen = false
 
 1. **inotify quota amplification**: NimoOS-Photos's Watcher, Wiki (`NimoOS/`), and NimoOS-Search all run separate fsnotify instances watching directories like `/DATA/Gallery`. Each instance consumes its own inotify watches independently, so the pressure on `/proc/sys/fs/inotify/max_user_watches` stacks up. For very large directory trees, the quota may need to be raised manually (e.g. `echo 524288 > /proc/sys/fs/inotify/max_user_watches`). Each service currently keeps its own independent watcher (option A); a unified shared watch layer is a future TODO. On inotify **event queue overflow** (`fsnotify.ErrEventOverflow`), Watcher triggers a full-root recovery rescan (`service/watcher.go`); the rescan is single-flighted (`overflowRescanning`) with a 5-minute cooldown (`overflowRescanCooldown`) to prevent chained rescans during a write storm.
 
-2. **ML service offline**: the ML container (immich-machine-learning) ships as an offline image bundle, requiring `docker load` via the install script the first time. While the container isn't running, CLIP embedding, face recognition, and OCR are all skipped (`ml.IsReady()` returns false); Embedder automatically backfills historical assets once it detects a `false→true` transition.
+2. **ML service offline**: the ML container (nimoos-photos-ml-server) ships as an offline image bundle, requiring `docker load` via the install script the first time. While the container isn't running, CLIP embedding, face recognition, and OCR are all skipped (`ml.IsReady()` returns false); Embedder automatically backfills historical assets once it detects a `false→true` transition.
 
    **ML hang self-healing**: the ML worker can get stuck in a "port listening, worker is an empty shell" hang state (an aftereffect of gunicorn killing the worker mid-load on a cold-load timeout; compose's `restart: unless-stopped` only rescues a process exit, not a hang). The built-in watchdog `MLWatchdog` (`service/mlwatchdog.go`) probes every 30s: only after 12 consecutive `/ping` failures (about 6 minutes, deliberately placed after gunicorn's 300s self-heal window as a second line of defense) and confirming via `docker inspect` that the container is running does it `docker restart`, with a 10-minute cooldown; if the container isn't running (ML package not installed / manually stopped by the user), it silently skips and resets the counter. Compose also has its own healthcheck, but that's only for observability via `docker ps` / AppManagement — it doesn't drive restarts.
 

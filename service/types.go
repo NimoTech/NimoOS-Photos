@@ -194,7 +194,7 @@ type IndexStatus struct {
 	GalleryDir string `json:"galleryDir,omitempty"`
 	DiskTotal  int64  `json:"diskTotal,omitempty"`
 	DiskAvail  int64  `json:"diskAvail,omitempty"`
-	// MLReady reflects whether the immich-machine-learning backend answers /ping.
+	// MLReady reflects whether the nimoos-photos-ml-server backend answers /ping.
 	MLReady bool `json:"mlReady"`
 	// Offline counts assets currently flagged offline=1 (their removable drive
 	// is unplugged). These assets are hidden from every user-facing surface but
