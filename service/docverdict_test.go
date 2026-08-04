@@ -136,3 +136,28 @@ func TestBackfillDocVerdicts(t *testing.T) {
 	// Idempotent: running another round with no changes must not error
 	require.NoError(t, e.BackfillDocVerdicts(context.Background()))
 }
+
+// TestBackfillDocVerdictsRerunPendingConsumedAfterRun verifies the same
+// CAS/rerun-pending guard Backfill/BackfillOCR/BackfillAesthetic already
+// have (see TestEmbedder_BackfillOCRRerunPendingConsumedAfterRun), now
+// extended to BackfillDocVerdicts: it's called from both the "ml-recovery"
+// and "post-batch-backfill" gated chains, which may legitimately fire at
+// the same time since they use distinct gate names, so a concurrent second
+// call must merge into a pending rerun instead of double-running the
+// query+compute loop.
+func TestBackfillDocVerdictsRerunPendingConsumedAfterRun(t *testing.T) {
+	db := makeTestDB(t)
+	e := NewEmbedder(db, &mockML{}, nil, nil)
+
+	// Simulate a doc-verdict backfill round already running (as if the
+	// ml-recovery chain got there first): a concurrent trigger from the
+	// post-batch-backfill chain must set pending, not be swallowed.
+	e.docVerdictRunning.Store(true)
+	require.NoError(t, e.BackfillDocVerdicts(context.Background()))
+	require.True(t, e.docVerdictRerunPending.Load(), "a trigger received while running must set docVerdictRerunPending")
+	e.docVerdictRunning.Store(false)
+
+	// The next actual run consumes pending and runs one more round (both rounds complete immediately on an empty DB).
+	require.NoError(t, e.BackfillDocVerdicts(context.Background()))
+	require.False(t, e.docVerdictRerunPending.Load(), "pending should be consumed once the backfill finishes")
+}

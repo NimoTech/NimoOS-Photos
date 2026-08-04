@@ -72,6 +72,16 @@ type Embedder struct {
 	aestheticRerunPending atomic.Bool
 	aestheticHead         *aesthetic.Head
 
+	// docVerdictRunning / docVerdictRerunPending guard BackfillDocVerdicts
+	// the same way aestheticRunning/aestheticRerunPending guard
+	// BackfillAesthetic. This one matters across chains, not just within
+	// one: BackfillDocVerdicts is invoked from both the "ml-recovery" and
+	// "post-batch-backfill" gated chains, which use distinct gate names and
+	// so may legitimately fire concurrently — without this guard they'd
+	// double-run the same query+compute loop.
+	docVerdictRunning      atomic.Bool
+	docVerdictRerunPending atomic.Bool
+
 	// rerunPending / ocrRerunPending record "a trigger arrived while a
 	// backfill pass was already running". A second call that loses the CAS
 	// can't just silently return nil like before: the in-progress pass may
@@ -573,7 +583,38 @@ func (e *Embedder) backfillOCROnce(ctx context.Context) error {
 // publish task events (unlike BackfillOCR, which runs inference). Assets
 // without a vector aren't selected; they converge on the next recovery-chain
 // hook after CLIP Backfill fills in their vector.
+//
+// Safe for concurrent calls: unlike Backfill/BackfillOCR/BackfillAesthetic,
+// each of which is only ever driven by a single chain, this is invoked from
+// both the "ml-recovery" and "post-batch-backfill" gated chains — distinct
+// gate names that may legitimately fire at the same time — so it needs the
+// same guard even though nothing else about it changed. A second call
+// returns nil immediately but sets docVerdictRerunPending, so the
+// in-progress pass automatically runs one more round (requerying targets)
+// once it finishes, guaranteeing the trigger isn't swallowed (same
+// mechanism and narrow-window caveat as Backfill's rerunPending; see its
+// doc comment).
 func (e *Embedder) BackfillDocVerdicts(ctx context.Context) error {
+	if !e.docVerdictRunning.CompareAndSwap(false, true) {
+		e.docVerdictRerunPending.Store(true)
+		return nil
+	}
+	defer e.docVerdictRunning.Store(false)
+
+	for {
+		if err := e.backfillDocVerdictsOnce(ctx); err != nil {
+			return err
+		}
+		if !e.docVerdictRerunPending.CompareAndSwap(true, false) {
+			return nil
+		}
+	}
+}
+
+// backfillDocVerdictsOnce is BackfillDocVerdicts's single-pass body (query
+// targets + compute each one's verdict), without the concurrency guard or
+// rerun loop.
+func (e *Embedder) backfillDocVerdictsOnce(ctx context.Context) error {
 	rows, err := e.db.QueryContext(ctx, `
         SELECT o.asset_id
         FROM asset_ocr o
