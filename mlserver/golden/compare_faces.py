@@ -2,10 +2,13 @@
 baseline: face count parity, greedy-IoU-paired bounding box overlap, and
 paired embedding cosine similarity.
 
-Per-image detection results are cached to disk (golden/report_faces_cache.json,
-gitignored via the `report*.json` pattern) since CPU detection over the full
-207-image dataset is slow (~tens of minutes); pass --refresh to recompute
-after changing facemodel.py.
+Per-image detection results are cached to disk, one file per --device
+(golden/report_faces_cache.<device>.json, gitignored via the `report*.json`
+pattern) since detection over the full 207-image dataset is slow (~tens of
+minutes on CPU); pass --refresh to recompute after changing facemodel.py.
+Keying the cache by device (not just by digest) is deliberate: a run that
+switches --device without --refresh must never silently reuse -- and
+certify -- another device's cached results.
 """
 import argparse
 import gzip
@@ -20,7 +23,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from server.facemodel import FacePipeline
 from server.providers import resolve_providers
 
-CACHE_FILE = Path(__file__).resolve().parent / "report_faces_cache.json"
+def cache_file_for(device: str) -> Path:
+    """Per-device cache file -- keying solely by digest (the old scheme)
+    let a run that switched --device but forgot --refresh silently reuse
+    (and certify) stale results computed under a different execution
+    provider. The device is now structurally part of the cache identity,
+    so that mistake can't happen."""
+    return Path(__file__).resolve().parent / f"report_faces_cache.{device}.json"
 
 
 def parse_vec(raw) -> np.ndarray:
@@ -77,10 +86,11 @@ def main() -> None:
 
     ds, mlcache = Path(args.dataset), Path(args.cache)
     base = json.load(gzip.open(Path(__file__).resolve().parent / "baseline.json.gz", "rt"))
+    cache_file = cache_file_for(args.device)
 
     our_cache: dict = {}
-    if CACHE_FILE.exists() and not args.refresh:
-        our_cache = json.loads(CACHE_FILE.read_text())
+    if cache_file.exists() and not args.refresh:
+        our_cache = json.loads(cache_file.read_text())
 
     fp = None
     total = 0
@@ -105,7 +115,7 @@ def main() -> None:
             our_cache[digest] = fp.detect(data)
             # periodically flush so a crash mid-run doesn't lose progress
             if total % 10 == 0:
-                CACHE_FILE.write_text(json.dumps(our_cache))
+                cache_file.write_text(json.dumps(our_cache))
 
         our_faces = our_cache[digest]["facial-recognition"]
 
@@ -126,7 +136,7 @@ def main() -> None:
             "n_matched": len(matched),
         })
 
-    CACHE_FILE.write_text(json.dumps(our_cache))
+    cache_file.write_text(json.dumps(our_cache))
 
     count_pct = 100.0 * count_matches / total if total else 0.0
     iou_arr = np.asarray(all_iou) if all_iou else np.asarray([0.0])

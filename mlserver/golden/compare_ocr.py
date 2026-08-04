@@ -13,10 +13,13 @@ match rate, and a difflib.SequenceMatcher ratio for every non-exact
 image so a human can spot-check whether the diff is a real miss
 (dropped/garbled line) or a cosmetic split/merge/punctuation blip.
 
-Per-image OCR results are cached to disk (golden/report_ocr_cache.json,
-gitignored via the `report*.json` pattern) since CPU inference over the
-full 207-image dataset is slow; pass --refresh to recompute after
-changing ocrmodel.py.
+Per-image OCR results are cached to disk, one file per --device
+(golden/report_ocr_cache.<device>.json, gitignored via the `report*.json`
+pattern) since inference over the full 207-image dataset is slow; pass
+--refresh to recompute after changing ocrmodel.py. Keying the cache by
+device (not just by digest) is deliberate: a run that switches --device
+without --refresh must never silently reuse -- and certify -- another
+device's cached results.
 """
 import argparse
 import difflib
@@ -30,7 +33,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from server.ocrmodel import OcrPipeline
 from server.providers import resolve_providers
 
-CACHE_FILE = Path(__file__).resolve().parent / "report_ocr_cache.json"
+def cache_file_for(device: str) -> Path:
+    """Per-device cache file -- see module docstring for why device is
+    part of the cache identity, not just an out-of-band flag."""
+    return Path(__file__).resolve().parent / f"report_ocr_cache.{device}.json"
+
+
 GO_MIN_SCORE = 0.5  # mlclient's own textScore floor, see module docstring
 
 
@@ -48,10 +56,11 @@ def main() -> None:
 
     ds, mlcache = Path(args.dataset), Path(args.cache)
     base = json.load(gzip.open(Path(__file__).resolve().parent / "baseline.json.gz", "rt"))
+    cache_file = cache_file_for(args.device)
 
     our_cache: dict = {}
-    if CACHE_FILE.exists() and not args.refresh:
-        our_cache = json.loads(CACHE_FILE.read_text())
+    if cache_file.exists() and not args.refresh:
+        our_cache = json.loads(cache_file.read_text())
 
     op = None
     total = 0
@@ -76,9 +85,9 @@ def main() -> None:
             data = (ds / rec["file"]).read_bytes()
             our_cache[digest] = op.run(data)
             if total % 20 == 0:
-                CACHE_FILE.write_text(json.dumps(our_cache))
+                cache_file.write_text(json.dumps(our_cache))
 
-    CACHE_FILE.write_text(json.dumps(our_cache))
+    cache_file.write_text(json.dumps(our_cache))
 
     for digest, rec in base["images"].items():
         base_ocr = rec["ocr"]["ocr"]
