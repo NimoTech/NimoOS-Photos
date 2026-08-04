@@ -51,6 +51,26 @@ func TestRecordBackfillFailure_AccumulatesAndSchedules(t *testing.T) {
 	require.Equal(t, t1.UnixMilli()+(15*time.Minute).Milliseconds(), next)
 }
 
+// TestRecordBackfillFailure_FullLadderIncludingClamp exercises every rung of
+// the escalation ladder — including one step past the cap — proving the SQL
+// CASE ladder tracks backfillRetryDelays at every level, not just the first
+// two. This is the branch most likely to silently regress if either ladder
+// (Go or SQL) is edited without the other.
+func TestRecordBackfillFailure_FullLadderIncludingClamp(t *testing.T) {
+	db := makeTestDB(t)
+	id := insertAsset(t, db, "/a.jpg", "indexed")
+
+	ts := time.Now()
+	for i := 1; i <= 7; i++ {
+		recordBackfillFailure(db, backfillCLIP, id, ts, errors.New("boom"))
+		n, next := readBackfillFailure(t, db, backfillCLIP, id)
+		require.Equal(t, i, n, "fail_count at iteration %d", i)
+		require.Equal(t, ts.UnixMilli()+backfillRetryDelay(i).Milliseconds(), next,
+			"next_retry_at at iteration %d", i)
+		ts = ts.Add(time.Minute)
+	}
+}
+
 func TestRecordBackfillFailure_KindsAreIndependent(t *testing.T) {
 	db := makeTestDB(t)
 	id := insertAsset(t, db, "/a.jpg", "indexed")
