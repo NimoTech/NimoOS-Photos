@@ -9,17 +9,18 @@ import (
 
 const (
 	mlWatchdogInterval = 30 * time.Second
-	// 12 ticks (~6 minutes): must be greater than
-	// MACHINE_LEARNING_WORKER_TIMEOUT=300s. A cold model load blocks the
-	// worker's event loop (measured /ping latency during load goes from
-	// ~1ms to ~2.5s; a cold cache plus a slow disk can stall the heartbeat
-	// for >120s), and /ping shares its heartbeat with gunicorn, so a slow
-	// cold load can make /ping fail repeatedly without the worker actually
-	// being wedged. The threshold is placed after gunicorn's own
-	// self-healing window (kills and respawns the worker after a 300s
-	// timeout), so the watchdog is strictly a second line of defense:
-	// anything gunicorn can save never reaches us; only a worker still
-	// unresponsive after 6 minutes is genuinely wedged.
+	// 12 ticks (~6 minutes). The mlserver backend is a single-process
+	// uvicorn app whose model loads no longer block /ping (unlike the old
+	// gunicorn-fronted immich-ml, where a cold load could stall the shared
+	// heartbeat for >120s and a 300s self-healing respawn was the original
+	// reason this threshold was set this high). That self-heal window is
+	// gone with this backend, but the value is kept unchanged on purpose:
+	// it is a conservative second line of defense against container-level
+	// wedges -- a runtime crash, a docker-level stall, anything that leaves
+	// the container "running" per docker but unresponsive -- not a bound
+	// tuned to any particular startup cost. Six minutes of consecutive
+	// failures is cheap insurance against false-positive restarts and still
+	// catches a genuinely wedged container promptly.
 	mlWatchdogFailLimit = 12
 	mlWatchdogCooldown  = 10 * time.Minute
 	mlContainerName     = "nimoos-photos-ml-server-1"

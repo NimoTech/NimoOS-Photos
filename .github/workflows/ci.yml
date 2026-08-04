@@ -73,3 +73,54 @@ jobs:
         env:
           CGO_ENABLED: "1"
         run: go test ./...
+
+  # Runs on every trigger rather than being path-filtered to mlserver/**:
+  # GitHub Actions applies `on.<event>.paths` to the whole workflow file, so
+  # scoping just this job to a subtree would need either a second workflow
+  # file or a manual `git diff`/paths-filter step. That's more moving parts
+  # than this buys — the job below is a plain checkout + pip install + pytest
+  # (with pip caching), so paying its cost unconditionally is cheap and keeps
+  # the workflow boring.
+  mlserver-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out NimoOS-Photos
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential
+
+      # insightface has no prebuilt wheel for cp311/manylinux and compiles
+      # from source; build-essential above provides the toolchain. cython
+      # and numpy are already pinned inside requirements.txt itself (and
+      # ordered ahead of insightface alphabetically), so a single install
+      # pass is enough -- same as the throwaway builder stage in
+      # mlserver/Dockerfile, which does not do a separate pre-install step
+      # either.
+      - name: Set up Python
+        uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38 # v5.3.0
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: mlserver/requirements.txt
+
+      # --no-deps: requirements.txt is an authoritative, already-flattened
+      # lock of the runtime dependency set (see mlserver/Dockerfile for why
+      # letting pip resolve deps on its own breaks the cv2 import). Mirrors
+      # exactly how the production image installs this file.
+      - name: Install Python dependencies
+        working-directory: mlserver
+        run: pip install --no-deps -r requirements.txt
+
+      # Tests that need real ONNX models under /DATA/.system_data/photos/
+      # ml-cache skip themselves via a `skipif not CACHE.exists()` marker
+      # (see tests/test_face_shapes.py, tests/test_ocr_shapes.py) -- that
+      # directory never exists on a CI runner, so those tests skip cleanly
+      # instead of failing; everything else (API contract, CLIP preprocessing
+      # math, provider selection, registry lifecycle, OCR session building)
+      # runs for real.
+      - name: Test
+        working-directory: mlserver
+        run: pytest tests/ -q
