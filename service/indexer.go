@@ -2104,7 +2104,7 @@ func (ix *Indexer) BackfillSprites(ctx context.Context) {
 	scheduleRemove()
 }
 
-// MLReady reports whether the ML backend (immich-machine-learning) is reachable.
+// MLReady reports whether the ML backend (nimoos-photos-ml-server) is reachable.
 // Bounded by the ml client's short /ping timeout, safe to call from handlers.
 func (ix *Indexer) MLReady() bool { return ix.ml.IsReady() }
 

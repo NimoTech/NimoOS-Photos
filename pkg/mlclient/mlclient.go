@@ -1,4 +1,4 @@
-// Package mlclient provides an HTTP client for the immich-machine-learning service.
+// Package mlclient provides an HTTP client for the nimoos-photos-ml-server service.
 package mlclient
 
 import (
@@ -30,7 +30,7 @@ type FaceResult struct {
 	Embedding []float32   `json:"-"` // parsed from JSON string in response
 }
 
-// MLClient is an HTTP client for the immich-machine-learning prediction endpoint.
+// MLClient is an HTTP client for the nimoos-photos-ml-server prediction endpoint.
 type MLClient struct {
 	endpoint string
 	http     *http.Client

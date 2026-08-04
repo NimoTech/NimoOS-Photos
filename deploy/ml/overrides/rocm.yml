@@ -1,6 +1,6 @@
 # AMD iGPU (ROCm) device mapping; gfx1151 (AI Max+ 395 / Strix Halo) needs an HSA override
 services:
-  immich-machine-learning:
+  server:
     devices:
       - /dev/kfd:/dev/kfd
       - /dev/dri:/dev/dri

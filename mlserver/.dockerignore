@@ -1,0 +1,12 @@
+golden/
+tests/
+.venv/
+.golden-venv/
+.pytest_cache/
+.git/
+.gitignore
+.dockerignore
+pyproject.toml
+Dockerfile
+**/__pycache__/
+**/*.pyc

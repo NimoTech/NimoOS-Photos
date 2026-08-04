@@ -22,7 +22,7 @@ systemctl daemon-reload
 echo "Enabling service..."
 systemctl enable --force --no-ask-password "${APP_NAME}.service"
 
-# ── Photos AI (immich-machine-learning) offline bundle ────────────────────────
+# ── Photos AI (nimoos-photos-ml-server) offline bundle ────────────────────────
 # Download the pinned ML image bundle from OSS and bring up the system docker
 # app (docker load -> compose up -> /ping wait, all inside the bundle's install
 # .sh). Optional and fully non-fatal: a problem here must never fail the install.

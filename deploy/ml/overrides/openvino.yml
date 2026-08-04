@@ -1,5 +1,5 @@
 # Intel iGPU (OpenVINO) device mapping; deployed by install.sh as docker-compose.override.yml based on detection
 services:
-  immich-machine-learning:
+  server:
     devices:
       - /dev/dri:/dev/dri
