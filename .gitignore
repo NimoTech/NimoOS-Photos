@@ -5,5 +5,8 @@ coverage.txt
 # golden dataset collection venv (local tooling, not project code)
 mlserver/.golden-venv/
 
+# script/package-photos-ml.sh's default output dir (multi-GB dist bundles)
+/dist/
+
 # Claude Code local guidance — not for upload
 CLAUDE.md
