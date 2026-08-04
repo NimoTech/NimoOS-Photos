@@ -1893,12 +1893,17 @@ type spriteCandidate struct {
 
 // spriteBackfillCandidates selects existing videos still missing a hover-preview
 // sprite. Pure SQL filtering only — no stat, no generation — so it can be
-// exercised independently of ffmpeg/filesystem state in tests.
-func spriteBackfillCandidates(db *sql.DB) ([]spriteCandidate, error) {
+// exercised independently of ffmpeg/filesystem state in tests. Excludes assets
+// currently in cooldown after a prior sprite/preview generation failure (see
+// backfillCooldownSQL): a permanently-corrupt video gets one ffmpeg attempt
+// per retry window instead of being re-invoked every backfill pass.
+func spriteBackfillCandidates(db *sql.DB, now time.Time) ([]spriteCandidate, error) {
 	rows, err := db.Query(`
-		SELECT id, file_path, COALESCE(duration_ms,0) FROM assets
-		WHERE mime_type LIKE 'video/%' AND status='indexed' AND deleted_at IS NULL
-		  AND COALESCE(duration_ms,0) > 0`)
+		SELECT a.id, a.file_path, COALESCE(a.duration_ms,0) FROM assets a
+		WHERE a.mime_type LIKE 'video/%' AND a.status='indexed' AND a.deleted_at IS NULL
+		  AND COALESCE(a.duration_ms,0) > 0`+
+		backfillCooldownSQL("a"),
+		string(backfillSprite), now.UnixMilli())
 	if err != nil {
 		return nil, err
 	}
@@ -1970,13 +1975,21 @@ func pendingBackfill(candidates []spriteCandidate, thumbDir string, includePrevi
 // cancelled; the task is left running, for the registry's stale-task sweep
 // to clean up — consistent with how faces.go RunPipeline handles
 // interruption.
+//
+// Per-item failures (sprite or preview generation) are recorded against the
+// backfillSprite failure ledger, escalating a broken video onto the cooldown
+// ladder so it isn't re-invoked with ffmpeg every single pass; a success
+// clears any prior ledger entry. Two cases are deliberately NOT recorded:
+// sourceMissing skips (the source file's drive is offline — handled by the
+// offline mechanism, not a content problem) and the global ffmpeg-missing
+// abort (an environmental issue, not this asset's fault).
 func (ix *Indexer) BackfillSprites(ctx context.Context) {
 	if !ix.spriteBackfillRunning.CompareAndSwap(false, true) {
 		return
 	}
 	defer ix.spriteBackfillRunning.Store(false)
 
-	candidates, err := spriteBackfillCandidates(ix.db)
+	candidates, err := spriteBackfillCandidates(ix.db, time.Now())
 	if err != nil {
 		zap.L().Warn("sprite backfill candidate query failed", zap.Error(err))
 		return
@@ -2049,6 +2062,7 @@ func (ix *Indexer) BackfillSprites(ctx context.Context) {
 		}
 
 		var itemFailed bool
+		var lastItemErr error
 
 		spritePath := filepath.Join(ix.thumbDir, c.id, "sprite.jpg")
 		if _, statErr := os.Stat(spritePath); statErr != nil {
@@ -2061,6 +2075,7 @@ func (ix *Indexer) BackfillSprites(ctx context.Context) {
 				}
 				zap.L().Warn("sprite backfill failed", zap.String("asset_id", c.id), zap.Error(err))
 				itemFailed = true
+				lastItemErr = err
 			} else {
 				spritesGenerated++
 			}
@@ -2078,6 +2093,7 @@ func (ix *Indexer) BackfillSprites(ctx context.Context) {
 					}
 					zap.L().Warn("preview backfill failed", zap.String("asset_id", c.id), zap.Error(err))
 					itemFailed = true
+					lastItemErr = err
 				} else {
 					previewsGenerated++
 				}
@@ -2086,6 +2102,9 @@ func (ix *Indexer) BackfillSprites(ctx context.Context) {
 
 		if itemFailed {
 			failed++
+			recordBackfillFailure(ix.db, backfillSprite, c.id, time.Now(), lastItemErr)
+		} else {
+			clearBackfillFailure(ix.db, backfillSprite, c.id)
 		}
 		current++
 		pub(current, "running", "", nil)

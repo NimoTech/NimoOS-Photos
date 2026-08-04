@@ -3,16 +3,19 @@ package service
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"image"
 	_ "image/jpeg"
 	_ "image/png"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/NimoTech/NimoOS-Photos/pkg/mlclient"
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 )
 
@@ -295,4 +298,56 @@ func TestBackfillOCR_ClearsFailureAfterSuccess(t *testing.T) {
 	require.NoError(t, e.BackfillOCR(context.Background()))
 	n, _ := readBackfillFailure(t, db, backfillOCR, id)
 	require.Zero(t, n)
+}
+
+// insertVideoAsset inserts a minimal indexed video row for sprite-backfill
+// ledger tests (spriteBackfillCandidates requires mime_type LIKE 'video/%',
+// status='indexed', and duration_ms>0).
+func insertVideoAsset(t *testing.T, db *sql.DB, path string) string {
+	t.Helper()
+	id := uuid.NewString()
+	_, err := db.Exec(`INSERT INTO assets(id, file_path, file_size, mime_type, original_name,
+		is_live_photo_video, status, checksum, duration_ms)
+		VALUES(?,?,?, 'video/mp4', ?, 0, 'indexed', ?, 5000)`,
+		id, path, 1234, filepath.Base(path), uuid.NewString())
+	require.NoError(t, err)
+	return id
+}
+
+func TestSpriteBackfillCandidates_SkipsAssetsInCooldown(t *testing.T) {
+	db := makeTestDB(t)
+	insertVideoAsset(t, db, "/hot.mp4")
+	cold := insertVideoAsset(t, db, "/cold.mp4")
+	now := time.Now()
+	recordBackfillFailure(db, backfillSprite, cold, now, errAssert("x"))
+
+	cs, err := spriteBackfillCandidates(db, now)
+	require.NoError(t, err)
+	require.Len(t, cs, 1)
+	cs, err = spriteBackfillCandidates(db, now.Add(6*time.Minute))
+	require.NoError(t, err)
+	require.Len(t, cs, 2)
+}
+
+// A video that ffmpeg cannot process gets one attempt then cools down —
+// no more re-invoking ffmpeg on the same broken file every batch.
+func TestBackfillSprites_RecordsFailureThenSkipsNextRound(t *testing.T) {
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		t.Skip("ffmpeg not on PATH")
+	}
+	db := makeTestDB(t)
+	tmp := t.TempDir()
+	broken := filepath.Join(tmp, "broken.mp4")
+	require.NoError(t, os.WriteFile(broken, []byte("not actually an mp4"), 0o644))
+	id := insertVideoAsset(t, db, broken)
+
+	ix := NewIndexer(db, &mockML{}, filepath.Join(tmp, "thumbs"), 1)
+	ix.SetTaskRegistry(NewTaskRegistry(nil))
+	ix.BackfillSprites(context.Background())
+	n, _ := readBackfillFailure(t, db, backfillSprite, id)
+	require.Equal(t, 1, n)
+
+	ix.BackfillSprites(context.Background())
+	n, _ = readBackfillFailure(t, db, backfillSprite, id)
+	require.Equal(t, 1, n) // second round skipped it entirely (still 1, not 2)
 }
