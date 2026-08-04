@@ -182,3 +182,55 @@ func TestBackfill_ClearsFailureAfterSuccess(t *testing.T) {
 	n, _ := readBackfillFailure(t, db, backfillCLIP, id)
 	require.Zero(t, n)
 }
+
+// TestBackfill_ThumbPathMLErrorDoesNotFallThroughToSource locks the binding
+// constraint embedOne's doc comment claims: a light-path ML error must NOT
+// fall through to ForceReprocess. A naive "does the final embed still fail"
+// check can't tell the two apart here: embedClip always prefers an existing
+// small.jpg thumb file over any fallback bytes a full reprocess would hand
+// it, so even a regressed fallthrough would still fail to embed via the same
+// (still-present) garbage thumb. The real tell is a side effect ONLY
+// ForceReprocess produces: processFileInternal recomputes the file's
+// checksum from the real source bytes and unconditionally overwrites
+// assets.checksum via `INSERT ... ON CONFLICT(file_path) DO UPDATE SET
+// checksum=excluded.checksum` (indexer.go, ~line 1031), regardless of how
+// the downstream CLIP call turns out. So: keep the source file real and
+// readable (not deleted, unlike the light-path-success test above), make
+// only the *thumb* undecodable so the light-path CLIP call fails, and assert
+// the checksum recorded at insertAsset time is untouched afterward — proving
+// ForceReprocess (the only path that would rewrite it) never ran.
+func TestBackfill_ThumbPathMLErrorDoesNotFallThroughToSource(t *testing.T) {
+	db := makeTestDB(t)
+	tmp := t.TempDir()
+	thumbDir := filepath.Join(tmp, "thumbs")
+
+	// `good` has no thumb, so it takes the full pipeline and succeeds —
+	// keeping the environmental (all-failed) guard from suppressing the
+	// failure record below (TestBackfill_AllFailedPassRecordsNothing).
+	good := makeUniqueJPEG(t, tmp, 1)
+	insertAsset(t, db, good, "indexed")
+
+	bad := makeUniqueJPEG(t, tmp, 2) // real, readable source — deliberately NOT deleted
+	badID := insertAsset(t, db, bad, "indexed")
+	var origChecksum string
+	require.NoError(t, db.QueryRow(`SELECT checksum FROM assets WHERE id=?`, badID).Scan(&origChecksum))
+
+	// The thumb is garbage: image.Decode fails on it, so decodingML's
+	// light-path CLIP call fails for this asset specifically.
+	require.NoError(t, os.MkdirAll(filepath.Join(thumbDir, badID), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(thumbDir, badID, "small.jpg"), []byte("not a jpeg"), 0o644))
+
+	ml := &decodingML{}
+	ix := NewIndexer(db, ml, thumbDir, 1)
+	e := NewEmbedder(db, ml, ix, NewTaskRegistry(nil))
+	require.NoError(t, e.Backfill(context.Background()))
+
+	n, _ := readBackfillFailure(t, db, backfillCLIP, badID)
+	require.Equal(t, 1, n, "the thumb-path ML failure should be recorded")
+	require.False(t, e.hasEmbeddingForPath(bad), "no embedding should exist for the failed asset")
+
+	var checksumAfter string
+	require.NoError(t, db.QueryRow(`SELECT checksum FROM assets WHERE id=?`, badID).Scan(&checksumAfter))
+	require.Equal(t, origChecksum, checksumAfter,
+		"checksum must stay untouched — ForceReprocess (the only code path that rewrites it) must never run when a thumb is present")
+}
