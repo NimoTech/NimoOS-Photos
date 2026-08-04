@@ -110,3 +110,63 @@ func TestBackfillGate_NoConcurrentRunsAcrossWindowBoundary(t *testing.T) {
 
 	require.LessOrEqual(t, maxInFlight.Load(), int32(1), "concurrent invocations of the same chain observed")
 }
+
+// TestBackfillGate_NoOverlapWhenRunOutlivesWindow reproduces the bug this
+// fix addresses: when fn runs longer than the window, a fresh Run(name, ...)
+// that arrives after the window has elapsed — but while the leading fn is
+// still executing — must not take the immediate branch. Before inFlight
+// existed, it would: Run only checked "outside the window" against
+// lastRun, which is set at the start of the execution, so once the window
+// elapsed mid-run every subsequent Run call ran fn concurrently with the
+// still-in-flight leading call (observed as maxInFlight == 2+).
+//
+// The burst below fires calls both inside and past the window boundary
+// while the leading call sleeps for ~3x the window, then asserts the whole
+// burst merged into pendingFn (maxInFlight never exceeds 1) and that exactly
+// one deferred run — the merged pending trigger, armed by the completion
+// step once the leading call finally releases inFlight — executes
+// afterwards.
+func TestBackfillGate_NoOverlapWhenRunOutlivesWindow(t *testing.T) {
+	window := 30 * time.Millisecond
+	g := newBackfillGate(window)
+
+	var inFlightN atomic.Int32
+	var maxInFlight atomic.Int32
+	var runs atomic.Int32
+	fn := func() {
+		n := inFlightN.Add(1)
+		for {
+			old := maxInFlight.Load()
+			if n <= old || maxInFlight.CompareAndSwap(old, n) {
+				break
+			}
+		}
+		time.Sleep(3 * window) // outlive the window: fn runs ~3x longer than the gate's throttle window
+		runs.Add(1)
+		inFlightN.Add(-1)
+	}
+
+	leadingDone := make(chan struct{})
+	go func() {
+		g.Run("a", fn)
+		close(leadingDone)
+	}()
+	time.Sleep(2 * time.Millisecond) // let the leading call enter fn (set inFlight) before the burst starts
+
+	// Burst of Run calls while the leading call is still executing, spanning
+	// both inside and past the window boundary — the exact scenario that
+	// used to double-run.
+	burstDeadline := time.Now().Add(2 * window)
+	for time.Now().Before(burstDeadline) {
+		g.Run("a", fn)
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	<-leadingDone
+	require.Eventually(t, func() bool { return runs.Load() == 2 }, 2*time.Second, 5*time.Millisecond,
+		"exactly one deferred run (the merged pending trigger) should execute after the leading run finishes")
+
+	require.EqualValues(t, 1, maxInFlight.Load(), "no two invocations of the same chain should overlap")
+	time.Sleep(3 * window)
+	require.EqualValues(t, 2, runs.Load(), "leading run + exactly one merged deferred run, nothing extra")
+}
