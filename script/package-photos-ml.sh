@@ -86,3 +86,23 @@ tar -czf "${BUNDLE}" -C "${STAGE}" .
 # match the file sitting right next to it, not a path from this machine.
 (cd "$(dirname "${BUNDLE}")" && sha256sum "$(basename "${BUNDLE}")" > "$(basename "${BUNDLE}")".sha256)
 echo "✓ Done: ${BUNDLE} ($(du -sh "${BUNDLE}" | cut -f1))"
+
+# This script's local dist filename (photos-ml-universal-v<version>.tar.gz)
+# is not what setup-photos.sh downloads (nimoos-photos-ml-<version>.tar.gz) --
+# nothing renames it automatically, so print the exact upload commands
+# (rename-on-upload) instead of leaving that as tribal knowledge.
+UPLOAD_NAME="nimoos-photos-ml-${VERSION}.tar.gz"
+UPLOAD_DIR="NimoTech/NimoOS-Photos/releases/download/photos-ml-${VERSION}"
+UPLOAD_SIDECAR="${OUT}/${UPLOAD_NAME}.sha256"
+echo ""
+echo "  setup-photos.sh expects the OSS object named '${UPLOAD_NAME}', not the"
+echo "  local '$(basename "${BUNDLE}")' -- rename on upload:"
+echo ""
+echo "  Upload with:"
+echo "    ossutil cp ${BUNDLE} oss://nimoos/${UPLOAD_DIR}/${UPLOAD_NAME} -f"
+echo ""
+echo "  The sidecar must be regenerated against the renamed bare filename (its"
+echo "  recorded name has to match '${UPLOAD_NAME}', not '$(basename "${BUNDLE}")'"
+echo "  -- sha256sum -c on the downloading machine matches by name):"
+echo "    sha256sum ${BUNDLE} | awk -v n=\"${UPLOAD_NAME}\" '{print \$1\"  \"n}' > ${UPLOAD_SIDECAR}"
+echo "    ossutil cp ${UPLOAD_SIDECAR} oss://nimoos/${UPLOAD_DIR}/${UPLOAD_NAME}.sha256 -f"
