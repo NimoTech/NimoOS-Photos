@@ -401,6 +401,23 @@ func migrate(db *sql.DB) error {
 			updated_at  INTEGER NOT NULL DEFAULT 0   -- Unix ms
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_profile_entities_kind ON user_profile_entities(kind)`,
+
+		// ── Backfill failure ledger (loop-guard) ────────────────────────
+		// Per-(kind, asset) exponential cooldown so a permanently failing
+		// asset (corrupt file, oversized image) stops being re-selected by
+		// every backfill round. Success always clears the row; the ladder
+		// caps at 24h rather than blacklisting forever, so a replaced file
+		// or an upgraded ML backend self-heals without manual surgery.
+		`CREATE TABLE IF NOT EXISTS backfill_failures (
+			kind          TEXT NOT NULL,              -- 'clip' | 'ocr' | 'sprite'
+			asset_id      TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+			fail_count    INTEGER NOT NULL DEFAULT 0,
+			last_fail_at  INTEGER NOT NULL DEFAULT 0, -- Unix ms
+			next_retry_at INTEGER NOT NULL DEFAULT 0, -- Unix ms; > now means in cooldown
+			last_error    TEXT NOT NULL DEFAULT '',
+			PRIMARY KEY (kind, asset_id)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_backfill_failures_retry ON backfill_failures(kind, next_retry_at)`,
 	}
 
 	for _, stmt := range statements {

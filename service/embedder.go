@@ -72,6 +72,16 @@ type Embedder struct {
 	aestheticRerunPending atomic.Bool
 	aestheticHead         *aesthetic.Head
 
+	// docVerdictRunning / docVerdictRerunPending guard BackfillDocVerdicts
+	// the same way aestheticRunning/aestheticRerunPending guard
+	// BackfillAesthetic. This one matters across chains, not just within
+	// one: BackfillDocVerdicts is invoked from both the "ml-recovery" and
+	// "post-batch-backfill" gated chains, which use distinct gate names and
+	// so may legitimately fire concurrently — without this guard they'd
+	// double-run the same query+compute loop.
+	docVerdictRunning      atomic.Bool
+	docVerdictRerunPending atomic.Bool
+
 	// rerunPending / ocrRerunPending record "a trigger arrived while a
 	// backfill pass was already running". A second call that loses the CAS
 	// can't just silently return nil like before: the in-progress pass may
@@ -91,6 +101,11 @@ type Embedder struct {
 	// between Embedder and FaceService; service.go wires it to
 	// faces.RunPipeline. Safely skipped when nil (not wired up / tests).
 	onRecovered func(context.Context)
+
+	// gate throttles the ML-recovery chain (see runGated). Installed via
+	// SetGate; nil in tests and any caller that never sets one, meaning no
+	// throttling.
+	gate *backfillGate
 }
 
 func NewEmbedder(db *sql.DB, ml MLProvider, idx *Indexer, reg *TaskRegistry) *Embedder {
@@ -102,36 +117,56 @@ func NewEmbedder(db *sql.DB, ml MLProvider, idx *Indexer, reg *TaskRegistry) *Em
 
 func (e *Embedder) SetPollInterval(d time.Duration) { e.pollInterval = d }
 
+// SetGate installs the shared backfill throttle. A nil gate (tests, callers
+// that never SetGate) means no throttling.
+func (e *Embedder) SetGate(g *backfillGate) { e.gate = g }
+
+func (e *Embedder) runGated(fn func()) {
+	if e.gate == nil {
+		fn()
+		return
+	}
+	e.gate.Run("ml-recovery", fn)
+}
+
 // SetOnRecovered injects the callback invoked once at the tail of the ML-ready
 // recovery chain (after Backfill/reembed/BackfillOCR), used to catch up on
 // face detection backlog accumulated while ML was down.
 func (e *Embedder) SetOnRecovered(fn func(context.Context)) { e.onRecovered = fn }
 
-// queryMissing lists the file paths of assets that are status='indexed' but
-// have no row in asset_clip_idx.
-func (e *Embedder) queryMissing(ctx context.Context) ([]string, error) {
+// clipTarget is one CLIP backfill candidate.
+type clipTarget struct {
+	id   string
+	path string
+}
+
+// queryMissing lists the assets that are status='indexed' but have no row in
+// asset_clip_idx, excluding any currently in cooldown after a prior failure.
+func (e *Embedder) queryMissing(ctx context.Context, now time.Time) ([]clipTarget, error) {
 	// a.offline=0: an asset on a currently-unplugged removable drive can't be
 	// read, so retrying it here would just burn CPU on a guaranteed failure
 	// every poll interval. MountGuard re-triggers Backfill right after the
 	// drive is reinserted, so the gap is closed the moment the file is
 	// reachable again.
-	rows, err := e.db.QueryContext(ctx, `
-        SELECT a.file_path FROM assets a
+	q := `
+        SELECT a.id, a.file_path FROM assets a
         LEFT JOIN asset_clip_idx i ON i.asset_id = a.id
-        WHERE a.status = 'indexed' AND a.offline = 0 AND i.asset_id IS NULL`)
+        WHERE a.status = 'indexed' AND a.offline = 0 AND i.asset_id IS NULL` +
+		backfillCooldownSQL("a")
+	rows, err := e.db.QueryContext(ctx, q, string(backfillCLIP), now.UnixMilli())
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var paths []string
+	var out []clipTarget
 	for rows.Next() {
-		var p string
-		if err := rows.Scan(&p); err != nil {
+		var tg clipTarget
+		if err := rows.Scan(&tg.id, &tg.path); err != nil {
 			return nil, err
 		}
-		paths = append(paths, p)
+		out = append(out, tg)
 	}
-	return paths, rows.Err()
+	return out, rows.Err()
 }
 
 // hasEmbeddingForPath looks up whether the given path already has a row in
@@ -174,20 +209,34 @@ func (e *Embedder) Backfill(ctx context.Context) error {
 	}
 }
 
+// embedOne fills one asset's CLIP vector, preferring the thumbnail path.
+// When the thumb is present the original file is never opened; the full
+// ForceReprocess pipeline is only the fallback for assets without a thumb.
+// A light-path ML error does not fall through to ForceReprocess — that
+// would re-issue the same doomed ML call after reading gigabytes more.
+func (e *Embedder) embedOne(tg clipTarget) bool {
+	if hasSmallThumb(e.indexer.thumbDir, tg.id) {
+		_ = e.indexer.embedClip(tg.id, nil)
+		return e.hasEmbeddingForPath(tg.path)
+	}
+	e.indexer.ForceReprocess(tg.path, processOpts{force: true, skipExif: true, skipThumb: true})
+	return e.hasEmbeddingForPath(tg.path)
+}
+
 // backfillOnce is Backfill's single-pass body (query targets + backfill each
 // one + report task progress), without the concurrency guard or rerun loop.
 func (e *Embedder) backfillOnce(ctx context.Context) error {
-	paths, err := e.queryMissing(ctx)
+	targets, err := e.queryMissing(ctx, time.Now())
 	if err != nil {
 		return err
 	}
-	if len(paths) == 0 {
+	if len(targets) == 0 {
 		return nil
 	}
 
 	taskID := fmt.Sprintf("embedding_%d", time.Now().UnixNano())
 	started := time.Now()
-	total := int64(len(paths))
+	total := int64(len(targets))
 	pubRunning := func(processed int64) {
 		e.reg.Upsert(Task{
 			ID:        taskID,
@@ -203,18 +252,37 @@ func (e *Embedder) backfillOnce(ctx context.Context) error {
 	pubRunning(0)
 
 	var processed, success, failed int64
-	for _, p := range paths {
+	type failedTarget struct {
+		tg clipTarget
+	}
+	var failures []failedTarget
+	for _, tg := range targets {
 		if ctx.Err() != nil {
 			break
 		}
-		e.indexer.ForceReprocess(p, processOpts{force: true, skipExif: true, skipThumb: true})
-		processed++
-		if e.hasEmbeddingForPath(p) {
+		if e.embedOne(tg) {
 			success++
+			clearBackfillFailure(e.db, backfillCLIP, tg.id)
 		} else {
 			failed++
+			failures = append(failures, failedTarget{tg: tg})
 		}
+		processed++
 		pubRunning(processed)
+	}
+	// Environmental guard: an all-failed pass with ML actually unreachable
+	// (IsReady()==false) means the ML backend itself is down (same condition
+	// as TaskErrMLLostDuringBackfill below) — recording per-asset failures
+	// would walk healthy assets up the cooldown ladder. But when ML is
+	// ready, an all-failed pass means the assets themselves are broken and
+	// MUST be recorded, or that corrupt set gets re-read every gate window
+	// forever and never converges.
+	if success > 0 || failed == 0 || e.ml.IsReady() {
+		now := time.Now()
+		for _, f := range failures {
+			recordBackfillFailure(e.db, backfillCLIP, f.tg.id, now,
+				fmt.Errorf("clip backfill produced no embedding"))
+		}
 	}
 
 	// If ctx is already cancelled (user cancellation or service shutdown),
@@ -260,16 +328,18 @@ func (e *Embedder) backfillOnce(ctx context.Context) error {
 // needs a rerun to fill it in), or boxes_ver=0 (an older run didn't store
 // per-line coordinates into asset_ocr_lines, needs a rerun for search-hit
 // highlighting).
-func (e *Embedder) queryMissingOCR(ctx context.Context) ([]ocrTarget, error) {
+func (e *Embedder) queryMissingOCR(ctx context.Context, now time.Time) ([]ocrTarget, error) {
 	// a.offline=0: same reasoning as queryMissing above — skip assets whose
 	// source is unreachable because their removable drive is unplugged.
-	rows, err := e.db.QueryContext(ctx, `
+	q := `
         SELECT a.id, a.file_path, COALESCE(a.mime_type,'') LIKE 'video/%'
         FROM assets a
         LEFT JOIN asset_ocr o ON o.asset_id = a.id
         WHERE a.status = 'indexed' AND a.deleted_at IS NULL AND a.offline = 0
           AND COALESCE(a.mime_type,'') NOT LIKE 'video/%'
-          AND (o.asset_id IS NULL OR o.coverage IS NULL OR COALESCE(o.boxes_ver,0) = 0)`)
+          AND (o.asset_id IS NULL OR o.coverage IS NULL OR COALESCE(o.boxes_ver,0) = 0)` +
+		backfillCooldownSQL("a")
+	rows, err := e.db.QueryContext(ctx, q, string(backfillOCR), now.UnixMilli())
 	if err != nil {
 		return nil, err
 	}
@@ -318,7 +388,7 @@ func (e *Embedder) BackfillOCR(ctx context.Context) error {
 // backfillOCROnce is BackfillOCR's single-pass body, without the concurrency
 // guard or rerun loop.
 func (e *Embedder) backfillOCROnce(ctx context.Context) error {
-	targets, err := e.queryMissingOCR(ctx)
+	targets, err := e.queryMissingOCR(ctx, time.Now())
 	if err != nil {
 		return err
 	}
@@ -343,10 +413,20 @@ func (e *Embedder) backfillOCROnce(ctx context.Context) error {
 	}
 	pubRunning(0)
 
+	// passFailures/passSuccess are captured by pass below and reset at the
+	// start of every call, so only the LAST call's results (the built-in
+	// ML-cold-start retry re-runs pass once) ever reach the ledger
+	// write-back after this function's final pass — see the retry block and
+	// the write-back below.
+	var passFailures map[string]error
+	var passSuccess []string
+
 	// pass runs through the given targets once, returning
 	// processed/failed counts (readFail = source file unreadable, ocrFail =
 	// ML call failed).
 	pass := func(ts []ocrTarget) (processed, failed, readFail, ocrFail int64) {
+		passFailures = map[string]error{}
+		passSuccess = nil
 		for _, t := range ts {
 			if ctx.Err() != nil {
 				break
@@ -358,10 +438,17 @@ func (e *Embedder) backfillOCROnce(ctx context.Context) error {
 			data, rerr := os.ReadFile(src)
 			if rerr != nil || len(data) == 0 {
 				// The original/thumbnail is unreadable (file deleted,
-				// thumbnail missing, etc.), unrelated to ML.
+				// thumbnail missing, etc.), unrelated to ML. Recorded in the
+				// ledger too: a corrupt/missing source is exactly what the
+				// cooldown exists to stop re-reading every pass.
 				readFail++
 				failed++
 				processed++
+				cause := rerr
+				if cause == nil {
+					cause = fmt.Errorf("source file empty: %s", src)
+				}
+				passFailures[t.id] = cause
 				pubRunning(processed)
 				continue
 			}
@@ -378,6 +465,7 @@ func (e *Embedder) backfillOCROnce(ctx context.Context) error {
 					readFail++
 					failed++
 					processed++
+					passFailures[t.id] = fmt.Errorf("oversized image with no thumbnail fallback available")
 					pubRunning(processed)
 					continue
 				}
@@ -385,8 +473,12 @@ func (e *Embedder) backfillOCROnce(ctx context.Context) error {
 			if oerr := e.indexer.ocrAsset(t.id, data); oerr != nil {
 				ocrFail++
 				failed++
-			} else if derr := e.indexer.computeDocVerdict(t.id); derr != nil {
-				zap.L().Warn("doc verdict after ocr backfill failed", zap.String("asset_id", t.id), zap.Error(derr))
+				passFailures[t.id] = oerr
+			} else {
+				if derr := e.indexer.computeDocVerdict(t.id); derr != nil {
+					zap.L().Warn("doc verdict after ocr backfill failed", zap.String("asset_id", t.id), zap.Error(derr))
+				}
+				passSuccess = append(passSuccess, t.id)
 			}
 			processed++
 			pubRunning(processed)
@@ -409,7 +501,7 @@ func (e *Embedder) backfillOCROnce(ctx context.Context) error {
 			return ctx.Err()
 		case <-time.After(ocrBackfillRetryDelay):
 		}
-		if ts2, qerr := e.queryMissingOCR(ctx); qerr == nil && len(ts2) > 0 {
+		if ts2, qerr := e.queryMissingOCR(ctx, time.Now()); qerr == nil && len(ts2) > 0 {
 			total = int64(len(ts2))
 			pubRunning(0)
 			processed, failed, readFail, ocrFail = pass(ts2)
@@ -418,6 +510,22 @@ func (e *Embedder) backfillOCROnce(ctx context.Context) error {
 
 	if ctx.Err() != nil {
 		return ctx.Err()
+	}
+
+	// Ledger write-back from the FINAL pass only; skip entirely when the
+	// pass is classified as ML-down (all processed failed via ocrFail AND
+	// ML is actually unreachable). When ML is ready, an all-failed pass
+	// means the assets themselves are broken and MUST be recorded, or that
+	// corrupt set gets re-read every gate window forever and never
+	// converges.
+	if !(processed > 0 && failed == processed && ocrFail > 0 && !e.ml.IsReady()) {
+		now := time.Now()
+		for id, cause := range passFailures {
+			recordBackfillFailure(e.db, backfillOCR, id, now, cause)
+		}
+	}
+	for _, id := range passSuccess {
+		clearBackfillFailure(e.db, backfillOCR, id)
 	}
 
 	final := Task{
@@ -475,7 +583,38 @@ func (e *Embedder) backfillOCROnce(ctx context.Context) error {
 // publish task events (unlike BackfillOCR, which runs inference). Assets
 // without a vector aren't selected; they converge on the next recovery-chain
 // hook after CLIP Backfill fills in their vector.
+//
+// Safe for concurrent calls: unlike Backfill/BackfillOCR/BackfillAesthetic,
+// each of which is only ever driven by a single chain, this is invoked from
+// both the "ml-recovery" and "post-batch-backfill" gated chains — distinct
+// gate names that may legitimately fire at the same time — so it needs the
+// same guard even though nothing else about it changed. A second call
+// returns nil immediately but sets docVerdictRerunPending, so the
+// in-progress pass automatically runs one more round (requerying targets)
+// once it finishes, guaranteeing the trigger isn't swallowed (same
+// mechanism and narrow-window caveat as Backfill's rerunPending; see its
+// doc comment).
 func (e *Embedder) BackfillDocVerdicts(ctx context.Context) error {
+	if !e.docVerdictRunning.CompareAndSwap(false, true) {
+		e.docVerdictRerunPending.Store(true)
+		return nil
+	}
+	defer e.docVerdictRunning.Store(false)
+
+	for {
+		if err := e.backfillDocVerdictsOnce(ctx); err != nil {
+			return err
+		}
+		if !e.docVerdictRerunPending.CompareAndSwap(true, false) {
+			return nil
+		}
+	}
+}
+
+// backfillDocVerdictsOnce is BackfillDocVerdicts's single-pass body (query
+// targets + compute each one's verdict), without the concurrency guard or
+// rerun loop.
+func (e *Embedder) backfillDocVerdictsOnce(ctx context.Context) error {
 	rows, err := e.db.QueryContext(ctx, `
         SELECT o.asset_id
         FROM asset_ocr o
@@ -649,7 +788,7 @@ func (e *Embedder) tick(ctx context.Context) {
 	ready := e.ml.IsReady()
 	prev := e.lastReady.Swap(ready)
 	if ready && !prev {
-		go func() {
+		go e.runGated(func() {
 			// Backfill first (fills assets that never got an embedding), then the
 			// one-time re-embed of all existing assets from their thumbnails,
 			// then OCR for assets indexed before OCR support existed, then doc
@@ -668,7 +807,7 @@ func (e *Embedder) tick(ctx context.Context) {
 			if e.onRecovered != nil {
 				e.onRecovered(ctx)
 			}
-		}()
+		})
 	}
 }
 

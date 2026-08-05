@@ -47,9 +47,10 @@ func TestEmbedder_QueryMissing(t *testing.T) {
 	insertClipIdx(t, db, hasIdx) // already has an idx row, should not be returned
 
 	e := NewEmbedder(db, &mockML{}, nil, nil)
-	paths, err := e.queryMissing(context.Background())
+	targets, err := e.queryMissing(context.Background(), time.Now())
 	require.NoError(t, err)
-	require.Equal(t, []string{"/a.jpg"}, paths)
+	require.Len(t, targets, 1)
+	require.Equal(t, "/a.jpg", targets[0].path)
 	_ = missing
 }
 
@@ -67,9 +68,10 @@ func TestEmbedder_QueryMissingExcludesOffline(t *testing.T) {
 	require.NoError(t, err)
 
 	e := NewEmbedder(db, &mockML{}, nil, nil)
-	paths, err := e.queryMissing(context.Background())
+	targets, err := e.queryMissing(context.Background(), time.Now())
 	require.NoError(t, err)
-	require.Equal(t, []string{"/a.jpg"}, paths)
+	require.Len(t, targets, 1)
+	require.Equal(t, "/a.jpg", targets[0].path)
 	_ = online
 }
 
@@ -82,7 +84,7 @@ func TestEmbedder_QueryMissingOCRExcludesOffline(t *testing.T) {
 	require.NoError(t, err)
 
 	e := NewEmbedder(db, &mockML{}, nil, nil)
-	targets, err := e.queryMissingOCR(context.Background())
+	targets, err := e.queryMissingOCR(context.Background(), time.Now())
 	require.NoError(t, err)
 	ids := map[string]bool{}
 	for _, tg := range targets {
@@ -111,7 +113,7 @@ func TestQueryMissingOCRIncludesLegacyBoxless(t *testing.T) {
 	require.NoError(t, err)
 
 	e := NewEmbedder(db, &mockML{}, nil, nil)
-	targets, err := e.queryMissingOCR(context.Background())
+	targets, err := e.queryMissingOCR(context.Background(), time.Now())
 	require.NoError(t, err)
 
 	ids := make([]string, 0, len(targets))
@@ -132,7 +134,7 @@ func TestVideoOCRExcludedAndPruned(t *testing.T) {
 	require.NoError(t, err)
 
 	e := NewEmbedder(db, &mockML{}, nil, nil)
-	targets, err := e.queryMissingOCR(context.Background())
+	targets, err := e.queryMissingOCR(context.Background(), time.Now())
 	require.NoError(t, err)
 	ids := map[string]bool{}
 	for _, tg := range targets {
@@ -154,9 +156,11 @@ func TestVideoOCRExcludedAndPruned(t *testing.T) {
 	require.Equal(t, 1, imgRows, "the image's OCR row should be kept")
 }
 
-// gateML's CLIPImageEmbed blocks on release on its first call and always
-// returns an error, used to create a "Backfill running for a long time"
-// window and keep an asset with a missing vector missing.
+// gateML's CLIPImageEmbed blocks on its first call until release, then
+// (including that first call) always succeeds like mockML — used to create
+// a "Backfill running for a long time" window without leaving the asset
+// permanently unembeddable (the cooldown ledger would otherwise legitimately
+// block a same-asset retry observation, per TestQueryMissing_SkipsAssetsInCooldown).
 type gateML struct {
 	mockML
 	clipCalls atomic.Int32
@@ -164,12 +168,12 @@ type gateML struct {
 	release   chan struct{}
 }
 
-func (m *gateML) CLIPImageEmbed(_ []byte) ([]float32, error) {
+func (m *gateML) CLIPImageEmbed(b []byte) ([]float32, error) {
 	if m.clipCalls.Add(1) == 1 {
 		m.entered <- struct{}{}
 		<-m.release
 	}
-	return nil, fmt.Errorf("clip backend unavailable")
+	return m.mockML.CLIPImageEmbed(b)
 }
 
 // TestEmbedder_BackfillRerunsWhenTriggeredMidRun verifies the
@@ -179,7 +183,12 @@ func (m *gateML) CLIPImageEmbed(_ []byte) ([]float32, error) {
 // and wouldn't see an asset that just became backfillable (typically:
 // MountGuard just marked a replugged drive back to online). The second
 // call should set pending, so the current pass automatically requeries and
-// runs another round once it finishes.
+// runs another round once it finishes — proved here by inserting a new
+// asset while the first pass is blocked mid-flight (after it already
+// queried its targets) and confirming only the rerun pass could have
+// embedded it. (The cooldown ledger now legitimately blocks the old
+// observation of "the same failing asset gets retried", since a failed
+// asset cools down instead of being retried on the very next pass.)
 func TestEmbedder_BackfillRerunsWhenTriggeredMidRun(t *testing.T) {
 	prev := config.Cfg
 	t.Cleanup(func() { config.Cfg = prev })
@@ -187,7 +196,8 @@ func TestEmbedder_BackfillRerunsWhenTriggeredMidRun(t *testing.T) {
 	config.Cfg = &config.Config{ScenesEnabled: true}
 
 	db := makeTestDB(t)
-	path := makeTestJPEG(t, t.TempDir())
+	tmp := t.TempDir()
+	path := makeUniqueJPEG(t, tmp, 0)
 	insertAsset(t, db, path, "indexed") // missing CLIP vector → a Backfill target
 
 	ml := &gateML{entered: make(chan struct{}, 1), release: make(chan struct{})}
@@ -202,12 +212,17 @@ func TestEmbedder_BackfillRerunsWhenTriggeredMidRun(t *testing.T) {
 	require.NoError(t, e.Backfill(context.Background()))
 	require.True(t, e.rerunPending.Load(), "a trigger received while running must set rerunPending")
 
+	// Insert a new asset while the first pass is blocked: it didn't exist
+	// when the first pass queried its targets, so only the rerun pass
+	// (triggered by rerunPending) can pick it up.
+	newPath := makeUniqueJPEG(t, tmp, 1)
+	insertAsset(t, db, newPath, "indexed")
+
 	close(ml.release)
 	require.NoError(t, <-errCh)
 
-	// After the first pass finished, it automatically reran a round: the
-	// same still-missing-vector asset was retried (2 CLIP calls total).
-	require.Equal(t, int32(2), ml.clipCalls.Load(), "another backfill round should run automatically after the current round finishes")
+	require.True(t, e.hasEmbeddingForPath(newPath),
+		"the rerun pass triggered by rerunPending should have requeried and embedded the newly inserted asset")
 	require.False(t, e.rerunPending.Load(), "pending should be consumed after the rerun round finishes")
 	require.False(t, e.running.Load())
 }
