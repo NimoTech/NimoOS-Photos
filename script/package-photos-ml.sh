@@ -80,5 +80,9 @@ printf 'universal\n' > "${STAGE}/FLAVOR"
 mkdir -p "${OUT}"
 BUNDLE="${OUT}/photos-ml-universal-v${VERSION}.tar.gz"
 tar -czf "${BUNDLE}" -C "${STAGE}" .
-sha256sum "${BUNDLE}" > "${BUNDLE}.sha256"
+# Bare-filename format (not the absolute/relative path sha256sum records by
+# default): setup-photos.sh downloads bundle + sidecar into the same tmp dir
+# and runs `sha256sum -c` from inside it, which requires the recorded name to
+# match the file sitting right next to it, not a path from this machine.
+(cd "$(dirname "${BUNDLE}")" && sha256sum "$(basename "${BUNDLE}")" > "$(basename "${BUNDLE}")".sha256)
 echo "✓ Done: ${BUNDLE} ($(du -sh "${BUNDLE}" | cut -f1))"
