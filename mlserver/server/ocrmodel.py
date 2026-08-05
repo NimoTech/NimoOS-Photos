@@ -111,6 +111,8 @@ Contract quirks required by pkg/mlclient (per T2's duck-type contract):
   pixel-identical arrays on this stack, so this is a fidelity/
   readability choice, not something the golden gate depended on.
 """
+import os
+from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from pathlib import Path
 
@@ -141,6 +143,17 @@ _NORM_STD_INV = 1.0 / (0.5 * 255.0)
 # includes the OpenVINO EP; see module docstring point 3's T7 update for
 # why that's safe (byte-identical golden result to CPU on this pipeline).
 _PREFERRED_PROVIDERS = ["CPUExecutionProvider"]
+
+# Worker count for the per-line perspective-crop thread pool (see
+# _crop_lines_parallel below). Bounded well under the host's core count:
+# this server also runs CLIP/face inference concurrently and shouldn't
+# starve them just to parallelize OCR's own crop step. PIL's ImagingCore
+# C transform/resize/decode loops release the GIL for their duration
+# (confirmed empirically -- see perf/ocr-crop-throughput's report), so a
+# small thread pool gets real wall-clock parallelism here without adding
+# process-level concurrency risk.
+_CROP_WORKERS = max(1, min(6, os.cpu_count() or 1))
+_CROP_EXECUTOR = ThreadPoolExecutor(max_workers=_CROP_WORKERS, thread_name_prefix="ocr-crop")
 
 _DEFAULT_CFG_PATH = Path(rapidocr.__file__).resolve().parent / "config.yaml"
 
@@ -190,7 +203,7 @@ def _build_session(model_path: Path, providers: list) -> ort.InferenceSession:
     return ort.InferenceSession(str(model_path), providers=chosen)
 
 
-def _crop_line(img: np.ndarray, box: np.ndarray) -> np.ndarray:
+def _crop_line(img_pil: Image.Image, box: np.ndarray) -> np.ndarray:
     """Perspective-crop one detected text line out of the full image.
 
     immich's own recognition wrapper does NOT use rapidocr's public
@@ -208,6 +221,15 @@ def _crop_line(img: np.ndarray, box: np.ndarray) -> np.ndarray:
     producing slightly different pixels than immich's PIL-based one on
     the exact same box coordinates, which is what fed slightly
     different pixels into the recognizer.
+
+    `img_pil` is the WHOLE image, already converted once by the caller
+    (see `run()`/`_crop_lines_parallel`) -- `Image.fromarray` is a pure
+    read of `img`'s buffer and `.transform()` never mutates `self`, so
+    reusing one `Image` object across every line in the image is exactly
+    equivalent to re-converting per line, just without redoing the same
+    O(image size) numpy->PIL conversion once per detected line (perf/
+    ocr-crop-throughput: this conversion, repeated per line, profiled as
+    the dominant cost of OCR's per-line loop).
     """
     pts = box.astype(np.float32)
     crop_w = int(max(np.linalg.norm(pts[0] - pts[1]), np.linalg.norm(pts[2] - pts[3])))
@@ -220,13 +242,36 @@ def _crop_line(img: np.ndarray, box: np.ndarray) -> np.ndarray:
     h_mat = cv2.getPerspectiveTransform(std_rect, pts)
     h_mat = h_mat / h_mat[2, 2]
     coeffs = tuple(h_mat[:2].reshape(-1)) + tuple(h_mat[2, :2])
-    cropped = Image.fromarray(img).transform(
+    cropped = img_pil.transform(
         (crop_w, crop_h), Image.Transform.PERSPECTIVE, data=coeffs, resample=Image.Resampling.BICUBIC
     )
     arr = np.asarray(cropped)
     if arr.shape[0] * 1.0 / arr.shape[1] >= 1.5:
         arr = np.rot90(arr)
     return np.ascontiguousarray(arr)
+
+
+def _crop_lines_parallel(img_pil: Image.Image, boxes) -> list:
+    """Run `_crop_line` for every detected box, in parallel, preserving
+    input order in the returned list (determinism: recognition zips the
+    result back against `det_boxes`/`det_scores` by position).
+
+    Each box's crop is an independent read of the same shared, immutable
+    (from this function's point of view) `img_pil` plus its own box's
+    coordinates -- there is no shared mutable state between iterations,
+    so this changes nothing about *what* gets computed, only how many OS
+    threads run the (GIL-releasing) PIL/cv2 C calls concurrently.
+    `ThreadPoolExecutor.map` blocks on each future in submission order
+    when consuming results, so the returned list is bit-for-bit the same
+    sequence a plain `for` loop would produce, regardless of which
+    thread happens to finish first.
+
+    A single line is not worth the thread-pool dispatch overhead, so it
+    stays on the calling thread.
+    """
+    if len(boxes) <= 1:
+        return [_crop_line(img_pil, box) for box in boxes]
+    return list(_CROP_EXECUTOR.map(lambda box: _crop_line(img_pil, box), boxes))
 
 
 class OcrPipeline:
@@ -274,7 +319,12 @@ class OcrPipeline:
             det_boxes, det_scores = self.det.postprocess_op(preds, (h, w))
 
             if len(det_boxes):
-                crops = [_crop_line(img, box) for box in det_boxes]
+                # Convert the full image to PIL exactly once per call
+                # (not once per detected line -- see _crop_line's
+                # docstring): `Image.fromarray` re-reads the whole H*W*3
+                # buffer, and a text-heavy image can have 100+ lines.
+                img_pil = Image.fromarray(img)
+                crops = _crop_lines_parallel(img_pil, det_boxes)
                 rec_out = self.rec(TextRecInput(img=crops))
                 for box, box_score, text, text_score in zip(det_boxes, det_scores, rec_out.txts, rec_out.scores):
                     if text_score <= REC_MIN_SCORE:
