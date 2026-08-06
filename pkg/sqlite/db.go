@@ -754,10 +754,30 @@ func migrate(db *sql.DB) error {
 	// idx_assets_livevideo (is_live_photo_video is almost always 0, so that
 	// "search" touches nearly every row) plus a temp b-tree sort, instead of
 	// walking idx_assets_sortkey directly — silently defeating the indexes
-	// just added above. Scoping ANALYZE to the assets table keeps this cheap
-	// even on large libraries (it does not scan every other table).
-	if _, err := db.Exec(`ANALYZE assets`); err != nil {
-		return fmt.Errorf("migrate analyze assets: %w", err)
+	// just added above. Two layers cover this without paying a full-table
+	// scan on every restart of a ~500k-row library:
+	//   1. A guarded one-time ANALYZE assets: only runs when sqlite_stat1 has
+	//      no rows for this table yet (upgrade from a version that never
+	//      analyzed it, or a brand-new install), so it fires exactly once
+	//      per install instead of on every startup.
+	//   2. An unconditional PRAGMA optimize: this is self-limiting — SQLite's
+	//      own heuristics decide whether any table's stats are stale enough
+	//      to be worth re-analyzing — so on a normal restart with fresh
+	//      stats it is a near-zero-cost no-op, and it is what keeps stats
+	//      from going stale again as a library grows from empty to hundreds
+	//      of thousands of rows over the following months.
+	var statRows int
+	err = db.QueryRow(`SELECT COUNT(*) FROM sqlite_stat1 WHERE tbl='assets'`).Scan(&statRows)
+	if err != nil && !strings.Contains(err.Error(), "no such table") {
+		return fmt.Errorf("migrate check sqlite_stat1: %w", err)
+	}
+	if statRows == 0 {
+		if _, err := db.Exec(`ANALYZE assets`); err != nil {
+			return fmt.Errorf("migrate analyze assets: %w", err)
+		}
+	}
+	if _, err := db.Exec(`PRAGMA optimize;`); err != nil {
+		return fmt.Errorf("migrate pragma optimize: %w", err)
 	}
 
 	return nil
