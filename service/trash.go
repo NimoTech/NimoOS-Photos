@@ -216,9 +216,11 @@ func (s *TrashService) purgeFiles(id, curPath string) {
 	os.RemoveAll(filepath.Join(s.thumbDir, id)) //nolint:errcheck
 }
 
-// ListTrash returns every asset currently in the trash (excluding
-// live-video companions), ordered by delete time descending.
-func (s *TrashService) ListTrash(userID string) ([]Asset, error) {
+// ListTrash returns a page of assets currently in the trash (excluding
+// live-video companions), ordered by delete time descending. limit/offset
+// are expected to already be normalized by the caller (handler applies the
+// default + 500 cap); limit<=0 here would return zero rows.
+func (s *TrashService) ListTrash(userID string, limit, offset int) ([]Asset, error) {
 	rows, err := s.db.Query(`
 SELECT a.id, a.file_path, a.file_size, COALESCE(a.mime_type,''),
        COALESCE(a.original_name,''), a.taken_at, a.duration_ms,
@@ -226,7 +228,8 @@ SELECT a.id, a.file_path, a.file_size, COALESCE(a.mime_type,''),
        a.indexed_at, a.status, a.deleted_at, COALESCE(a.original_path,'')
 FROM assets a
 WHERE a.deleted_at IS NOT NULL AND a.is_live_photo_video = 0
-ORDER BY a.deleted_at DESC`)
+ORDER BY a.deleted_at DESC
+LIMIT ? OFFSET ?`, limit, offset)
 	if err != nil {
 		return nil, fmt.Errorf("ListTrash query: %w", err)
 	}

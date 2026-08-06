@@ -63,8 +63,10 @@ func (h *FavoritesHandler) ListIDs(c echo.Context) error {
 func (h *FavoritesHandler) List(c echo.Context) error {
 	limit, _ := strconv.Atoi(c.QueryParam("limit"))
 	offset, _ := strconv.Atoi(c.QueryParam("offset"))
-	if limit < 0 || limit > 500 {
-		limit = 0
+	// Default AND ceiling: an absent limit used to mean "everything", which
+	// at gallery scale serializes tens of thousands of rows per request.
+	if limit <= 0 || limit > 500 {
+		limit = 500
 	}
 	assets, err := h.svc.Favorites().List(JWTUserID(c), service.ListFavoritesOpts{
 		Limit:  limit,
