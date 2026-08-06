@@ -415,6 +415,22 @@ func (s *PersonService) setHidden(id string, hidden bool) error {
 	return nil
 }
 
+// PersonVisible reports whether the person exists and is not hidden, with
+// the same 404 semantics as GetPerson. Used by list-style person endpoints
+// (assets/relations/places) that would otherwise leak hidden persons' data
+// or silently return empty arrays for nonexistent ids.
+func (s *PersonService) PersonVisible(id string) error {
+	var one int
+	err := s.db.QueryRow(`SELECT 1 FROM persons WHERE id=? AND hidden=0`, id).Scan(&one)
+	if err == sql.ErrNoRows {
+		return ErrNotFound
+	}
+	if err != nil {
+		return fmt.Errorf("PersonVisible: %w", err)
+	}
+	return nil
+}
+
 // PersonRelations returns other persons who co-appear with this person in the same asset, ordered by co-occurrence count descending.
 func (s *PersonService) PersonRelations(id string) ([]PersonRelation, error) {
 	rows, err := s.db.Query(`
