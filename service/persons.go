@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/NimoTech/NimoOS-Photos/pkg/config"
 	"github.com/NimoTech/NimoOS-Photos/pkg/sqlite"
 	"github.com/disintegration/imaging"
 )
@@ -22,6 +23,16 @@ type PersonService struct {
 }
 
 func NewPersonService(db *sql.DB) *PersonService { return &PersonService{db: db} }
+
+// minPersonConfidence returns the configured floor for unnamed clusters;
+// 0 (no gating) when config isn't initialized (tests constructing services
+// directly).
+func minPersonConfidence() float64 {
+	if config.Cfg != nil {
+		return config.Cfg.MinPersonConfidence
+	}
+	return 0.0
+}
 
 // ListPersons returns all non-hidden persons as rich objects (with count/confidence/first-last-seen/places count).
 func (s *PersonService) ListPersons() ([]Person, error) {
@@ -61,8 +72,8 @@ SELECT p.id, p.name,
                ORDER BY a2.aesthetic_score DESC LIMIT 1),
            '') AS hero
 FROM persons p
-WHERE p.hidden=0
-ORDER BY cnt DESC, p.rowid`)
+WHERE p.hidden=0 AND (p.name!='' OR p.favorite=1 OR COALESCE(p.relation,'')!='' OR p.confidence >= ?)
+ORDER BY cnt DESC, p.rowid`, minPersonConfidence())
 	if err != nil {
 		return nil, fmt.Errorf("ListPersons: %w", err)
 	}
@@ -440,10 +451,10 @@ JOIN face_detections fd1 ON fd1.id=fp1.face_id
 JOIN face_detections fd2 ON fd2.asset_id=fd1.asset_id AND fd2.id!=fd1.id
 JOIN face_person fp2 ON fp2.face_id=fd2.id
 JOIN assets a ON a.id=fd1.asset_id AND a.deleted_at IS NULL AND a.offline=0 AND a.is_live_photo_video=0
-JOIN persons p ON p.id=fp2.person_id AND p.hidden=0
+JOIN persons p ON p.id=fp2.person_id AND p.hidden=0 AND (p.name!='' OR p.favorite=1 OR COALESCE(p.relation,'')!='' OR p.confidence >= ?)
 WHERE fp1.person_id=? AND fp2.person_id!=fp1.person_id
 GROUP BY fp2.person_id
-ORDER BY cnt DESC`, id)
+ORDER BY cnt DESC`, minPersonConfidence(), id)
 	if err != nil {
 		return nil, fmt.Errorf("PersonRelations: %w", err)
 	}
@@ -532,7 +543,7 @@ type personCentroid struct {
 func (s *PersonService) MergeSuggestions() ([]MergeSuggestion, error) {
 	rows, err := s.db.Query(`
 SELECT id, COALESCE(name,''), COALESCE(cover_face_id,''), centroid
-FROM persons WHERE hidden=0 AND centroid IS NOT NULL`)
+FROM persons WHERE hidden=0 AND centroid IS NOT NULL AND (name!='' OR favorite=1 OR COALESCE(relation,'')!='' OR confidence >= ?)`, minPersonConfidence())
 	if err != nil {
 		return nil, fmt.Errorf("MergeSuggestions load: %w", err)
 	}

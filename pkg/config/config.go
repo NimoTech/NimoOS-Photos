@@ -47,6 +47,14 @@ type Config struct {
 	// default — see service/search.go for the full rationale and calibration
 	// history of this knob.
 	MinMatchSimilarity float64
+	// MinPersonConfidence is the cohesion floor for exposing UNNAMED
+	// auto-clusters via the People list / relations / merge-suggestion APIs.
+	// DBSCAN chaining can occasionally weld many different people into one
+	// low-cohesion "garbage bin" cluster; gating on cluster confidence keeps
+	// it out of every user-facing surface while the data stays in the DB for
+	// future re-clustering. Named/favorited/related persons are never gated.
+	// Defaults to 0.5 when absent from the config file.
+	MinPersonConfidence float64
 	// SimDisplayFloor/SimDisplayCeil linearly rescale the raw CLIP cosine
 	// similarity into the [0,1] display score shown to the UI. Defaults
 	// (0.03/0.13) were empirically calibrated against the current CLIP model
@@ -120,10 +128,11 @@ func Init(configFile, confSample string) error {
 		AestheticEnabled: v.GetBool("photos.AestheticEnabled"),
 		PreviewPregen:    v.GetBool("photos.PreviewPregen"),
 
-		MinMatchSimilarity: v.GetFloat64("photos.MinMatchSimilarity"),
-		SimDisplayFloor:    v.GetFloat64("photos.SimDisplayFloor"),
-		SimDisplayCeil:     v.GetFloat64("photos.SimDisplayCeil"),
-		SearchCutAlpha:     v.GetFloat64("photos.SearchCutAlpha"),
+		MinMatchSimilarity:  v.GetFloat64("photos.MinMatchSimilarity"),
+		MinPersonConfidence: v.GetFloat64("photos.MinPersonConfidence"),
+		SimDisplayFloor:     v.GetFloat64("photos.SimDisplayFloor"),
+		SimDisplayCeil:      v.GetFloat64("photos.SimDisplayCeil"),
+		SearchCutAlpha:      v.GetFloat64("photos.SearchCutAlpha"),
 
 		DocWSem:       v.GetFloat64("photos.DocWSem"),
 		DocWGeo:       v.GetFloat64("photos.DocWGeo"),
@@ -173,6 +182,12 @@ func Init(configFile, confSample string) error {
 	// Semantic search relevance floor: defaults to 0 (no filtering) when absent from the config, matching the hardcoded behavior before this became configurable.
 	if !v.IsSet("photos.MinMatchSimilarity") {
 		Cfg.MinMatchSimilarity = 0.0
+	}
+	// Unnamed-cluster confidence floor: defaults to 0.5 when absent from the
+	// config, so low-cohesion "garbage bin" clusters stay out of the People
+	// list/relations/merge-suggestions by default.
+	if !v.IsSet("photos.MinPersonConfidence") {
+		Cfg.MinPersonConfidence = 0.5
 	}
 	// Display-layer calibration interval endpoints: use the current model's empirical defaults when absent from the config.
 	if !v.IsSet("photos.SimDisplayFloor") {
