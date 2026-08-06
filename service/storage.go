@@ -23,19 +23,13 @@ type StorageStats struct {
 	PrunableBytes  int64 `json:"prunableBytes"`
 }
 
-// rawExts are extensions counted as "RAW originals" in the storage breakdown.
-// The indexer does not ingest RAW yet, so this bucket is 0 today; the set is
-// kept so the API shape survives future RAW support.
-var rawExts = map[string]bool{
-	".dng": true, ".cr2": true, ".cr3": true, ".nef": true,
-	".arw": true, ".orf": true, ".rw2": true, ".raf": true,
-}
-
 // storageCacheTTL bounds how often the thumbs-dir walk runs.
 const storageCacheTTL = 60 * time.Second
 
 // StorageService computes disk usage and library breakdown for the settings
-// page. Stats() results are cached for storageCacheTTL.
+// page. DB-derived buckets are recomputed on every Stats() call (a single
+// aggregate query, cheap even at gallery scale); filesystem-derived buckets
+// are refreshed in the background at most once per storageCacheTTL.
 type StorageService struct {
 	db        *sql.DB
 	dbPath    string // photos.db path (AI bucket = db + -wal + -shm)
@@ -43,106 +37,136 @@ type StorageService struct {
 	faceDir   string
 	statfsDir string // any path on the volume that holds the library
 
-	mu       sync.Mutex
-	cached   *StorageStats
-	cachedAt time.Time
+	mu           sync.Mutex
+	fsCache      *fsStats // cache/prunable bytes from the last completed walk
+	fsCachedAt   time.Time
+	fsRefreshing bool
+}
+
+// fsStats is the filesystem-derived half of StorageStats: it requires
+// walking the whole thumbnail tree (one directory per asset), which at
+// gallery scale is hundreds of thousands of stat calls — never do it on
+// the request path.
+type fsStats struct {
+	CacheBytes    int64
+	PrunableBytes int64
 }
 
 func NewStorageService(db *sql.DB, dbPath, thumbDir, faceDir, statfsDir string) *StorageService {
 	return &StorageService{db: db, dbPath: dbPath, thumbDir: thumbDir, faceDir: faceDir, statfsDir: statfsDir}
 }
 
-// Stats returns storage statistics, recomputing at most once per storageCacheTTL.
+// Stats returns storage statistics. DB-derived buckets are computed fresh on
+// every call (a single aggregate query); filesystem-derived buckets come from
+// a background walk refreshed at most every storageCacheTTL — stale values
+// are served immediately rather than blocking the request.
 func (s *StorageService) Stats() (*StorageStats, error) {
-	s.mu.Lock()
-	if s.cached != nil && time.Since(s.cachedAt) < storageCacheTTL {
-		c := *s.cached
-		s.mu.Unlock()
-		return &c, nil
-	}
-	s.mu.Unlock()
-
-	st, err := s.compute()
+	st, err := s.computeDB()
 	if err != nil {
 		return nil, err
 	}
 	s.mu.Lock()
-	s.cached, s.cachedAt = st, time.Now()
+	if s.fsCache != nil {
+		st.CacheBytes = s.fsCache.CacheBytes
+		st.PrunableBytes = s.fsCache.PrunableBytes
+	}
+	if !s.fsRefreshing && (s.fsCache == nil || time.Since(s.fsCachedAt) >= storageCacheTTL) {
+		s.fsRefreshing = true
+		go s.refreshFS()
+	}
 	s.mu.Unlock()
-	c := *st
-	return &c, nil
+	return st, nil
 }
 
-// Invalidate drops the cached stats (e.g. after a prune).
+// Invalidate clears the cached filesystem-derived stats so the next Stats()
+// call kicks a fresh background walk (e.g. after a prune). DB-derived
+// buckets are always fresh already, so there is nothing else to drop.
 func (s *StorageService) Invalidate() {
 	s.mu.Lock()
-	s.cached = nil
+	s.fsCache = nil
 	s.mu.Unlock()
 }
 
-func (s *StorageService) compute() (*StorageStats, error) {
-	st := &StorageStats{}
+// WarmFS kicks one background walk so the settings page has cache numbers
+// soon after boot. Safe to call more than once.
+func (s *StorageService) WarmFS() {
+	s.mu.Lock()
+	if !s.fsRefreshing {
+		s.fsRefreshing = true
+		go s.refreshFS()
+	}
+	s.mu.Unlock()
+}
 
-	// 1. Volume capacity via statfs.
+func (s *StorageService) computeDB() (*StorageStats, error) {
+	st := &StorageStats{}
 	var fsStat syscall.Statfs_t
 	if err := syscall.Statfs(s.statfsDir, &fsStat); err == nil {
 		st.DiskTotalBytes = int64(fsStat.Blocks) * int64(fsStat.Bsize)
 		st.DiskFreeBytes = int64(fsStat.Bavail) * int64(fsStat.Bsize)
 	}
-
-	// 2. Library breakdown from the assets table. Trashed assets still occupy
-	//    disk until purged, so deleted_at is intentionally NOT filtered.
-	// The same scan also collects asset IDs for orphan detection below,
-	// avoiding a second full-table pass.
-	ids := map[string]bool{}
-	rows, err := s.db.Query(`SELECT id, COALESCE(file_path,''), COALESCE(file_size,0), COALESCE(mime_type,'') FROM assets`)
+	// Trashed assets still occupy disk until purged: deleted_at intentionally
+	// not filtered (same contract as the old per-row scan).
+	err := s.db.QueryRow(`
+SELECT
+  COALESCE(SUM(CASE WHEN `+rawExtCase+` THEN file_size ELSE 0 END), 0),
+  COALESCE(SUM(CASE WHEN NOT `+rawExtCase+` AND COALESCE(mime_type,'') LIKE 'video/%' THEN file_size ELSE 0 END), 0),
+  COALESCE(SUM(CASE WHEN NOT `+rawExtCase+` AND COALESCE(mime_type,'') NOT LIKE 'video/%' THEN file_size ELSE 0 END), 0)
+FROM assets`).Scan(&st.RawBytes, &st.VideosBytes, &st.PhotosBytes)
 	if err != nil {
 		return nil, err
 	}
-	for rows.Next() {
-		var id, path, mime string
-		var size int64
-		if err := rows.Scan(&id, &path, &size, &mime); err != nil {
-			rows.Close()
-			return nil, err
-		}
-		ids[id] = true
-		switch {
-		case rawExts[strings.ToLower(filepath.Ext(path))]:
-			st.RawBytes += size
-		case strings.HasPrefix(mime, "video/"):
-			st.VideosBytes += size
-		default:
-			st.PhotosBytes += size
-		}
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-
-	// 3. Thumbnail cache + orphans (keep in sync with Prune()).
-	entries, _ := os.ReadDir(s.thumbDir)
-	for _, e := range entries {
-		size := dirSize(filepath.Join(s.thumbDir, e.Name()))
-		st.CacheBytes += size
-		if e.IsDir() && !ids[e.Name()] {
-			st.PrunableBytes += size
-		}
-	}
-	// Face thumbnails count as cache but are keyed by person, not asset —
-	// orphan detection for this bucket lives in Prune()'s face_detections
-	// diff instead (orphan jpgs left by deleting a person/photo are reclaimed
-	// by Prune uniformly).
-	st.CacheBytes += dirSize(s.faceDir)
-
-	// 4. AI bucket = SQLite database files.
 	for _, suffix := range []string{"", "-wal", "-shm"} {
 		if fi, err := os.Stat(s.dbPath + suffix); err == nil {
 			st.AIBytes += fi.Size()
 		}
 	}
 	return st, nil
+}
+
+// rawExtCase mirrors the rawExts map in SQL so the aggregate stays in one
+// round-trip. Keep the two lists in sync.
+const rawExtCase = `(lower(COALESCE(file_path,'')) LIKE '%.dng' OR lower(COALESCE(file_path,'')) LIKE '%.cr2'
+	OR lower(COALESCE(file_path,'')) LIKE '%.cr3' OR lower(COALESCE(file_path,'')) LIKE '%.nef'
+	OR lower(COALESCE(file_path,'')) LIKE '%.arw' OR lower(COALESCE(file_path,'')) LIKE '%.orf'
+	OR lower(COALESCE(file_path,'')) LIKE '%.rw2' OR lower(COALESCE(file_path,'')) LIKE '%.raf')`
+
+// refreshFS runs the expensive thumbnail-tree walk off the request path and
+// publishes the result. Orphan detection reuses the old logic (dir name not
+// present in assets.id).
+func (s *StorageService) refreshFS() {
+	defer func() {
+		s.mu.Lock()
+		s.fsRefreshing = false
+		s.mu.Unlock()
+	}()
+	ids := map[string]bool{}
+	rows, err := s.db.Query(`SELECT id FROM assets`)
+	if err != nil {
+		return
+	}
+	for rows.Next() {
+		var id string
+		if rows.Scan(&id) == nil {
+			ids[id] = true
+		}
+	}
+	rows.Close()
+
+	out := &fsStats{}
+	entries, _ := os.ReadDir(s.thumbDir)
+	for _, e := range entries {
+		size := dirSize(filepath.Join(s.thumbDir, e.Name()))
+		out.CacheBytes += size
+		if e.IsDir() && !ids[e.Name()] {
+			out.PrunableBytes += size
+		}
+	}
+	out.CacheBytes += dirSize(s.faceDir)
+
+	s.mu.Lock()
+	s.fsCache, s.fsCachedAt = out, time.Now()
+	s.mu.Unlock()
 }
 
 // PruneResult reports what Prune removed.
@@ -190,7 +214,7 @@ func (s *StorageService) Prune(stagingDir string, stagingMaxAge time.Duration) (
 
 	// face-thumbs orphans: cleaned up by diffing against face_detections
 	// (deleting a person/photo doesn't clean this up; see the comment in
-	// Stats — this is the only reclamation path).
+	// refreshFS — this is the only reclamation path).
 	faceIDs := map[string]bool{}
 	frows, err := s.db.Query(`SELECT id FROM face_detections`)
 	if err != nil {
