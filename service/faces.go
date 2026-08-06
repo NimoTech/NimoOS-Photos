@@ -29,6 +29,15 @@ const (
 	suggestEpsilon = 0.75
 )
 
+// personAnchoredCond is the SQL predicate for persons that must survive
+// re-clustering with identity intact: user-named / favorited / related /
+// hidden, plus a user-pinned cover (cover_locked=1) or a user-chosen hero
+// background. NOTE: purgeAutoPersons / purgeEmptyAutoPersons deliberately
+// keep the narrower legacy predicate — those paths only run when a person
+// has zero member faces left, and an unnamed shell whose only anchor was a
+// (now dangling) pinned cover must still be cleaned up.
+const personAnchoredCond = `(name!='' OR favorite=1 OR relation!='' OR hidden=1 OR cover_locked=1 OR COALESCE(hero_asset_id,'')!='')`
+
 // cosDist computes the cosine distance between two float32 vectors.
 // Returns 1.0 if either vector has zero norm.
 func cosDist(a, b []float32) float64 {
@@ -827,7 +836,7 @@ func (s *FaceService) rebuildPersonsWithProgress(ctx context.Context, faces []fa
 		centroid []float32
 	}
 	anchorRows, err := tx.QueryContext(ctx,
-		`SELECT id FROM persons WHERE name!='' OR favorite=1 OR relation!='' OR hidden=1`)
+		`SELECT id FROM persons WHERE `+personAnchoredCond)
 	if err != nil {
 		return err
 	}
@@ -898,12 +907,12 @@ func (s *FaceService) rebuildPersonsWithProgress(ctx context.Context, faces []fa
 	// 2. Delete auto persons (non-anchored) and their face_person rows.
 	if _, err = tx.Exec(`
 		DELETE FROM face_person
-		WHERE person_id IN (SELECT id FROM persons WHERE NOT (name!='' OR favorite=1 OR relation!='' OR hidden=1))`); err != nil {
+		WHERE person_id IN (SELECT id FROM persons WHERE NOT ` + personAnchoredCond + `)`); err != nil {
 		return err
 	}
 	if _, err = tx.Exec(`
 		DELETE FROM persons
-		WHERE NOT (name!='' OR favorite=1 OR relation!='' OR hidden=1)`); err != nil {
+		WHERE NOT ` + personAnchoredCond); err != nil {
 		return err
 	}
 
