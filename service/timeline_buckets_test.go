@@ -60,6 +60,53 @@ GROUP BY 1`)
 	require.Contains(t, plan, "idx_assets_monthkey")
 }
 
+func TestTimelineBucketAssetsUsesMonthIndex(t *testing.T) {
+	db := openPerfDB(t)
+	seedPerfAssets(t, db, 2000)
+	// Mirrors TestTimelineBucketsUsesMonthIndex / TestListAssetsUsesSortIndex:
+	// without a fresh ANALYZE on the freshly-seeded table, the planner falls
+	// back to a fixed equality-index cost guess and can pick a different
+	// index (e.g. idx_assets_livevideo) plus a temp b-tree sort instead of
+	// walking idx_assets_monthkey directly — the query still runs fast
+	// in-memory either way, so a benchmark alone can't tell the two apart.
+	_, err := db.Exec(`ANALYZE assets`)
+	require.NoError(t, err)
+
+	// Full shape of the equality-month-key branch TimelineBucketAssets
+	// actually runs: userID join, hasOcrExpr's EXISTS column, equality on
+	// the month key, ORDER BY COALESCE(...) DESC, LIMIT/OFFSET. Copied
+	// verbatim from timeline_buckets.go so this test tracks the real query,
+	// not an approximation of it.
+	rows, err := db.Query(`EXPLAIN QUERY PLAN
+SELECT a.id, a.file_path, a.file_size, COALESCE(a.mime_type,''),
+       COALESCE(a.original_name,''), a.taken_at, a.duration_ms,
+       COALESCE(a.live_photo_video_id,''), a.is_live_photo_video,
+       EXISTS(SELECT 1 FROM asset_ocr ocr WHERE ocr.asset_id=a.id AND ocr.text<>'' AND COALESCE(ocr.coverage,1)>=0.05 AND COALESCE(ocr.line_count,0)>=8 AND COALESCE(ocr.is_doc,1)=1),
+       a.indexed_at, a.status,
+       e.width, e.height, e.latitude, e.longitude, e.make, e.model,
+       e.iso, e.shutter_speed, e.aperture, e.focal_length, e.orientation,
+       e.video_codec, e.audio_codec, e.frame_rate, e.bit_rate, e.rotation,
+       f.favorited_at
+FROM assets a
+LEFT JOIN asset_exif e ON e.asset_id = a.id
+LEFT JOIN asset_favorites f ON f.asset_id = a.id AND f.user_id = ?
+WHERE a.is_live_photo_video = 0 AND a.deleted_at IS NULL AND a.offline = 0
+  AND strftime('%Y-%m', COALESCE(a.taken_at, a.indexed_at)) = ?
+ORDER BY COALESCE(a.taken_at, a.indexed_at) DESC
+LIMIT ? OFFSET ?`, "u1", "2018-04", 500, 0)
+	require.NoError(t, err)
+	defer rows.Close()
+	plan := ""
+	for rows.Next() {
+		var a, b, c int
+		var detail string
+		require.NoError(t, rows.Scan(&a, &b, &c, &detail))
+		plan += detail + "\n"
+	}
+	require.Contains(t, plan, "idx_assets_monthkey",
+		"bucket-assets query must equality-seek the month-key index, not fall back to a table scan plus temp b-tree sort")
+}
+
 func TestTimelineBucketAssets(t *testing.T) {
 	db := openPerfDB(t)
 	seedPerfAssets(t, db, 1000)
