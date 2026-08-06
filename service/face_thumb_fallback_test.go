@@ -57,3 +57,29 @@ func TestFaceThumbnailFallsBackToLiveFace(t *testing.T) {
 	require.NoError(t, err, "must fall back to the remaining live face")
 	require.FileExists(t, out)
 }
+
+// End-to-end: a 100x50 raw image with orientation=6 must produce a rotated
+// crop rather than a mis-scaled one (bbox and EXIF dims are raw-space).
+func TestFaceThumbnailOrientation6(t *testing.T) {
+	db := makeTestFaceDB(t)
+	dir := t.TempDir()
+	vec := make([]float32, 512)
+	vec[0] = 1.0
+	insertAssetFace(t, db, "a1", normalize(vec))
+	p1 := writePlainJPEG(t, dir, "a1.jpg", 100, 50)
+	_, err := db.Exec(`UPDATE assets SET file_path=? WHERE id='a1'`, p1)
+	require.NoError(t, err)
+	_, err = db.Exec(`UPDATE face_detections SET bbox='{"x1":10,"y1":10,"x2":40,"y2":40}'`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO asset_exif(asset_id, width, height, orientation)
+		VALUES('a1', 100, 50, 6)`)
+	require.NoError(t, err)
+
+	require.NoError(t, service.NewFaceService(db).RunClustering(context.Background()))
+	var pid string
+	require.NoError(t, db.QueryRow(`SELECT id FROM persons`).Scan(&pid))
+
+	out, err := service.NewPersonService(db).FaceThumbnail(pid, filepath.Join(dir, "cache"), dir)
+	require.NoError(t, err)
+	require.FileExists(t, out)
+}

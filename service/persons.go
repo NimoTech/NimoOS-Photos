@@ -940,6 +940,32 @@ func hybridCoverScore(score sql.NullFloat64, bboxJSON string, w, h sql.NullInt64
 	return aest * ratio
 }
 
+// applyOrientation rotates/flips img so it displays upright, mirroring the
+// EXIF orientation table applied by image viewers (and by
+// imaging.AutoOrientation). Used on the cropped face square: the crop itself
+// runs in RAW (pre-rotation) coordinates because the ML face pipeline never
+// applies EXIF transpose (see mlserver/server/facemodel.py), so bbox and
+// asset_exif width/height are both in the raw coordinate space.
+func applyOrientation(img *image.NRGBA, orientation int) *image.NRGBA {
+	switch orientation {
+	case 2:
+		return imaging.FlipH(img)
+	case 3:
+		return imaging.Rotate180(img)
+	case 4:
+		return imaging.FlipV(img)
+	case 5:
+		return imaging.Transpose(img)
+	case 6:
+		return imaging.Rotate270(img)
+	case 7:
+		return imaging.Transverse(img)
+	case 8:
+		return imaging.Rotate90(img)
+	}
+	return img
+}
+
 // FaceThumbnail crops a square face out of the original image using
 // cover_face's bbox, caches it in cacheDir, and returns the file path.
 // Returns the cached path directly if already cached. Returns ErrNotFound if
@@ -949,14 +975,14 @@ func hybridCoverScore(score sql.NullFloat64, bboxJSON string, w, h sql.NullInt64
 // ratio); image sources still use the original file to preserve sharpness.
 func (s *PersonService) FaceThumbnail(personID, cacheDir, thumbDir string) (string, error) {
 	var faceID, bbox, srcPath, mimeType, assetID string
-	var origW, origH sql.NullInt64
+	var origW, origH, orientation sql.NullInt64
 	err := s.db.QueryRow(`
-SELECT fd.id, fd.bbox, a.file_path, COALESCE(a.mime_type,''), a.id, e.width, e.height
+SELECT fd.id, fd.bbox, a.file_path, COALESCE(a.mime_type,''), a.id, e.width, e.height, e.orientation
 FROM persons p
 JOIN face_detections fd ON fd.id=p.cover_face_id
 JOIN assets a ON a.id=fd.asset_id AND a.offline=0 AND a.deleted_at IS NULL
 LEFT JOIN asset_exif e ON e.asset_id=a.id
-WHERE p.id=? AND p.hidden=0`, personID).Scan(&faceID, &bbox, &srcPath, &mimeType, &assetID, &origW, &origH)
+WHERE p.id=? AND p.hidden=0`, personID).Scan(&faceID, &bbox, &srcPath, &mimeType, &assetID, &origW, &origH, &orientation)
 	if err == sql.ErrNoRows {
 		// Distinguish "person missing/hidden" (a real 404) from "person alive
 		// but its cover is unusable right now" (cover asset trashed/offline or
@@ -966,7 +992,7 @@ WHERE p.id=? AND p.hidden=0`, personID).Scan(&faceID, &bbox, &srcPath, &mimeType
 		if e := s.db.QueryRow(`SELECT hidden FROM persons WHERE id=?`, personID).Scan(&hidden); e != nil || hidden == 1 {
 			return "", ErrNotFound
 		}
-		faceID, bbox, srcPath, mimeType, assetID, origW, origH, err = s.fallbackCoverFace(personID)
+		faceID, bbox, srcPath, mimeType, assetID, origW, origH, orientation, err = s.fallbackCoverFace(personID)
 		if err != nil {
 			return "", err
 		}
@@ -995,7 +1021,7 @@ WHERE p.id=? AND p.hidden=0`, personID).Scan(&faceID, &bbox, &srcPath, &mimeType
 	if err := json.Unmarshal([]byte(bbox), &bb); err != nil {
 		return "", fmt.Errorf("FaceThumbnail bbox: %w", err)
 	}
-	img, err := imaging.Open(srcPath, imaging.AutoOrientation(true))
+	img, err := imaging.Open(srcPath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return "", ErrNotFound // source file is gone (drive unplugged/deleted): externally this is a 404, not a 500
@@ -1049,6 +1075,9 @@ WHERE p.id=? AND p.hidden=0`, personID).Scan(&faceID, &bbox, &srcPath, &mimeType
 	}
 	cropped := imaging.Crop(img, image.Rect(x0, y0, x1, y1))
 	square := imaging.Fill(cropped, 256, 256, imaging.Center, imaging.Lanczos)
+	if !strings.HasPrefix(mimeType, "video/") && orientation.Valid {
+		square = applyOrientation(square, int(orientation.Int64))
+	}
 	if err := imaging.Save(square, outPath); err != nil {
 		return "", fmt.Errorf("FaceThumbnail save: %w", err)
 	}
@@ -1059,9 +1088,9 @@ WHERE p.id=? AND p.hidden=0`, personID).Scan(&faceID, &bbox, &srcPath, &mimeType
 // (not trashed, not offline), for use when the stored cover is unusable.
 // Not persisted: the minute-level self-heal + next clustering pass own the
 // durable cover repair; this only keeps the endpoint serving meanwhile.
-func (s *PersonService) fallbackCoverFace(personID string) (faceID, bbox, srcPath, mimeType, assetID string, origW, origH sql.NullInt64, err error) {
+func (s *PersonService) fallbackCoverFace(personID string) (faceID, bbox, srcPath, mimeType, assetID string, origW, origH, orientation sql.NullInt64, err error) {
 	rows, qerr := s.db.Query(`
-SELECT fd.id, fd.bbox, a.file_path, COALESCE(a.mime_type,''), a.id, e.width, e.height
+SELECT fd.id, fd.bbox, a.file_path, COALESCE(a.mime_type,''), a.id, e.width, e.height, e.orientation
 FROM face_person fp
 JOIN face_detections fd ON fd.id=fp.face_id AND fd.excluded=0
 JOIN assets a ON a.id=fd.asset_id AND a.deleted_at IS NULL AND a.offline=0
@@ -1076,8 +1105,8 @@ WHERE fp.person_id=?`, personID)
 	found := false
 	for rows.Next() {
 		var fid, bb, fp, mt, aid string
-		var w, h sql.NullInt64
-		if serr := rows.Scan(&fid, &bb, &fp, &mt, &aid, &w, &h); serr != nil {
+		var w, h, ori sql.NullInt64
+		if serr := rows.Scan(&fid, &bb, &fp, &mt, &aid, &w, &h, &ori); serr != nil {
 			err = serr
 			return
 		}
@@ -1093,7 +1122,7 @@ WHERE fp.person_id=?`, personID)
 		}
 		if !found || area > bestArea {
 			found, bestArea = true, area
-			faceID, bbox, srcPath, mimeType, assetID, origW, origH = fid, bb, fp, mt, aid, w, h
+			faceID, bbox, srcPath, mimeType, assetID, origW, origH, orientation = fid, bb, fp, mt, aid, w, h, ori
 		}
 	}
 	if rerr := rows.Err(); rerr != nil {
