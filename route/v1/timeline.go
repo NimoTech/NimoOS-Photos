@@ -24,3 +24,14 @@ func (h *TimelineHandler) List(c echo.Context) error {
 	}
 	return c.JSON(http.StatusOK, groups)
 }
+
+// Buckets returns the per-month bucket directory of the timeline.
+//
+// GET /v1/photos/timeline/buckets
+func (h *TimelineHandler) Buckets(c echo.Context) error {
+	buckets, err := h.svc.Search().TimelineBuckets()
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	}
+	return c.JSON(http.StatusOK, buckets)
+}
