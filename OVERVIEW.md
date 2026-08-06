@@ -86,14 +86,14 @@ The ML backend is an independent Docker Compose stack (`deploy/ml/docker-compose
 | GET | `/persons` | List of persons (face clusters) |
 | GET | `/persons/merge-suggestions` | Merge suggestions |
 | POST | `/persons/merge-suggestions/reject` | Reject a merge suggestion |
-| POST | `/persons/merge` | Merge persons |
+| POST | `/persons/merge` | Merge persons (400 if `from_id==into_id`; 404 if either person doesn't exist) |
 | POST | `/persons/recluster` | Re-cluster |
 | GET/PUT/DELETE | `/persons/:id` | Person detail/update/delete |
 | POST | `/persons/:id/restore` | Restore a deleted person |
-| GET | `/persons/:id/assets` | Person's photos |
-| GET | `/persons/:id/relations` | Related persons |
-| GET | `/persons/:id/places` | Places this person appears in |
-| GET | `/persons/:id/face-thumbnail` | Person face thumbnail (JWT-exempt) |
+| GET | `/persons/:id/assets` | Person's photos (404 if the person is hidden or missing, via the `PersonVisible` guard) |
+| GET | `/persons/:id/relations` | Related persons (404 if the person is hidden or missing, via `PersonVisible`) |
+| GET | `/persons/:id/places` | Places this person appears in (404 if the person is hidden or missing, via `PersonVisible`) |
+| GET | `/persons/:id/face-thumbnail` | Person face thumbnail (JWT-exempt; crops in raw pixel coordinates and rotates per `asset_exif.orientation` at serve time; falls back to a live face if the cover asset is trashed/offline) |
 | POST | `/persons/:id/detach` | Detach a specific face from this person |
 | GET | `/status` | Indexing status (pending/indexed/queue counts) |
 | POST | `/scan` | Manually trigger a directory scan |
@@ -170,6 +170,12 @@ Smart View also reuses the `SmartSearch` interface to define dynamic albums by n
 - Merge-suggestion threshold `suggestEpsilon=0.75`
 - Results written to `persons` + `face_person`
 
+**Re-clustering anchors** (`personAnchoredCond`, `service/faces.go`): a person survives re-clustering with its identity (id/name/cover) intact if it's named, favorited, has a `relation`, is hidden, **or has a user-pinned cover (`cover_locked=1`) or hero (`hero_asset_id`)** — the latter two were added so a manually chosen cover/hero doesn't get reshuffled by the next clustering pass. This anchor set only protects a person *while it still has member faces*: the separate zero-faces purge paths (`purgeAutoPersons` / `purgeEmptyAutoPersons`) intentionally use the narrower legacy predicate (name/favorite/relation/hidden only, without `cover_locked`/`hero_asset_id`) — a shell person whose only "anchor" was a pinned cover is still purged once it has no faces left.
+
+When a person's active face count drops to zero (merge, detach, or a re-clustering pass), its `cover_face_id` / `cover_asset_id` / `cover_locked` / `centroid` / `confidence` are cleared (`recomputeOneCentroidTx`, `service/persons.go`, used by merge/detach, also clears `hero_asset_id`; the clustering-rebuild path `recomputePersonStatsTx`, `service/faces.go`, does not clear `hero_asset_id` — a minor asymmetry). Independently, `ClearDanglingCovers` (`service/faces.go`) runs on the same **1-minute** scheduler tick as the empty-person purge and self-heals `persons.cover_face_id` pointers that no longer resolve to a `face_detections` row (e.g. after a cascaded asset delete leaves a stale pointer — `cover_face_id` carries no FK constraint).
+
+**Low-confidence gating** (`photos.MinPersonConfidence`, default `0.5` when absent from config — see Sample configuration): unnamed, unfavorited, relation-less auto-clusters whose `persons.confidence` is below this floor are hidden from `GET /persons`, `GET /persons/:id/relations` (co-appearance), and `GET /persons/merge-suggestions`. Named, favorited, related, or hidden persons are always shown/considered regardless of `confidence`.
+
 ### 4. Embedder backfill
 
 `Embedder.Run` checks ML readiness every 30 seconds:
@@ -200,7 +206,7 @@ Scoring runs on two complementary paths:
 - Album implicit cover (`service/album.go`: both the album-list summary query and the single-album detail query take the highest-scoring member in the album by `aesthetic_score DESC`, with `position`/`rowid` as a stable fallback)
 - Place city card + spot cover candidates (`service/places.go`: city-aggregation card and spot best-photo queries)
 - Smart View preview seeds (`service/smartview.go`: preview sampling sorted by score)
-- Person cover hybrid score (`service/persons.go` `hybridCoverScore`: whole-image aesthetic score × that face's bbox area ratio; both factors must be comparable — an unscored asset/missing EXIF width-height/degenerate bbox is marked incomparable; unaffected when `cover_locked=1`, which still skips automatic recomputation)
+- Person cover hybrid score (`service/persons.go` `hybridCoverScore`: whole-image aesthetic score × that face's bbox area ratio × the face detection's own confidence (`face_detections.score`, clamped to `[0,1]`; `NULL` on rows written before the column existed is treated as neutral, i.e. a factor of `1`); the aesthetic/area factors must be comparable — an unscored asset/missing EXIF width-height/degenerate bbox is marked incomparable; unaffected when `cover_locked=1`, which still skips automatic recomputation)
 - Person hero fallback (`service/persons.go`: list/detail hero query when there's no locked cover)
 
 A manually specified cover (`cover_asset_id`/`cover_face_id`/`cover_locked=1`) always takes priority over the aesthetic score; when the whole-library score is NULL (e.g. during a rescore right after switching heads), all five sites above fall back to their own previous ranking (time/position, etc.).
@@ -240,8 +246,8 @@ Config toggle `AestheticEnabled` (`photos.conf`, default `true`), **not hot-relo
 | `asset_exif` | EXIF/video metadata (resolution, GPS, camera, ISO, codec, etc.) |
 | `clip_embeddings` | sqlite-vec **vec0** virtual table, 1152-dim CLIP vectors |
 | `asset_clip_idx` | rowid ↔ asset_id mapping (joins clip_embeddings and assets) |
-| `face_detections` | Face detection results (bbox, 512-dim embedding, excluded flag) |
-| `persons` | Face clustering results (name, cover, centroid, confidence) |
+| `face_detections` | Face detection results (bbox, 512-dim embedding, excluded flag, `score` REAL = detector confidence, `NULL` on legacy rows predating the column = neutral factor in cover selection) |
+| `persons` | Face clustering results (name, cover, centroid, confidence; `hidden` flag drives the `PersonVisible` 404 guard; `cover_locked`/`hero_asset_id` anchor a pinned cover/hero through re-clustering) |
 | `face_person` | Face → person mapping |
 | `asset_ocr` | OCR text (coverage, line_count density-candidate gate; boxes_ver=0 means per-line coordinates aren't stored; doc_sem/doc_geo/is_doc are the semantic margin/geometric regularity/final verdict of the mixed criterion (NULL=not yet computed, query falls back to pure density), doc_ver=0 means pending computation; the single write path is computeDocVerdict()) |
 | `asset_ocr_lines` | OCR per-line text + normalized four-corner coordinates (JSON, 8 floats, [0,1]); line_no matches the concatenation order in asset_ocr.text; single write path is ocrAsset(); cascade-deletes with assets via foreign key; used for GET /assets/:id/ocr search-hit highlighting and doc geometric-regularity computation |
@@ -302,6 +308,7 @@ ScenesEnabled = true
 OCREnabled = true
 SmartViewEnabled = true
 AestheticEnabled = true
+MinPersonConfidence = 0.5
 PreviewPregen = false
 ```
 
@@ -310,6 +317,7 @@ PreviewPregen = false
 - `MLEndpoint`: nimoos-photos-ml-server address, default `http://127.0.0.1:3003`.
 - Feature toggles (`FacesEnabled/ScenesEnabled/OCREnabled/SmartViewEnabled/AestheticEnabled`) all default to `true`; turning off `ScenesEnabled` means new photos no longer get CLIP vectors, disabling semantic search. `AestheticEnabled` is not hot-reloaded — turning it off only stops new scoring (both inline and backfill are skipped), existing `aesthetic_score` values aren't cleared; see "Core flows § 7 Aesthetic scoring".
 - `PreviewPregen`: default `false`, video `preview.mp4` is purely lazy-generated (generated on first `GET /preview`), with pre-generation skipped only during ingest/startup backfill. When set to `true`, it's asynchronously pre-generated on ingest just like `sprite.jpg`, and also covered by `BackfillSprites` for existing videos. `sprite.jpg` is unaffected by this toggle and is always pre-generated.
+- `MinPersonConfidence`: default `0.5` when absent from the config file. Cohesion floor for exposing **unnamed, unfavorited, relation-less** auto face-clusters through `GET /persons`, `GET /persons/:id/relations`, and `GET /persons/merge-suggestions`; named/favorited/related/hidden persons are always shown regardless of `confidence`. See Core flows §3 (Face clustering).
 
 ---
 
@@ -338,6 +346,8 @@ PreviewPregen = false
 4. **TUS upload vs. fsnotify race**: after a TUS upload completes, `MarkAndReserve` claims a placeholder first, then rename happens, then `SubmitReserved` — preventing the Watcher's Create event from racing ahead into the anonymous batch slot (`batches[""]`), which would garble front-end progress reporting.
 
 5. **Orphan reconciliation for caption backflow**: `Puller` (`service/captionpull.go`) periodically pulls the full caption diff-upsert from NimoOS-Parser into the local `asset_caption` table (used for Smart Moments topic matching). If a pulled asset ID no longer exists locally in `assets` (a true orphan, usually because a delete notification was lost and Parser-side data wasn't cleaned up accordingly), besides skipping the local write, it also best-effort deletes the corresponding vector back on the Parser side — a fallback reconciliation for cases where the "clean-up-on-delete" chain drops an event. `asset_caption` itself is cleaned up automatically via the `asset_id` foreign key's `ON DELETE CASCADE` when `assets` rows are deleted, so no separate Prune logic is needed.
+
+6. **Face-thumbnail crop/rotation happens at serve time, not in the ML pipeline**: the ML detector's face bbox is always in the source image's raw, pre-rotation pixel space — `mlserver`'s face pipeline deliberately disables EXIF-transpose auto-rotation (`cv2.IMREAD_IGNORE_ORIENTATION`) to match the original immich-ml baseline. `PersonService.FaceThumbnail` (`service/persons.go`) therefore crops the square face avatar in that same raw coordinate space and only then rotates the cropped square per `asset_exif.orientation` (skipped for video sources, whose extracted key frame carries no independent rotation tag). Crops are cached to disk under `face-thumbs/<face_id>.jpg` (see Data storage) and orphans (rows with no matching `face_detections`) are reclaimed by the daily Prune, but the cache is not content-versioned — **`POST /cache/prune` will not fix stale crops**, since those files still have a live `face_detections` row, they're just cropped/rotated by the old logic. **One-time OPS step after deploying this fix: manually clear the `face-thumbs/` directory under `DataPath` once** (e.g. `rm -rf <DataPath>/face-thumbs/*`); the endpoint regenerates each crop on demand from the raw source image on next request. Separately, if a person's cover asset is trashed/offline, `FaceThumbnail` falls back to that person's largest live face rather than 404ing; this fallback result is not persisted back to `cover_face_id` — durable repair is left to the periodic `ClearDanglingCovers` / re-clustering pass (see Core flows §3).
 
 ---
 
