@@ -543,6 +543,15 @@ func (s *FaceService) detectFaceScanTarget(ctx context.Context, t faceScanTarget
 	if err != nil {
 		return err
 	}
+	// The same path can be overwritten with different content (checksum
+	// change resets face_scanned=0): drop this asset's previous detections
+	// first, or faces from the old content keep polluting clustering forever.
+	// Mirrors rebuild.go's delete-before-rescan; face_person rows are removed
+	// by the FK cascade. Runs only after a successful ML call so a transient
+	// ML failure never wipes existing data.
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM face_detections WHERE asset_id = ?`, t.id); err != nil {
+		return err
+	}
 	insertFaceDetections(s.db, t.id, faces)
 	if _, err := s.db.ExecContext(ctx, `UPDATE assets SET face_scanned = 1 WHERE id = ?`, t.id); err != nil {
 		return err
