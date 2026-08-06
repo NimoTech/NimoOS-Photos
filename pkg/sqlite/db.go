@@ -654,6 +654,10 @@ func migrate(db *sql.DB) error {
 		// get the current timestamp, and the conflict branch for existing
 		// members doesn't touch this column.
 		`ALTER TABLE moment_assets ADD COLUMN added_at INTEGER`,
+		// Face detection confidence from the ML detector, used as a
+		// face-quality factor when auto-selecting person covers. NULL for
+		// rows inserted before this column existed (treated as neutral).
+		`ALTER TABLE face_detections ADD COLUMN score REAL`,
 	}
 	for _, stmt := range alters {
 		if _, err := db.Exec(stmt); err != nil &&

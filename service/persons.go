@@ -824,7 +824,7 @@ func recomputeOneCentroidTx(tx *sql.Tx, personID string) error {
 	// asset_exif for width/height — when missing, hybridCoverScore marks that
 	// face as incomparable).
 	rows, err := tx.Query(`
-SELECT fd.id, fd.asset_id, fd.embedding, fd.bbox,
+SELECT fd.id, fd.asset_id, fd.embedding, fd.bbox, fd.score,
        a.aesthetic_score, e.width, e.height
 FROM face_person fp
 JOIN face_detections fd ON fd.id=fp.face_id
@@ -837,13 +837,14 @@ WHERE fp.person_id=? AND fd.excluded=0`, personID)
 	var faceIDs, assetIDs, bboxes []string
 	var vecs [][]float32
 	var scores []sql.NullFloat64
+	var faceScores []sql.NullFloat64
 	var ws, hs []sql.NullInt64
 	for rows.Next() {
 		var fid, aid, bbox string
 		var blob []byte
-		var score sql.NullFloat64
+		var faceScore, score sql.NullFloat64
 		var w, h sql.NullInt64
-		if err := rows.Scan(&fid, &aid, &blob, &bbox, &score, &w, &h); err != nil {
+		if err := rows.Scan(&fid, &aid, &blob, &bbox, &faceScore, &score, &w, &h); err != nil {
 			rows.Close()
 			return err
 		}
@@ -852,6 +853,7 @@ WHERE fp.person_id=? AND fd.excluded=0`, personID)
 		bboxes = append(bboxes, bbox)
 		vecs = append(vecs, sqlite.DeserializeFloat32(blob))
 		scores = append(scores, score)
+		faceScores = append(faceScores, faceScore)
 		ws = append(ws, w)
 		hs = append(hs, h)
 	}
@@ -907,7 +909,7 @@ WHERE fp.person_id=? AND fd.excluded=0`, personID)
 	// existing libraries that haven't been scored yet).
 	best, bestHybrid := -1, -1.0
 	for i := range vecs {
-		if h := hybridCoverScore(scores[i], bboxes[i], ws[i], hs[i]); h > bestHybrid {
+		if h := hybridCoverScore(scores[i], bboxes[i], ws[i], hs[i], faceScores[i]); h > bestHybrid {
 			bestHybrid = h
 			best = i
 		}
@@ -934,10 +936,13 @@ WHERE fp.person_id=? AND fd.excluded=0`, personID)
 }
 
 // hybridCoverScore computes a person's cover hybrid score (whole-image
-// aesthetic score × face area ratio); returns -1 when incomparable.
-// Incomparable scenarios: the asset hasn't been scored, EXIF is missing
-// width/height, or the bbox is unparseable or degenerate (area<=0).
-func hybridCoverScore(score sql.NullFloat64, bboxJSON string, w, h sql.NullInt64) float64 {
+// aesthetic score × face area ratio × face detection quality); returns -1
+// when incomparable. Incomparable scenarios: the asset hasn't been scored,
+// EXIF is missing width/height, or the bbox is unparseable or degenerate
+// (area<=0). faceScore is the ML detector's confidence for this face
+// ([0,1]); NULL (legacy rows predating the column) is treated as neutral
+// (1.0), so existing libraries don't regress until re-indexed.
+func hybridCoverScore(score sql.NullFloat64, bboxJSON string, w, h sql.NullInt64, faceScore sql.NullFloat64) float64 {
 	if !score.Valid || !w.Valid || !h.Valid || w.Int64 <= 0 || h.Int64 <= 0 {
 		return -1
 	}
@@ -964,7 +969,16 @@ func hybridCoverScore(score sql.NullFloat64, bboxJSON string, w, h sql.NullInt64
 	} else if aest > 1 {
 		aest = 1
 	}
-	return aest * ratio
+	q := 1.0 // legacy rows without a stored detection score stay neutral
+	if faceScore.Valid {
+		q = faceScore.Float64
+		if q < 0 {
+			q = 0
+		} else if q > 1 {
+			q = 1
+		}
+	}
+	return aest * ratio * q
 }
 
 // applyOrientation rotates/flips img so it displays upright, mirroring the
