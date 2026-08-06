@@ -553,6 +553,49 @@ WHERE fd.asset_id IN (`+strings.Join(placeholders, ",")+`)
 	return rows.Err()
 }
 
+// attachNamedFacesAll fills Faces like attachNamedFaces but with a single
+// full-scan query and no IN(...) — Timeline passes the entire library and
+// would otherwise approach SQLite's bound-parameter limit as it grows.
+func (s *SearchService) attachNamedFacesAll(assets []Asset) error {
+	if len(assets) == 0 {
+		return nil
+	}
+	idIndex := make(map[string]int, len(assets))
+	for i, a := range assets {
+		idIndex[a.ID] = i
+	}
+	rows, err := s.db.Query(`
+SELECT fd.asset_id, p.name
+FROM face_detections fd
+JOIN face_person fp ON fp.face_id = fd.id
+JOIN persons p ON p.id = fp.person_id
+WHERE p.name <> '' AND COALESCE(p.hidden, 0) = 0 AND COALESCE(fd.excluded, 0) = 0`)
+	if err != nil {
+		return fmt.Errorf("attachNamedFacesAll query: %w", err)
+	}
+	defer rows.Close()
+	seen := make(map[string]map[string]bool)
+	for rows.Next() {
+		var assetID, name string
+		if err := rows.Scan(&assetID, &name); err != nil {
+			return err
+		}
+		i, ok := idIndex[assetID]
+		if !ok {
+			continue
+		}
+		if seen[assetID] == nil {
+			seen[assetID] = map[string]bool{}
+		}
+		if seen[assetID][name] {
+			continue
+		}
+		seen[assetID][name] = true
+		assets[i].Faces = append(assets[i].Faces, name)
+	}
+	return rows.Err()
+}
+
 // ─── Timeline ────────────────────────────────────────────────────────────────
 
 // Timeline returns all non-live-photo-video assets grouped by year/month in
@@ -584,6 +627,9 @@ ORDER BY COALESCE(a.taken_at, a.indexed_at) DESC`, userID)
 		return nil, err
 	}
 	enrichPlaceNames(s.db, assets)
+	if err := s.attachNamedFacesAll(assets); err != nil {
+		return nil, err
+	}
 
 	type key struct{ year, month int }
 	var order []key
@@ -630,7 +676,14 @@ LIMIT ? OFFSET ?`, personID, limit, offset)
 		return nil, fmt.Errorf("PersonAssets query: %w", err)
 	}
 	defer rows.Close()
-	return scanAssets(rows)
+	assets, err := scanAssets(rows)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.attachNamedFaces(assets); err != nil {
+		return nil, err
+	}
+	return assets, nil
 }
 
 // ─── Person management ───────────────────────────────────────────────────────
@@ -791,6 +844,9 @@ LIMIT ? OFFSET ?`
 		return nil, err
 	}
 	enrichPlaceNames(s.db, assets)
+	if err := s.attachNamedFaces(assets); err != nil {
+		return nil, err
+	}
 	return assets, nil
 }
 
@@ -837,6 +893,9 @@ WHERE a.is_live_photo_video = 0 AND a.deleted_at IS NULL AND a.offline = 0
 	sort.Slice(assets, func(i, j int) bool { return pos[assets[i].ID] < pos[assets[j].ID] })
 
 	enrichPlaceNames(s.db, assets)
+	if err := s.attachNamedFaces(assets); err != nil {
+		return nil, err
+	}
 	return assets, nil
 }
 
@@ -866,6 +925,9 @@ WHERE a.id = ?`, userID, id)
 	}
 	if len(assets) == 0 {
 		return nil, ErrNotFound
+	}
+	if err := s.attachNamedFaces(assets); err != nil {
+		return nil, err
 	}
 	return &assets[0], nil
 }
