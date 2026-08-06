@@ -852,8 +852,9 @@ func (s *FaceService) rebuildPersonsWithProgress(ctx context.Context, faces []fa
 		}
 	}()
 
-	// 1. Load anchored persons (has name/favorite/relation/hidden) and their
-	//    current member faces, and compute centroids.
+	// 1. Load anchored persons (matching personAnchoredCond: named/favorited/
+	//    related/hidden, or with a pinned cover / hero) and their current
+	//    member faces, and compute centroids.
 	type anchor struct {
 		id       string
 		centroid []float32
