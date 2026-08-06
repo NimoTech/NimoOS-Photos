@@ -49,3 +49,51 @@ ORDER BY 1 DESC, 2 DESC`)
 	}
 	return out, rows.Err()
 }
+
+// TimelineBucketAssets returns one month bucket's assets, newest first,
+// paginated. Column set matches the legacy Timeline query exactly so the
+// frontend's asset transform works unchanged. The WHERE month-key expression
+// matches idx_assets_monthkey verbatim: equality on the key plus the index's
+// second column ordering makes each page O(offset+limit) instead of a full
+// re-sort. year==0 && month==0 addresses the "unknown date" bucket.
+func (s *SearchService) TimelineBucketAssets(userID string, year, month, limit, offset int) ([]Asset, error) {
+	monthCond := `strftime('%Y-%m', COALESCE(a.taken_at, a.indexed_at)) = ?`
+	args := []interface{}{userID}
+	if year == 0 && month == 0 {
+		monthCond = `strftime('%Y-%m', COALESCE(a.taken_at, a.indexed_at)) IS NULL`
+	} else {
+		args = append(args, fmt.Sprintf("%04d-%02d", year, month))
+	}
+	args = append(args, limit, offset)
+
+	rows, err := s.db.Query(`
+SELECT a.id, a.file_path, a.file_size, COALESCE(a.mime_type,''),
+       COALESCE(a.original_name,''), a.taken_at, a.duration_ms,
+       COALESCE(a.live_photo_video_id,''), a.is_live_photo_video, `+hasOcrExpr+`,
+       a.indexed_at, a.status,
+       e.width, e.height, e.latitude, e.longitude, e.make, e.model,
+       e.iso, e.shutter_speed, e.aperture, e.focal_length, e.orientation,
+       e.video_codec, e.audio_codec, e.frame_rate, e.bit_rate, e.rotation,
+       f.favorited_at
+FROM assets a
+LEFT JOIN asset_exif e ON e.asset_id = a.id
+LEFT JOIN asset_favorites f ON f.asset_id = a.id AND f.user_id = ?
+WHERE a.is_live_photo_video = 0 AND a.deleted_at IS NULL AND a.offline = 0
+  AND `+monthCond+`
+ORDER BY COALESCE(a.taken_at, a.indexed_at) DESC
+LIMIT ? OFFSET ?`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("TimelineBucketAssets query: %w", err)
+	}
+	defer rows.Close()
+
+	assets, err := scanAssetsDetailedWithFav(rows)
+	if err != nil {
+		return nil, err
+	}
+	enrichPlaceNames(s.db, assets)
+	if err := s.attachNamedFaces(assets); err != nil {
+		return nil, err
+	}
+	return assets, nil
+}

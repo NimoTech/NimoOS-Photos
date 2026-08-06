@@ -59,3 +59,71 @@ GROUP BY 1`)
 	}
 	require.Contains(t, plan, "idx_assets_monthkey")
 }
+
+func TestTimelineBucketAssets(t *testing.T) {
+	db := openPerfDB(t)
+	seedPerfAssets(t, db, 1000)
+
+	svc := service.NewSearchService(db, nil)
+	buckets, err := svc.TimelineBuckets()
+	require.NoError(t, err)
+	// The newest bucket may be a partial month — pick one big enough to page.
+	var b service.TimelineBucket
+	for _, cand := range buckets {
+		if cand.Count >= 25 {
+			b = cand
+			break
+		}
+	}
+	require.GreaterOrEqual(t, b.Count, 25, "need a bucket with enough assets to paginate")
+
+	page1, err := svc.TimelineBucketAssets("u1", b.Year, b.Month, 10, 0)
+	require.NoError(t, err)
+	require.Len(t, page1, 10)
+	// Newest-first within the bucket, and every asset belongs to the bucket.
+	for i, a := range page1 {
+		ts := a.TakenAt
+		require.NotNil(t, ts)
+		require.Equal(t, b.Year, ts.Year())
+		require.Equal(t, b.Month, int(ts.Month()))
+		if i > 0 {
+			require.False(t, ts.After(*page1[i-1].TakenAt), "descending order")
+		}
+	}
+	// Paging: page 2 starts where page 1 ended, no overlap.
+	page2, err := svc.TimelineBucketAssets("u1", b.Year, b.Month, 10, 10)
+	require.NoError(t, err)
+	require.NotEqual(t, page1[0].ID, page2[0].ID)
+
+	// Whole-bucket sweep equals the directory count.
+	got := 0
+	for off := 0; ; off += 500 {
+		page, err := svc.TimelineBucketAssets("u1", b.Year, b.Month, 500, off)
+		require.NoError(t, err)
+		got += len(page)
+		if len(page) < 500 {
+			break
+		}
+	}
+	require.Equal(t, b.Count, got)
+}
+
+func BenchmarkTimelineLegacyVsBucket(b *testing.B) {
+	db := openPerfDB(b)
+	seedPerfAssets(b, db, 100_000)
+	svc := service.NewSearchService(db, nil)
+	b.Run("legacy-full-timeline", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			if _, err := svc.Timeline("u1"); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+	b.Run("bucket-page", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			if _, err := svc.TimelineBucketAssets("u1", 2020, 6, 500, 0); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}
