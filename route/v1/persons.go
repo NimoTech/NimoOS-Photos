@@ -217,7 +217,13 @@ func (h *PersonsHandler) Merge(c echo.Context) error {
 	if err := c.Bind(&req); err != nil || req.FromID == "" || req.IntoID == "" {
 		return echo.NewHTTPError(http.StatusBadRequest, "from_id and into_id required")
 	}
+	if req.FromID == req.IntoID {
+		return echo.NewHTTPError(http.StatusBadRequest, "from_id and into_id must differ")
+	}
 	if err := h.svc.Search().MergePersons(req.FromID, req.IntoID); err != nil {
+		if errors.Is(err, service.ErrNotFound) {
+			return echo.NewHTTPError(http.StatusNotFound)
+		}
 		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
 	}
 	return c.JSON(http.StatusOK, map[string]string{"status": "merged"})

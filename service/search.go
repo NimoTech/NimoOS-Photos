@@ -672,11 +672,29 @@ func (s *SearchService) UpdatePersonName(id, name string) error {
 // deletes the source person and recomputes the centroid/confidence/cover of
 // intoID — all within a single transaction.
 func (s *SearchService) MergePersons(fromID, intoID string) error {
+	if fromID == intoID {
+		return fmt.Errorf("MergePersons: from and into must be different persons")
+	}
+
 	tx, err := s.db.Begin()
 	if err != nil {
 		return fmt.Errorf("MergePersons begin tx: %w", err)
 	}
 	defer tx.Rollback() //nolint:errcheck
+
+	var one int
+	if err = tx.QueryRow(`SELECT 1 FROM persons WHERE id=?`, fromID).Scan(&one); err != nil {
+		if err == sql.ErrNoRows {
+			return ErrNotFound
+		}
+		return fmt.Errorf("MergePersons check from: %w", err)
+	}
+	if err = tx.QueryRow(`SELECT 1 FROM persons WHERE id=?`, intoID).Scan(&one); err != nil {
+		if err == sql.ErrNoRows {
+			return ErrNotFound
+		}
+		return fmt.Errorf("MergePersons check into: %w", err)
+	}
 
 	if _, err = tx.Exec(`UPDATE face_person SET person_id=? WHERE person_id=?`, intoID, fromID); err != nil {
 		return fmt.Errorf("MergePersons update: %w", err)
