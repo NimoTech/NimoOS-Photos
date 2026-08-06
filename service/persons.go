@@ -731,7 +731,8 @@ WHERE fp.person_id = ? AND fd.excluded = 0 AND fd.asset_id IN (%s)`, strings.Joi
 		}
 	}
 
-	// Recompute centroid / cover / confidence (recomputeOneCentroidTx returns early when vecs=0).
+	// Recompute centroid / cover / confidence (recomputeOneCentroidTx clears
+	// cover/centroid when vecs=0, i.e. all faces were just detached).
 	if err := recomputeOneCentroidTx(tx, personID); err != nil {
 		return 0, fmt.Errorf("DetachAssetsFromPerson recompute: %w", err)
 	}
@@ -754,16 +755,9 @@ WHERE fp.person_id = ? AND fd.excluded = 0 AND fd.asset_id IN (%s)`, strings.Joi
 			if _, err := tx.Exec(`DELETE FROM persons WHERE id=?`, personID); err != nil {
 				return 0, fmt.Errorf("DetachAssetsFromPerson delete empty: %w", err)
 			}
-		} else {
-			// Anchored person is kept but cover/centroid/lock/hero are all cleared
-			// (recomputeOneCentroidTx returned early with vecs=0, so we do it here).
-			if _, err := tx.Exec(
-				`UPDATE persons SET cover_face_id=NULL, cover_asset_id=NULL, cover_locked=0, hero_asset_id=NULL, centroid=NULL, confidence=0, updated_at=CURRENT_TIMESTAMP WHERE id=?`,
-				personID,
-			); err != nil {
-				return 0, fmt.Errorf("DetachAssetsFromPerson clear cover: %w", err)
-			}
 		}
+		// Anchored persons are kept; cover/centroid/lock/hero are already
+		// cleared above by recomputeOneCentroidTx's vecs=0 branch.
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -840,7 +834,12 @@ WHERE fp.person_id=? AND fd.excluded=0`, personID)
 	}
 	rows.Close()
 	if len(vecs) == 0 {
-		return nil
+		// No active faces left: clear cover/centroid so the person stops
+		// pointing at detached or deleted faces (dangling cover_face_id).
+		_, err = tx.Exec(`UPDATE persons SET cover_face_id=NULL, cover_asset_id=NULL,
+			cover_locked=0, hero_asset_id=NULL, centroid=NULL, confidence=0,
+			updated_at=CURRENT_TIMESTAMP WHERE id=?`, personID)
+		return err
 	}
 	centroid := ComputeCentroid(vecs)
 	conf := ClusterConfidence(vecs, centroid)

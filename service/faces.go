@@ -765,6 +765,20 @@ func (s *FaceService) purgeEmptyAutoPersons(ctx context.Context) error {
 	return err
 }
 
+// ClearDanglingCovers nulls out persons.cover_face_id/cover_asset_id when the
+// referenced face_detections row no longer exists. cover_face_id was added via
+// ALTER TABLE and carries no FK, so deleting an asset (which cascades its
+// face_detections away) leaves the pointer dangling and the face-thumbnail
+// endpoint permanently 404ing. Runs on the minute scheduler next to
+// purgeEmptyAutoPersons; safe to call repeatedly.
+func (s *FaceService) ClearDanglingCovers(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE persons SET cover_face_id=NULL, cover_asset_id=NULL, cover_locked=0
+		WHERE cover_face_id IS NOT NULL
+		  AND NOT EXISTS (SELECT 1 FROM face_detections fd WHERE fd.id = persons.cover_face_id)`)
+	return err
+}
+
 func (s *FaceService) loadFacesWithProgress(ctx context.Context, total int64,
 	onProgress func(int64),
 ) ([]faceRow, error) {
@@ -1077,6 +1091,11 @@ func (s *FaceService) recomputePersonStatsTx(ctx context.Context, tx *sql.Tx) er
 		fr.Close()
 
 		if len(vecs) == 0 {
+			if _, err = tx.ExecContext(ctx, `UPDATE persons SET cover_face_id=NULL,
+				cover_asset_id=NULL, cover_locked=0, centroid=NULL, confidence=0,
+				updated_at=? WHERE id=?`, now, meta.id); err != nil {
+				return err
+			}
 			continue
 		}
 		centroid := ComputeCentroid(vecs)
@@ -1143,6 +1162,10 @@ func (s *FaceService) StartScheduler(ctx context.Context) {
 				// every deletion path.
 				if err := s.purgeEmptyAutoPersons(ctx); err != nil {
 					zap.L().Warn("purge empty auto-persons failed", zap.Error(err))
+				}
+
+				if err := s.ClearDanglingCovers(ctx); err != nil {
+					zap.L().Warn("clear dangling covers failed", zap.Error(err))
 				}
 
 				// Failure backoff: don't retry for a while after the last failure.
