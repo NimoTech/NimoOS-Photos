@@ -89,6 +89,13 @@ func TestStoragePruneRemovesOnlyOrphans(t *testing.T) {
 		return err == nil && st.PrunableBytes == 300 // populate the fs cache, to verify Prune invalidates it
 	}, 5*time.Second, 20*time.Millisecond)
 
+	// Capture the walk timestamp before Prune so the post-Prune assertion
+	// below can require a genuinely new completed walk, not just the nil
+	// zero-value that a not-yet-refreshed fsCache would also satisfy.
+	s.mu.Lock()
+	beforePrune := s.fsCachedAt
+	s.mu.Unlock()
+
 	res, err := s.Prune("", 0) // scenario with no staging directory
 	require.NoError(t, err)
 	require.Equal(t, int64(300), res.FreedBytes)
@@ -101,8 +108,17 @@ func TestStoragePruneRemovesOnlyOrphans(t *testing.T) {
 
 	require.Eventually(t, func() bool {
 		st, err := s.Stats()
-		return err == nil && st.PrunableBytes == 0 // fs cache invalidated and recomputed
-	}, 5*time.Second, 20*time.Millisecond)
+		if err != nil {
+			return false
+		}
+		s.mu.Lock()
+		refreshed := s.fsCache != nil && s.fsCachedAt.After(beforePrune)
+		s.mu.Unlock()
+		// Require an actual completed post-Prune walk (fsCachedAt advanced),
+		// not merely the nil-fsCache zero value Invalidate() alone produces —
+		// that would pass on the very first tick before refreshFS ever runs.
+		return refreshed && st.PrunableBytes == 0
+	}, 5*time.Second, 20*time.Millisecond, "PrunableBytes must reflect a real post-Prune walk, not a nil-cache zero value")
 }
 
 func TestPruneRemovesOrphanFaceThumbs(t *testing.T) {
