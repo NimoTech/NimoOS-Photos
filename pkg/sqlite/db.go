@@ -22,6 +22,15 @@ func init() {
 	sqlite_vec.Auto()
 }
 
+// maxOpenConns caps the shared pool. SQLite in WAL mode allows one writer
+// plus concurrent readers; an unbounded database/sql pool just piles up
+// connections (fd + memory) during indexing storms without adding write
+// throughput. 8 covers the HTTP handlers plus every background worker
+// (indexer x3, faces, embedder, schedulers) with headroom; nesting depth
+// of query-inside-rows loops in this codebase is <= 2, far below the cap,
+// so pool-exhaustion deadlock is not reachable.
+const maxOpenConns = 8
+
 // SerializeFloat32 encodes a []float32 slice into a little-endian BLOB
 // compatible with sqlite-vec's expected binary embedding format.
 func SerializeFloat32(v []float32) []byte {
@@ -59,6 +68,9 @@ func Open(path string) (*sql.DB, error) {
 		db.Close()
 		return nil, fmt.Errorf("sqlite.Open ping: %w", err)
 	}
+
+	db.SetMaxOpenConns(maxOpenConns)
+	db.SetMaxIdleConns(maxOpenConns)
 
 	if err := migrate(db); err != nil {
 		db.Close()
@@ -713,6 +725,39 @@ func migrate(db *sql.DB) error {
 
 	if err := regeocodeIfStale(db); err != nil {
 		return err
+	}
+
+	// Timeline sort/bucket indexes. Every list surface orders by
+	// COALESCE(taken_at, indexed_at) DESC; a plain column index cannot
+	// serve an expression sort, so without these every page request
+	// re-sorts the whole live set. Partial WHERE mirrors the shared
+	// timeline filters exactly — queries must repeat those three
+	// predicates verbatim for the planner to accept the partial index.
+	// strftime with an explicit format (no 'now'/'localtime') is
+	// deterministic and therefore legal in an index expression.
+	for _, stmt := range []string{
+		`CREATE INDEX IF NOT EXISTS idx_assets_sortkey
+		   ON assets(COALESCE(taken_at, indexed_at) DESC)
+		   WHERE deleted_at IS NULL AND offline = 0 AND is_live_photo_video = 0`,
+		`CREATE INDEX IF NOT EXISTS idx_assets_monthkey
+		   ON assets(strftime('%Y-%m', COALESCE(taken_at, indexed_at)),
+		             COALESCE(taken_at, indexed_at) DESC)
+		   WHERE deleted_at IS NULL AND offline = 0 AND is_live_photo_video = 0`,
+	} {
+		if _, err := db.Exec(stmt); err != nil {
+			return fmt.Errorf("timeline index: %w", err)
+		}
+	}
+
+	// Without sqlite_stat1, SQLite's cost model defaults to a fixed guess
+	// for equality-constrained indexes and ends up preferring
+	// idx_assets_livevideo (is_live_photo_video is almost always 0, so that
+	// "search" touches nearly every row) plus a temp b-tree sort, instead of
+	// walking idx_assets_sortkey directly — silently defeating the indexes
+	// just added above. Scoping ANALYZE to the assets table keeps this cheap
+	// even on large libraries (it does not scan every other table).
+	if _, err := db.Exec(`ANALYZE assets`); err != nil {
+		return fmt.Errorf("migrate analyze assets: %w", err)
 	}
 
 	return nil

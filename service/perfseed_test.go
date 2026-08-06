@@ -63,3 +63,33 @@ func TestSeedPerfAssetsSmoke(t *testing.T) {
 	require.Equal(t, 500, total)
 	require.Equal(t, 10, trashed)
 }
+
+func TestListAssetsUsesSortIndex(t *testing.T) {
+	db := openPerfDB(t)
+	seedPerfAssets(t, db, 2000)
+	// openPerfDB's migrate() ran ANALYZE on an empty table, so sqlite_stat1
+	// still reflects 0 rows after the bulk insert above. Without a fresh
+	// ANALYZE here, SQLite's cost model defaults to a fixed equality-index
+	// guess and picks idx_assets_livevideo (nearly every row has
+	// is_live_photo_video=0) plus a temp b-tree sort instead of walking
+	// idx_assets_sortkey directly. Real deployments hit populated tables at
+	// every startup, so migrate()'s ANALYZE reflects real data there; this
+	// call mirrors that for the freshly-seeded test DB.
+	_, err := db.Exec(`ANALYZE assets`)
+	require.NoError(t, err)
+	rows, err := db.Query(`EXPLAIN QUERY PLAN
+SELECT a.id FROM assets a
+WHERE a.is_live_photo_video = 0 AND a.deleted_at IS NULL AND a.offline = 0
+ORDER BY COALESCE(a.taken_at, a.indexed_at) DESC LIMIT 50`)
+	require.NoError(t, err)
+	defer rows.Close()
+	plan := ""
+	for rows.Next() {
+		var a, b, c int
+		var detail string
+		require.NoError(t, rows.Scan(&a, &b, &c, &detail))
+		plan += detail + "\n"
+	}
+	require.Contains(t, plan, "idx_assets_sortkey",
+		"pager query must walk the partial expression index, not sort the table")
+}
