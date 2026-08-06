@@ -958,9 +958,19 @@ JOIN assets a ON a.id=fd.asset_id AND a.offline=0 AND a.deleted_at IS NULL
 LEFT JOIN asset_exif e ON e.asset_id=a.id
 WHERE p.id=? AND p.hidden=0`, personID).Scan(&faceID, &bbox, &srcPath, &mimeType, &assetID, &origW, &origH)
 	if err == sql.ErrNoRows {
-		return "", ErrNotFound
-	}
-	if err != nil {
+		// Distinguish "person missing/hidden" (a real 404) from "person alive
+		// but its cover is unusable right now" (cover asset trashed/offline or
+		// cover already cleared): the latter falls back to any live face so
+		// the avatar doesn't break the moment a cover photo is trashed.
+		var hidden int
+		if e := s.db.QueryRow(`SELECT hidden FROM persons WHERE id=?`, personID).Scan(&hidden); e != nil || hidden == 1 {
+			return "", ErrNotFound
+		}
+		faceID, bbox, srcPath, mimeType, assetID, origW, origH, err = s.fallbackCoverFace(personID)
+		if err != nil {
+			return "", err
+		}
+	} else if err != nil {
 		return "", fmt.Errorf("FaceThumbnail query: %w", err)
 	}
 
@@ -1043,4 +1053,55 @@ WHERE p.id=? AND p.hidden=0`, personID).Scan(&faceID, &bbox, &srcPath, &mimeType
 		return "", fmt.Errorf("FaceThumbnail save: %w", err)
 	}
 	return outPath, nil
+}
+
+// fallbackCoverFace picks the person's largest-bbox face whose asset is live
+// (not trashed, not offline), for use when the stored cover is unusable.
+// Not persisted: the minute-level self-heal + next clustering pass own the
+// durable cover repair; this only keeps the endpoint serving meanwhile.
+func (s *PersonService) fallbackCoverFace(personID string) (faceID, bbox, srcPath, mimeType, assetID string, origW, origH sql.NullInt64, err error) {
+	rows, qerr := s.db.Query(`
+SELECT fd.id, fd.bbox, a.file_path, COALESCE(a.mime_type,''), a.id, e.width, e.height
+FROM face_person fp
+JOIN face_detections fd ON fd.id=fp.face_id AND fd.excluded=0
+JOIN assets a ON a.id=fd.asset_id AND a.deleted_at IS NULL AND a.offline=0
+LEFT JOIN asset_exif e ON e.asset_id=a.id
+WHERE fp.person_id=?`, personID)
+	if qerr != nil {
+		err = fmt.Errorf("fallbackCoverFace query: %w", qerr)
+		return
+	}
+	defer rows.Close()
+	bestArea := -1.0
+	found := false
+	for rows.Next() {
+		var fid, bb, fp, mt, aid string
+		var w, h sql.NullInt64
+		if serr := rows.Scan(&fid, &bb, &fp, &mt, &aid, &w, &h); serr != nil {
+			err = serr
+			return
+		}
+		var box struct {
+			X1 float64 `json:"x1"`
+			Y1 float64 `json:"y1"`
+			X2 float64 `json:"x2"`
+			Y2 float64 `json:"y2"`
+		}
+		area := 0.0
+		if json.Unmarshal([]byte(bb), &box) == nil {
+			area = (box.X2 - box.X1) * (box.Y2 - box.Y1)
+		}
+		if !found || area > bestArea {
+			found, bestArea = true, area
+			faceID, bbox, srcPath, mimeType, assetID, origW, origH = fid, bb, fp, mt, aid, w, h
+		}
+	}
+	if rerr := rows.Err(); rerr != nil {
+		err = rerr
+		return
+	}
+	if !found {
+		err = ErrNotFound
+	}
+	return
 }
