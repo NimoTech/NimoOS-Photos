@@ -7,6 +7,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -198,35 +199,121 @@ func DBSCAN(vecs [][]float32, epsilon float64, minPoints int) []int {
 	return labels
 }
 
+// buildNeighborLists computes, for every vector, the sparse set of neighbor
+// indices whose cosine distance is <= epsilon (self excluded). The O(n^2)
+// distance work is split by row across runtime.NumCPU() workers; each worker
+// only ever writes to the row range it owns (out[lo:hi]), so there is no
+// shared-write contention and no need for per-row locking. The number of
+// completed rows is aggregated with an atomic counter; onProgress itself is
+// invoked under a mutex (held for the duration of the call) so callers never
+// observe concurrent/overlapping invocations — matching the single-threaded
+// delivery contract DBSCANWithProgress previously provided from its outer
+// loop, on which existing progress callbacks (e.g. mutating shared slices or
+// publishing SSE events) rely. onProgress fires once per 1% of rows
+// completed. onProgress may be nil, in which case no progress is reported.
+func buildNeighborLists(vecs [][]float32, epsilon float64, onProgress func(done, n int)) [][]int {
+	n := len(vecs)
+	out := make([][]int, n)
+	if n == 0 {
+		if onProgress != nil {
+			onProgress(0, 0)
+		}
+		return out
+	}
+
+	workers := runtime.NumCPU()
+	if workers > n {
+		workers = n
+	}
+	if workers < 1 {
+		workers = 1
+	}
+
+	var completed atomic.Int64
+	var progressMu sync.Mutex
+	lastReported := -1 // guarded by progressMu
+	report := func() {
+		done := completed.Add(1)
+		if onProgress == nil {
+			return
+		}
+		bucket := int((done * 100) / int64(n))
+		progressMu.Lock()
+		defer progressMu.Unlock()
+		// Strict > (not !=) so a goroutine that reads a stale, already-
+		// superseded bucket can never rewind lastReported and re-fire a
+		// smaller "done" after a larger one was already reported.
+		if bucket > lastReported {
+			lastReported = bucket
+			onProgress(int(done), n)
+		}
+	}
+
+	rowsPerWorker := (n + workers - 1) / workers
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		lo := w * rowsPerWorker
+		hi := lo + rowsPerWorker
+		if hi > n {
+			hi = n
+		}
+		if lo >= hi {
+			continue
+		}
+		wg.Add(1)
+		go func(lo, hi int) {
+			defer wg.Done()
+			for i := lo; i < hi; i++ {
+				var neighbors []int
+				for j := 0; j < n; j++ {
+					if j == i {
+						continue
+					}
+					if cosDist(vecs[i], vecs[j]) <= epsilon {
+						neighbors = append(neighbors, j)
+					}
+				}
+				out[i] = neighbors
+				report()
+			}
+		}(lo, hi)
+	}
+	wg.Wait()
+
+	if onProgress != nil {
+		onProgress(n, n) // guarantee the final state has done==n
+	}
+	return out
+}
+
 // DBSCANWithProgress behaves like DBSCAN, but calls onProgress once per 1%
 // of progress crossed. onProgress must not be nil; the final call before
 // return is guaranteed to have done==n.
+//
+// Phase 1 parallelizes the O(n^2) neighbor computation (buildNeighborLists)
+// across CPU cores — this is where nearly all the wall-clock time goes, and
+// where the progress reporting now lives. Phase 2 is the original serial
+// cluster-expansion logic, unchanged line-for-line except that regionQuery
+// calls are replaced with lookups into the precomputed neighbor lists; the
+// outer loop order and seed-queue expansion order are preserved exactly, so
+// labels are byte-identical to DBSCAN.
 func DBSCANWithProgress(vecs [][]float32, epsilon float64, minPoints int, onProgress func(done, n int)) []int {
 	n := len(vecs)
+	neighborLists := buildNeighborLists(vecs, epsilon, onProgress)
+
 	labels := make([]int, n)
 	for i := range labels {
 		labels[i] = -1
 	}
 	visited := make([]bool, n)
 	clusterID := 0
-	lastReport := -1
-	bucket := func(i int) int {
-		if n == 0 {
-			return 0
-		}
-		return (i * 100) / n
-	}
 
 	for i := 0; i < n; i++ {
-		if b := bucket(i); b != lastReport {
-			onProgress(i, n)
-			lastReport = b
-		}
 		if visited[i] {
 			continue
 		}
 		visited[i] = true
-		neighbors := regionQuery(vecs, i, epsilon)
+		neighbors := neighborLists[i]
 		if len(neighbors) < minPoints {
 			labels[i] = clusterID
 			clusterID++
@@ -239,7 +326,7 @@ func DBSCANWithProgress(vecs [][]float32, epsilon float64, minPoints int, onProg
 			s := seeds[j]
 			if !visited[s] {
 				visited[s] = true
-				sNeighbors := regionQuery(vecs, s, epsilon)
+				sNeighbors := neighborLists[s]
 				if len(sNeighbors) >= minPoints {
 					for _, s2 := range sNeighbors {
 						if !visited[s2] {
@@ -254,7 +341,6 @@ func DBSCANWithProgress(vecs [][]float32, epsilon float64, minPoints int, onProg
 		}
 		clusterID++
 	}
-	onProgress(n, n) // guarantee the final state has done==n
 	return labels
 }
 
