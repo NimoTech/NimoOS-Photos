@@ -178,6 +178,37 @@ When a person's active face count drops to zero (merge, detach, or a re-clusteri
 
 **Low-confidence gating** (`photos.MinPersonConfidence`, default `0.5` when absent from config — see Sample configuration): unnamed, unfavorited, relation-less auto-clusters whose `persons.confidence` is below this floor are hidden from `GET /persons`, `GET /persons/:id/relations` (co-appearance), and `GET /persons/merge-suggestions`. Named, favorited, related, or hidden persons are always shown/considered regardless of `confidence`.
 
+#### Face clustering parameters (`photos.ClusterEpsilon`)
+
+`clusterEpsilon()` (`service/faces.go`) resolves the DBSCAN cosine-distance threshold from `photos.ClusterEpsilon` (falls back to the legacy `0.6` constant if unset/non-positive). The default was changed from `0.6` to **`0.48`** by this project after an offline percolation-cliff study (`cmd/cluster-analysis`, run read-only against a copy of a real production DB, 4409 faces / 8 named persons + one 2612-face garbage cluster):
+
+| eps | minPoints | resulting max cluster size | garbage-cluster retention |
+|---|---|---|---|
+| 0.40 – 0.48 | 1 | ~363 – 366 | ~14% |
+| **0.50** | 1 | **685** | 26% |
+| 0.60 (old default) | 1 | **2612** | 100% (59% of all 4409 faces in one unnamed person) |
+
+`maxSize` is flat across 0.40–0.48, then jumps discontinuously at 0.50 and climbs monotonically back to the full 2612 by 0.60 — a percolation cliff, not a smooth tradeoff. **0.48 sits at the safe edge below the cliff**: it dissolves the mega cluster by 86% (2612→366) at the lowest fragmentation cost among the dissolving options, with named-person purity staying at 1.000.
+
+Two knobs were deliberately **not** changed, because the same study showed they don't help:
+- **`minPoints` stays `1`.** Raising it to 2 or 3 gives essentially zero extra dissolution (the garbage blob's average node degree trivially clears minPoints=3 almost everywhere) while permanently breaking sparse 2-face identities that only ever have one mutual neighbor within range — recall drops to a flat 0.812 the moment minPoints≥2. Raising minPoints trades real, low-sample identities for near-zero dissolution gain.
+- **No bounding-box size gate on the clustering input.** Filtering out small face crops before DBSCAN was tested at 2%/4%/6% of image min-dimension; even the mildest 2% gate deletes a named person's only face, and the 4% gate only shrinks the residual cluster by 5% while erasing two named persons' faces entirely. A size gate deletes legitimate low-sample persons faster than it dissolves the chain, so it is not used as a dissolution lever.
+
+**Merge-suggestion band**: `suggestEpsilon = 0.75` (upper bound) is unchanged, but the band's lower bound is `clusterEpsilon()` itself, so it now runs **0.48–0.75** (previously 0.60–0.75) — under-clustering at the lower epsilon is recovered by this wider suggestion band rather than by DBSCAN itself.
+
+**Rollback**: explicitly set `photos.ClusterEpsilon = 0.6` in `photos.conf` and restart (or trigger a recluster) to return to the pre-project chaining behavior; do not just delete the key, since a missing key resolves to the new `0.48` default, not the old constant.
+
+**Re-tuning**: if a future library needs different tuning (different camera mix, face count, or identity distribution), re-run the sweep with `cmd/cluster-analysis` against a **read-only copy** of that library's DB (never point it at a live `/DATA/.system_data` path) before changing the default — see `cmd/cluster-analysis/README.md` for the full methodology and flags.
+
+#### Performance notes
+
+- `face_person(person_id)` is indexed (`idx_face_person_person`, `pkg/sqlite/db.go`), backing the person-scoped face lookups used throughout re-clustering and the `/persons/:id/*` endpoints.
+- DBSCAN's neighbor-list computation is parallelized across CPU cores (`DBSCANWithProgress`, used by the production clustering pipeline) instead of the old serial `regionQuery` loop. Benchmarked on a 4409-face production library (16 cores): serial 6.65s → parallel 0.61s, **~11x speedup**, with output labels identical to the serial path (verified by `cmd/cluster-analysis`).
+
+#### Known behavior: residual cluster after re-clustering
+
+After adopting `ClusterEpsilon=0.48`, re-clustering a library with a pre-existing garbage mega-cluster leaves one **residual unnamed cluster** rather than dissolving it to nothing — in the validation run above, 366 faces with `ClusterConfidence = 0.8613`. This is above the `MinPersonConfidence` gate (default `0.5`, see above), so it **will still appear** in `GET /persons` as one unnamed person, not be filtered out. This is expected and orthogonal to the epsilon fix: `ClusterConfidence` measures members' average similarity to their own cluster's centroid, which stays high even for an imperfect multi-identity fragment as long as its members are still mutually closer than the epsilon threshold — the confidence gate catches low-cohesion garbage, not merely-imperfect (but still tightly-clustered) ones. Reducing epsilon further would re-fragment named, sparsely-sampled identities before it fully dissolves this residual, so it is left as-is; within-cluster purity metrics (splitting a "confident but still-mixed" cluster) are a documented follow-up, not solved by this project.
+
 ### 4. Embedder backfill
 
 `Embedder.Run` checks ML readiness every 30 seconds:
@@ -377,6 +408,8 @@ nimoos-message-bus.service ──▶ nimoos-photos.service
 - First boot after upgrading past this change runs the one-time `ANALYZE assets` and creates the two partial indexes — on a ~500k-row library this is expected to take on the order of seconds, not minutes. Every boot after that only runs `PRAGMA optimize`.
 - The `/favorites` and `/trash` list endpoints' absent-limit semantics changed to default to 500 rows instead of returning everything. **The frontend PR (`NimoOS-UI`, branch `perf/photos-timeline-scale`) must ship in the same rollout batch as this backend change** — an old frontend talking to the new backend will see at most 500 rows in those two views until it's updated to page/load-more past that cap.
 - `/timeline` is kept for backward compatibility but is deprecated for scale; new frontend code should move to `/timeline/buckets` + `/timeline/bucket`.
+
+**Rollout note for the `ClusterEpsilon` default change** (see Core flows §3 "Face clustering parameters"): the new `0.48` default only takes effect the next time faces are (re-)clustered — it does not retroactively touch an already-clustered library. After deploying this change, trigger `POST /v1/photos/persons/recluster` once (or just wait for the daily 03:xx scheduled pass, see `StartScheduler`) so unnamed clusters rebuild under the new epsilon and the old garbage mega-cluster dissolves. Named/favorited/related/hidden persons are anchored (`personAnchoredCond`) and keep their identity/cover through this pass regardless of epsilon — only unnamed auto-clusters get rebuilt.
 
 ```bash
 # Build
