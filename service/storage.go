@@ -48,6 +48,13 @@ type StorageService struct {
 	// state that predates the invalidation and must be discarded instead of
 	// resurrecting stale PrunableBytes/CacheBytes for a full storageCacheTTL.
 	fsGen int
+
+	// walkDirFn is a test-only seam over dirSize: refreshFS calls it instead
+	// of calling dirSize directly, so a test can inject a slow/blocking walk
+	// to discriminate Stats()'s async contract (it must return before the
+	// filesystem walk completes) without racing real goroutine timing.
+	// Defaults to dirSize; never overridden outside tests.
+	walkDirFn func(root string) int64
 }
 
 // fsStats is the filesystem-derived half of StorageStats: it requires
@@ -60,7 +67,7 @@ type fsStats struct {
 }
 
 func NewStorageService(db *sql.DB, dbPath, thumbDir, faceDir, statfsDir string) *StorageService {
-	return &StorageService{db: db, dbPath: dbPath, thumbDir: thumbDir, faceDir: faceDir, statfsDir: statfsDir}
+	return &StorageService{db: db, dbPath: dbPath, thumbDir: thumbDir, faceDir: faceDir, statfsDir: statfsDir, walkDirFn: dirSize}
 }
 
 // Stats returns storage statistics. DB-derived buckets are computed fresh on
@@ -173,13 +180,13 @@ func (s *StorageService) refreshFS(gen int) {
 	out := &fsStats{}
 	entries, _ := os.ReadDir(s.thumbDir)
 	for _, e := range entries {
-		size := dirSize(filepath.Join(s.thumbDir, e.Name()))
+		size := s.walkDirFn(filepath.Join(s.thumbDir, e.Name()))
 		out.CacheBytes += size
 		if e.IsDir() && !ids[e.Name()] {
 			out.PrunableBytes += size
 		}
 	}
-	out.CacheBytes += dirSize(s.faceDir)
+	out.CacheBytes += s.walkDirFn(s.faceDir)
 
 	s.mu.Lock()
 	if s.fsGen != gen {

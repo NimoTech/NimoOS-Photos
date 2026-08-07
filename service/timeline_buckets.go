@@ -57,6 +57,15 @@ ORDER BY 1 DESC, 2 DESC`)
 // second column ordering makes each page O(offset+limit) instead of a full
 // re-sort. year==0 && month==0 addresses the "unknown date" bucket.
 func (s *SearchService) TimelineBucketAssets(userID string, year, month, limit, offset int) ([]Asset, error) {
+	// Clamp defensively here too, not just at the route layer (timeline.go):
+	// this keeps the ≤500-row IN-batch contract attachNamedFaces relies on
+	// intact even for a future direct caller that bypasses the HTTP handler.
+	// limit<=0 also covers SQL's own LIMIT 0 quirk (zero rows, not
+	// "everything"), so a zero/negative value must fall back to the default
+	// page size rather than being passed through verbatim.
+	if limit <= 0 || limit > 500 {
+		limit = 500
+	}
 	monthCond := `strftime('%Y-%m', COALESCE(a.taken_at, a.indexed_at)) = ?`
 	args := []interface{}{userID}
 	if year == 0 && month == 0 {

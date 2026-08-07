@@ -125,6 +125,25 @@ func TestListHandler(t *testing.T) {
 	require.True(t, strings.Contains(rec.Body.String(), `"favoritedAt"`))
 }
 
+// TestListHandlerNegativeOffsetClamped mirrors trash.go's negative-offset
+// handling: SQLite already treats a negative OFFSET as zero, so this mainly
+// pins that the handler doesn't error out and still returns the full page,
+// equivalent to offset=0.
+func TestListHandlerNegativeOffsetClamped(t *testing.T) {
+	h, svcs, cleanup := newFavHarness(t)
+	defer cleanup()
+
+	_, _ = svcs.Favorites().Favorite("default", "a1")
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/photos/favorites?limit=10&offset=-5", nil)
+	rec := httptest.NewRecorder()
+	c := echo.New().NewContext(req, rec)
+
+	require.NoError(t, h.List(c))
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.True(t, strings.Contains(rec.Body.String(), `"id":"a1"`))
+}
+
 func TestExportZipHandler(t *testing.T) {
 	dir := t.TempDir()
 	fileA := filepath.Join(dir, "alpha.jpg")
