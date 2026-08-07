@@ -146,6 +146,7 @@ func migrate(db *sql.DB) error {
 			face_id   TEXT PRIMARY KEY REFERENCES face_detections(id) ON DELETE CASCADE,
 			person_id TEXT REFERENCES persons(id) ON DELETE SET NULL
 		)`,
+		`CREATE INDEX IF NOT EXISTS idx_face_person_person ON face_person(person_id)`,
 
 		// ── Albums ────────────────────────────────────────────────────────
 		`CREATE TABLE IF NOT EXISTS albums (
