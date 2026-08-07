@@ -166,6 +166,54 @@ func TestStorageRefreshFSDiscardsStaleResultOnConcurrentInvalidate(t *testing.T)
 	}, 5*time.Second, 20*time.Millisecond, "a fresh refresh after the discard should publish normally")
 }
 
+// TestStatsReturnsBeforeSlowWalkCompletes discriminates Stats()'s async
+// contract for real: it injects a walkDirFn that blocks on a channel, then
+// asserts Stats() already returned (DB buckets populated, cache buckets at
+// their pre-walk zero value) while the walk is still stuck — proving Stats()
+// does not itself wait on the filesystem walk. Releasing the channel then
+// lets the walk finish and publish, observed via Eventually.
+func TestStatsReturnsBeforeSlowWalkCompletes(t *testing.T) {
+	db := makeTestDB(t)
+	_, err := db.Exec(`INSERT INTO assets(id, file_path, file_size, mime_type, status)
+		VALUES('a1','/x/a.jpg',1000,'image/jpeg','indexed')`)
+	require.NoError(t, err)
+
+	thumbDir := t.TempDir()
+	writeFileOfSize(t, thumbDir, "a1/small.jpg", 100)
+
+	s := NewStorageService(db, filepath.Join(t.TempDir(), "photos.db"), thumbDir, t.TempDir(), t.TempDir())
+
+	release := make(chan struct{})
+	entered := make(chan struct{}, 8)
+	// test-only seam: blocks every walk call until release is closed, so the
+	// background refreshFS goroutine provably cannot have finished yet when
+	// the assertions below run.
+	s.walkDirFn = func(root string) int64 {
+		entered <- struct{}{}
+		<-release
+		return dirSize(root)
+	}
+
+	st, err := s.Stats() // kicks the background walk, must not block on it
+	require.NoError(t, err)
+	require.Equal(t, int64(1000), st.PhotosBytes, "DB-derived buckets are always fresh")
+	require.Equal(t, int64(0), st.CacheBytes, "cache bucket must still be at its pre-walk zero value")
+
+	// Confirm the walk actually started (avoids a vacuously-true assertion
+	// above if refreshFS's goroutine simply hadn't been scheduled yet).
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("walkDirFn was never called")
+	}
+
+	close(release)
+	require.Eventually(t, func() bool {
+		st, err := s.Stats()
+		return err == nil && st.CacheBytes == 100
+	}, 5*time.Second, 20*time.Millisecond, "cache bytes should land once the slow walk is released")
+}
+
 func TestPruneRemovesOrphanFaceThumbs(t *testing.T) {
 	db := makeTestDB(t)
 	_, err := db.Exec(`INSERT INTO assets(id, file_path, file_size, mime_type, status)

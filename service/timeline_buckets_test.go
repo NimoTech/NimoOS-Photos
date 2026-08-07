@@ -37,6 +37,37 @@ func TestTimelineBuckets(t *testing.T) {
 	require.Equal(t, 500, videos)
 }
 
+// TestTimelineBucketsUnknownDateBucket covers the {0,0} "unknown date"
+// bucket: an asset with both taken_at and indexed_at NULL still must show up
+// in TimelineBuckets (as the last, {Year:0,Month:0} entry) and be fetchable
+// through TimelineBucketAssets(uid, 0, 0, ...) — this is the fallback bucket
+// for assets that predate any timestamp being recorded at all.
+func TestTimelineBucketsUnknownDateBucket(t *testing.T) {
+	db := openPerfDB(t)
+	seedPerfAssets(t, db, 200) // ordinary dated assets, all visible under the three predicates
+	// Manually insert one asset with taken_at and indexed_at both NULL:
+	// status='indexed' and the three visibility predicates
+	// (is_live_photo_video=0, deleted_at IS NULL, offline=0) hold via column
+	// defaults, so this row is visible but has no derivable date.
+	_, err := db.Exec(`INSERT INTO assets(id, file_path, status) VALUES('unknown-date-1','/g/unknown-date-1.jpg','indexed')`)
+	require.NoError(t, err)
+
+	svc := service.NewSearchService(db, nil)
+	buckets, err := svc.TimelineBuckets()
+	require.NoError(t, err)
+	require.NotEmpty(t, buckets)
+
+	last := buckets[len(buckets)-1]
+	require.Equal(t, 0, last.Year, "unknown-date bucket must be {0,0}")
+	require.Equal(t, 0, last.Month, "unknown-date bucket must be {0,0}")
+	require.Equal(t, 1, last.Count)
+
+	page, err := svc.TimelineBucketAssets("u1", 0, 0, 10, 0)
+	require.NoError(t, err)
+	require.Len(t, page, 1)
+	require.Equal(t, "unknown-date-1", page[0].ID)
+}
+
 func TestTimelineBucketsUsesMonthIndex(t *testing.T) {
 	db := openPerfDB(t)
 	seedPerfAssets(t, db, 2000)
@@ -108,6 +139,11 @@ LIMIT ? OFFSET ?`, "u1", "2018-04", 500, 0)
 	}
 	require.Contains(t, plan, "idx_assets_monthkey",
 		"bucket-assets query must equality-seek the month-key index, not fall back to a table scan plus temp b-tree sort")
+	// Pin the negative directly: idx_assets_monthkey's second column already
+	// orders by COALESCE(taken_at, indexed_at) DESC, so ORDER BY should be
+	// satisfied by the index walk itself with no separate sort step.
+	require.NotContains(t, plan, "TEMP B-TREE",
+		"the index's own column order should satisfy ORDER BY without a temp b-tree sort")
 }
 
 func TestTimelineBucketAssets(t *testing.T) {
