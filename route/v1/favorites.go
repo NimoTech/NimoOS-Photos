@@ -68,6 +68,13 @@ func (h *FavoritesHandler) List(c echo.Context) error {
 	if limit <= 0 || limit > 500 {
 		limit = 500
 	}
+	// Explicit clamp, matching trash.go's List: SQLite already treats a
+	// negative OFFSET as zero, so this is defense-in-depth rather than a bug
+	// fix — it keeps the two handlers' pagination contracts textually
+	// identical instead of relying on an engine-specific fallback.
+	if offset < 0 {
+		offset = 0
+	}
 	assets, err := h.svc.Favorites().List(JWTUserID(c), service.ListFavoritesOpts{
 		Limit:  limit,
 		Offset: offset,
