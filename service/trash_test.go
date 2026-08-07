@@ -76,7 +76,7 @@ func TestTrashThenRestore(t *testing.T) {
 	if _, err := os.Stat(orig); !os.IsNotExist(err) {
 		t.Fatalf("original file should be moved out of gallery root")
 	}
-	items, err := ts.ListTrash("u1")
+	items, err := ts.ListTrash("u1", 500, 0)
 	if err != nil {
 		t.Fatalf("ListTrash: %v", err)
 	}
@@ -96,7 +96,7 @@ func TestTrashThenRestore(t *testing.T) {
 	if _, err := os.Stat(orig); err != nil {
 		t.Fatalf("file should be restored to original path: %v", err)
 	}
-	items, _ = ts.ListTrash("u1")
+	items, _ = ts.ListTrash("u1", 500, 0)
 	if len(items) != 0 {
 		t.Fatalf("trash should be empty after restore, got %d", len(items))
 	}
@@ -113,7 +113,7 @@ func TestPurgeRemovesFileAndThumb(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(thumb, "a1")); !os.IsNotExist(err) {
 		t.Fatalf("thumb dir should be removed")
 	}
-	items, _ := ts.ListTrash("u1")
+	items, _ := ts.ListTrash("u1", 500, 0)
 	if len(items) != 0 {
 		t.Fatalf("trash should be empty after purge")
 	}
@@ -132,7 +132,7 @@ func TestEmptyTrash(t *testing.T) {
 	if err := ts.EmptyTrash(); err != nil {
 		t.Fatalf("EmptyTrash: %v", err)
 	}
-	items, _ := ts.ListTrash("u1")
+	items, _ := ts.ListTrash("u1", 500, 0)
 	if len(items) != 0 {
 		t.Fatalf("trash should be empty")
 	}
@@ -157,7 +157,7 @@ func TestPurgeExpired(t *testing.T) {
 	if err := ts.PurgeExpired(30); err != nil {
 		t.Fatalf("PurgeExpired: %v", err)
 	}
-	items, _ := ts.ListTrash("u1")
+	items, _ := ts.ListTrash("u1", 500, 0)
 	if len(items) != 0 {
 		t.Fatalf("expired item should be purged")
 	}
@@ -171,7 +171,7 @@ func TestPurgeExpiredKeepsRecent(t *testing.T) {
 	if err := ts.PurgeExpired(30); err != nil {
 		t.Fatal(err)
 	}
-	items, _ := ts.ListTrash("u1")
+	items, _ := ts.ListTrash("u1", 500, 0)
 	if len(items) != 1 {
 		t.Fatalf("recent item should be kept, got %d", len(items))
 	}
