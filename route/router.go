@@ -166,6 +166,8 @@ func InitRouter(ctx context.Context, svc service.Services, runtimePath string, t
 
 	// Timeline
 	g.GET("/timeline", tl.List)
+	g.GET("/timeline/buckets", tl.Buckets)
+	g.GET("/timeline/bucket", tl.Bucket)
 
 	// Album endpoints
 	g.GET("/albums", albums.List)

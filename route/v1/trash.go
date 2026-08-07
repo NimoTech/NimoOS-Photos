@@ -3,6 +3,7 @@ package v1
 import (
 	"errors"
 	"net/http"
+	"strconv"
 
 	"github.com/NimoTech/NimoOS-Photos/service"
 	"github.com/labstack/echo/v4"
@@ -16,7 +17,17 @@ func NewTrashHandler(svc service.Services) *TrashHandler { return &TrashHandler{
 
 // List GET /v1/photos/trash
 func (h *TrashHandler) List(c echo.Context) error {
-	items, err := h.svc.Trash().ListTrash(JWTUserID(c))
+	limit, _ := strconv.Atoi(c.QueryParam("limit"))
+	offset, _ := strconv.Atoi(c.QueryParam("offset"))
+	// Default AND ceiling: an absent limit used to mean "everything", which
+	// at gallery scale serializes tens of thousands of rows per request.
+	if limit <= 0 || limit > 500 {
+		limit = 500
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	items, err := h.svc.Trash().ListTrash(JWTUserID(c), limit, offset)
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
 	}

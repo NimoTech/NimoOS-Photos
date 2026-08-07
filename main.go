@@ -112,6 +112,11 @@ func main() {
 		}
 	}()
 
+	// Warm the filesystem-derived storage stats once at boot so the settings
+	// page has cache/prunable numbers soon after startup instead of waiting
+	// for the first request to kick the background walk.
+	go svc.Storage().WarmFS()
+
 	// Daily full cache cleanup: orphaned thumbnail directories + orphaned
 	// face-thumbs + expired staging, same implementation as the manual
 	// button on the settings page (POST /cache/prune).

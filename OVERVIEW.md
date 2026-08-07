@@ -62,7 +62,9 @@ The ML backend is an independent Docker Compose stack (`deploy/ml/docker-compose
 | GET | `/assets/:id/live` | Get Live Photo video (JWT-exempt) |
 | GET | `/assets/:id/sprite` | Video hover-preview sprite (JWT-exempt) |
 | GET | `/assets/:id/ocr` | OCR line text + normalized coordinates (`?q=` returns only matching lines, using the same matching rules as /search/smart's OCR; used for front-end search-hit highlighting; JWT-protected) |
-| GET | `/timeline` | Timeline grouped by year/month |
+| GET | `/timeline` | Timeline grouped by year/month. **Deprecated for scale**: kept for backward compatibility, but it scans the whole table and groups in Go, so cost grows linearly with library size (benchmarked at ~571.7ms for 100k assets). New consumers should use `/timeline/buckets` + `/timeline/bucket` instead |
+| GET | `/timeline/buckets` | Month-bucket directory: one row per `YYYY-MM` (grouped by `strftime('%Y-%m', COALESCE(taken_at, indexed_at))`) with its asset count, ordered newest-first; the unknown-date bucket (`taken_at`/`indexed_at` both null) sorts last. Backed by `idx_assets_monthkey`, so it's an index scan rather than a table scan |
+| GET | `/timeline/bucket` | Paginated assets within a single month bucket (`?year=&month=&limit=&offset=`; `year=0&month=0` selects the unknown-date bucket). `limit` defaults/caps at 500, `offset` floors at 0, `year<0 \|\| month<0 \|\| month>12` returns 400. Same column set/enrichment as `/timeline` (EXIF, favorited_at, OCR-hit flag, named faces, place names) but scoped to one month via an equality match on `idx_assets_monthkey`, so it stays flat-cost regardless of library size (benchmarked at ~1.04ms/page for 100k assets, a page selected via `year=2020,month=6` — vs. ~571.7ms for the legacy full `/timeline` scan, roughly a 549× speedup) |
 | POST | `/search/smart` | CLIP semantic search + OCR exact match (localhost MCP calls are JWT-exempt, see Authentication) |
 | GET | `/search/faces/:person_id` | Find assets by person |
 | GET/POST/DELETE | `/albums[/:id]` | Album CRUD (`GET /albums` is JWT-exempt for localhost MCP calls, see Authentication) |
@@ -77,8 +79,8 @@ The ML backend is an independent Docker Compose stack (`deploy/ml/docker-compose
 | PUT/DELETE | `/places/:key/spot-name` | Set/reset spot name |
 | POST | `/places/:key/album` | Create an album from a place |
 | POST/DELETE | `/favorites/:asset_id` | Favorite/unfavorite |
-| GET | `/favorites[/ids/export/top]` | Favorites list/IDs/export/top |
-| GET | `/trash` | Trash |
+| GET | `/favorites[/ids/export/top]` | Favorites list/IDs/export/top. `GET /favorites` list defaults/caps `limit` at 500 (an unspecified or out-of-range `limit` is normalized to 500, not "unlimited"); `/export` is unaffected and still returns the full set |
+| GET | `/trash` | Trash. `limit`/`offset` are handler-parsed and normalized the same way: `limit<=0 \|\| limit>500` → 500, `offset<0` → 0 |
 | POST | `/trash/restore` | Batch restore |
 | POST | `/trash/empty` | Empty trash |
 | POST/DELETE | `/trash/:id/restore` | Restore/permanently delete a single item |
@@ -99,7 +101,7 @@ The ML backend is an independent Docker Compose stack (`deploy/ml/docker-compose
 | POST | `/scan` | Manually trigger a directory scan |
 | GET | `/tasks` | Current task list (index/embedding/ocr) |
 | GET/PUT | `/config` | Album configuration (WatchDirs, feature toggles, etc.) |
-| GET | `/storage` | Storage stats |
+| GET | `/storage` | Storage stats. DB-derived buckets (Photos/Videos/Raw/AI/Disk) come from a single SQL aggregate query and are always computed fresh on every call (no cache in front of them anymore). FS-derived buckets (CacheBytes/PrunableBytes, from walking `thumbs/`/`face-thumbs/`) are stale-while-revalidate: the request returns immediately with the last cached value (or zero on first call) while a background walk (`refreshFS`, single-flighted via an in-flight flag) refreshes it for the next call; `main.go` also calls `WarmFS()` once at startup so the settings page isn't stuck on zero right after boot. `Prune()` still invalidates the FS cache, triggering a fresh walk on the next `Stats()`/`WarmFS()` call |
 | POST | `/cache/prune` | Clean up orphaned thumbnails + orphaned face-thumbs + expired upload staging (same implementation as the daily scheduled cleanup) |
 | POST | `/index/rebuild` | Rebuild the vector index |
 | GET | `/about` | Version/ML status information |
@@ -256,6 +258,16 @@ Config toggle `AestheticEnabled` (`photos.conf`, default `true`), **not hot-relo
 | `spot_name_overrides` | User-customized spot names |
 | `photos_meta` | Key-value metadata (e.g. `index_last_rebuilt`, `ml_model_gen`, `aesthetic_head_ver`) |
 
+**Timeline/scale indexes** (`pkg/sqlite/db.go`, migration-time): two partial indexes back the timeline endpoints and the general asset list —
+- `idx_assets_sortkey`: on `COALESCE(taken_at, indexed_at) DESC`, `WHERE is_live_photo_video = 0 AND deleted_at IS NULL AND offline = 0` — lets `ListAssets`'s default sort walk the index instead of a `TEMP B-TREE` sort.
+- `idx_assets_monthkey`: on `strftime('%Y-%m', COALESCE(taken_at, indexed_at))`, same `WHERE` — backs both `/timeline/buckets` (index scan) and `/timeline/bucket` (equality seek).
+
+Both are **partial indexes with SQLite's exact-predicate matching**: any query that reads/writes the same `WHERE`/expression must reproduce the predicate text verbatim, or the planner won't pick the index. The connection pool is also capped at 8 (`SetMaxOpenConns`/`SetMaxIdleConns`), sized for a single-node SQLite-WAL deployment rather than left at the driver default.
+
+SQLite's cost model needs `sqlite_stat1` statistics to route around a low-selectivity equality index (`is_live_photo_video=0`, true for nearly every row) and pick these sort/month indexes instead — without stats it can pick the wrong index and add a `TEMP B-TREE` sort even though a partial index that avoids it exists. `migrate()` therefore does:
+1. A **guarded, one-time** `ANALYZE assets` — only runs when `sqlite_stat1` has no rows yet for the `assets` table (fresh DB, or upgrading from a version that never ran it). On a library with ~500k rows this is a single-table scan taking on the order of seconds, and it only happens once across the service's lifetime (not on every restart).
+2. An unconditional `PRAGMA optimize` on every subsequent startup — self-limiting (SQLite decides internally whether any table's stats are stale enough to be worth refreshing), near-zero cost on a normal restart with no big data-volume swing.
+
 ---
 
 ## CGO dependencies
@@ -350,6 +362,11 @@ nimoos-message-bus.service ──▶ nimoos-photos.service
 ```
 
 `Type=notify`; considered started only after `SdNotify(Ready)`.
+
+**Rollout notes for the timeline/pagination/storage perf changes** (see "Timeline/scale indexes" and the `/favorites`, `/trash`, `/storage` route rows above):
+- First boot after upgrading past this change runs the one-time `ANALYZE assets` and creates the two partial indexes — on a ~500k-row library this is expected to take on the order of seconds, not minutes. Every boot after that only runs `PRAGMA optimize`.
+- The `/favorites` and `/trash` list endpoints' absent-limit semantics changed to default to 500 rows instead of returning everything. **The frontend PR (`NimoOS-UI`, branch `perf/photos-timeline-scale`) must ship in the same rollout batch as this backend change** — an old frontend talking to the new backend will see at most 500 rows in those two views until it's updated to page/load-more past that cap.
+- `/timeline` is kept for backward compatibility but is deprecated for scale; new frontend code should move to `/timeline/buckets` + `/timeline/bucket`.
 
 ```bash
 # Build
