@@ -121,6 +121,51 @@ func TestStoragePruneRemovesOnlyOrphans(t *testing.T) {
 	}, 5*time.Second, 20*time.Millisecond, "PrunableBytes must reflect a real post-Prune walk, not a nil-cache zero value")
 }
 
+// TestStorageRefreshFSDiscardsStaleResultOnConcurrentInvalidate covers the overlap
+// where a Prune() (Invalidate()) completes while a refreshFS() launched
+// before it is still walking. The stale walk carries a pre-Prune filesystem
+// snapshot and must not resurrect it into fsCache once it finishes — that
+// would republish PrunableBytes/CacheBytes Prune just cleared for a full
+// storageCacheTTL. refreshFS is unexported but this test file is in package
+// service, so the overlap is orchestrated directly rather than raced with
+// real goroutine timing (see the fsGen doc comment on the struct).
+func TestStorageRefreshFSDiscardsStaleResultOnConcurrentInvalidate(t *testing.T) {
+	db := makeTestDB(t)
+	_, err := db.Exec(`INSERT INTO assets(id, file_path, file_size, mime_type, status)
+		VALUES('a1','/x/a.jpg',1000,'image/jpeg','indexed')`)
+	require.NoError(t, err)
+
+	thumbDir := t.TempDir()
+	writeFileOfSize(t, thumbDir, "a1/small.jpg", 100)
+	writeFileOfSize(t, thumbDir, "ghost/small.jpg", 300)
+
+	s := NewStorageService(db, filepath.Join(t.TempDir(), "photos.db"), thumbDir, t.TempDir(), t.TempDir())
+
+	// Simulate a refreshFS() that was launched (as Stats()/WarmFS() would,
+	// capturing fsGen under s.mu at launch time) while fsGen was still 0.
+	launchGen := s.fsGen
+
+	// A concurrent Prune() finishes and calls Invalidate() while that walk is
+	// still in flight, bumping fsGen.
+	s.Invalidate()
+
+	// The in-flight walk (still holding the pre-Invalidate generation) now
+	// finishes and tries to publish its (stale) snapshot.
+	s.refreshFS(launchGen)
+
+	s.mu.Lock()
+	cache := s.fsCache
+	s.mu.Unlock()
+	require.Nil(t, cache, "a walk started before Invalidate() must discard its result, not resurrect stale bytes")
+
+	// A subsequent real refresh (current generation) must still publish
+	// normally — the discard above must not wedge future refreshes.
+	require.Eventually(t, func() bool {
+		st, err := s.Stats()
+		return err == nil && st.PrunableBytes == 300
+	}, 5*time.Second, 20*time.Millisecond, "a fresh refresh after the discard should publish normally")
+}
+
 func TestPruneRemovesOrphanFaceThumbs(t *testing.T) {
 	db := makeTestDB(t)
 	_, err := db.Exec(`INSERT INTO assets(id, file_path, file_size, mime_type, status)

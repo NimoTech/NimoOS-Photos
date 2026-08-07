@@ -41,6 +41,13 @@ type StorageService struct {
 	fsCache      *fsStats // cache/prunable bytes from the last completed walk
 	fsCachedAt   time.Time
 	fsRefreshing bool
+	// fsGen is bumped by Invalidate(). A refreshFS() run captures the
+	// generation in effect when it was launched and compares it again right
+	// before publishing: if Invalidate() (e.g. from Prune()) ran while the
+	// walk was in flight, the snapshot it collected reflects a filesystem
+	// state that predates the invalidation and must be discarded instead of
+	// resurrecting stale PrunableBytes/CacheBytes for a full storageCacheTTL.
+	fsGen int
 }
 
 // fsStats is the filesystem-derived half of StorageStats: it requires
@@ -72,7 +79,8 @@ func (s *StorageService) Stats() (*StorageStats, error) {
 	}
 	if !s.fsRefreshing && (s.fsCache == nil || time.Since(s.fsCachedAt) >= storageCacheTTL) {
 		s.fsRefreshing = true
-		go s.refreshFS()
+		gen := s.fsGen
+		go s.refreshFS(gen)
 	}
 	s.mu.Unlock()
 	return st, nil
@@ -81,9 +89,12 @@ func (s *StorageService) Stats() (*StorageStats, error) {
 // Invalidate clears the cached filesystem-derived stats so the next Stats()
 // call kicks a fresh background walk (e.g. after a prune). DB-derived
 // buckets are always fresh already, so there is nothing else to drop.
+// Bumping fsGen also tells any refreshFS() already in flight that its
+// eventual result is stale and must be discarded (see fsGen's doc comment).
 func (s *StorageService) Invalidate() {
 	s.mu.Lock()
 	s.fsCache = nil
+	s.fsGen++
 	s.mu.Unlock()
 }
 
@@ -93,7 +104,8 @@ func (s *StorageService) WarmFS() {
 	s.mu.Lock()
 	if !s.fsRefreshing {
 		s.fsRefreshing = true
-		go s.refreshFS()
+		gen := s.fsGen
+		go s.refreshFS(gen)
 	}
 	s.mu.Unlock()
 }
@@ -133,8 +145,13 @@ const rawExtCase = `(lower(COALESCE(file_path,'')) LIKE '%.dng' OR lower(COALESC
 
 // refreshFS runs the expensive thumbnail-tree walk off the request path and
 // publishes the result. Orphan detection reuses the old logic (dir name not
-// present in assets.id).
-func (s *StorageService) refreshFS() {
+// present in assets.id). gen is the fsGen captured by the caller at launch
+// time (under s.mu); if Invalidate() bumps fsGen before this walk finishes
+// (e.g. a concurrent Prune() completed mid-walk), the snapshot collected
+// here is stale and is discarded instead of being published — the next
+// Stats() call already sees fsCache == nil (from Invalidate) and kicks a
+// fresh walk on its own, so no extra self-retrigger is needed here.
+func (s *StorageService) refreshFS(gen int) {
 	defer func() {
 		s.mu.Lock()
 		s.fsRefreshing = false
@@ -165,6 +182,11 @@ func (s *StorageService) refreshFS() {
 	out.CacheBytes += dirSize(s.faceDir)
 
 	s.mu.Lock()
+	if s.fsGen != gen {
+		// Stale: an Invalidate() (Prune()) ran while we were walking.
+		s.mu.Unlock()
+		return
+	}
 	s.fsCache, s.fsCachedAt = out, time.Now()
 	s.mu.Unlock()
 }
