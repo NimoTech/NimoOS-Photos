@@ -682,6 +682,11 @@ func (s *FaceService) RunPipeline(ctx context.Context) error {
 			return uerr
 		}
 		if unassigned == 0 {
+			// This is the daily-skip guard: in steady state (nothing to
+			// detect, nothing unassigned to cluster) the scheduled daily
+			// RunPipeline exits here without ever reaching clusterStage, so
+			// persons are not rebuilt and person UUIDs don't churn.
+			// Verified by TestRunPipelineNoOpWhenNothingChanged.
 			return nil
 		}
 	}
