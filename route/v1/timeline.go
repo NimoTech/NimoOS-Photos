@@ -54,6 +54,9 @@ func (h *TimelineHandler) Bucket(c echo.Context) error {
 	if month < 0 || month > 12 || year < 0 {
 		return echo.NewHTTPError(http.StatusBadRequest, "invalid year/month")
 	}
+	if !validBucketYM(year, month) {
+		return echo.NewHTTPError(http.StatusBadRequest, "year and month must both be zero (unknown bucket) or both be set")
+	}
 	assets, err := h.svc.Search().TimelineBucketAssets(JWTUserID(c), year, month, limit, offset)
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
@@ -62,4 +65,17 @@ func (h *TimelineHandler) Bucket(c echo.Context) error {
 		assets = []service.Asset{}
 	}
 	return c.JSON(http.StatusOK, assets)
+}
+
+// validBucketYM reports whether year/month is a valid timeline bucket key:
+// either both zero (the "unknown date" bucket — taken_at and indexed_at both
+// NULL) or both set with month in 1..12. A "half-zero" pair like
+// year=2020,month=0 can never correspond to a real bucket. Callers are
+// expected to have already rejected out-of-range values (negative
+// year/month, month>12) before consulting this half-zero rule.
+func validBucketYM(year, month int) bool {
+	if year < 0 || month < 0 || month > 12 {
+		return false
+	}
+	return (year == 0) == (month == 0)
 }
