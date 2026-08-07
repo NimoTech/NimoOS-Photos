@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/NimoTech/NimoOS-Photos/pkg/config"
 	"github.com/NimoTech/NimoOS-Photos/pkg/sqlite"
 	"github.com/disintegration/imaging"
 )
@@ -22,6 +23,16 @@ type PersonService struct {
 }
 
 func NewPersonService(db *sql.DB) *PersonService { return &PersonService{db: db} }
+
+// minPersonConfidence returns the configured floor for unnamed clusters;
+// 0 (no gating) when config isn't initialized (tests constructing services
+// directly).
+func minPersonConfidence() float64 {
+	if config.Cfg != nil {
+		return config.Cfg.MinPersonConfidence
+	}
+	return 0.0
+}
 
 // ListPersons returns all non-hidden persons as rich objects (with count/confidence/first-last-seen/places count).
 func (s *PersonService) ListPersons() ([]Person, error) {
@@ -61,8 +72,8 @@ SELECT p.id, p.name,
                ORDER BY a2.aesthetic_score DESC LIMIT 1),
            '') AS hero
 FROM persons p
-WHERE p.hidden=0
-ORDER BY cnt DESC, p.rowid`)
+WHERE p.hidden=0 AND (p.name!='' OR p.favorite=1 OR COALESCE(p.relation,'')!='' OR p.confidence >= ?)
+ORDER BY cnt DESC, p.rowid`, minPersonConfidence())
 	if err != nil {
 		return nil, fmt.Errorf("ListPersons: %w", err)
 	}
@@ -415,6 +426,22 @@ func (s *PersonService) setHidden(id string, hidden bool) error {
 	return nil
 }
 
+// PersonVisible reports whether the person exists and is not hidden, with
+// the same 404 semantics as GetPerson. Used by list-style person endpoints
+// (assets/relations/places) that would otherwise leak hidden persons' data
+// or silently return empty arrays for nonexistent ids.
+func (s *PersonService) PersonVisible(id string) error {
+	var one int
+	err := s.db.QueryRow(`SELECT 1 FROM persons WHERE id=? AND hidden=0`, id).Scan(&one)
+	if err == sql.ErrNoRows {
+		return ErrNotFound
+	}
+	if err != nil {
+		return fmt.Errorf("PersonVisible: %w", err)
+	}
+	return nil
+}
+
 // PersonRelations returns other persons who co-appear with this person in the same asset, ordered by co-occurrence count descending.
 func (s *PersonService) PersonRelations(id string) ([]PersonRelation, error) {
 	rows, err := s.db.Query(`
@@ -424,10 +451,10 @@ JOIN face_detections fd1 ON fd1.id=fp1.face_id
 JOIN face_detections fd2 ON fd2.asset_id=fd1.asset_id AND fd2.id!=fd1.id
 JOIN face_person fp2 ON fp2.face_id=fd2.id
 JOIN assets a ON a.id=fd1.asset_id AND a.deleted_at IS NULL AND a.offline=0 AND a.is_live_photo_video=0
-JOIN persons p ON p.id=fp2.person_id AND p.hidden=0
+JOIN persons p ON p.id=fp2.person_id AND p.hidden=0 AND (p.name!='' OR p.favorite=1 OR COALESCE(p.relation,'')!='' OR p.confidence >= ?)
 WHERE fp1.person_id=? AND fp2.person_id!=fp1.person_id
 GROUP BY fp2.person_id
-ORDER BY cnt DESC`, id)
+ORDER BY cnt DESC`, minPersonConfidence(), id)
 	if err != nil {
 		return nil, fmt.Errorf("PersonRelations: %w", err)
 	}
@@ -511,12 +538,12 @@ type personCentroid struct {
 }
 
 // MergeSuggestions returns person pairs whose centroid distance falls within
-// the (dbscanEpsilon, suggestEpsilon) band and that haven't been rejected,
+// the (clusterEpsilon(), suggestEpsilon) band and that haven't been rejected,
 // with confidence=1-dist, ordered by confidence descending.
 func (s *PersonService) MergeSuggestions() ([]MergeSuggestion, error) {
 	rows, err := s.db.Query(`
 SELECT id, COALESCE(name,''), COALESCE(cover_face_id,''), centroid
-FROM persons WHERE hidden=0 AND centroid IS NOT NULL`)
+FROM persons WHERE hidden=0 AND centroid IS NOT NULL AND (name!='' OR favorite=1 OR COALESCE(relation,'')!='' OR confidence >= ?)`, minPersonConfidence())
 	if err != nil {
 		return nil, fmt.Errorf("MergeSuggestions load: %w", err)
 	}
@@ -547,7 +574,7 @@ FROM persons WHERE hidden=0 AND centroid IS NOT NULL`)
 	for i := 0; i < len(ps); i++ {
 		for j := i + 1; j < len(ps); j++ {
 			d := cosDist(ps[i].centroid, ps[j].centroid)
-			if d <= dbscanEpsilon || d >= suggestEpsilon {
+			if d <= clusterEpsilon() || d >= suggestEpsilon {
 				continue
 			}
 			a, b := ps[i], ps[j]
@@ -731,7 +758,8 @@ WHERE fp.person_id = ? AND fd.excluded = 0 AND fd.asset_id IN (%s)`, strings.Joi
 		}
 	}
 
-	// Recompute centroid / cover / confidence (recomputeOneCentroidTx returns early when vecs=0).
+	// Recompute centroid / cover / confidence (recomputeOneCentroidTx clears
+	// cover/centroid when vecs=0, i.e. all faces were just detached).
 	if err := recomputeOneCentroidTx(tx, personID); err != nil {
 		return 0, fmt.Errorf("DetachAssetsFromPerson recompute: %w", err)
 	}
@@ -754,16 +782,9 @@ WHERE fp.person_id = ? AND fd.excluded = 0 AND fd.asset_id IN (%s)`, strings.Joi
 			if _, err := tx.Exec(`DELETE FROM persons WHERE id=?`, personID); err != nil {
 				return 0, fmt.Errorf("DetachAssetsFromPerson delete empty: %w", err)
 			}
-		} else {
-			// Anchored person is kept but cover/centroid/lock/hero are all cleared
-			// (recomputeOneCentroidTx returned early with vecs=0, so we do it here).
-			if _, err := tx.Exec(
-				`UPDATE persons SET cover_face_id=NULL, cover_asset_id=NULL, cover_locked=0, hero_asset_id=NULL, centroid=NULL, confidence=0, updated_at=CURRENT_TIMESTAMP WHERE id=?`,
-				personID,
-			); err != nil {
-				return 0, fmt.Errorf("DetachAssetsFromPerson clear cover: %w", err)
-			}
 		}
+		// Anchored persons are kept; cover/centroid/lock/hero are already
+		// cleared above by recomputeOneCentroidTx's vecs=0 branch.
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -803,7 +824,7 @@ func recomputeOneCentroidTx(tx *sql.Tx, personID string) error {
 	// asset_exif for width/height — when missing, hybridCoverScore marks that
 	// face as incomparable).
 	rows, err := tx.Query(`
-SELECT fd.id, fd.asset_id, fd.embedding, fd.bbox,
+SELECT fd.id, fd.asset_id, fd.embedding, fd.bbox, fd.score,
        a.aesthetic_score, e.width, e.height
 FROM face_person fp
 JOIN face_detections fd ON fd.id=fp.face_id
@@ -816,13 +837,14 @@ WHERE fp.person_id=? AND fd.excluded=0`, personID)
 	var faceIDs, assetIDs, bboxes []string
 	var vecs [][]float32
 	var scores []sql.NullFloat64
+	var faceScores []sql.NullFloat64
 	var ws, hs []sql.NullInt64
 	for rows.Next() {
 		var fid, aid, bbox string
 		var blob []byte
-		var score sql.NullFloat64
+		var faceScore, score sql.NullFloat64
 		var w, h sql.NullInt64
-		if err := rows.Scan(&fid, &aid, &blob, &bbox, &score, &w, &h); err != nil {
+		if err := rows.Scan(&fid, &aid, &blob, &bbox, &faceScore, &score, &w, &h); err != nil {
 			rows.Close()
 			return err
 		}
@@ -831,6 +853,7 @@ WHERE fp.person_id=? AND fd.excluded=0`, personID)
 		bboxes = append(bboxes, bbox)
 		vecs = append(vecs, sqlite.DeserializeFloat32(blob))
 		scores = append(scores, score)
+		faceScores = append(faceScores, faceScore)
 		ws = append(ws, w)
 		hs = append(hs, h)
 	}
@@ -840,7 +863,12 @@ WHERE fp.person_id=? AND fd.excluded=0`, personID)
 	}
 	rows.Close()
 	if len(vecs) == 0 {
-		return nil
+		// No active faces left: clear cover/centroid so the person stops
+		// pointing at detached or deleted faces (dangling cover_face_id).
+		_, err = tx.Exec(`UPDATE persons SET cover_face_id=NULL, cover_asset_id=NULL,
+			cover_locked=0, hero_asset_id=NULL, centroid=NULL, confidence=0,
+			updated_at=CURRENT_TIMESTAMP WHERE id=?`, personID)
+		return err
 	}
 	centroid := ComputeCentroid(vecs)
 	conf := ClusterConfidence(vecs, centroid)
@@ -881,7 +909,7 @@ WHERE fp.person_id=? AND fd.excluded=0`, personID)
 	// existing libraries that haven't been scored yet).
 	best, bestHybrid := -1, -1.0
 	for i := range vecs {
-		if h := hybridCoverScore(scores[i], bboxes[i], ws[i], hs[i]); h > bestHybrid {
+		if h := hybridCoverScore(scores[i], bboxes[i], ws[i], hs[i], faceScores[i]); h > bestHybrid {
 			bestHybrid = h
 			best = i
 		}
@@ -908,10 +936,13 @@ WHERE fp.person_id=? AND fd.excluded=0`, personID)
 }
 
 // hybridCoverScore computes a person's cover hybrid score (whole-image
-// aesthetic score × face area ratio); returns -1 when incomparable.
-// Incomparable scenarios: the asset hasn't been scored, EXIF is missing
-// width/height, or the bbox is unparseable or degenerate (area<=0).
-func hybridCoverScore(score sql.NullFloat64, bboxJSON string, w, h sql.NullInt64) float64 {
+// aesthetic score × face area ratio × face detection quality); returns -1
+// when incomparable. Incomparable scenarios: the asset hasn't been scored,
+// EXIF is missing width/height, or the bbox is unparseable or degenerate
+// (area<=0). faceScore is the ML detector's confidence for this face
+// ([0,1]); NULL (legacy rows predating the column) is treated as neutral
+// (1.0), so existing libraries don't regress until re-indexed.
+func hybridCoverScore(score sql.NullFloat64, bboxJSON string, w, h sql.NullInt64, faceScore sql.NullFloat64) float64 {
 	if !score.Valid || !w.Valid || !h.Valid || w.Int64 <= 0 || h.Int64 <= 0 {
 		return -1
 	}
@@ -938,7 +969,42 @@ func hybridCoverScore(score sql.NullFloat64, bboxJSON string, w, h sql.NullInt64
 	} else if aest > 1 {
 		aest = 1
 	}
-	return aest * ratio
+	q := 1.0 // legacy rows without a stored detection score stay neutral
+	if faceScore.Valid {
+		q = faceScore.Float64
+		if q < 0 {
+			q = 0
+		} else if q > 1 {
+			q = 1
+		}
+	}
+	return aest * ratio * q
+}
+
+// applyOrientation rotates/flips img so it displays upright, mirroring the
+// EXIF orientation table applied by image viewers (and by
+// imaging.AutoOrientation). Used on the cropped face square: the crop itself
+// runs in RAW (pre-rotation) coordinates because the ML face pipeline never
+// applies EXIF transpose (see mlserver/server/facemodel.py), so bbox and
+// asset_exif width/height are both in the raw coordinate space.
+func applyOrientation(img *image.NRGBA, orientation int) *image.NRGBA {
+	switch orientation {
+	case 2:
+		return imaging.FlipH(img)
+	case 3:
+		return imaging.Rotate180(img)
+	case 4:
+		return imaging.FlipV(img)
+	case 5:
+		return imaging.Transpose(img)
+	case 6:
+		return imaging.Rotate270(img)
+	case 7:
+		return imaging.Transverse(img)
+	case 8:
+		return imaging.Rotate90(img)
+	}
+	return img
 }
 
 // FaceThumbnail crops a square face out of the original image using
@@ -950,18 +1016,28 @@ func hybridCoverScore(score sql.NullFloat64, bboxJSON string, w, h sql.NullInt64
 // ratio); image sources still use the original file to preserve sharpness.
 func (s *PersonService) FaceThumbnail(personID, cacheDir, thumbDir string) (string, error) {
 	var faceID, bbox, srcPath, mimeType, assetID string
-	var origW, origH sql.NullInt64
+	var origW, origH, orientation sql.NullInt64
 	err := s.db.QueryRow(`
-SELECT fd.id, fd.bbox, a.file_path, COALESCE(a.mime_type,''), a.id, e.width, e.height
+SELECT fd.id, fd.bbox, a.file_path, COALESCE(a.mime_type,''), a.id, e.width, e.height, e.orientation
 FROM persons p
 JOIN face_detections fd ON fd.id=p.cover_face_id
 JOIN assets a ON a.id=fd.asset_id AND a.offline=0 AND a.deleted_at IS NULL
 LEFT JOIN asset_exif e ON e.asset_id=a.id
-WHERE p.id=? AND p.hidden=0`, personID).Scan(&faceID, &bbox, &srcPath, &mimeType, &assetID, &origW, &origH)
+WHERE p.id=? AND p.hidden=0`, personID).Scan(&faceID, &bbox, &srcPath, &mimeType, &assetID, &origW, &origH, &orientation)
 	if err == sql.ErrNoRows {
-		return "", ErrNotFound
-	}
-	if err != nil {
+		// Distinguish "person missing/hidden" (a real 404) from "person alive
+		// but its cover is unusable right now" (cover asset trashed/offline or
+		// cover already cleared): the latter falls back to any live face so
+		// the avatar doesn't break the moment a cover photo is trashed.
+		var hidden int
+		if e := s.db.QueryRow(`SELECT hidden FROM persons WHERE id=?`, personID).Scan(&hidden); e != nil || hidden == 1 {
+			return "", ErrNotFound
+		}
+		faceID, bbox, srcPath, mimeType, assetID, origW, origH, orientation, err = s.fallbackCoverFace(personID)
+		if err != nil {
+			return "", err
+		}
+	} else if err != nil {
 		return "", fmt.Errorf("FaceThumbnail query: %w", err)
 	}
 
@@ -986,7 +1062,7 @@ WHERE p.id=? AND p.hidden=0`, personID).Scan(&faceID, &bbox, &srcPath, &mimeType
 	if err := json.Unmarshal([]byte(bbox), &bb); err != nil {
 		return "", fmt.Errorf("FaceThumbnail bbox: %w", err)
 	}
-	img, err := imaging.Open(srcPath, imaging.AutoOrientation(true))
+	img, err := imaging.Open(srcPath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return "", ErrNotFound // source file is gone (drive unplugged/deleted): externally this is a 404, not a 500
@@ -1040,8 +1116,62 @@ WHERE p.id=? AND p.hidden=0`, personID).Scan(&faceID, &bbox, &srcPath, &mimeType
 	}
 	cropped := imaging.Crop(img, image.Rect(x0, y0, x1, y1))
 	square := imaging.Fill(cropped, 256, 256, imaging.Center, imaging.Lanczos)
+	if !strings.HasPrefix(mimeType, "video/") && orientation.Valid {
+		square = applyOrientation(square, int(orientation.Int64))
+	}
 	if err := imaging.Save(square, outPath); err != nil {
 		return "", fmt.Errorf("FaceThumbnail save: %w", err)
 	}
 	return outPath, nil
+}
+
+// fallbackCoverFace picks the person's largest-bbox face whose asset is live
+// (not trashed, not offline), for use when the stored cover is unusable.
+// Not persisted: the minute-level self-heal + next clustering pass own the
+// durable cover repair; this only keeps the endpoint serving meanwhile.
+func (s *PersonService) fallbackCoverFace(personID string) (faceID, bbox, srcPath, mimeType, assetID string, origW, origH, orientation sql.NullInt64, err error) {
+	rows, qerr := s.db.Query(`
+SELECT fd.id, fd.bbox, a.file_path, COALESCE(a.mime_type,''), a.id, e.width, e.height, e.orientation
+FROM face_person fp
+JOIN face_detections fd ON fd.id=fp.face_id AND fd.excluded=0
+JOIN assets a ON a.id=fd.asset_id AND a.deleted_at IS NULL AND a.offline=0
+LEFT JOIN asset_exif e ON e.asset_id=a.id
+WHERE fp.person_id=?`, personID)
+	if qerr != nil {
+		err = fmt.Errorf("fallbackCoverFace query: %w", qerr)
+		return
+	}
+	defer rows.Close()
+	bestArea := -1.0
+	found := false
+	for rows.Next() {
+		var fid, bb, fp, mt, aid string
+		var w, h, ori sql.NullInt64
+		if serr := rows.Scan(&fid, &bb, &fp, &mt, &aid, &w, &h, &ori); serr != nil {
+			err = serr
+			return
+		}
+		var box struct {
+			X1 float64 `json:"x1"`
+			Y1 float64 `json:"y1"`
+			X2 float64 `json:"x2"`
+			Y2 float64 `json:"y2"`
+		}
+		area := 0.0
+		if json.Unmarshal([]byte(bb), &box) == nil {
+			area = (box.X2 - box.X1) * (box.Y2 - box.Y1)
+		}
+		if !found || area > bestArea {
+			found, bestArea = true, area
+			faceID, bbox, srcPath, mimeType, assetID, origW, origH, orientation = fid, bb, fp, mt, aid, w, h, ori
+		}
+	}
+	if rerr := rows.Err(); rerr != nil {
+		err = rerr
+		return
+	}
+	if !found {
+		err = ErrNotFound
+	}
+	return
 }

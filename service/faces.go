@@ -7,6 +7,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -25,9 +26,28 @@ const (
 	// onto an anchored person's centroid.
 	assignEpsilon = 0.55
 	// suggestEpsilon is the cosine distance upper bound for "merge suggestion"
-	// pairs (the lower bound is dbscanEpsilon).
+	// pairs (the lower bound is clusterEpsilon()).
 	suggestEpsilon = 0.75
 )
+
+// clusterEpsilon returns the configured DBSCAN epsilon. Falls back to the
+// legacy constant when config isn't initialized (tests constructing services
+// directly keep their historical 0.6 semantics) or the value is non-positive.
+func clusterEpsilon() float64 {
+	if config.Cfg != nil && config.Cfg.ClusterEpsilon > 0 {
+		return config.Cfg.ClusterEpsilon
+	}
+	return dbscanEpsilon
+}
+
+// personAnchoredCond is the SQL predicate for persons that must survive
+// re-clustering with identity intact: user-named / favorited / related /
+// hidden, plus a user-pinned cover (cover_locked=1) or a user-chosen hero
+// background. NOTE: purgeAutoPersons / purgeEmptyAutoPersons deliberately
+// keep the narrower legacy predicate — those paths only run when a person
+// has zero member faces left, and an unnamed shell whose only anchor was a
+// (now dangling) pinned cover must still be cleaned up.
+const personAnchoredCond = `(name!='' OR favorite=1 OR relation!='' OR hidden=1 OR cover_locked=1 OR COALESCE(hero_asset_id,'')!='')`
 
 // cosDist computes the cosine distance between two float32 vectors.
 // Returns 1.0 if either vector has zero norm.
@@ -179,35 +199,121 @@ func DBSCAN(vecs [][]float32, epsilon float64, minPoints int) []int {
 	return labels
 }
 
+// buildNeighborLists computes, for every vector, the sparse set of neighbor
+// indices whose cosine distance is <= epsilon (self excluded). The O(n^2)
+// distance work is split by row across runtime.NumCPU() workers; each worker
+// only ever writes to the row range it owns (out[lo:hi]), so there is no
+// shared-write contention and no need for per-row locking. The number of
+// completed rows is aggregated with an atomic counter; onProgress itself is
+// invoked under a mutex (held for the duration of the call) so callers never
+// observe concurrent/overlapping invocations — matching the single-threaded
+// delivery contract DBSCANWithProgress previously provided from its outer
+// loop, on which existing progress callbacks (e.g. mutating shared slices or
+// publishing SSE events) rely. onProgress fires once per 1% of rows
+// completed. onProgress may be nil, in which case no progress is reported.
+func buildNeighborLists(vecs [][]float32, epsilon float64, onProgress func(done, n int)) [][]int {
+	n := len(vecs)
+	out := make([][]int, n)
+	if n == 0 {
+		if onProgress != nil {
+			onProgress(0, 0)
+		}
+		return out
+	}
+
+	workers := runtime.NumCPU()
+	if workers > n {
+		workers = n
+	}
+	if workers < 1 {
+		workers = 1
+	}
+
+	var completed atomic.Int64
+	var progressMu sync.Mutex
+	lastReported := -1 // guarded by progressMu
+	report := func() {
+		done := completed.Add(1)
+		if onProgress == nil {
+			return
+		}
+		bucket := int((done * 100) / int64(n))
+		progressMu.Lock()
+		defer progressMu.Unlock()
+		// Strict > (not !=) so a goroutine that reads a stale, already-
+		// superseded bucket can never rewind lastReported and re-fire a
+		// smaller "done" after a larger one was already reported.
+		if bucket > lastReported {
+			lastReported = bucket
+			onProgress(int(done), n)
+		}
+	}
+
+	rowsPerWorker := (n + workers - 1) / workers
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		lo := w * rowsPerWorker
+		hi := lo + rowsPerWorker
+		if hi > n {
+			hi = n
+		}
+		if lo >= hi {
+			continue
+		}
+		wg.Add(1)
+		go func(lo, hi int) {
+			defer wg.Done()
+			for i := lo; i < hi; i++ {
+				var neighbors []int
+				for j := 0; j < n; j++ {
+					if j == i {
+						continue
+					}
+					if cosDist(vecs[i], vecs[j]) <= epsilon {
+						neighbors = append(neighbors, j)
+					}
+				}
+				out[i] = neighbors
+				report()
+			}
+		}(lo, hi)
+	}
+	wg.Wait()
+
+	if onProgress != nil {
+		onProgress(n, n) // guarantee the final state has done==n
+	}
+	return out
+}
+
 // DBSCANWithProgress behaves like DBSCAN, but calls onProgress once per 1%
 // of progress crossed. onProgress must not be nil; the final call before
 // return is guaranteed to have done==n.
+//
+// Phase 1 parallelizes the O(n^2) neighbor computation (buildNeighborLists)
+// across CPU cores — this is where nearly all the wall-clock time goes, and
+// where the progress reporting now lives. Phase 2 is the original serial
+// cluster-expansion logic, unchanged line-for-line except that regionQuery
+// calls are replaced with lookups into the precomputed neighbor lists; the
+// outer loop order and seed-queue expansion order are preserved exactly, so
+// labels are byte-identical to DBSCAN.
 func DBSCANWithProgress(vecs [][]float32, epsilon float64, minPoints int, onProgress func(done, n int)) []int {
 	n := len(vecs)
+	neighborLists := buildNeighborLists(vecs, epsilon, onProgress)
+
 	labels := make([]int, n)
 	for i := range labels {
 		labels[i] = -1
 	}
 	visited := make([]bool, n)
 	clusterID := 0
-	lastReport := -1
-	bucket := func(i int) int {
-		if n == 0 {
-			return 0
-		}
-		return (i * 100) / n
-	}
 
 	for i := 0; i < n; i++ {
-		if b := bucket(i); b != lastReport {
-			onProgress(i, n)
-			lastReport = b
-		}
 		if visited[i] {
 			continue
 		}
 		visited[i] = true
-		neighbors := regionQuery(vecs, i, epsilon)
+		neighbors := neighborLists[i]
 		if len(neighbors) < minPoints {
 			labels[i] = clusterID
 			clusterID++
@@ -220,7 +326,7 @@ func DBSCANWithProgress(vecs [][]float32, epsilon float64, minPoints int, onProg
 			s := seeds[j]
 			if !visited[s] {
 				visited[s] = true
-				sNeighbors := regionQuery(vecs, s, epsilon)
+				sNeighbors := neighborLists[s]
 				if len(sNeighbors) >= minPoints {
 					for _, s2 := range sNeighbors {
 						if !visited[s2] {
@@ -235,7 +341,6 @@ func DBSCANWithProgress(vecs [][]float32, epsilon float64, minPoints int, onProg
 		}
 		clusterID++
 	}
-	onProgress(n, n) // guarantee the final state has done==n
 	return labels
 }
 
@@ -368,7 +473,7 @@ func (s *FaceService) clusterStage(ctx context.Context, onStart func(total int64
 	for i, f := range faces {
 		vecs[i] = f.vec
 	}
-	labels := DBSCANWithProgress(vecs, dbscanEpsilon, dbscanMinPoints,
+	labels := DBSCANWithProgress(vecs, clusterEpsilon(), dbscanMinPoints,
 		func(done, n int) {
 			if n == 0 {
 				return
@@ -534,6 +639,15 @@ func (s *FaceService) detectFaceScanTarget(ctx context.Context, t faceScanTarget
 	if err != nil {
 		return err
 	}
+	// The same path can be overwritten with different content (checksum
+	// change resets face_scanned=0): drop this asset's previous detections
+	// first, or faces from the old content keep polluting clustering forever.
+	// Mirrors rebuild.go's delete-before-rescan; face_person rows are removed
+	// by the FK cascade. Runs only after a successful ML call so a transient
+	// ML failure never wipes existing data.
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM face_detections WHERE asset_id = ?`, t.id); err != nil {
+		return err
+	}
 	insertFaceDetections(s.db, t.id, faces)
 	if _, err := s.db.ExecContext(ctx, `UPDATE assets SET face_scanned = 1 WHERE id = ?`, t.id); err != nil {
 		return err
@@ -568,6 +682,11 @@ func (s *FaceService) RunPipeline(ctx context.Context) error {
 			return uerr
 		}
 		if unassigned == 0 {
+			// This is the daily-skip guard: in steady state (nothing to
+			// detect, nothing unassigned to cluster) the scheduled daily
+			// RunPipeline exits here without ever reaching clusterStage, so
+			// persons are not rebuilt and person UUIDs don't churn.
+			// Verified by TestRunPipelineNoOpWhenNothingChanged.
 			return nil
 		}
 	}
@@ -756,6 +875,20 @@ func (s *FaceService) purgeEmptyAutoPersons(ctx context.Context) error {
 	return err
 }
 
+// ClearDanglingCovers nulls out persons.cover_face_id/cover_asset_id when the
+// referenced face_detections row no longer exists. cover_face_id was added via
+// ALTER TABLE and carries no FK, so deleting an asset (which cascades its
+// face_detections away) leaves the pointer dangling and the face-thumbnail
+// endpoint permanently 404ing. Runs on the minute scheduler next to
+// purgeEmptyAutoPersons; safe to call repeatedly.
+func (s *FaceService) ClearDanglingCovers(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE persons SET cover_face_id=NULL, cover_asset_id=NULL, cover_locked=0
+		WHERE cover_face_id IS NOT NULL
+		  AND NOT EXISTS (SELECT 1 FROM face_detections fd WHERE fd.id = persons.cover_face_id)`)
+	return err
+}
+
 func (s *FaceService) loadFacesWithProgress(ctx context.Context, total int64,
 	onProgress func(int64),
 ) ([]faceRow, error) {
@@ -820,14 +953,15 @@ func (s *FaceService) rebuildPersonsWithProgress(ctx context.Context, faces []fa
 		}
 	}()
 
-	// 1. Load anchored persons (has name/favorite/relation/hidden) and their
-	//    current member faces, and compute centroids.
+	// 1. Load anchored persons (matching personAnchoredCond: named/favorited/
+	//    related/hidden, or with a pinned cover / hero) and their current
+	//    member faces, and compute centroids.
 	type anchor struct {
 		id       string
 		centroid []float32
 	}
 	anchorRows, err := tx.QueryContext(ctx,
-		`SELECT id FROM persons WHERE name!='' OR favorite=1 OR relation!='' OR hidden=1`)
+		`SELECT id FROM persons WHERE `+personAnchoredCond)
 	if err != nil {
 		return err
 	}
@@ -898,12 +1032,12 @@ func (s *FaceService) rebuildPersonsWithProgress(ctx context.Context, faces []fa
 	// 2. Delete auto persons (non-anchored) and their face_person rows.
 	if _, err = tx.Exec(`
 		DELETE FROM face_person
-		WHERE person_id IN (SELECT id FROM persons WHERE NOT (name!='' OR favorite=1 OR relation!='' OR hidden=1))`); err != nil {
+		WHERE person_id IN (SELECT id FROM persons WHERE NOT ` + personAnchoredCond + `)`); err != nil {
 		return err
 	}
 	if _, err = tx.Exec(`
 		DELETE FROM persons
-		WHERE NOT (name!='' OR favorite=1 OR relation!='' OR hidden=1)`); err != nil {
+		WHERE NOT ` + personAnchoredCond); err != nil {
 		return err
 	}
 
@@ -1068,6 +1202,11 @@ func (s *FaceService) recomputePersonStatsTx(ctx context.Context, tx *sql.Tx) er
 		fr.Close()
 
 		if len(vecs) == 0 {
+			if _, err = tx.ExecContext(ctx, `UPDATE persons SET cover_face_id=NULL,
+				cover_asset_id=NULL, cover_locked=0, centroid=NULL, confidence=0,
+				updated_at=? WHERE id=?`, now, meta.id); err != nil {
+				return err
+			}
 			continue
 		}
 		centroid := ComputeCentroid(vecs)
@@ -1134,6 +1273,10 @@ func (s *FaceService) StartScheduler(ctx context.Context) {
 				// every deletion path.
 				if err := s.purgeEmptyAutoPersons(ctx); err != nil {
 					zap.L().Warn("purge empty auto-persons failed", zap.Error(err))
+				}
+
+				if err := s.ClearDanglingCovers(ctx); err != nil {
+					zap.L().Warn("clear dangling covers failed", zap.Error(err))
 				}
 
 				// Failure backoff: don't retry for a while after the last failure.

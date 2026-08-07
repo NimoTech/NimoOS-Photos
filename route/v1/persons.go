@@ -145,6 +145,12 @@ func (h *PersonsHandler) Restore(c echo.Context) error {
 
 // GET /v1/photos/persons/:id/assets?limit=&offset=
 func (h *PersonsHandler) Assets(c echo.Context) error {
+	if err := h.svc.Persons().PersonVisible(c.Param("id")); err != nil {
+		if errors.Is(err, service.ErrNotFound) {
+			return echo.NewHTTPError(http.StatusNotFound)
+		}
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	}
 	limit, _ := strconv.Atoi(c.QueryParam("limit"))
 	offset, _ := strconv.Atoi(c.QueryParam("offset"))
 	if limit <= 0 || limit > 500 {
@@ -159,6 +165,12 @@ func (h *PersonsHandler) Assets(c echo.Context) error {
 
 // GET /v1/photos/persons/:id/relations
 func (h *PersonsHandler) Relations(c echo.Context) error {
+	if err := h.svc.Persons().PersonVisible(c.Param("id")); err != nil {
+		if errors.Is(err, service.ErrNotFound) {
+			return echo.NewHTTPError(http.StatusNotFound)
+		}
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	}
 	rels, err := h.svc.Persons().PersonRelations(c.Param("id"))
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
@@ -168,6 +180,12 @@ func (h *PersonsHandler) Relations(c echo.Context) error {
 
 // GET /v1/photos/persons/:id/places
 func (h *PersonsHandler) Places(c echo.Context) error {
+	if err := h.svc.Persons().PersonVisible(c.Param("id")); err != nil {
+		if errors.Is(err, service.ErrNotFound) {
+			return echo.NewHTTPError(http.StatusNotFound)
+		}
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	}
 	places, err := h.svc.Persons().PersonPlaces(c.Param("id"))
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
@@ -217,7 +235,13 @@ func (h *PersonsHandler) Merge(c echo.Context) error {
 	if err := c.Bind(&req); err != nil || req.FromID == "" || req.IntoID == "" {
 		return echo.NewHTTPError(http.StatusBadRequest, "from_id and into_id required")
 	}
+	if req.FromID == req.IntoID {
+		return echo.NewHTTPError(http.StatusBadRequest, "from_id and into_id must differ")
+	}
 	if err := h.svc.Search().MergePersons(req.FromID, req.IntoID); err != nil {
+		if errors.Is(err, service.ErrNotFound) {
+			return echo.NewHTTPError(http.StatusNotFound)
+		}
 		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
 	}
 	return c.JSON(http.StatusOK, map[string]string{"status": "merged"})

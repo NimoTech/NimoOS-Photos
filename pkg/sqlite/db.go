@@ -146,6 +146,7 @@ func migrate(db *sql.DB) error {
 			face_id   TEXT PRIMARY KEY REFERENCES face_detections(id) ON DELETE CASCADE,
 			person_id TEXT REFERENCES persons(id) ON DELETE SET NULL
 		)`,
+		`CREATE INDEX IF NOT EXISTS idx_face_person_person ON face_person(person_id)`,
 
 		// ── Albums ────────────────────────────────────────────────────────
 		`CREATE TABLE IF NOT EXISTS albums (
@@ -666,6 +667,10 @@ func migrate(db *sql.DB) error {
 		// get the current timestamp, and the conflict branch for existing
 		// members doesn't touch this column.
 		`ALTER TABLE moment_assets ADD COLUMN added_at INTEGER`,
+		// Face detection confidence from the ML detector, used as a
+		// face-quality factor when auto-selecting person covers. NULL for
+		// rows inserted before this column existed (treated as neutral).
+		`ALTER TABLE face_detections ADD COLUMN score REAL`,
 	}
 	for _, stmt := range alters {
 		if _, err := db.Exec(stmt); err != nil &&
