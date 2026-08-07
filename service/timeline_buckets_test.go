@@ -1,7 +1,10 @@
 package service_test
 
 import (
+	"database/sql"
+	"fmt"
 	"testing"
+	"time"
 
 	"github.com/NimoTech/NimoOS-Photos/service"
 	"github.com/stretchr/testify/require"
@@ -153,6 +156,51 @@ func TestTimelineBucketAssets(t *testing.T) {
 		}
 	}
 	require.Equal(t, b.Count, got)
+}
+
+// seedOneMonthAssets bulk-inserts n indexed assets, all timestamped one
+// minute apart within a single given year/month, so a single bucket can be
+// pushed past the 500-row IN-batch contract — seedPerfAssets' 3h cadence caps
+// out well under 500 rows per month regardless of n.
+func seedOneMonthAssets(t *testing.T, db *sql.DB, year, month, n int) {
+	t.Helper()
+	tx, err := db.Begin()
+	require.NoError(t, err)
+	stmt, err := tx.Prepare(`INSERT INTO assets
+		(id, file_path, file_size, mime_type, taken_at, indexed_at, status, is_live_photo_video, offline)
+		VALUES (?,?,?,?,?,?, 'indexed', 0, 0)`)
+	require.NoError(t, err)
+	base := time.Date(year, time.Month(month), 1, 0, 0, 0, 0, time.UTC)
+	for i := 0; i < n; i++ {
+		id := fmt.Sprintf("month-%04d%02d-%05d", year, month, i)
+		taken := base.Add(time.Duration(i) * time.Minute)
+		_, err = stmt.Exec(id, "/g/"+id+".jpg", int64(1000), "image/jpeg", taken, taken)
+		require.NoError(t, err)
+	}
+	require.NoError(t, tx.Commit())
+}
+
+// TestTimelineBucketAssetsClampsLimit pins TimelineBucketAssets' own internal
+// limit clamp (<=500), independent of the route-layer clamp in timeline.go —
+// a future direct caller that skips the route layer must not be able to blow
+// past the ≤500-row IN-batch contract attachNamedFaces relies on. Without the
+// clamp, SQL LIMIT 0 returns zero rows (not "everything") and LIMIT 9999
+// would return more than 500 rows from an oversized bucket — both wrong.
+func TestTimelineBucketAssetsClampsLimit(t *testing.T) {
+	db := openPerfDB(t)
+	seedOneMonthAssets(t, db, 2021, 5, 600)
+
+	svc := service.NewSearchService(db, nil)
+
+	// limit=0 must fall back to the 500 default, not literally zero rows.
+	page, err := svc.TimelineBucketAssets("u1", 2021, 5, 0, 0)
+	require.NoError(t, err)
+	require.Len(t, page, 500)
+
+	// limit=9999 must be clamped down to 500, even though the bucket has 600 rows.
+	page, err = svc.TimelineBucketAssets("u1", 2021, 5, 9999, 0)
+	require.NoError(t, err)
+	require.Len(t, page, 500)
 }
 
 func BenchmarkTimelineLegacyVsBucket(b *testing.B) {
