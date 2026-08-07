@@ -10,6 +10,23 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// TestDBSupportsPragmaOptimize exercises the exact statement main.go's daily
+// maintenance ticker now runs alongside Storage().Prune (see the B5 debt-sweep
+// item): Services.DB() already exposes the shared *sql.DB handle to main.go,
+// so no new pass-through method was needed — this pins that running PRAGMA
+// optimize against a normal migrated, populated DB succeeds, which is what
+// the ticker callback relies on. The ticker's own goroutine/24h-interval
+// plumbing has no existing test precedent in this codebase (main.go is
+// package main and untested) and isn't exercised here.
+func TestDBSupportsPragmaOptimize(t *testing.T) {
+	db := makeTestDB(t)
+	_, err := db.Exec(`INSERT INTO assets(id, file_path, status) VALUES('a1','/x/a.jpg','indexed')`)
+	require.NoError(t, err)
+
+	_, err = db.Exec(`PRAGMA optimize;`)
+	require.NoError(t, err)
+}
+
 // TestServicesExposesGeo asserts that Services built by NewService can get a non-nil GeoService via Geo().
 func TestServicesExposesGeo(t *testing.T) {
 	tmp := t.TempDir()

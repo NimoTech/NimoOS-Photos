@@ -129,6 +129,19 @@ func main() {
 			} else if res.RemovedCount > 0 {
 				zap.L().Info("daily cache prune", zap.Int("removed", res.RemovedCount), zap.Int64("freed_bytes", res.FreedBytes))
 			}
+			// PRAGMA optimize also runs once at startup (pkg/sqlite migrate()),
+			// which is enough for a process that restarts periodically. But an
+			// install that stays up for a long time (empty library at boot,
+			// then a large import) never restarts, so sqlite_stat1 keeps
+			// reflecting the empty-table snapshot from startup and the query
+			// planner's cost estimates go stale as the library grows. Re-running
+			// it here, on the same daily tick as the cache prune, is SQLite's
+			// own recommended self-limiting pattern: it decides on its own
+			// whether any table's stats are worth refreshing, so this is a
+			// near-zero-cost no-op on a day nothing changed.
+			if _, err := svc.DB().Exec(`PRAGMA optimize;`); err != nil {
+				zap.L().Warn("daily PRAGMA optimize failed", zap.Error(err))
+			}
 		}
 	}()
 
