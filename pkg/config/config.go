@@ -55,6 +55,16 @@ type Config struct {
 	// future re-clustering. Named/favorited/related persons are never gated.
 	// Defaults to 0.5 when absent from the config file.
 	MinPersonConfidence float64
+	// ClusterEpsilon is the DBSCAN cosine-distance threshold for face
+	// clustering. An offline study on a real library (OVERVIEW.md "Face
+	// clustering parameters") found a percolation cliff at ~0.50: above it,
+	// transitive chaining welds unrelated people into one garbage mega-
+	// cluster (observed: 59% of all faces in one unnamed person at the
+	// legacy 0.60). 0.48 keeps a safe margin below the cliff while
+	// preserving named-person purity; under-clustering is recovered by the
+	// merge-suggestion band, whose lower bound follows this value.
+	// Defaults to 0.48 when absent from the config file.
+	ClusterEpsilon float64
 	// SimDisplayFloor/SimDisplayCeil linearly rescale the raw CLIP cosine
 	// similarity into the [0,1] display score shown to the UI. Defaults
 	// (0.03/0.13) were empirically calibrated against the current CLIP model
@@ -130,6 +140,7 @@ func Init(configFile, confSample string) error {
 
 		MinMatchSimilarity:  v.GetFloat64("photos.MinMatchSimilarity"),
 		MinPersonConfidence: v.GetFloat64("photos.MinPersonConfidence"),
+		ClusterEpsilon:      v.GetFloat64("photos.ClusterEpsilon"),
 		SimDisplayFloor:     v.GetFloat64("photos.SimDisplayFloor"),
 		SimDisplayCeil:      v.GetFloat64("photos.SimDisplayCeil"),
 		SearchCutAlpha:      v.GetFloat64("photos.SearchCutAlpha"),
@@ -188,6 +199,12 @@ func Init(configFile, confSample string) error {
 	// list/relations/merge-suggestions by default.
 	if !v.IsSet("photos.MinPersonConfidence") {
 		Cfg.MinPersonConfidence = 0.5
+	}
+	// DBSCAN clustering epsilon: defaults to 0.48 when absent from the config,
+	// keeping a safe margin below the ~0.50 percolation cliff (see the
+	// ClusterEpsilon field doc above).
+	if !v.IsSet("photos.ClusterEpsilon") {
+		Cfg.ClusterEpsilon = 0.48
 	}
 	// Display-layer calibration interval endpoints: use the current model's empirical defaults when absent from the config.
 	if !v.IsSet("photos.SimDisplayFloor") {

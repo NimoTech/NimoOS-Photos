@@ -25,9 +25,19 @@ const (
 	// onto an anchored person's centroid.
 	assignEpsilon = 0.55
 	// suggestEpsilon is the cosine distance upper bound for "merge suggestion"
-	// pairs (the lower bound is dbscanEpsilon).
+	// pairs (the lower bound is clusterEpsilon()).
 	suggestEpsilon = 0.75
 )
+
+// clusterEpsilon returns the configured DBSCAN epsilon. Falls back to the
+// legacy constant when config isn't initialized (tests constructing services
+// directly keep their historical 0.6 semantics) or the value is non-positive.
+func clusterEpsilon() float64 {
+	if config.Cfg != nil && config.Cfg.ClusterEpsilon > 0 {
+		return config.Cfg.ClusterEpsilon
+	}
+	return dbscanEpsilon
+}
 
 // personAnchoredCond is the SQL predicate for persons that must survive
 // re-clustering with identity intact: user-named / favorited / related /
@@ -377,7 +387,7 @@ func (s *FaceService) clusterStage(ctx context.Context, onStart func(total int64
 	for i, f := range faces {
 		vecs[i] = f.vec
 	}
-	labels := DBSCANWithProgress(vecs, dbscanEpsilon, dbscanMinPoints,
+	labels := DBSCANWithProgress(vecs, clusterEpsilon(), dbscanMinPoints,
 		func(done, n int) {
 			if n == 0 {
 				return

@@ -538,7 +538,7 @@ type personCentroid struct {
 }
 
 // MergeSuggestions returns person pairs whose centroid distance falls within
-// the (dbscanEpsilon, suggestEpsilon) band and that haven't been rejected,
+// the (clusterEpsilon(), suggestEpsilon) band and that haven't been rejected,
 // with confidence=1-dist, ordered by confidence descending.
 func (s *PersonService) MergeSuggestions() ([]MergeSuggestion, error) {
 	rows, err := s.db.Query(`
@@ -574,7 +574,7 @@ FROM persons WHERE hidden=0 AND centroid IS NOT NULL AND (name!='' OR favorite=1
 	for i := 0; i < len(ps); i++ {
 		for j := i + 1; j < len(ps); j++ {
 			d := cosDist(ps[i].centroid, ps[j].centroid)
-			if d <= dbscanEpsilon || d >= suggestEpsilon {
+			if d <= clusterEpsilon() || d >= suggestEpsilon {
 				continue
 			}
 			a, b := ps[i], ps[j]
