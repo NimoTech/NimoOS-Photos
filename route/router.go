@@ -226,9 +226,12 @@ func InitRouter(ctx context.Context, svc service.Services, runtimePath string, t
 	g.POST("/persons/merge-suggestions/reject", persons.RejectSuggestion)
 	g.POST("/persons/merge", persons.Merge)
 	g.POST("/persons/recluster", persons.Recluster)
+	// Must precede GET /persons/:id — otherwise "hidden" is swallowed as an :id lookup.
+	g.GET("/persons/hidden", persons.ListHidden)
 	g.GET("/persons/:id", persons.Get)
 	g.PUT("/persons/:id", persons.Update)
 	g.DELETE("/persons/:id", persons.Delete)
+	g.POST("/persons/:id/hide", persons.Hide)
 	g.POST("/persons/:id/restore", persons.Restore)
 	g.GET("/persons/:id/assets", persons.Assets)
 	g.GET("/persons/:id/relations", persons.Relations)

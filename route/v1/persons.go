@@ -133,6 +133,37 @@ func (h *PersonsHandler) Delete(c echo.Context) error {
 	return c.JSON(http.StatusOK, map[string]string{"status": "hidden"})
 }
 
+// POST /v1/photos/persons/:id/hide
+//
+// Plain hide: sets hidden=1 with no purge_at, so PurgeDuePersons' sweep
+// (which only touches purge_at IS NOT NULL rows) never picks this up. This
+// is distinct from Delete's default path (HidePersonForPurge), which
+// schedules a hard purge after the grace period.
+func (h *PersonsHandler) Hide(c echo.Context) error {
+	err := h.svc.Persons().HidePerson(c.Param("id"))
+	if errors.Is(err, service.ErrNotFound) {
+		return echo.NewHTTPError(http.StatusNotFound)
+	}
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	}
+	return c.JSON(http.StatusOK, map[string]string{"status": "hidden"})
+}
+
+// GET /v1/photos/persons/hidden
+//
+// Lists plainly-hidden persons for the hidden-people management view.
+// Excludes persons currently in the purge grace period (those are "being
+// deleted", not "hidden"). Must be registered before GET /persons/:id or
+// "hidden" would be swallowed as an :id lookup — see route/router.go.
+func (h *PersonsHandler) ListHidden(c echo.Context) error {
+	persons, err := h.svc.Persons().ListHiddenPersons()
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	}
+	return c.JSON(http.StatusOK, persons)
+}
+
 // POST /v1/photos/persons/:id/restore
 func (h *PersonsHandler) Restore(c echo.Context) error {
 	err := h.svc.Persons().RestorePerson(c.Param("id"))

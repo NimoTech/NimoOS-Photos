@@ -436,6 +436,33 @@ func (s *PersonService) RestorePerson(id string) error {
 	return nil
 }
 
+// ListHiddenPersons returns plainly-hidden persons (hidden=1, no pending
+// purge) for the hidden-people management view. Rows in the purge grace
+// period (purge_at IS NOT NULL, scheduled via HidePersonForPurge) are
+// excluded — those are "being deleted", not "hidden", and are never swept
+// back in here. Only light fields are populated (ID/Name/CoverFaceID/
+// Confidence); this is meant for a compact admin list, not the rich object
+// ListPersons/GetPerson return.
+func (s *PersonService) ListHiddenPersons() ([]Person, error) {
+	rows, err := s.db.Query(`
+SELECT id, name, COALESCE(cover_face_id,''), confidence
+FROM persons WHERE hidden=1 AND purge_at IS NULL
+ORDER BY updated_at DESC`)
+	if err != nil {
+		return nil, fmt.Errorf("ListHiddenPersons: %w", err)
+	}
+	defer rows.Close()
+	var out []Person
+	for rows.Next() {
+		var p Person
+		if err := rows.Scan(&p.ID, &p.Name, &p.CoverFaceID, &p.Confidence); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
 func (s *PersonService) setHidden(id string, hidden bool) error {
 	v := 0
 	if hidden {

@@ -506,7 +506,8 @@ func (s *services) RestartScanTicker(minutes int) {
 }
 
 // NewTestServices builds a minimal Services backed by db, for handler tests.
-// Only SmartViews, Albums, and Search are wired; other accessors return nil.
+// Only SmartViews, Albums, Search, and Persons are wired; other accessors
+// return nil.
 func NewTestServices(db *sql.DB) Services {
 	search := NewSearchService(db, zeroML{})
 	albums := NewAlbumService(db)
@@ -514,6 +515,7 @@ func NewTestServices(db *sql.DB) Services {
 		db:         db,
 		search:     search,
 		albums:     albums,
+		persons:    NewPersonService(db),
 		smartViews: NewSmartViewService(db, search),
 		storage:    NewStorageService(db, "", os.TempDir(), os.TempDir(), os.TempDir()),
 	}
