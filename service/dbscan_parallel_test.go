@@ -29,3 +29,23 @@ func TestDBSCANParallelMatchesSerial(t *testing.T) {
 		}
 	}
 }
+
+// The (n,n) terminal progress call must fire exactly once per run.
+func TestDBSCANProgressTerminalOnce(t *testing.T) {
+	vecs := make([][]float32, 300)
+	rng := rand.New(rand.NewSource(1))
+	for i := range vecs {
+		v := make([]float32, 16)
+		for j := range v {
+			v[j] = rng.Float32()
+		}
+		vecs[i] = v
+	}
+	terminal := 0
+	service.DBSCANWithProgress(vecs, 0.48, 1, func(done, n int) {
+		if done == n {
+			terminal++
+		}
+	})
+	require.Equal(t, 1, terminal, "terminal onProgress(n,n) must fire exactly once")
+}

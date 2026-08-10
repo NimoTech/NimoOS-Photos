@@ -280,7 +280,13 @@ func buildNeighborLists(vecs [][]float32, epsilon float64, onProgress func(done,
 	}
 	wg.Wait()
 
-	if onProgress != nil {
+	// Only fire the explicit trailing call when the last worker's report()
+	// hasn't already pushed lastReported to the terminal 100% bucket —
+	// otherwise the caller would observe two (n,n) terminal calls.
+	progressMu.Lock()
+	alreadyTerminal := lastReported == 100
+	progressMu.Unlock()
+	if onProgress != nil && !alreadyTerminal {
 		onProgress(n, n) // guarantee the final state has done==n
 	}
 	return out
