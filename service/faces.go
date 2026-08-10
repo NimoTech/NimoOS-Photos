@@ -377,6 +377,11 @@ type FaceService struct {
 	// upload being mistaken for the upload finishing and clustering firing
 	// early. When nil (tests / not wired up), treated as always idle.
 	indexIdleFor func() time.Duration
+
+	// duePurger sweeps persons whose undo grace period has elapsed
+	// (PersonService.PurgeDuePersons), injected because FaceService owns the
+	// minute scheduler while person purge logic lives in PersonService.
+	duePurger func(context.Context) error
 }
 
 // clusterFailBackoff is the minimum retry interval after RunClustering fails.
@@ -403,6 +408,11 @@ func (s *FaceService) SetIndexIdleSource(fn func() time.Duration) { s.indexIdleF
 
 // SetML injects the ML provider used by RunPipeline's detection stage.
 func (s *FaceService) SetML(ml MLProvider) { s.ml = ml }
+
+// SetDuePurger injects the callback that sweeps persons whose undo grace
+// period has elapsed (PersonService.PurgeDuePersons), called on the minute
+// scheduler tick right after ClearDanglingCovers.
+func (s *FaceService) SetDuePurger(fn func(context.Context) error) { s.duePurger = fn }
 
 // SetThumbDir injects the thumbnail root directory (mirrors the Indexer's
 // existing field), used by RunPipeline to locate video keyframe thumbnails
@@ -1277,6 +1287,12 @@ func (s *FaceService) StartScheduler(ctx context.Context) {
 
 				if err := s.ClearDanglingCovers(ctx); err != nil {
 					zap.L().Warn("clear dangling covers failed", zap.Error(err))
+				}
+
+				if s.duePurger != nil {
+					if err := s.duePurger(ctx); err != nil {
+						zap.L().Warn("purge due persons failed", zap.Error(err))
+					}
 				}
 
 				// Failure backoff: don't retry for a while after the last failure.

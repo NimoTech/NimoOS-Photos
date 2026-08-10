@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -15,6 +16,7 @@ import (
 	"github.com/NimoTech/NimoOS-Photos/pkg/config"
 	"github.com/NimoTech/NimoOS-Photos/pkg/sqlite"
 	"github.com/disintegration/imaging"
+	"go.uber.org/zap"
 )
 
 // PersonService provides People list/detail/edit/relations/places/merge suggestions.
@@ -408,8 +410,18 @@ func (s *PersonService) PurgePerson(id string) error {
 // HidePerson soft-deletes the person (hidden=1).
 func (s *PersonService) HidePerson(id string) error { return s.setHidden(id, true) }
 
-// RestorePerson restores the person (hidden=0).
-func (s *PersonService) RestorePerson(id string) error { return s.setHidden(id, false) }
+// RestorePerson restores the person (hidden=0) and cancels any pending purge.
+func (s *PersonService) RestorePerson(id string) error {
+	res, err := s.db.Exec(
+		`UPDATE persons SET hidden=0, purge_at=NULL, updated_at=CURRENT_TIMESTAMP WHERE id=?`, id)
+	if err != nil {
+		return fmt.Errorf("RestorePerson: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
 
 func (s *PersonService) setHidden(id string, hidden bool) error {
 	v := 0
@@ -422,6 +434,66 @@ func (s *PersonService) setHidden(id string, hidden bool) error {
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
 		return ErrNotFound
+	}
+	return nil
+}
+
+// personPurgeGrace is the server-side undo window for a person delete: the
+// person is hidden immediately and hard-purged this long after, unless
+// restored. Survives page reloads and service restarts (persisted column).
+const personPurgeGrace = 30 * time.Second
+
+// sqliteOffset formats a time.Duration as the SQLite datetime() modifier
+// string (e.g. "+30 seconds"), keeping personPurgeGrace as the single
+// source of truth for the grace period.
+func sqliteOffset(d time.Duration) string {
+	return fmt.Sprintf("+%d seconds", int(d.Seconds()))
+}
+
+// HidePersonForPurge soft-deletes the person (hidden=1) and schedules the
+// hard purge at now+personPurgeGrace. ErrNotFound when absent.
+func (s *PersonService) HidePersonForPurge(id string) error {
+	res, err := s.db.Exec(
+		`UPDATE persons SET hidden=1, purge_at=datetime('now', ?), updated_at=CURRENT_TIMESTAMP WHERE id=?`,
+		sqliteOffset(personPurgeGrace), id)
+	if err != nil {
+		return fmt.Errorf("HidePersonForPurge: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// PurgeDuePersons hard-purges every person whose purge_at has passed.
+// Runs on the minute scheduler; each purge reuses PurgePerson's transaction
+// (exclude faces, drop bindings, delete row). Errors are per-person logged
+// by the caller, not fatal to the sweep.
+func (s *PersonService) PurgeDuePersons(ctx context.Context) error {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id FROM persons WHERE hidden=1 AND purge_at IS NOT NULL AND purge_at <= datetime('now')`)
+	if err != nil {
+		return fmt.Errorf("PurgeDuePersons query: %w", err)
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return fmt.Errorf("PurgeDuePersons scan: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("PurgeDuePersons iter: %w", err)
+	}
+	rows.Close()
+
+	for _, id := range ids {
+		if err := s.PurgePerson(id); err != nil {
+			zap.L().Warn("purge due person failed", zap.String("person_id", id), zap.Error(err))
+		}
 	}
 	return nil
 }
