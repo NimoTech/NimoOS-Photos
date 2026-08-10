@@ -28,6 +28,13 @@ type FaceResult struct {
 	BBox      BoundingBox `json:"boundingBox"`
 	Score     float64     `json:"score"`
 	Embedding []float32   `json:"-"` // parsed from JSON string in response
+
+	// Frontality and Sharpness are optional per-face quality signals emitted
+	// by nimoos-photos-ml-server. They are pointers by contract: a backend
+	// that doesn't emit them (e.g. rollback to immich-ml) yields nil, which
+	// downstream stores as NULL and treats as quality-neutral rather than 0.
+	Frontality *float64 `json:"frontality,omitempty"`
+	Sharpness  *float64 `json:"sharpness,omitempty"`
 }
 
 // MLClient is an HTTP client for the nimoos-photos-ml-server prediction endpoint.
@@ -173,11 +180,16 @@ func (c *MLClient) DetectAndRecognizeFaces(imageData []byte) ([]FaceResult, erro
 		return nil, fmt.Errorf("mlclient: missing facial-recognition in response")
 	}
 
-	// Each face: {"boundingBox":{...}, "embedding":"[...]", "score":0.9}
+	// Each face: {"boundingBox":{...}, "embedding":"[...]", "score":0.9,
+	// "frontality":0.9, "sharpness":0.4}. frontality/sharpness are optional:
+	// older/rolled-back backends (immich-ml) omit them entirely, in which
+	// case the pointers stay nil.
 	var rawFaces []struct {
 		BoundingBox BoundingBox `json:"boundingBox"`
 		Score       float64     `json:"score"`
 		Embedding   string      `json:"embedding"`
+		Frontality  *float64    `json:"frontality"`
+		Sharpness   *float64    `json:"sharpness"`
 	}
 	if err := json.Unmarshal(facesRaw, &rawFaces); err != nil {
 		return nil, fmt.Errorf("mlclient: unmarshal face list: %w", err)
@@ -191,9 +203,11 @@ func (c *MLClient) DetectAndRecognizeFaces(imageData []byte) ([]FaceResult, erro
 			continue
 		}
 		results = append(results, FaceResult{
-			BBox:      rf.BoundingBox,
-			Score:     rf.Score,
-			Embedding: emb,
+			BBox:       rf.BoundingBox,
+			Score:      rf.Score,
+			Embedding:  emb,
+			Frontality: rf.Frontality,
+			Sharpness:  rf.Sharpness,
 		})
 	}
 	return results, nil
