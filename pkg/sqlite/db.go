@@ -676,6 +676,12 @@ func migrate(db *sql.DB) error {
 		// face-quality factor when auto-selecting person covers. NULL for
 		// rows inserted before this column existed (treated as neutral).
 		`ALTER TABLE face_detections ADD COLUMN score REAL`,
+		// Frontality and sharpness are optional per-face quality signals from
+		// the ML detector (pose/blur estimates), used alongside score to weigh
+		// person-cover selection. NULL for rows predating these columns, or
+		// when the ML backend doesn't emit them (treated as neutral).
+		`ALTER TABLE face_detections ADD COLUMN frontality REAL`,
+		`ALTER TABLE face_detections ADD COLUMN sharpness REAL`,
 	}
 	for _, stmt := range alters {
 		if _, err := db.Exec(stmt); err != nil &&

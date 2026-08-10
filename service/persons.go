@@ -948,7 +948,7 @@ func recomputeOneCentroidTx(tx *sql.Tx, personID string) error {
 	// asset_exif for width/height — when missing, hybridCoverScore marks that
 	// face as incomparable).
 	rows, err := tx.Query(`
-SELECT fd.id, fd.asset_id, fd.embedding, fd.bbox, fd.score,
+SELECT fd.id, fd.asset_id, fd.embedding, fd.bbox, fd.score, fd.frontality, fd.sharpness,
        a.aesthetic_score, e.width, e.height
 FROM face_person fp
 JOIN face_detections fd ON fd.id=fp.face_id
@@ -961,14 +961,14 @@ WHERE fp.person_id=? AND fd.excluded=0`, personID)
 	var faceIDs, assetIDs, bboxes []string
 	var vecs [][]float32
 	var scores []sql.NullFloat64
-	var faceScores []sql.NullFloat64
+	var faceScores, fronts, sharps []sql.NullFloat64
 	var ws, hs []sql.NullInt64
 	for rows.Next() {
 		var fid, aid, bbox string
 		var blob []byte
-		var faceScore, score sql.NullFloat64
+		var faceScore, score, front, sharp sql.NullFloat64
 		var w, h sql.NullInt64
-		if err := rows.Scan(&fid, &aid, &blob, &bbox, &faceScore, &score, &w, &h); err != nil {
+		if err := rows.Scan(&fid, &aid, &blob, &bbox, &faceScore, &front, &sharp, &score, &w, &h); err != nil {
 			rows.Close()
 			return err
 		}
@@ -978,6 +978,8 @@ WHERE fp.person_id=? AND fd.excluded=0`, personID)
 		vecs = append(vecs, sqlite.DeserializeFloat32(blob))
 		scores = append(scores, score)
 		faceScores = append(faceScores, faceScore)
+		fronts = append(fronts, front)
+		sharps = append(sharps, sharp)
 		ws = append(ws, w)
 		hs = append(hs, h)
 	}
@@ -1033,7 +1035,8 @@ WHERE fp.person_id=? AND fd.excluded=0`, personID)
 	// existing libraries that haven't been scored yet).
 	best, bestHybrid := -1, -1.0
 	for i := range vecs {
-		if h := hybridCoverScore(scores[i], bboxes[i], ws[i], hs[i], faceScores[i]); h > bestHybrid {
+		quality := faceQualityFactor(faceScores[i], fronts[i], sharps[i])
+		if h := hybridCoverScore(scores[i], bboxes[i], ws[i], hs[i], quality); h > bestHybrid {
 			bestHybrid = h
 			best = i
 		}
@@ -1060,13 +1063,13 @@ WHERE fp.person_id=? AND fd.excluded=0`, personID)
 }
 
 // hybridCoverScore computes a person's cover hybrid score (whole-image
-// aesthetic score × face area ratio × face detection quality); returns -1
+// aesthetic score × face area ratio × face quality factor); returns -1
 // when incomparable. Incomparable scenarios: the asset hasn't been scored,
 // EXIF is missing width/height, or the bbox is unparseable or degenerate
-// (area<=0). faceScore is the ML detector's confidence for this face
-// ([0,1]); NULL (legacy rows predating the column) is treated as neutral
-// (1.0), so existing libraries don't regress until re-indexed.
-func hybridCoverScore(score sql.NullFloat64, bboxJSON string, w, h sql.NullInt64, faceScore sql.NullFloat64) float64 {
+// (area<=0). quality is the precomputed face-quality multiplier (see
+// faceQualityFactor); callers pass faceQualityFactor(...)'s result rather
+// than a NullFloat64 so the NULL-vs-neutral handling lives in one place.
+func hybridCoverScore(score sql.NullFloat64, bboxJSON string, w, h sql.NullInt64, quality float64) float64 {
 	if !score.Valid || !w.Valid || !h.Valid || w.Int64 <= 0 || h.Int64 <= 0 {
 		return -1
 	}
@@ -1093,16 +1096,38 @@ func hybridCoverScore(score sql.NullFloat64, bboxJSON string, w, h sql.NullInt64
 	} else if aest > 1 {
 		aest = 1
 	}
-	q := 1.0 // legacy rows without a stored detection score stay neutral
-	if faceScore.Valid {
-		q = faceScore.Float64
-		if q < 0 {
-			q = 0
-		} else if q > 1 {
-			q = 1
-		}
+	return aest * ratio * quality
+}
+
+// clamp01 clamps v into [0,1].
+func clamp01(v float64) float64 {
+	if v < 0 {
+		return 0
+	} else if v > 1 {
+		return 1
 	}
-	return aest * ratio * q
+	return v
+}
+
+// faceQualityFactor combines the detector score with the optional
+// frontality/sharpness signals into a single cover-ranking multiplier.
+// Each signal is range-compressed via lerp(0.5, 1.0, s) so one weak
+// signal dampens rather than annihilates a candidate; a NULL signal
+// (legacy rows, or an ML backend that doesn't emit it) contributes a
+// neutral 1.0. detScore keeps B8's existing raw-clamp semantics: NULL→1,
+// otherwise clamp to [0,1].
+func faceQualityFactor(detScore, frontality, sharpness sql.NullFloat64) float64 {
+	q := 1.0 // legacy rows without a stored detection score stay neutral
+	if detScore.Valid {
+		q = clamp01(detScore.Float64)
+	}
+	if frontality.Valid {
+		q *= 0.5 + 0.5*clamp01(frontality.Float64)
+	}
+	if sharpness.Valid {
+		q *= 0.5 + 0.5*clamp01(sharpness.Float64)
+	}
+	return q
 }
 
 // applyOrientation rotates/flips img so it displays upright, mirroring the

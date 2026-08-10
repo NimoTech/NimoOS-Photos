@@ -1285,8 +1285,8 @@ func insertFaceDetections(db *sql.DB, assetID string, faces []mlclient.FaceResul
 		bboxJSON, _ := json.Marshal(face.BBox)
 		faceID := uuid.NewString()
 		if _, err := db.Exec(
-			`INSERT INTO face_detections(id, asset_id, bbox, embedding, score) VALUES(?,?,?,?,?)`,
-			faceID, assetID, string(bboxJSON), sqlite.SerializeFloat32(face.Embedding), face.Score,
+			`INSERT INTO face_detections(id, asset_id, bbox, embedding, score, frontality, sharpness) VALUES(?,?,?,?,?,?,?)`,
+			faceID, assetID, string(bboxJSON), sqlite.SerializeFloat32(face.Embedding), face.Score, face.Frontality, face.Sharpness,
 		); err != nil {
 			fmt.Fprintf(os.Stderr, "[indexer] failed to insert face_detection %s: %v\n", assetID, err)
 		}

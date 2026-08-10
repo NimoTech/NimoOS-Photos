@@ -158,6 +158,86 @@ func TestOCR(t *testing.T) {
 	}
 }
 
+// facesServer starts a fake ML service that returns a single facial-recognition
+// face whose raw JSON body is exactly respFaceJSON, letting tests control
+// presence/absence of optional per-face quality fields.
+func facesServer(t *testing.T, respFaceJSON string) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseMultipartForm(32 << 20); err != nil {
+			http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		body := `{"facial-recognition":[` + respFaceJSON + `],"imageHeight":100,"imageWidth":100}`
+		_, _ = w.Write([]byte(body))
+	}))
+}
+
+// faceEmbeddingJSON returns a valid embedding string of common.FaceDim dims
+// for embedding into a fake face JSON fixture.
+func faceEmbeddingJSON(t *testing.T) string {
+	t.Helper()
+	embedding := make([]float64, common.FaceDim)
+	embedding[0] = 0.9
+	embJSON, err := json.Marshal(embedding)
+	if err != nil {
+		t.Fatalf("marshal embedding: %v", err)
+	}
+	embStr, err := json.Marshal(string(embJSON))
+	if err != nil {
+		t.Fatalf("marshal embedding string: %v", err)
+	}
+	return string(embStr)
+}
+
+func TestDetectAndRecognizeFaces_QualitySignalsPresent(t *testing.T) {
+	embStr := faceEmbeddingJSON(t)
+	faceJSON := `{"boundingBox":{"x1":0.1,"y1":0.1,"x2":0.5,"y2":0.9},"embedding":` + embStr +
+		`,"score":0.99,"frontality":0.87,"sharpness":0.42}`
+	srv := facesServer(t, faceJSON)
+	defer srv.Close()
+
+	client := mlclient.New(srv.URL)
+	faces, err := client.DetectAndRecognizeFaces([]byte("fake-jpeg-bytes"))
+	if err != nil {
+		t.Fatalf("DetectAndRecognizeFaces error: %v", err)
+	}
+	if len(faces) != 1 {
+		t.Fatalf("expected 1 face, got %d", len(faces))
+	}
+	if faces[0].Frontality == nil || *faces[0].Frontality < 0.86 || *faces[0].Frontality > 0.88 {
+		t.Fatalf("expected Frontality ≈ 0.87, got %v", faces[0].Frontality)
+	}
+	if faces[0].Sharpness == nil || *faces[0].Sharpness < 0.41 || *faces[0].Sharpness > 0.43 {
+		t.Fatalf("expected Sharpness ≈ 0.42, got %v", faces[0].Sharpness)
+	}
+}
+
+func TestDetectAndRecognizeFaces_QualitySignalsAbsent(t *testing.T) {
+	// immich-ml shape: no frontality/sharpness fields at all.
+	embStr := faceEmbeddingJSON(t)
+	faceJSON := `{"boundingBox":{"x1":0.1,"y1":0.1,"x2":0.5,"y2":0.9},"embedding":` + embStr +
+		`,"score":0.99}`
+	srv := facesServer(t, faceJSON)
+	defer srv.Close()
+
+	client := mlclient.New(srv.URL)
+	faces, err := client.DetectAndRecognizeFaces([]byte("fake-jpeg-bytes"))
+	if err != nil {
+		t.Fatalf("DetectAndRecognizeFaces error: %v", err)
+	}
+	if len(faces) != 1 {
+		t.Fatalf("expected 1 face, got %d", len(faces))
+	}
+	if faces[0].Frontality != nil {
+		t.Fatalf("expected Frontality nil when backend omits it, got %v", *faces[0].Frontality)
+	}
+	if faces[0].Sharpness != nil {
+		t.Fatalf("expected Sharpness nil when backend omits it, got %v", *faces[0].Sharpness)
+	}
+}
+
 func TestIsReady(t *testing.T) {
 	srv := mockMLServer(t)
 	defer srv.Close()

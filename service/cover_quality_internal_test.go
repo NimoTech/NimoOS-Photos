@@ -11,14 +11,18 @@ func TestHybridCoverScoreUsesFaceQuality(t *testing.T) {
 	w := sql.NullInt64{Int64: 200, Valid: true}
 	h := sql.NullInt64{Int64: 200, Valid: true}
 
-	sharp := hybridCoverScore(aest, bbox, w, h, sql.NullFloat64{Float64: 0.95, Valid: true})
-	blurry := hybridCoverScore(aest, bbox, w, h, sql.NullFloat64{Float64: 0.30, Valid: true})
-	legacy := hybridCoverScore(aest, bbox, w, h, sql.NullFloat64{})
+	sharp := hybridCoverScore(aest, bbox, w, h, 0.95)
+	blurry := hybridCoverScore(aest, bbox, w, h, 0.30)
 
 	if !(sharp > blurry) {
 		t.Fatalf("high-quality face must outscore low-quality: %v vs %v", sharp, blurry)
 	}
-	if legacy != sharp/0.95 {
-		t.Fatalf("NULL score must be neutral (x1.0): got %v", legacy)
+	// NULL-neutrality (quality=1.0) is now faceQualityFactor's responsibility;
+	// see TestFaceQualityFactor for that assertion.
+	legacy := hybridCoverScore(aest, bbox, w, h, 1.0)
+	wantAest := (aest.Float64 - 1) / 9
+	wantRatio := 100.0 * 100.0 / (200.0 * 200.0)
+	if legacy != wantAest*wantRatio {
+		t.Fatalf("quality=1.0 must equal aest*ratio: got %v, want %v", legacy, wantAest*wantRatio)
 	}
 }
