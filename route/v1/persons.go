@@ -108,7 +108,9 @@ func (h *PersonsHandler) DeleteCover(c echo.Context) error {
 // DELETE /v1/photos/persons/:id
 //
 // ?purge=true  → permanently delete: exclude faces, drop bindings, delete person row.
-// (default)    → soft hide: sets hidden=1, backward-compatible.
+// (default)    → undoable soft hide: sets hidden=1 and schedules a hard purge
+//
+//	after the grace period unless restored first.
 func (h *PersonsHandler) Delete(c echo.Context) error {
 	id := c.Param("id")
 	if c.QueryParam("purge") == "true" {
@@ -121,7 +123,7 @@ func (h *PersonsHandler) Delete(c echo.Context) error {
 		}
 		return c.JSON(http.StatusOK, map[string]string{"status": "purged"})
 	}
-	err := h.svc.Persons().HidePerson(id)
+	err := h.svc.Persons().HidePersonForPurge(id)
 	if errors.Is(err, service.ErrNotFound) {
 		return echo.NewHTTPError(http.StatusNotFound)
 	}

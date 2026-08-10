@@ -172,9 +172,10 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 	placesSvc := NewPlacesServiceWithAlbums(db, gaz, geoSvc, albums)
 	faces := NewFaceService(db)
 	faces.SetTaskRegistry(taskReg)
-	faces.SetIndexIdleSource(idx.IdleFor) // safety-net clustering debounce: only triggers once index activity has been quiet long enough
-	faces.SetML(ml)                       // used by RunPipeline's detection stage
-	faces.SetThumbDir(thumbDir)           // used by RunPipeline for video keyframe thumbnails
+	faces.SetIndexIdleSource(idx.IdleFor)       // safety-net clustering debounce: only triggers once index activity has been quiet long enough
+	faces.SetML(ml)                             // used by RunPipeline's detection stage
+	faces.SetThumbDir(thumbDir)                 // used by RunPipeline for video keyframe thumbnails
+	faces.SetDuePurger(persons.PurgeDuePersons) // sweeps hidden persons past their undo grace period
 	rebuilder := NewRebuilder(parentCtx, db, idx, faces, taskReg, cfg.Workers)
 	embedder := NewEmbedder(db, ml, idx, taskReg)
 	// One shared gate throttles the heavy backfill chains; faces/geo/smart

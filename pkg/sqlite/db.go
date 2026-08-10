@@ -624,6 +624,11 @@ func migrate(db *sql.DB) error {
 		`ALTER TABLE persons ADD COLUMN cover_locked INTEGER NOT NULL DEFAULT 0`,
 		// hero_asset_id: user-chosen hero/background photo for this person (must have a valid face).
 		`ALTER TABLE persons ADD COLUMN hero_asset_id TEXT`,
+		// purge_at: when a hidden person is scheduled for hard purge (undo
+		// window). NULL = no purge scheduled; the minute scheduler sweeps rows
+		// whose purge_at has passed. Persisted so the grace period survives
+		// page reloads and service restarts.
+		`ALTER TABLE persons ADD COLUMN purge_at DATETIME`,
 		// boxes_ver=0 → OCR text predates line-geometry storage; the OCR
 		// backfill (queryMissingOCR) re-runs these to populate asset_ocr_lines.
 		`ALTER TABLE asset_ocr ADD COLUMN boxes_ver INTEGER NOT NULL DEFAULT 0`,

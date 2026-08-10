@@ -90,8 +90,8 @@ The ML backend is an independent Docker Compose stack (`deploy/ml/docker-compose
 | POST | `/persons/merge-suggestions/reject` | Reject a merge suggestion |
 | POST | `/persons/merge` | Merge persons (400 if `from_id==into_id`; 404 if either person doesn't exist) |
 | POST | `/persons/recluster` | Re-cluster |
-| GET/PUT/DELETE | `/persons/:id` | Person detail/update/delete |
-| POST | `/persons/:id/restore` | Restore a deleted person |
+| GET/PUT/DELETE | `/persons/:id` | Person detail/update/delete (`DELETE` default = undoable hide + grace-period purge, `?purge=true` = immediate hard delete — see Core flows §3 "Person delete semantics") |
+| POST | `/persons/:id/restore` | Restore a deleted person, cancelling any pending grace-period purge |
 | GET | `/persons/:id/assets` | Person's photos (404 if the person is hidden or missing, via the `PersonVisible` guard) |
 | GET | `/persons/:id/relations` | Related persons (404 if the person is hidden or missing, via `PersonVisible`) |
 | GET | `/persons/:id/places` | Places this person appears in (404 if the person is hidden or missing, via `PersonVisible`) |
@@ -177,6 +177,12 @@ Smart View also reuses the `SmartSearch` interface to define dynamic albums by n
 When a person's active face count drops to zero (merge, detach, or a re-clustering pass), its `cover_face_id` / `cover_asset_id` / `cover_locked` / `centroid` / `confidence` are cleared (`recomputeOneCentroidTx`, `service/persons.go`, used by merge/detach, also clears `hero_asset_id`; the clustering-rebuild path `recomputePersonStatsTx`, `service/faces.go`, does not clear `hero_asset_id` — a minor asymmetry). Independently, `ClearDanglingCovers` (`service/faces.go`) runs on the same **1-minute** scheduler tick as the empty-person purge and self-heals `persons.cover_face_id` pointers that no longer resolve to a `face_detections` row (e.g. after a cascaded asset delete leaves a stale pointer — `cover_face_id` carries no FK constraint).
 
 **Low-confidence gating** (`photos.MinPersonConfidence`, default `0.5` when absent from config — see Sample configuration): unnamed, unfavorited, relation-less auto-clusters whose `persons.confidence` is below this floor are hidden from `GET /persons`, `GET /persons/:id/relations` (co-appearance), and `GET /persons/merge-suggestions`. Named, favorited, related, or hidden persons are always shown/considered regardless of `confidence`.
+
+#### Person delete semantics (undo)
+
+`DELETE /persons/:id` (default, i.e. without `?purge=true`) is a **server-side undoable delete**, not an immediate hard delete: `PersonService.HidePersonForPurge` (`service/persons.go`) sets `hidden=1` and schedules a hard purge `personPurgeGrace` seconds in the future (constant in `service/persons.go`, currently **30s**) via the persisted `persons.purge_at` column. The same **1-minute** scheduler tick that runs `ClearDanglingCovers`/the empty-person purge (see above) also runs `PersonService.PurgeDuePersons`, which hard-purges (reusing `PurgePerson`: exclude faces, drop bindings, delete the row) every person whose `purge_at` has passed. `POST /persons/:id/restore` (`RestorePerson`) cancels the pending purge — it clears `purge_at` back to `NULL` in the same statement that un-hides the person, so a restore that arrives after the sweep has already fired the purge simply finds no row and returns 404 (a benign race, not an error case to guard against).
+
+Because the schedule lives in a persisted column rather than an in-memory timer, **a page reload or a service restart mid-grace-period no longer silently cancels the pending delete** — the previous client-side implementation used a `setTimeout` in the frontend store, which was lost on any reload or crash, quietly turning an intended delete into a permanent no-op. The sweep picks up any overdue row on its next tick regardless of what happened to the process in between. `?purge=true` is unchanged: it still bypasses the grace period entirely and hard-deletes synchronously in the same request. The response bodies of both `DELETE` and `POST /restore` are unchanged, so this is a behavior-only change from the caller's point of view.
 
 #### Face clustering parameters (`photos.ClusterEpsilon`)
 
@@ -296,7 +302,7 @@ The Go client (`pkg/mlclient`) parses both as `*float64` (`FaceResult.Frontality
 | `clip_embeddings` | sqlite-vec **vec0** virtual table, 1152-dim CLIP vectors |
 | `asset_clip_idx` | rowid ↔ asset_id mapping (joins clip_embeddings and assets) |
 | `face_detections` | Face detection results (bbox, 512-dim embedding, excluded flag, `score` REAL = detector confidence; `frontality`/`sharpness` REAL = optional per-face quality signals from `mlserver`, see Core flows §8 — `NULL` on legacy rows predating the columns, or on any backend that doesn't emit them, = neutral factor in cover selection) |
-| `persons` | Face clustering results (name, cover, centroid, confidence; `hidden` flag drives the `PersonVisible` 404 guard; `cover_locked`/`hero_asset_id` anchor a pinned cover/hero through re-clustering) |
+| `persons` | Face clustering results (name, cover, centroid, confidence; `hidden` flag drives the `PersonVisible` 404 guard; `cover_locked`/`hero_asset_id` anchor a pinned cover/hero through re-clustering; `purge_at` schedules the undo-window hard purge for a soft-deleted person — see Core flows §3 "Person delete semantics") |
 | `face_person` | Face → person mapping |
 | `asset_ocr` | OCR text (coverage, line_count density-candidate gate; boxes_ver=0 means per-line coordinates aren't stored; doc_sem/doc_geo/is_doc are the semantic margin/geometric regularity/final verdict of the mixed criterion (NULL=not yet computed, query falls back to pure density), doc_ver=0 means pending computation; the single write path is computeDocVerdict()) |
 | `asset_ocr_lines` | OCR per-line text + normalized four-corner coordinates (JSON, 8 floats, [0,1]); line_no matches the concatenation order in asset_ocr.text; single write path is ocrAsset(); cascade-deletes with assets via foreign key; used for GET /assets/:id/ocr search-hit highlighting and doc geometric-regularity computation |
