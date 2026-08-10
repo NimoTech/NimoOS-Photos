@@ -98,6 +98,22 @@ func main() {
 	// that never went through the new inline pre-generation path.
 	go svc.Indexer().BackfillSprites(ctx)
 
+	// One-shot pure-Go sharpness backfill for legacy face_detections rows
+	// (sharpness IS NULL) predating the quality-signal feature. Delayed a
+	// few minutes past startup so it doesn't compete with the cold-start
+	// indexing/detection burst; marker-guarded (BackfillSharpness) so it
+	// never repeats once done, and stays interruptible via ctx.
+	go func() {
+		select {
+		case <-time.After(service.SharpnessBackfillStartupDelay):
+		case <-ctx.Done():
+			return
+		}
+		if err := svc.Faces().BackfillSharpness(ctx, config.Cfg.DataPath); err != nil {
+			zap.L().Warn("legacy sharpness backfill failed", zap.Error(err))
+		}
+	}()
+
 	// One-time cleanup of orphaned TUS staging files on startup (scans both
 	// the new and legacy directories; the legacy directory is only ever
 	// swept once, on startup, as a fallback). Daily cleanup after that is

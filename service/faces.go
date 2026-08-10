@@ -5,8 +5,6 @@ import (
 	"database/sql"
 	"fmt"
 	"math"
-	"os"
-	"path/filepath"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -627,26 +625,9 @@ func (s *FaceService) queryFaceScanTargets(ctx context.Context) ([]faceScanTarge
 // existing failure path (return error, skip, leave for the next retry)
 // rather than forcing the oversized original onto the ML service.
 func (s *FaceService) detectFaceScanTarget(ctx context.Context, t faceScanTarget) error {
-	src := t.path
-	if t.isVideo {
-		src = filepath.Join(s.thumbDir, t.id, "large.jpg")
-		if _, statErr := os.Stat(src); statErr != nil {
-			src = filepath.Join(s.thumbDir, t.id, "small.jpg")
-		}
-	}
-	data, err := os.ReadFile(src)
+	data, err := resolveFaceScanSource(s.thumbDir, t.id, t.path, t.isVideo)
 	if err != nil {
-		return fmt.Errorf("failed to read source file: %w", err)
-	}
-	if len(data) == 0 {
-		return fmt.Errorf("failed to read source file: source file is empty")
-	}
-	if !t.isVideo && oversizedForML(data) {
-		thumb := readLargeOrSmallThumb(s.thumbDir, t.id)
-		if len(thumb) == 0 {
-			return fmt.Errorf("original image exceeds ML pixel limit and no fallback thumbnail is available")
-		}
-		data = thumb
+		return err
 	}
 	if s.ml == nil {
 		return fmt.Errorf("ML provider not injected")

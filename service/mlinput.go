@@ -2,6 +2,7 @@ package service
 
 import (
 	"bytes"
+	"fmt"
 	"image"
 	"os"
 	"path/filepath"
@@ -58,4 +59,38 @@ func readLargeOrSmallThumb(thumbDir, id string) []byte {
 		return b
 	}
 	return nil
+}
+
+// resolveFaceScanSource resolves the byte content of the source image fed to
+// face detection for one asset: video assets read <thumbDir>/<id>/large.jpg
+// (a keyframe), falling back to small.jpg when missing; images read the
+// original file, unless it exceeds maxMLInputPixels, in which case it falls
+// back to the same large/small thumbnail. This is the exact selection rule
+// detectFaceScanTarget uses to build the bytes it sends to ML — extracted
+// here so the sharpness backfill (quality_backfill.go), which must crop the
+// stored bbox out of that very same source image, can reuse it verbatim
+// instead of maintaining a second copy that could silently drift.
+func resolveFaceScanSource(thumbDir, id, path string, isVideo bool) ([]byte, error) {
+	src := path
+	if isVideo {
+		src = filepath.Join(thumbDir, id, "large.jpg")
+		if _, statErr := os.Stat(src); statErr != nil {
+			src = filepath.Join(thumbDir, id, "small.jpg")
+		}
+	}
+	data, err := os.ReadFile(src)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read source file: %w", err)
+	}
+	if len(data) == 0 {
+		return nil, fmt.Errorf("failed to read source file: source file is empty")
+	}
+	if !isVideo && oversizedForML(data) {
+		thumb := readLargeOrSmallThumb(thumbDir, id)
+		if len(thumb) == 0 {
+			return nil, fmt.Errorf("original image exceeds ML pixel limit and no fallback thumbnail is available")
+		}
+		data = thumb
+	}
+	return data, nil
 }
