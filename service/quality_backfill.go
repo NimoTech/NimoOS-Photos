@@ -36,11 +36,14 @@ const (
 	sharpnessCropSize = 112
 
 	// sharpnessK is the Laplacian-variance half-point used to squash the
-	// raw variance into [0,1) via v/(v+sharpnessK). This constant MUST stay
-	// equal to mlserver's SHARPNESS_K (mlserver/server/facemodel.py) — that
-	// Python constant is the single source of truth; if it ever changes,
-	// update this one too so legacy-backfilled and ML-computed sharpness
-	// values stay on the same scale.
+	// raw variance into [0,1) via v/(v+sharpnessK), where the variance is
+	// computed on 8-bit-per-channel luma (0-255 scale, matching cv2's
+	// grayscale — see grayLaplacianVariance's descale comment). This
+	// constant MUST stay equal to mlserver's SHARPNESS_K
+	// (mlserver/server/facemodel.py) — that Python constant is the single
+	// source of truth; if it ever changes, update this one too so
+	// legacy-backfilled and ML-computed sharpness values stay on the same
+	// scale.
 	sharpnessK = 100.0
 
 	// sharpnessBackfillMarkerFile is the one-shot marker written into the
@@ -198,13 +201,19 @@ func (s *FaceService) legacyFaceSharpness(r legacySharpnessRow) (score float64, 
 }
 
 // grayLaplacianVariance computes the variance of the 3x3 Laplacian response
-// ({0,1,0; 1,-4,1; 0,1,0}) over img's luma (0.299 R + 0.587 G + 0.114 B),
-// restricted to rect and evaluated only at interior points (the kernel
-// needs a full 3x3 neighborhood, so pixels on rect's own border are
-// excluded). Returns 0 when rect has no interior point (either dimension
-// under 3px) — a degenerate case that never occurs for a
-// sharpnessCropSize-square resize, but keeps this pure function well
-// defined for arbitrary input.
+// ({0,1,0; 1,-4,1; 0,1,0}) over img's luma (0.299 R + 0.587 G + 0.114 B) on
+// the standard 8-bit-per-channel scale (0-255) — matching cv2's grayscale
+// scale in mlserver/server/facemodel.py, which is what sharpnessK is
+// calibrated against. img.At().RGBA() returns 16-bit-range components
+// (0-65535, ~257x the 8-bit value), so each channel is right-shifted by 8
+// before the luma weights are applied; skipping this descale would inflate
+// the variance by ~257^2 (~66000x) and saturate squashSharpness to ~1.0 for
+// virtually every real crop, destroying the signal. Evaluated only at
+// interior points of rect (the kernel needs a full 3x3 neighborhood, so
+// pixels on rect's own border are excluded). Returns 0 when rect has no
+// interior point (either dimension under 3px) — a degenerate case that
+// never occurs for a sharpnessCropSize-square resize, but keeps this pure
+// function well defined for arbitrary input.
 func grayLaplacianVariance(img image.Image, rect image.Rectangle) float64 {
 	rect = rect.Intersect(img.Bounds())
 	if rect.Dx() < 3 || rect.Dy() < 3 {
@@ -212,7 +221,9 @@ func grayLaplacianVariance(img image.Image, rect image.Rectangle) float64 {
 	}
 	luma := func(x, y int) float64 {
 		r, g, b, _ := img.At(x, y).RGBA()
-		return 0.299*float64(r) + 0.587*float64(g) + 0.114*float64(b)
+		// Descale 16-bit (0-65535) to 8-bit (0-255) to match cv2's grayscale
+		// scale — see the doc comment above.
+		return 0.299*float64(r>>8) + 0.587*float64(g>>8) + 0.114*float64(b>>8)
 	}
 
 	var sum, sumSq float64

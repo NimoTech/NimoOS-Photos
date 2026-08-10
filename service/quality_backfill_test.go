@@ -75,6 +75,56 @@ func TestGrayLaplacianVariance_TooSmallRectIsZero(t *testing.T) {
 	require.Equal(t, 0.0, grayLaplacianVariance(img, img.Bounds()), "a 2x2 rect has no interior point for a 3x3 kernel")
 }
 
+// TestGrayLaplacianVariance_CheckerboardAbsoluteScale pins the ABSOLUTE
+// output scale, not just relative ordering — a regression test for a real
+// bug where img.At().RGBA() (16-bit range, 0-65535) was fed straight into
+// the luma weights without descaling to 8-bit, inflating the variance by
+// ~257^2 (~66000x) and saturating squashSharpness to ~1.0 for virtually
+// every real crop. Ordering-only tests (noise > blurred) pass either way
+// and can't catch this; only an absolute value pins it down.
+//
+// Setup: a 4x4 checkerboard, pixel (x,y) white (255,255,255) when x+y is
+// even, black (0,0,0) otherwise. Hand-derived expected variance: luma
+// weights sum to exactly 1.0, so luma(white)=255.0 and luma(black)=0.0
+// exactly (no rounding). Every interior pixel's 4-neighbors are all the
+// opposite checkerboard color, so the Laplacian response at each interior
+// point is exactly ±4*255=±1020 (center=black -> +1020, center=white ->
+// -1020). The interior is the 2x2 grid x,y in {1,2}: (1,1)+(2,2) are white
+// (lap=-1020), (1,2)+(2,1) are black (lap=+1020) — an even 2/2 split, so
+// mean(lap)=0 and variance = mean(lap^2) = 1020^2 = 1,040,400 on the
+// correct 8-bit scale. The 257x scale bug above would instead land around
+// 1020^2 * 257^2 ≈ 6.87e10 — many orders of magnitude outside the
+// tolerance below.
+func TestGrayLaplacianVariance_CheckerboardAbsoluteScale(t *testing.T) {
+	img := image.NewNRGBA(image.Rect(0, 0, 4, 4))
+	for y := 0; y < 4; y++ {
+		for x := 0; x < 4; x++ {
+			v := uint8(0)
+			if (x+y)%2 == 0 {
+				v = 255
+			}
+			img.SetNRGBA(x, y, color.NRGBA{R: v, G: v, B: v, A: 255})
+		}
+	}
+	got := grayLaplacianVariance(img, img.Bounds())
+	require.InDelta(t, 1040400.0, got, 1.0,
+		"variance must be on the 8-bit luma scale (1020^2); a 257x (16-bit) scale bug would land ~6.6e4x higher")
+}
+
+// TestSquashSharpness_AbsoluteScaleBands is the end-to-end absolute-scale
+// regression companion to the checkerboard test above: it pins
+// squashSharpness(grayLaplacianVariance(...)) into bands that a 257x scale
+// error would blow straight through (at that scale both ends saturate to
+// ~1.0 and the bands below would be violated on the low end).
+func TestSquashSharpness_AbsoluteScaleBands(t *testing.T) {
+	noise := makeNoiseImage(112, 112)
+	blurred := imaging.Blur(noise, 8)
+	sNoise := squashSharpness(grayLaplacianVariance(noise, noise.Bounds()))
+	sBlur := squashSharpness(grayLaplacianVariance(blurred, blurred.Bounds()))
+	require.Greater(t, sNoise, 0.7, "unblurred high-frequency noise must land solidly sharp on the correct 8-bit scale")
+	require.Less(t, sBlur, 0.6, "a heavily Gaussian-blurred crop must land clearly below the noise crop on the correct 8-bit scale")
+}
+
 // ---- BackfillSharpness integration tests ---------------------------------
 
 func insertSharpnessTestAsset(t *testing.T, db *sql.DB, id, path string) {
