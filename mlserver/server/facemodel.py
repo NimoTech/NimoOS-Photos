@@ -63,6 +63,34 @@ def decode_bgr(data: bytes) -> np.ndarray:
     return img
 
 
+def frontality_from_kps(kps: np.ndarray) -> float:
+    """Symmetry heuristic from the 5-point landmarks (left eye, right eye,
+    nose, mouth-left, mouth-right): a frontal face has its nose x near the
+    eye midpoint. Returns 1.0 for perfectly frontal, approaching 0.0 for
+    strong profiles. Heuristic, not a pose model — good enough to rank
+    cover candidates."""
+    le, re_, nose = kps[0], kps[1], kps[2]
+    eye_dist = float(np.linalg.norm(re_ - le))
+    if eye_dist < 1e-6:
+        return 0.0
+    mid_x = (le[0] + re_[0]) / 2.0
+    dev = abs(float(nose[0]) - mid_x) / eye_dist
+    return max(0.0, 1.0 - 2.0 * dev)
+
+
+SHARPNESS_K = 100.0  # Laplacian-variance half-point: var==K maps to 0.5
+
+
+def sharpness_from_crop(crop_bgr: np.ndarray) -> float:
+    """Blur measure on the 112x112 aligned crop: variance of the Laplacian
+    on grayscale, squashed to [0,1] via v/(v+K). Monotonic; K chosen so a
+    typically sharp face (var >= ~300) scores >= 0.75 and a heavily blurred
+    one (var <= ~30) scores <= 0.23."""
+    gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
+    v = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+    return v / (v + SHARPNESS_K)
+
+
 class FacePipeline:
     def __init__(self, model_dir: Path, providers: list) -> None:
         self.det = get_model(str(model_dir / "detection" / "model.onnx"), providers=providers)
@@ -77,10 +105,13 @@ class FacePipeline:
         faces = []
         for bbox, kps in zip(bboxes, kpss if kpss is not None else []):
             x1, y1, x2, y2, score = [float(v) for v in bbox]
-            emb = self.rec.get_feat(norm_crop(img, kps)).flatten().astype(np.float32)
+            crop = norm_crop(img, kps)
+            emb = self.rec.get_feat(crop).flatten().astype(np.float32)
             faces.append({
                 "boundingBox": {"x1": x1, "y1": y1, "x2": x2, "y2": y2},
                 "embedding": json.dumps([float(v) for v in emb]),
                 "score": score,
+                "frontality": frontality_from_kps(kps),
+                "sharpness": sharpness_from_crop(crop),
             })
         return {"facial-recognition": faces, "imageWidth": w, "imageHeight": h}
