@@ -365,7 +365,8 @@ func (s *PersonService) UnlockPersonCover(personID string) (string, error) {
 //
 // Assets are never touched. The operation is intentionally unrestricted —
 // anchored (named/favorited) persons can be purged because this is an explicit
-// user action. Returns ErrNotFound if no person with the given id exists.
+// user action, and it does not re-check hidden/purge_at (unlike the sweep's
+// purgeDuePerson). Returns ErrNotFound if no person with the given id exists.
 func (s *PersonService) PurgePerson(id string) error {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -384,25 +385,37 @@ func (s *PersonService) PurgePerson(id string) error {
 		return fmt.Errorf("PurgePerson check: %w", err)
 	}
 
-	// Step 1: mark all face_detections that belong to this person as excluded=1.
-	if _, err := tx.Exec(`
-		UPDATE face_detections SET excluded=1
-		WHERE id IN (SELECT face_id FROM face_person WHERE person_id=?)`, id); err != nil {
-		return fmt.Errorf("PurgePerson exclude faces: %w", err)
-	}
-
-	// Step 2: delete face_person bindings.
-	if _, err := tx.Exec(`DELETE FROM face_person WHERE person_id=?`, id); err != nil {
-		return fmt.Errorf("PurgePerson delete face_person: %w", err)
-	}
-
-	// Step 3: delete the person row.
-	if _, err := tx.Exec(`DELETE FROM persons WHERE id=?`, id); err != nil {
-		return fmt.Errorf("PurgePerson delete person: %w", err)
+	if err := purgePersonRowsTx(tx, id); err != nil {
+		return fmt.Errorf("PurgePerson: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("PurgePerson commit: %w", err)
+	}
+	return nil
+}
+
+// purgePersonRowsTx performs the actual deletion body shared by PurgePerson
+// and the sweep's purgeDuePerson: mark the person's faces excluded, drop the
+// face_person bindings, delete the persons row. Callers are responsible for
+// whatever existence/guard check applies to their semantics; this function
+// assumes the caller already decided the row should go.
+func purgePersonRowsTx(tx *sql.Tx, id string) error {
+	// Step 1: mark all face_detections that belong to this person as excluded=1.
+	if _, err := tx.Exec(`
+		UPDATE face_detections SET excluded=1
+		WHERE id IN (SELECT face_id FROM face_person WHERE person_id=?)`, id); err != nil {
+		return fmt.Errorf("exclude faces: %w", err)
+	}
+
+	// Step 2: delete face_person bindings.
+	if _, err := tx.Exec(`DELETE FROM face_person WHERE person_id=?`, id); err != nil {
+		return fmt.Errorf("delete face_person: %w", err)
+	}
+
+	// Step 3: delete the person row.
+	if _, err := tx.Exec(`DELETE FROM persons WHERE id=?`, id); err != nil {
+		return fmt.Errorf("delete person: %w", err)
 	}
 	return nil
 }
@@ -466,9 +479,10 @@ func (s *PersonService) HidePersonForPurge(id string) error {
 }
 
 // PurgeDuePersons hard-purges every person whose purge_at has passed.
-// Runs on the minute scheduler; each purge reuses PurgePerson's transaction
-// (exclude faces, drop bindings, delete row). Errors are per-person logged
-// by the caller, not fatal to the sweep.
+// Runs on the minute scheduler; each purge goes through purgeDuePerson,
+// which re-checks the guard inside its own transaction (see that function's
+// doc comment for why). Errors are per-person logged by the caller, not
+// fatal to the sweep.
 func (s *PersonService) PurgeDuePersons(ctx context.Context) error {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT id FROM persons WHERE hidden=1 AND purge_at IS NOT NULL AND purge_at <= datetime('now')`)
@@ -491,9 +505,47 @@ func (s *PersonService) PurgeDuePersons(ctx context.Context) error {
 	rows.Close()
 
 	for _, id := range ids {
-		if err := s.PurgePerson(id); err != nil {
+		if err := s.purgeDuePerson(id); err != nil {
 			zap.L().Warn("purge due person failed", zap.String("person_id", id), zap.Error(err))
 		}
+	}
+	return nil
+}
+
+// purgeDuePerson hard-purges a single person, but only after re-verifying
+// inside the purge transaction that it is still due: hidden=1, purge_at
+// non-NULL, and not in the future. This closes a TOCTOU race with
+// RestorePerson: PurgeDuePersons' outer SELECT and this function's tx can
+// straddle a concurrent RestorePerson call — if the restore's UPDATE commits
+// after the outer SELECT but before this transaction starts, the row would
+// otherwise be purged despite having just been "successfully" restored. When
+// the guard no longer holds (restored, already purged, or somehow still not
+// due), this silently returns nil — not an error, since losing the race to a
+// legitimate restore isn't a failure.
+func (s *PersonService) purgeDuePerson(id string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("purgeDuePerson begin: %w", err)
+	}
+	defer tx.Rollback()
+
+	var due int
+	err = tx.QueryRow(`
+		SELECT 1 FROM persons
+		WHERE id=? AND hidden=1 AND purge_at IS NOT NULL AND purge_at <= datetime('now')`, id).Scan(&due)
+	if err == sql.ErrNoRows {
+		return nil // no longer due (restored, already gone, or race): not an error
+	}
+	if err != nil {
+		return fmt.Errorf("purgeDuePerson check: %w", err)
+	}
+
+	if err := purgePersonRowsTx(tx, id); err != nil {
+		return fmt.Errorf("purgeDuePerson: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("purgeDuePerson commit: %w", err)
 	}
 	return nil
 }
