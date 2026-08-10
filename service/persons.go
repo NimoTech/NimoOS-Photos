@@ -37,6 +37,10 @@ func minPersonConfidence() float64 {
 }
 
 // ListPersons returns all non-hidden persons as rich objects (with count/confidence/first-last-seen/places count).
+// Ordering ranks named/favorited persons ahead of unnamed clusters, then by photo
+// count: several frontend surfaces read this list unfiltered (e.g. the person-detail
+// merge-target picker), so a named person with fewer photos should still surface
+// before a higher-count unnamed cluster.
 func (s *PersonService) ListPersons() ([]Person, error) {
 	rows, err := s.db.Query(`
 SELECT p.id, p.name,
@@ -75,7 +79,7 @@ SELECT p.id, p.name,
            '') AS hero
 FROM persons p
 WHERE p.hidden=0 AND (p.name!='' OR p.favorite=1 OR COALESCE(p.relation,'')!='' OR p.confidence >= ?)
-ORDER BY cnt DESC, p.rowid`, minPersonConfidence())
+ORDER BY (p.name!='' OR p.favorite=1) DESC, cnt DESC, p.rowid`, minPersonConfidence())
 	if err != nil {
 		return nil, fmt.Errorf("ListPersons: %w", err)
 	}

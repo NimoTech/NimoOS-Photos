@@ -88,6 +88,39 @@ func TestFacesIndexedUpTo(t *testing.T) {
 	require.Contains(t, *ts2, "2026")
 }
 
+// A named person must outrank a higher-count unnamed cluster in ListPersons.
+// This matters even though the People page splits named/unnamed into separate
+// sections client-side: PhotosPersonDetail's merge-target picker reads the
+// unfiltered list directly, so the raw backend order is user-visible there.
+func TestListPersons_NamedOutranksHigherCountUnnamed(t *testing.T) {
+	db := makeTestFaceDB(t)
+	dim := 512
+	v1 := make([]float32, dim)
+	v1[0] = 1.0
+	v2 := make([]float32, dim)
+	v2[1] = 1.0
+	v3 := make([]float32, dim)
+	v3[2] = 1.0
+
+	f1 := insertAssetFace(t, db, "no-a1", normalize(v1))
+	f2 := insertAssetFace(t, db, "no-a2", normalize(v2)) // second photo -> unnamed cluster cnt=2
+	f3 := insertAssetFace(t, db, "no-a3", normalize(v3)) // sole photo -> named person cnt=1
+
+	_, err := db.Exec(`INSERT INTO persons(id, name) VALUES('unnamed-cluster', ''), ('bob', 'Bob')`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO face_person(face_id, person_id) VALUES(?, 'unnamed-cluster'), (?, 'unnamed-cluster'), (?, 'bob')`,
+		f1, f2, f3)
+	require.NoError(t, err)
+
+	list, err := service.NewPersonService(db).ListPersons()
+	require.NoError(t, err)
+	require.Len(t, list, 2)
+	require.Equal(t, "bob", list[0].ID, "named person should rank first despite lower count")
+	require.Equal(t, 1, list[0].Count)
+	require.Equal(t, "unnamed-cluster", list[1].ID)
+	require.Equal(t, 2, list[1].Count)
+}
+
 func TestGetPerson_Stats(t *testing.T) {
 	db := makeTestFaceDB(t)
 	dim := 512
