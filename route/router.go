@@ -99,7 +99,10 @@ func InitRouter(ctx context.Context, svc service.Services, runtimePath string, t
 			// Media serving endpoints: thumbnail/original/live are already
 			// protected by the Gateway; <img> tags can't send Authorization headers.
 			p := c.Path()
-			if p == common.V1APIPath+"/version" {
+			// /healthz is registered below with a comment claiming no auth is
+			// required; the Skipper must actually exempt it to match, else it
+			// 401s in production despite the comment (reproduced against prod).
+			if p == "/healthz" || p == common.V1APIPath+"/version" {
 				return true
 			}
 			if mediaGetSkip(c.Request().Method, p) {
@@ -223,9 +226,12 @@ func InitRouter(ctx context.Context, svc service.Services, runtimePath string, t
 	g.POST("/persons/merge-suggestions/reject", persons.RejectSuggestion)
 	g.POST("/persons/merge", persons.Merge)
 	g.POST("/persons/recluster", persons.Recluster)
+	// Must precede GET /persons/:id — otherwise "hidden" is swallowed as an :id lookup.
+	g.GET("/persons/hidden", persons.ListHidden)
 	g.GET("/persons/:id", persons.Get)
 	g.PUT("/persons/:id", persons.Update)
 	g.DELETE("/persons/:id", persons.Delete)
+	g.POST("/persons/:id/hide", persons.Hide)
 	g.POST("/persons/:id/restore", persons.Restore)
 	g.GET("/persons/:id/assets", persons.Assets)
 	g.GET("/persons/:id/relations", persons.Relations)

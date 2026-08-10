@@ -83,9 +83,10 @@ SHARPNESS_K = 100.0  # Laplacian-variance half-point: var==K maps to 0.5
 
 def sharpness_from_crop(crop_bgr: np.ndarray) -> float:
     """Blur measure on the 112x112 aligned crop: variance of the Laplacian
-    on grayscale, squashed to [0,1] via v/(v+K). Monotonic; K chosen so a
-    typically sharp face (var >= ~300) scores >= 0.75 and a heavily blurred
-    one (var <= ~30) scores <= 0.23."""
+    on grayscale, squashed via v/(v+K) to a value in [0,1); exactly 0.0 only
+    for a zero-gradient (flat) crop. Monotonic; K chosen so a typically sharp
+    face (var >= ~300) scores >= 0.75 and a heavily blurred one (var <= ~30)
+    scores <= 0.23."""
     gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
     v = float(cv2.Laplacian(gray, cv2.CV_64F).var())
     return v / (v + SHARPNESS_K)

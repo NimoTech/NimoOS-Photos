@@ -33,8 +33,8 @@ type FaceResult struct {
 	// by nimoos-photos-ml-server. They are pointers by contract: a backend
 	// that doesn't emit them (e.g. rollback to immich-ml) yields nil, which
 	// downstream stores as NULL and treats as quality-neutral rather than 0.
-	Frontality *float64 `json:"frontality,omitempty"`
-	Sharpness  *float64 `json:"sharpness,omitempty"`
+	Frontality *float64 `json:"frontality"`
+	Sharpness  *float64 `json:"sharpness"`
 }
 
 // MLClient is an HTTP client for the nimoos-photos-ml-server prediction endpoint.

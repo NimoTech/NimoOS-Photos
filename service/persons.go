@@ -37,6 +37,10 @@ func minPersonConfidence() float64 {
 }
 
 // ListPersons returns all non-hidden persons as rich objects (with count/confidence/first-last-seen/places count).
+// Ordering ranks named/favorited persons ahead of unnamed clusters, then by photo
+// count: several frontend surfaces read this list unfiltered (e.g. the person-detail
+// merge-target picker), so a named person with fewer photos should still surface
+// before a higher-count unnamed cluster.
 func (s *PersonService) ListPersons() ([]Person, error) {
 	rows, err := s.db.Query(`
 SELECT p.id, p.name,
@@ -75,7 +79,7 @@ SELECT p.id, p.name,
            '') AS hero
 FROM persons p
 WHERE p.hidden=0 AND (p.name!='' OR p.favorite=1 OR COALESCE(p.relation,'')!='' OR p.confidence >= ?)
-ORDER BY cnt DESC, p.rowid`, minPersonConfidence())
+ORDER BY (p.name!='' OR p.favorite=1) DESC, cnt DESC, p.rowid`, minPersonConfidence())
 	if err != nil {
 		return nil, fmt.Errorf("ListPersons: %w", err)
 	}
@@ -434,6 +438,33 @@ func (s *PersonService) RestorePerson(id string) error {
 		return ErrNotFound
 	}
 	return nil
+}
+
+// ListHiddenPersons returns plainly-hidden persons (hidden=1, no pending
+// purge) for the hidden-people management view. Rows in the purge grace
+// period (purge_at IS NOT NULL, scheduled via HidePersonForPurge) are
+// excluded — those are "being deleted", not "hidden", and are never swept
+// back in here. Only light fields are populated (ID/Name/CoverFaceID/
+// Confidence); this is meant for a compact admin list, not the rich object
+// ListPersons/GetPerson return.
+func (s *PersonService) ListHiddenPersons() ([]Person, error) {
+	rows, err := s.db.Query(`
+SELECT id, name, COALESCE(cover_face_id,''), confidence
+FROM persons WHERE hidden=1 AND purge_at IS NULL
+ORDER BY updated_at DESC`)
+	if err != nil {
+		return nil, fmt.Errorf("ListHiddenPersons: %w", err)
+	}
+	defer rows.Close()
+	var out []Person
+	for rows.Next() {
+		var p Person
+		if err := rows.Scan(&p.ID, &p.Name, &p.CoverFaceID, &p.Confidence); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
 }
 
 func (s *PersonService) setHidden(id string, hidden bool) error {
