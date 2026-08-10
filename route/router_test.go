@@ -79,7 +79,7 @@ func newTestJWTRouter() *echo.Echo {
 				return true
 			}
 			p := c.Path()
-			if p == common.V1APIPath+"/version" {
+			if p == "/healthz" || p == common.V1APIPath+"/version" {
 				return true
 			}
 			if mediaGetSkip(c.Request().Method, p) {
@@ -107,6 +107,8 @@ func newTestJWTRouter() *echo.Echo {
 	}))
 
 	ok := func(c echo.Context) error { return c.String(http.StatusOK, "ok") }
+
+	e.GET("/healthz", ok)
 
 	g := e.Group(common.V1APIPath)
 	g.POST("/smart-views/preview", ok)
@@ -144,4 +146,21 @@ func TestJWTExemption_PreviewSuffixCollision(t *testing.T) {
 	e.ServeHTTP(getSpriteRec, getSprite)
 	require.Equal(t, http.StatusOK, getSpriteRec.Code,
 		"GET /assets/:id/sprite should remain JWT-exempt and reach the handler normally")
+}
+
+// TestJWTExemption_Healthz is a route-layer regression test for the /healthz
+// endpoint: router.go registers it with a comment claiming "no auth
+// required", but the JWT Skipper never actually exempted it — a request
+// without an Authorization header was rejected with 401 in production. This
+// test reproduces that at the real HTTP request layer (not just by calling
+// the Skipper helpers) and must pass once /healthz is added to the Skipper's
+// exempt set alongside /version.
+func TestJWTExemption_Healthz(t *testing.T) {
+	e := newTestJWTRouter()
+
+	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code,
+		"GET /healthz without a token must be JWT-exempt as the router.go comment claims")
 }

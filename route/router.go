@@ -99,7 +99,10 @@ func InitRouter(ctx context.Context, svc service.Services, runtimePath string, t
 			// Media serving endpoints: thumbnail/original/live are already
 			// protected by the Gateway; <img> tags can't send Authorization headers.
 			p := c.Path()
-			if p == common.V1APIPath+"/version" {
+			// /healthz is registered below with a comment claiming no auth is
+			// required; the Skipper must actually exempt it to match, else it
+			// 401s in production despite the comment (reproduced against prod).
+			if p == "/healthz" || p == common.V1APIPath+"/version" {
 				return true
 			}
 			if mediaGetSkip(c.Request().Method, p) {
