@@ -31,7 +31,15 @@ const (
 	// doesn't match, a full rebuild is triggered automatically.
 	// gen 1 = ViT-B-32__openai + buffalo_l + PP-OCRv5_mobile (implicit; old DBs have no such key).
 	// gen 2 = nllb-clip-large-siglip__v1 + antelopev2 + PP-OCRv5_server.
-	MLModelGen = "3"
+	// gen 3 = ViT-SO400M-16-SigLIP2-384__webli + antelopev2 + PP-OCRv5_server.
+	// gen 4 = no model change; forces a full face regeneration so every face
+	// row carries a detector score/frontality/sharpness (older rows predate
+	// those columns), then re-clusters at ClusterEpsilon 0.48 and re-ranks
+	// every person's cover through the unified quality-weighted selection
+	// path (see selectCoverFace). This intentionally drops all existing
+	// persons, including user-named ones, since names can't be reattached
+	// across a from-scratch re-cluster.
+	MLModelGen = "4"
 )
 
 // TUS upload staging
