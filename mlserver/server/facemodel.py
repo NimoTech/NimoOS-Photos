@@ -75,7 +75,10 @@ def frontality_from_kps(kps: np.ndarray) -> float:
         return 0.0
     mid_x = (le[0] + re_[0]) / 2.0
     dev = abs(float(nose[0]) - mid_x) / eye_dist
-    return max(0.0, 1.0 - 2.0 * dev)
+    # float(...) is required here: dev is derived from numpy scalar
+    # arithmetic, so max(0.0, 1.0 - 2.0 * dev) can yield np.float32 (when
+    # that branch wins), which FastAPI/pydantic cannot JSON-serialize.
+    return float(max(0.0, 1.0 - 2.0 * dev))
 
 
 SHARPNESS_K = 100.0  # Laplacian-variance half-point: var==K maps to 0.5
@@ -89,7 +92,10 @@ def sharpness_from_crop(crop_bgr: np.ndarray) -> float:
     scores <= 0.23."""
     gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
     v = float(cv2.Laplacian(gray, cv2.CV_64F).var())
-    return v / (v + SHARPNESS_K)
+    # float(...) is required here: cv2 return types are not guaranteed to be
+    # native Python floats, and FastAPI/pydantic cannot JSON-serialize numpy
+    # scalar types at the API serialization boundary.
+    return float(v / (v + SHARPNESS_K))
 
 
 class FacePipeline:
