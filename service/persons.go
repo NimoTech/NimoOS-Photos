@@ -1059,15 +1059,33 @@ WHERE fp.person_id=? AND fd.excluded=0`, personID)
 			return err
 		}
 	}
-	// Hybrid-score selection: whole-image aesthetic score × face area ratio;
-	// incomparable (no score / no EXIF / degenerate bbox) is recorded as -1.
+	// Hybrid-score selection, shared with recomputePersonStatsTx (the
+	// full-rebuild path) so both paths rank covers identically.
+	best := selectCoverFace(vecs, centroid, bboxes, scores, ws, hs, faceScores, fronts, sharps)
+	_, err = tx.Exec(
+		`UPDATE persons SET centroid=?, confidence=?, cover_face_id=?, cover_asset_id=?, updated_at=CURRENT_TIMESTAMP WHERE id=?`,
+		sqlite.SerializeFloat32(centroid), conf, faceIDs[best], assetIDs[best], personID)
+	return err
+}
+
+// selectCoverFace picks the cover face index for a person from parallel
+// slices of its active faces, using the quality-weighted hybrid score
+// (whole-image aesthetics x face-area ratio x detector/frontality/sharpness
+// factors); falls back to nearest-centroid when every face is incomparable
+// (no aesthetic score / no EXIF dims). Shared by recomputeOneCentroidTx
+// (merge/detach/unlock path) and recomputePersonStatsTx (full-rebuild path)
+// so both paths rank covers identically.
+func selectCoverFace(vecs [][]float32, centroid []float32, bboxes []string,
+	aesScores []sql.NullFloat64, ws, hs []sql.NullInt64,
+	detScores, fronts, sharps []sql.NullFloat64) int {
+	// Incomparable (no score / no EXIF / degenerate bbox) is recorded as -1.
 	// When all faces are incomparable, fall back to nearest-centroid (the
 	// original behavior, which also covers the transition period for
 	// existing libraries that haven't been scored yet).
 	best, bestHybrid := -1, -1.0
 	for i := range vecs {
-		quality := faceQualityFactor(faceScores[i], fronts[i], sharps[i])
-		if h := hybridCoverScore(scores[i], bboxes[i], ws[i], hs[i], quality); h > bestHybrid {
+		quality := faceQualityFactor(detScores[i], fronts[i], sharps[i])
+		if h := hybridCoverScore(aesScores[i], bboxes[i], ws[i], hs[i], quality); h > bestHybrid {
 			bestHybrid = h
 			best = i
 		}
@@ -1077,7 +1095,7 @@ WHERE fp.person_id=? AND fd.excluded=0`, personID)
 		// every face's cosDist exactly equals the initial bestDist (2.0) (the
 		// strict less-than check never fires), the loop body never updates
 		// best, so it must still land on a valid face index to avoid an
-		// out-of-bounds panic on faceIDs[best] below.
+		// out-of-bounds panic on the caller's faceIDs[best] indexing.
 		best = 0
 		bestDist := 2.0
 		for i, v := range vecs {
@@ -1087,10 +1105,7 @@ WHERE fp.person_id=? AND fd.excluded=0`, personID)
 			}
 		}
 	}
-	_, err = tx.Exec(
-		`UPDATE persons SET centroid=?, confidence=?, cover_face_id=?, cover_asset_id=?, updated_at=CURRENT_TIMESTAMP WHERE id=?`,
-		sqlite.SerializeFloat32(centroid), conf, faceIDs[best], assetIDs[best], personID)
-	return err
+	return best
 }
 
 // hybridCoverScore computes a person's cover hybrid score (whole-image

@@ -1171,26 +1171,44 @@ func (s *FaceService) recomputePersonStatsTx(ctx context.Context, tx *sql.Tx) er
 
 	now := time.Now()
 	for _, meta := range metas {
+		// Load member faces along with the same quality/EXIF/aesthetic signals
+		// recomputeOneCentroidTx uses, so selectCoverFace ranks covers
+		// identically in both paths.
 		fr, ferr := tx.QueryContext(ctx, `
-			SELECT fd.id, fd.asset_id, fd.embedding
+			SELECT fd.id, fd.asset_id, fd.embedding, fd.bbox, fd.score, fd.frontality, fd.sharpness,
+			       a.aesthetic_score, e.width, e.height
 			FROM face_person fp
 			JOIN face_detections fd ON fd.id = fp.face_id
+			JOIN assets a ON a.id = fd.asset_id
+			LEFT JOIN asset_exif e ON e.asset_id = fd.asset_id
 			WHERE fp.person_id = ? AND fd.excluded = 0`, meta.id)
 		if ferr != nil {
 			return ferr
 		}
-		var faceIDs, assetIDs []string
+		var faceIDs, assetIDs, bboxes []string
 		var vecs [][]float32
+		var aesScores []sql.NullFloat64
+		var detScores, fronts, sharps []sql.NullFloat64
+		var ws, hs []sql.NullInt64
 		for fr.Next() {
-			var fid, aid string
+			var fid, aid, bbox string
 			var blob []byte
-			if err = fr.Scan(&fid, &aid, &blob); err != nil {
+			var detScore, aesScore, front, sharp sql.NullFloat64
+			var w, h sql.NullInt64
+			if err = fr.Scan(&fid, &aid, &blob, &bbox, &detScore, &front, &sharp, &aesScore, &w, &h); err != nil {
 				fr.Close()
 				return err
 			}
 			faceIDs = append(faceIDs, fid)
 			assetIDs = append(assetIDs, aid)
+			bboxes = append(bboxes, bbox)
 			vecs = append(vecs, sqlite.DeserializeFloat32(blob))
+			aesScores = append(aesScores, aesScore)
+			detScores = append(detScores, detScore)
+			fronts = append(fronts, front)
+			sharps = append(sharps, sharp)
+			ws = append(ws, w)
+			hs = append(hs, h)
 		}
 		if cerr := fr.Err(); cerr != nil {
 			fr.Close()
@@ -1233,16 +1251,11 @@ func (s *FaceService) recomputePersonStatsTx(ctx context.Context, tx *sql.Tx) er
 			}
 		}
 
-		// Select the face nearest to the centroid as cover.
-		bestIdx, bestDist := 0, math.MaxFloat64
-		for i, v := range vecs {
-			if d := cosDist(v, centroid); d < bestDist {
-				bestDist = d
-				bestIdx = i
-			}
-		}
+		// Hybrid-score selection, shared with recomputeOneCentroidTx (the
+		// merge/detach/unlock path) so both paths rank covers identically.
+		best := selectCoverFace(vecs, centroid, bboxes, aesScores, ws, hs, detScores, fronts, sharps)
 		if _, err = coverStmt.ExecContext(ctx,
-			sqlite.SerializeFloat32(centroid), conf, faceIDs[bestIdx], assetIDs[bestIdx], now, meta.id); err != nil {
+			sqlite.SerializeFloat32(centroid), conf, faceIDs[best], assetIDs[best], now, meta.id); err != nil {
 			return err
 		}
 	}
