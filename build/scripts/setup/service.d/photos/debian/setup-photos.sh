@@ -27,9 +27,14 @@ systemctl enable --force --no-ask-password "${APP_NAME}.service"
 # app (docker load -> compose up -> /ping wait, all inside the bundle's install
 # .sh). Optional and fully non-fatal: a problem here must never fail the install.
 readonly PHOTOS_ML_VERSION="2.0.0"
-readonly OSS_DOMAIN="https://nimoos.oss-cn-shenzhen.aliyuncs.com"
+# get.nimotech.ai (S3 + CloudFront) is where every other NimoOS artifact comes
+# from. This used to point at the Shenzhen OSS domain, which silently lost
+# public read after the CDN migration — and because a download failure here is
+# deliberately non-fatal, fresh installs just skipped Photos AI without a word.
+# Overridable for mirrors/offline setups, same variable the installer uses.
+readonly DOWNLOAD_DOMAIN="${NIMO_DOWNLOAD_DOMAIN:-https://get.nimotech.ai/}"
 readonly BUNDLE="nimoos-photos-ml-${PHOTOS_ML_VERSION}.tar.gz"
-readonly BUNDLE_URL="${OSS_DOMAIN}/NimoTech/NimoOS-Photos/releases/download/photos-ml-${PHOTOS_ML_VERSION}/${BUNDLE}"
+readonly BUNDLE_URL="${DOWNLOAD_DOMAIN}nimoos/NimoOS-Photos/releases/download/photos-ml-${PHOTOS_ML_VERSION}/${BUNDLE}"
 
 install_photos_ml() {
     local arch
