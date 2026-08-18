@@ -164,3 +164,27 @@ func unescapeMount(s string) string {
 	r := strings.NewReplacer(`\040`, " ", `\011`, "\t", `\012`, "\n", `\134`, `\`)
 	return r.Replace(s)
 }
+
+// VolumeRootForPath returns the longest entry in roots that path lives under
+// (path equals the root, or starts with root+"/"), or "" if none match. Used
+// by TrashService to pin a per-asset .trash directory to the same filesystem
+// the asset already lives on (see trash.go) so the trash-move rename() is
+// always same-device and never hits EXDEV.
+//
+// Longest-match wins so a more specific root (e.g. a nested bind mount) beats
+// a shorter ancestor root if both happen to be present in roots.
+func VolumeRootForPath(path string, roots []string) string {
+	best := ""
+	for _, r := range roots {
+		r = strings.TrimRight(r, "/")
+		if r == "" {
+			continue
+		}
+		if path == r || strings.HasPrefix(path, r+"/") {
+			if len(r) > len(best) {
+				best = r
+			}
+		}
+	}
+	return best
+}

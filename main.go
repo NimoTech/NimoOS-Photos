@@ -128,6 +128,21 @@ func main() {
 		}
 	}()
 
+	// One-time cleanup of orphaned empty ".trash/<id>/" directories left
+	// behind by a soft-delete whose cross-device file move failed before this
+	// fix's per-volume trash + inline cleanup (see the 2026-08-18 delete-chain
+	// diagnosis). Delayed briefly past startup so it doesn't race any trash
+	// move still in flight; CleanupOrphanTrashDirs also self-guards on
+	// directory age.
+	go func() {
+		select {
+		case <-time.After(time.Minute):
+		case <-ctx.Done():
+			return
+		}
+		svc.Trash().CleanupOrphanTrashDirs()
+	}()
+
 	// Warm the filesystem-derived storage stats once at boot so the settings
 	// page has cache/prunable numbers soon after startup instead of waiting
 	// for the first request to kick the background walk.
