@@ -2,19 +2,46 @@ package service
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"syscall"
+	"time"
 )
 
+// orphanTrashDirAge is how old an empty ".trash/<id>/" directory must be
+// before CleanupOrphanTrashDirs will remove it. The floor exists so the sweep
+// never races a moveToTrash that is still in flight (mkdir happens before the
+// file lands in it).
+const orphanTrashDirAge = time.Hour
+
 // TrashService implements soft delete (trash): deleting moves the original
-// file to <galleryDir>/.trash/<id>/ and records deleted_at in the DB;
-// restoring moves it back; a permanent delete removes the file + thumbnail +
-// DB record.
+// file to <volumeRoot>/.trash/<id>/ (the volume root being whichever
+// currently-mounted scan root the asset's file already lives under — see
+// trashDirFor) and records deleted_at in the DB; restoring moves it back; a
+// permanent delete removes the file + thumbnail + DB record.
+//
+// Pinning the trash directory to the asset's own volume (instead of a single
+// fixed gallery root) is what keeps the move a same-device os.Rename: photo
+// libraries routinely span multiple mounted filesystems (e.g. /DATA plus one
+// or more /media/RAID_* arrays), and os.Rename fails with EXDEV across
+// devices. See the 2026-08-18 delete-chain diagnosis for the incident this
+// fixes.
 type TrashService struct {
 	db         *sql.DB
-	galleryDir string // gallery root that holds the trash root (.trash lives under it)
+	galleryDir string // fallback trash root, used only when an asset's path isn't under any currently-known scan root (see trashDirFor)
 	thumbDir   string // thumbnail root, cleaned up on permanent delete
+
+	// scanRoots returns the currently-mounted volume roots to match an
+	// asset's path against. Defaults to EnumerateScanRoots; overridden in
+	// tests to avoid depending on the real /proc/mounts.
+	scanRoots func() []string
+
+	// osRename performs the actual same-device move. Defaults to os.Rename;
+	// overridden in tests to simulate EXDEV without needing two real devices.
+	osRename func(oldpath, newpath string) error
 
 	// onCaptionDelete/onCaptionRestore are the caption hand-off hooks (Task
 	// 4). Function fields avoid TrashService importing CaptionFeeder
@@ -26,7 +53,13 @@ type TrashService struct {
 
 // NewTrashService constructs a TrashService.
 func NewTrashService(db *sql.DB, galleryDir, thumbDir string) *TrashService {
-	return &TrashService{db: db, galleryDir: galleryDir, thumbDir: thumbDir}
+	return &TrashService{
+		db:         db,
+		galleryDir: galleryDir,
+		thumbDir:   thumbDir,
+		scanRoots:  EnumerateScanRoots,
+		osRename:   os.Rename,
+	}
 }
 
 // SetCaptionDelete injects the caption-delete callback fired after a
@@ -41,8 +74,19 @@ func (s *TrashService) SetCaptionRestore(fn func(assetID string)) {
 	s.onCaptionRestore = fn
 }
 
-func (s *TrashService) trashDir(id string) string {
-	return filepath.Join(s.galleryDir, ".trash", id)
+// trashDirFor returns the .trash/<id>/ directory an asset currently at
+// filePath should be moved into: the .trash root under whichever
+// currently-mounted scan root filePath lives on, so the subsequent
+// os.Rename stays on the same device. Falls back to galleryDir when
+// filePath isn't under any currently-known scan root (e.g. an unusual
+// WatchDirs entry, or /proc/mounts being unreadable at the moment
+// EnumerateScanRoots ran).
+func (s *TrashService) trashDirFor(id, filePath string) string {
+	root := VolumeRootForPath(filePath, s.scanRoots())
+	if root == "" {
+		root = s.galleryDir
+	}
+	return filepath.Join(root, ".trash", id)
 }
 
 // TrashAsset moves an asset into the trash (including its Live Photo video
@@ -78,7 +122,7 @@ func (s *TrashService) TrashAsset(id string) error {
 }
 
 func (s *TrashService) moveToTrash(id, filePath string) error {
-	dstDir := s.trashDir(id)
+	dstDir := s.trashDirFor(id, filePath)
 	if err := os.MkdirAll(dstDir, 0755); err != nil {
 		return fmt.Errorf("moveToTrash mkdir: %w", err)
 	}
@@ -90,14 +134,69 @@ func (s *TrashService) moveToTrash(id, filePath string) error {
 	if _, err := s.db.Exec(
 		`UPDATE assets SET original_path=?, file_path=?, deleted_at=CURRENT_TIMESTAMP WHERE id=?`,
 		filePath, dst, id); err != nil {
+		os.RemoveAll(dstDir) //nolint:errcheck  clean up the just-created empty trash dir; the DB update never landed
 		return fmt.Errorf("moveToTrash update: %w", err)
 	}
-	if err := os.Rename(filePath, dst); err != nil && !os.IsNotExist(err) {
+	if err := s.renameOrCopy(filePath, dst); err != nil {
 		// Roll back so the row keeps pointing at the still-present original file.
 		s.db.Exec(`UPDATE assets SET original_path=NULL, file_path=?, deleted_at=NULL WHERE id=?`, filePath, id) //nolint:errcheck
+		// Clean up the trash dir the mkdir above created — otherwise it's an
+		// orphaned empty ".trash/<id>/" directory forever (this is exactly
+		// the leak the 2026-08-18 diagnosis found on disk).
+		os.RemoveAll(dstDir) //nolint:errcheck
 		return fmt.Errorf("moveToTrash rename: %w", err)
 	}
 	return nil
+}
+
+// renameOrCopy moves src to dst. It first tries the fast atomic os.Rename
+// path, which works here because trashDirFor/restoreFile always keep src and
+// dst on the same volume. If they still turn out to be on different devices
+// (EXDEV) — a defensive fallback for edge cases the volume-root matching
+// doesn't cover, e.g. a WatchDirs entry outside every EnumerateScanRoots
+// result, or the mount table changing between the two calls — it degrades to
+// a streamed copy + fsync + remove-source instead of failing outright.
+func (s *TrashService) renameOrCopy(src, dst string) error {
+	err := s.osRename(src, dst)
+	if err == nil || os.IsNotExist(err) {
+		return nil
+	}
+	if !errors.Is(err, syscall.EXDEV) {
+		return err
+	}
+	if cerr := copyFileContents(src, dst); cerr != nil {
+		os.Remove(dst) //nolint:errcheck  best-effort cleanup of a partial copy
+		return fmt.Errorf("cross-device copy: %w", cerr)
+	}
+	if rerr := os.Remove(src); rerr != nil && !os.IsNotExist(rerr) {
+		return fmt.Errorf("cross-device remove source: %w", rerr)
+	}
+	return nil
+}
+
+// copyFileContents streams src into dst and fsyncs before returning, so the
+// EXDEV fallback in renameOrCopy never removes the source file until the
+// copy is durably on disk.
+func copyFileContents(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close() //nolint:errcheck
+		return err
+	}
+	if err := out.Sync(); err != nil {
+		out.Close() //nolint:errcheck
+		return err
+	}
+	return out.Close()
 }
 
 // RestoreAsset moves an asset back to its original location (including its
@@ -149,7 +248,10 @@ func (s *TrashService) restoreFile(id, curPath, origPath string) error {
 		if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
 			return fmt.Errorf("restoreFile mkdir: %w", err)
 		}
-		if err := os.Rename(curPath, dst); err != nil && !os.IsNotExist(err) {
+		// Same-device in the ordinary case (curPath's trash dir was pinned to
+		// origPath's own volume by trashDirFor), with the same EXDEV fallback
+		// as moveToTrash for the same defensive edge cases.
+		if err := s.renameOrCopy(curPath, dst); err != nil {
 			return fmt.Errorf("restoreFile rename: %w", err)
 		}
 	}
@@ -211,8 +313,15 @@ func (s *TrashService) PurgeAsset(id string) error {
 }
 
 func (s *TrashService) purgeFiles(id, curPath string) {
-	os.Remove(curPath)                          //nolint:errcheck
-	os.RemoveAll(s.trashDir(id))                //nolint:errcheck
+	os.Remove(curPath) //nolint:errcheck
+	// The per-volume trash directory IS curPath's parent directory (moveToTrash
+	// joins filepath.Base(filePath) onto trashDirFor's result to get curPath),
+	// so removing it doesn't need to re-derive the volume root — it also
+	// correctly cleans up trash items created before this fix, whose curPath
+	// still points at the old fixed galleryDir/.trash/<id>/ layout.
+	if dir := filepath.Dir(curPath); dir != "." && dir != string(filepath.Separator) {
+		os.RemoveAll(dir) //nolint:errcheck
+	}
 	os.RemoveAll(filepath.Join(s.thumbDir, id)) //nolint:errcheck
 }
 
@@ -319,6 +428,47 @@ func (s *TrashService) trashIDs(whereExtra string) ([]string, error) {
 		ids = append(ids, id)
 	}
 	return ids, rows.Err()
+}
+
+// CleanupOrphanTrashDirs sweeps every currently-known trash root (the legacy
+// galleryDir fallback plus every currently-mounted scan root) for empty
+// ".trash/<id>/" directories and removes them. These are left behind by a
+// soft-delete whose file move failed after mkdir already created the
+// directory — moveToTrash now cleans up its own failure inline, but this is a
+// defensive sweep for anything left over from before this fix, or from a
+// crash mid-operation. Only directories that are BOTH empty AND older than
+// orphanTrashDirAge are removed, so a moveToTrash still in flight (mkdir done,
+// file not yet moved in) is never raced.
+func (s *TrashService) CleanupOrphanTrashDirs() {
+	roots := map[string]bool{s.galleryDir: true}
+	for _, r := range s.scanRoots() {
+		roots[r] = true
+	}
+	for root := range roots {
+		s.cleanupOrphanTrashDirsUnder(filepath.Join(root, ".trash"))
+	}
+}
+
+func (s *TrashService) cleanupOrphanTrashDirsUnder(trashRoot string) {
+	entries, err := os.ReadDir(trashRoot)
+	if err != nil {
+		return // no .trash under this root — nothing to do
+	}
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		dir := filepath.Join(trashRoot, e.Name())
+		inner, err := os.ReadDir(dir)
+		if err != nil || len(inner) != 0 {
+			continue // not empty (a real trashed file lives here), or unreadable — leave it alone
+		}
+		info, err := e.Info()
+		if err != nil || time.Since(info.ModTime()) < orphanTrashDirAge {
+			continue // too fresh — could be a moveToTrash still in flight
+		}
+		os.Remove(dir) //nolint:errcheck  best-effort; a stray dir is retried on the next sweep
+	}
 }
 
 // PurgeExpired permanently deletes trash items deleted before (now - retentionDays).

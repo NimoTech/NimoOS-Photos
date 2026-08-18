@@ -118,3 +118,29 @@ func TestParseRcloneMounts(t *testing.T) {
 	require.Equal(t, []string{"/mnt/a_gdrive_9 x", "/mnt/yu.wu_dropbox_1782892446"},
 		parseRcloneMounts(mounts))
 }
+
+// TestVolumeRootForPath covers the longest-prefix matching TrashService
+// relies on to pin an asset's trash directory to its own volume (see
+// trash.go's trashDirFor) instead of a single fixed root — the fix for the
+// 2026-08-18 delete-chain EXDEV diagnosis.
+func TestVolumeRootForPath(t *testing.T) {
+	roots := []string{"/DATA", "/media/RAID_0", "/media/RAID_0/.snapshots"}
+
+	cases := []struct {
+		name string
+		path string
+		want string
+	}{
+		{"under /DATA", "/DATA/Gallery/a.jpg", "/DATA"},
+		{"under /media/RAID_0", "/media/RAID_0/demo/photo.jpg", "/media/RAID_0"},
+		{"exact root match", "/media/RAID_0", "/media/RAID_0"},
+		{"longest match wins for nested roots", "/media/RAID_0/.snapshots/2026/x.jpg", "/media/RAID_0/.snapshots"},
+		{"no match returns empty", "/mnt/Disk-usb/x.jpg", ""},
+		{"sibling with shared prefix is not a false match", "/media/RAID_01/x.jpg", ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			require.Equal(t, c.want, VolumeRootForPath(c.path, roots))
+		})
+	}
+}
