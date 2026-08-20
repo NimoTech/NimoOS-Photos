@@ -10,6 +10,7 @@ type TimelineBucket struct {
 	Month      int `json:"month"`
 	Count      int `json:"count"`
 	VideoCount int `json:"videoCount"`
+	OCRCount   int `json:"ocrCount"`
 }
 
 // TimelineBuckets returns the per-month asset counts for the timeline, newest
@@ -30,7 +31,8 @@ func (s *SearchService) TimelineBuckets() ([]TimelineBucket, error) {
 SELECT COALESCE(CAST(strftime('%Y', COALESCE(a.taken_at, a.indexed_at)) AS INTEGER), 0),
        COALESCE(CAST(strftime('%m', COALESCE(a.taken_at, a.indexed_at)) AS INTEGER), 0),
        COUNT(*),
-       SUM(CASE WHEN COALESCE(a.mime_type,'') LIKE 'video/%' THEN 1 ELSE 0 END)
+       SUM(CASE WHEN COALESCE(a.mime_type,'') LIKE 'video/%' THEN 1 ELSE 0 END),
+       SUM(CASE WHEN `+hasOcrExpr+` THEN 1 ELSE 0 END)
 FROM assets a
 WHERE a.is_live_photo_video = 0 AND a.deleted_at IS NULL AND a.offline = 0
 GROUP BY strftime('%Y-%m', COALESCE(a.taken_at, a.indexed_at))
@@ -42,7 +44,7 @@ ORDER BY 1 DESC, 2 DESC`)
 	out := []TimelineBucket{}
 	for rows.Next() {
 		var b TimelineBucket
-		if err := rows.Scan(&b.Year, &b.Month, &b.Count, &b.VideoCount); err != nil {
+		if err := rows.Scan(&b.Year, &b.Month, &b.Count, &b.VideoCount, &b.OCRCount); err != nil {
 			return nil, err
 		}
 		out = append(out, b)
