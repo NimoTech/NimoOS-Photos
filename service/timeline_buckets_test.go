@@ -239,6 +239,47 @@ func TestTimelineBucketAssetsClampsLimit(t *testing.T) {
 	require.Len(t, page, 500)
 }
 
+// TestTimelineBucketsOCRCount pins the per-month OCRCount field: it must
+// count only assets that satisfy hasOcrExpr's density gate + is_doc
+// verdict, mirroring TestHasOcrExprTriState's semantics — a density-passing
+// OCR row with is_doc=0 is vetoed and must not be counted (the gate can't be
+// bypassed).
+func TestTimelineBucketsOCRCount(t *testing.T) {
+	db := openPerfDB(t)
+	seedOneMonthAssets(t, db, 2022, 3, 2) // month-202203-00000, month-202203-00001
+
+	// One of the two assets gets an OCR row that clears the density gate and
+	// is confirmed a document (is_doc=1) — must be counted.
+	_, err := db.Exec(`INSERT INTO asset_ocr(asset_id,text,coverage,line_count,is_doc) VALUES('month-202203-00000','x',0.1,20,1)`)
+	require.NoError(t, err)
+
+	svc := service.NewSearchService(db, nil)
+	buckets, err := svc.TimelineBuckets()
+	require.NoError(t, err)
+	require.Len(t, buckets, 1)
+	require.Equal(t, 2, buckets[0].Count)
+	require.Equal(t, 1, buckets[0].OCRCount, "one of two assets clears the OCR density gate + is_doc verdict")
+
+	// A second month: the OCR row's density gate passes but is_doc=0 vetoes
+	// it — must not be counted (density gate can't be bypassed by a rescue
+	// path, matching hasOcrExpr's documented semantics).
+	seedOneMonthAssets(t, db, 2022, 4, 1) // month-202204-00000
+	_, err = db.Exec(`INSERT INTO asset_ocr(asset_id,text,coverage,line_count,is_doc) VALUES('month-202204-00000','x',0.1,20,0)`)
+	require.NoError(t, err)
+
+	buckets, err = svc.TimelineBuckets()
+	require.NoError(t, err)
+	require.Len(t, buckets, 2)
+	var aprilBucket service.TimelineBucket
+	for _, b := range buckets {
+		if b.Year == 2022 && b.Month == 4 {
+			aprilBucket = b
+		}
+	}
+	require.Equal(t, 1, aprilBucket.Count)
+	require.Equal(t, 0, aprilBucket.OCRCount, "is_doc=0 vetoes even though the density gate passes")
+}
+
 func BenchmarkTimelineLegacyVsBucket(b *testing.B) {
 	db := openPerfDB(b)
 	seedPerfAssets(b, db, 100_000)
