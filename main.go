@@ -98,6 +98,20 @@ func main() {
 	// that never went through the new inline pre-generation path.
 	go svc.Indexer().BackfillSprites(ctx)
 
+	// One-shot exemplar-assignment migration: runs immediately (no startup
+	// delay -- unlike the sharpness backfill below, this isn't extra
+	// standalone work competing with the cold-start burst, it's just an
+	// explicit prompt for the clustering pipeline that would run anyway).
+	// Marker-guarded (RunExemplarMigration, service/exemplar_migrate.go), so
+	// it's a cheap no-op on every startup after the first. See that file and
+	// OVERVIEW.md's exemplar-assignment migration section for the lossless-
+	// first-pass guarantee this exists to trigger promptly.
+	go func() {
+		if err := svc.Faces().RunExemplarMigration(ctx); err != nil {
+			zap.L().Warn("exemplar-assignment migration failed", zap.Error(err))
+		}
+	}()
+
 	// One-shot pure-Go sharpness backfill for legacy face_detections rows
 	// (sharpness IS NULL) predating the quality-signal feature. Delayed a
 	// few minutes past startup so it doesn't compete with the cold-start

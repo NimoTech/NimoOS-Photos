@@ -14,6 +14,14 @@ var Cfg *Config
 // configPath is the file Init loaded from; Save writes back to the same file.
 var configPath = "/etc/nimoos/photos.conf"
 
+// calibratableConfigKeys mirrors service.calibratableKeys (kept as a separate
+// copy here to avoid an import cycle: service already imports pkg/config).
+// Any change to the self-calibratable threshold set must update both.
+var calibratableConfigKeys = []string{
+	"AssignAutoDist", "AssignSuggestDist",
+	"ClusterTightEps", "ClusterMergeEps", "MomentGapMinutes",
+}
+
 type Config struct {
 	RuntimePath      string
 	LogPath          string
@@ -94,6 +102,84 @@ type Config struct {
 	DocScoreFloor float64
 	DocSemFloor   float64
 	DocSemCeil    float64
+
+	// ClusterEngine selects the face-clustering algorithm: "apple" (default)
+	// runs the two-pass moment-greedy + complete-linkage HAC engine; "dbscan"
+	// keeps the legacy single-pass DBSCAN engine (ClusterEpsilon/assignEpsilon/
+	// suggestEpsilon). See OVERVIEW.md / the apple-engine SDD for the full
+	// rationale. Defaults to "apple" when absent from the config file.
+	ClusterEngine string
+	// MomentGapMinutes is the time gap (in minutes) used to segment a person's
+	// photos into "moments" for the apple engine's pass-1 greedy clustering:
+	// consecutive shots more than this far apart start a new moment. Defaults
+	// to 60 when absent from the config file.
+	MomentGapMinutes int
+	// ClusterTightEps is the cosine-distance epsilon for the apple engine's
+	// pass-1 greedy within-moment clustering — deliberately tighter than
+	// ClusterEpsilon since it only has to separate faces within a single
+	// moment, not across the whole library. Defaults to 0.35 when absent from
+	// the config file.
+	ClusterTightEps float64
+	// ClusterMergeEps is the cosine-distance stop threshold for the apple
+	// engine's pass-2 complete-linkage HAC merge of pass-1 clusters into
+	// persons. Defaults to 0.55 when absent from the config file.
+	ClusterMergeEps float64
+
+	// ── Exemplar templates + KNN assignment (replaces the anchored-person
+	//    centroid snap; see the exemplar-assignment SDD) ────────────────────
+	// ExemplarMaxPerPerson caps how many quality-gated exemplar faces a
+	// person keeps for KNN voting. Defaults to 24 when absent from the config file.
+	ExemplarMaxPerPerson int
+	// ExemplarMinScore/ExemplarMinFrontality/ExemplarMinSharpness are the
+	// quality gate a face_detections row must clear to become (or remain) an
+	// exemplar: detector score, pose frontality, and blur/sharpness, all in
+	// [0,1] (higher = better). Defaults to 0.75/0.5/0.3 when absent from the
+	// config file.
+	ExemplarMinScore      float64
+	ExemplarMinFrontality float64
+	ExemplarMinSharpness  float64
+	// AssignAutoDist is the KNN median-distance upper bound for auto-
+	// accepting a free-floating face onto a person (no human review).
+	// Defaults to 0.45 when absent from the config file.
+	AssignAutoDist float64
+	// AssignSuggestDist is the KNN median-distance upper bound for the
+	// "join" suggestion gray zone (AssignAutoDist, AssignSuggestDist]:
+	// queued for review rather than auto-accepted or discarded. Defaults to
+	// 0.60 when absent from the config file.
+	AssignSuggestDist float64
+	// AssignKNNK is the number of nearest exemplars (across all persons)
+	// consulted when voting on a free-floating face's assignment. Defaults
+	// to 5 when absent from the config file.
+	AssignKNNK int
+	// AssignMinVotes is the minimum number of the K nearest exemplars that
+	// must agree on the same person for that person to win the vote.
+	// Defaults to 3 when absent from the config file.
+	AssignMinVotes int
+
+	// ── Cluster-merge questions (gray-band merge suggestions) ────────────
+	// The apple engine's pass-2 HAC (see ClusterMergeEps) intentionally stops
+	// short of merging clusters whose complete-linkage distance exceeds
+	// ClusterMergeEps, to stay chaining-resistant. Cluster pairs just ABOVE
+	// that stop line are natural "almost merged" candidates: MergeSuggestBand
+	// widens the window (ClusterMergeEps, ClusterMergeEps+MergeSuggestBand]
+	// that a pair's distance must fall into to be surfaced as a
+	// merge_suggestions row (see service/merge_questions.go). Defaults to
+	// 0.06 when absent from the config file.
+	MergeSuggestBand float64
+	// MergeSuggestCap caps how many gray-band candidates are kept (closest
+	// dist first) per clustering pass, bounding both the write volume into
+	// merge_suggestions and the review queue's size. Defaults to 30 when
+	// absent from the config file.
+	MergeSuggestCap int
+
+	// Explicit records, for each of the five self-calibratable threshold keys
+	// (AssignAutoDist, AssignSuggestDist, ClusterTightEps, ClusterMergeEps,
+	// MomentGapMinutes), whether the config file explicitly set it. Threshold
+	// self-calibration must never override an operator's explicit choice, so
+	// it consults this map before adjusting a key; keys not in this set are
+	// absent. Populated from viper.IsSet before the default-backfill logic
+	// below runs (which would otherwise erase the explicit/default distinction).
+	Explicit map[string]bool
 }
 
 func Init(configFile, confSample string) error {
@@ -122,6 +208,18 @@ func Init(configFile, confSample string) error {
 	// watchDirs empty => watcher auto mode (scope = EnumerateScanRoots, i.e.
 	// the system disk + all mounted user partitions, dynamically following
 	// mounts); non-empty => manual watch list (backward compatible).
+
+	// Explicit tracking for the five self-calibratable threshold keys must be
+	// read via v.IsSet here, before the default-backfill `if !v.IsSet(...)`
+	// blocks further below run — those blocks only assign fallback values
+	// onto Cfg's fields, not onto v, so v.IsSet itself stays accurate
+	// regardless of order, but keeping this check up front avoids any future
+	// backfill logic accidentally shadowing the distinction.
+	explicit := make(map[string]bool, len(calibratableConfigKeys))
+	for _, key := range calibratableConfigKeys {
+		explicit[key] = v.IsSet("photos." + key)
+	}
+
 	Cfg = &Config{
 		RuntimePath:      v.GetString("common.RuntimePath"),
 		LogPath:          v.GetString("common.LogPath"),
@@ -150,6 +248,25 @@ func Init(configFile, confSample string) error {
 		DocScoreFloor: v.GetFloat64("photos.DocScoreFloor"),
 		DocSemFloor:   v.GetFloat64("photos.DocSemFloor"),
 		DocSemCeil:    v.GetFloat64("photos.DocSemCeil"),
+
+		ClusterEngine:    v.GetString("photos.ClusterEngine"),
+		MomentGapMinutes: v.GetInt("photos.MomentGapMinutes"),
+		ClusterTightEps:  v.GetFloat64("photos.ClusterTightEps"),
+		ClusterMergeEps:  v.GetFloat64("photos.ClusterMergeEps"),
+
+		ExemplarMaxPerPerson:  v.GetInt("photos.ExemplarMaxPerPerson"),
+		ExemplarMinScore:      v.GetFloat64("photos.ExemplarMinScore"),
+		ExemplarMinFrontality: v.GetFloat64("photos.ExemplarMinFrontality"),
+		ExemplarMinSharpness:  v.GetFloat64("photos.ExemplarMinSharpness"),
+		AssignAutoDist:        v.GetFloat64("photos.AssignAutoDist"),
+		AssignSuggestDist:     v.GetFloat64("photos.AssignSuggestDist"),
+		AssignKNNK:            v.GetInt("photos.AssignKNNK"),
+		AssignMinVotes:        v.GetInt("photos.AssignMinVotes"),
+
+		MergeSuggestBand: v.GetFloat64("photos.MergeSuggestBand"),
+		MergeSuggestCap:  v.GetInt("photos.MergeSuggestCap"),
+
+		Explicit: explicit,
 	}
 	if Cfg.RuntimePath == "" {
 		Cfg.RuntimePath = "/var/run/nimoos"
@@ -220,6 +337,60 @@ func Init(configFile, confSample string) error {
 	// The five doc-classification criteria (DocWSem/DocWGeo/DocScoreFloor/
 	// DocSemFloor/DocSemCeil) have no fallback here: a 0 value falls back to
 	// the empirical default in service/docscore.go's accessor (same pattern as simDisplayFloor).
+
+	// Cluster engine selector: defaults to "apple" when absent from the config.
+	if !v.IsSet("photos.ClusterEngine") {
+		Cfg.ClusterEngine = "apple"
+	}
+	// Moment segmentation gap (minutes): defaults to 60 when absent from the config.
+	if !v.IsSet("photos.MomentGapMinutes") {
+		Cfg.MomentGapMinutes = 60
+	}
+	// Apple engine pass-1 greedy epsilon: defaults to 0.35 when absent from the config.
+	if !v.IsSet("photos.ClusterTightEps") {
+		Cfg.ClusterTightEps = 0.35
+	}
+	// Apple engine pass-2 HAC stop distance: defaults to 0.55 when absent from the config.
+	if !v.IsSet("photos.ClusterMergeEps") {
+		Cfg.ClusterMergeEps = 0.55
+	}
+	// Exemplar template cap: defaults to 24 when absent from the config.
+	if !v.IsSet("photos.ExemplarMaxPerPerson") {
+		Cfg.ExemplarMaxPerPerson = 24
+	}
+	// Exemplar quality gate (score/frontality/sharpness): defaults to
+	// 0.75/0.5/0.3 when absent from the config.
+	if !v.IsSet("photos.ExemplarMinScore") {
+		Cfg.ExemplarMinScore = 0.75
+	}
+	if !v.IsSet("photos.ExemplarMinFrontality") {
+		Cfg.ExemplarMinFrontality = 0.5
+	}
+	if !v.IsSet("photos.ExemplarMinSharpness") {
+		Cfg.ExemplarMinSharpness = 0.3
+	}
+	// KNN assignment dual thresholds: defaults to 0.45/0.60 when absent from the config.
+	if !v.IsSet("photos.AssignAutoDist") {
+		Cfg.AssignAutoDist = 0.45
+	}
+	if !v.IsSet("photos.AssignSuggestDist") {
+		Cfg.AssignSuggestDist = 0.60
+	}
+	// KNN neighborhood size and minimum agreeing-vote count: defaults to 5/3 when absent from the config.
+	if !v.IsSet("photos.AssignKNNK") {
+		Cfg.AssignKNNK = 5
+	}
+	if !v.IsSet("photos.AssignMinVotes") {
+		Cfg.AssignMinVotes = 3
+	}
+	// Cluster-merge-question gray band: defaults to 0.06 (width above
+	// ClusterMergeEps) / 30 (max candidates per pass) when absent from the config.
+	if !v.IsSet("photos.MergeSuggestBand") {
+		Cfg.MergeSuggestBand = 0.06
+	}
+	if !v.IsSet("photos.MergeSuggestCap") {
+		Cfg.MergeSuggestCap = 30
+	}
 	return nil
 }
 

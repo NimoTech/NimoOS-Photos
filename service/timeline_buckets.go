@@ -32,7 +32,7 @@ SELECT COALESCE(CAST(strftime('%Y', COALESCE(a.taken_at, a.indexed_at)) AS INTEG
        COALESCE(CAST(strftime('%m', COALESCE(a.taken_at, a.indexed_at)) AS INTEGER), 0),
        COUNT(*),
        SUM(CASE WHEN COALESCE(a.mime_type,'') LIKE 'video/%' THEN 1 ELSE 0 END),
-       SUM(CASE WHEN `+hasOcrExpr+` THEN 1 ELSE 0 END)
+       SUM(CASE WHEN ` + hasOcrExpr + ` THEN 1 ELSE 0 END)
 FROM assets a
 WHERE a.is_live_photo_video = 0 AND a.deleted_at IS NULL AND a.offline = 0
 GROUP BY strftime('%Y-%m', COALESCE(a.taken_at, a.indexed_at))

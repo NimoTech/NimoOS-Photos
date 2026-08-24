@@ -551,11 +551,20 @@ func TestRunClustering_HiddenPersonNotDeletedAndExcludedFromNewClusters(t *testi
 	require.NoError(t, db.QueryRow(`SELECT hidden FROM persons WHERE id=?`, pid).Scan(&hidden))
 	require.Equal(t, 1, hidden)
 
-	// The nearby face is snapped onto the hidden person (hidden also
-	// participates in snapping as an anchor)
+	// Pre-exemplar-assignment (Task 4 of the exemplar-assignment SDD), the
+	// nearby face used to snap onto the hidden person via a raw
+	// centroid+assignEpsilon distance check. The apple engine (default here)
+	// now instead requires the anchored person to have quality-gated
+	// exemplars and a KNN vote that clears assignMinVotes (default 3) --
+	// hp-1 here has no score/frontality/sharpness signals at all, so it
+	// gates out of SelectExemplars entirely, leaving the hidden person with
+	// zero exemplars; Match therefore always returns "none" for it, and hp-2
+	// stays free (see faces_assign_test.go for the exemplar-gated case that
+	// does snap, and TestRunClustering_EngineSplit_QualityGateOnlyAppliesToApple
+	// for the dbscan engine, which is unaffected and still snaps here).
 	var cnt int
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM face_person WHERE person_id=?`, pid).Scan(&cnt))
-	require.Equal(t, 2, cnt)
+	require.Equal(t, 1, cnt, "apple engine: without quality signals the hidden person has no exemplars to match against")
 }
 
 func TestRunClustering_PreservesNamedAcrossReruns(t *testing.T) {
@@ -586,10 +595,16 @@ func TestRunClustering_PreservesNamedAcrossReruns(t *testing.T) {
 	require.NoError(t, db.QueryRow(`SELECT name FROM persons WHERE id=?`, pid).Scan(&name))
 	require.Equal(t, "Alice", name)
 
-	// The newly added face is snapped onto Alice (2 faces under Alice now)
+	// Pre-exemplar-assignment (Task 4 of the exemplar-assignment SDD), the
+	// newly added face used to snap onto Alice via a raw centroid+
+	// assignEpsilon distance check. The apple engine (default here) now
+	// requires quality-gated exemplars and a KNN vote clearing
+	// assignMinVotes (default 3); asset-a1 has no score/frontality/sharpness
+	// signals, so Alice has zero exemplars and asset-a2 stays free instead
+	// (see faces_assign_test.go for the exemplar-gated case that does join).
 	var cnt int
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM face_person WHERE person_id=?`, pid).Scan(&cnt))
-	require.Equal(t, 2, cnt)
+	require.Equal(t, 1, cnt, "apple engine: without quality signals Alice has no exemplars to match against")
 
 	// centroid/confidence have been written back
 	var conf float64
