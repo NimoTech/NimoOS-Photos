@@ -3,8 +3,10 @@ package v1
 import (
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/NimoTech/NimoOS-Photos/service"
 	"github.com/labstack/echo/v4"
@@ -238,6 +240,26 @@ func (h *PersonsHandler) FaceThumbnail(c echo.Context) error {
 	return c.File(path)
 }
 
+// GET /v1/photos/faces/:id/thumbnail
+//
+// Serves a cropped, cached square thumbnail for an arbitrary face_detections
+// id, independent of person membership — a suggestions-inbox candidate face
+// may be a free-floating face not (yet, or no longer) attached to any
+// person. JWT-exempt via the generic "*/thumbnail" suffix rule in
+// mediaGetSkip (route/router.go) — no separate rule needed, <img> tags can't
+// attach an Authorization header. 404s for an unknown face id or an
+// offline/deleted owning asset (see service.PersonService.FaceThumbnailByID).
+func (h *PersonsHandler) FaceThumbnailByID(c echo.Context) error {
+	path, err := h.svc.Persons().FaceThumbnailByID(c.Param("id"), h.faceThumbDir, h.thumbDir)
+	if errors.Is(err, service.ErrNotFound) {
+		return echo.NewHTTPError(http.StatusNotFound)
+	}
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	}
+	return c.File(path)
+}
+
 // POST /v1/photos/persons/:id/detach  { assetIds: [...] }
 //
 // Removes all faces belonging to this person among assetIds, and marks them excluded=1 so they never re-cluster back.
@@ -304,8 +326,205 @@ func (h *PersonsHandler) RejectSuggestion(c echo.Context) error {
 	return c.JSON(http.StatusOK, map[string]string{"status": "rejected"})
 }
 
+// ── Cluster-merge questions API (durable gray-band merge suggestions) ─────
+// Distinct from MergeSuggestions/RejectSuggestion above (the legacy
+// on-the-fly, named-centroid-only computation) and from the
+// PersonSuggestion(s) join/review queue below: this is the apple engine's
+// HAC-gray-band queue, generated durably during RunClustering and persisted
+// in merge_suggestions/face_negative_pairs. See service/merge_questions.go
+// and OVERVIEW.md's "Cluster-merge questions" section.
+
+// GET /v1/photos/persons/merge-suggestions/v2
+//
+// Lists every open cluster-merge question (dist ascending), hidden persons
+// excluded on either side. Must be registered before GET /persons/:id in
+// route/router.go, same route-order trap as /persons/hidden and
+// /persons/suggestions.
+func (h *PersonsHandler) MergeQuestions(c echo.Context) error {
+	pairs, err := h.svc.Persons().ListMergeQuestions()
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	}
+	return c.JSON(http.StatusOK, map[string]any{"pairs": pairs})
+}
+
+// POST /v1/photos/persons/merge-suggestions/v2/:id/accept
+func (h *PersonsHandler) AcceptMergeQuestion(c echo.Context) error {
+	dec, err := h.svc.Persons().AcceptMergeSuggestion(c.Param("id"))
+	if errors.Is(err, service.ErrNotFound) {
+		return echo.NewHTTPError(http.StatusNotFound)
+	}
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	}
+	return c.JSON(http.StatusOK, dec)
+}
+
+// POST /v1/photos/persons/merge-suggestions/v2/:id/reject
+func (h *PersonsHandler) RejectMergeQuestion(c echo.Context) error {
+	dec, err := h.svc.Persons().RejectMergeSuggestion(c.Param("id"))
+	if errors.Is(err, service.ErrNotFound) {
+		return echo.NewHTTPError(http.StatusNotFound)
+	}
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	}
+	return c.JSON(http.StatusOK, dec)
+}
+
 // POST /v1/photos/persons/recluster
 func (h *PersonsHandler) Recluster(c echo.Context) error {
 	go h.svc.Faces().RunClustering(h.ctx) //nolint:errcheck
 	return c.JSON(http.StatusAccepted, map[string]string{"status": "started"})
+}
+
+// ── Person suggestions API (Task 6 of the exemplar-assignment plan) ───────
+// Distinct from MergeSuggestions/RejectSuggestion above (a different table
+// and workflow: merge-candidate pairs, not join/review gray-zone faces).
+// Handler names below carry the "PersonSuggestion(s)" qualifier specifically
+// to avoid colliding with (and being confused for) that older concept.
+
+// GET /v1/photos/persons/suggestions
+//
+// Lists every open join/review suggestion, grouped by person (hidden
+// persons' suggestions excluded). Must be registered before GET
+// /persons/:id in route/router.go, or "suggestions" would be swallowed as an
+// :id lookup — same route-order trap as /persons/hidden.
+func (h *PersonsHandler) PersonSuggestions(c echo.Context) error {
+	groups, err := h.svc.Persons().ListSuggestions()
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	}
+	return c.JSON(http.StatusOK, map[string]any{"groups": groups})
+}
+
+// POST /v1/photos/persons/suggestions/:id/accept
+func (h *PersonsHandler) AcceptPersonSuggestion(c echo.Context) error {
+	dec, err := h.svc.Persons().AcceptSuggestion(c.Param("id"))
+	if errors.Is(err, service.ErrNotFound) {
+		return echo.NewHTTPError(http.StatusNotFound)
+	}
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	}
+	return c.JSON(http.StatusOK, dec)
+}
+
+// POST /v1/photos/persons/suggestions/:id/reject
+func (h *PersonsHandler) RejectPersonSuggestion(c echo.Context) error {
+	dec, err := h.svc.Persons().RejectSuggestion(c.Param("id"))
+	if errors.Is(err, service.ErrNotFound) {
+		return echo.NewHTTPError(http.StatusNotFound)
+	}
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	}
+	return c.JSON(http.StatusOK, dec)
+}
+
+// suggestionBatchResult is one id's outcome within BatchPersonSuggestions'
+// response map: "accepted"/"rejected" on success, "error" (with a message)
+// when the id was unknown or belonged to a hidden person.
+type suggestionBatchResult struct {
+	Status    string     `json:"status"`
+	DecidedAt *time.Time `json:"decidedAt,omitempty"`
+	Error     string     `json:"error,omitempty"`
+}
+
+// ── Threshold self-calibration API (Task 9) ───────────────────────────────
+// Status/history/factory-profile hot-update for the self-calibration
+// runner (service/calibrate_run.go). All three back onto *FaceService
+// (service/calibrate_api.go), never a second implementation of the
+// resolver/truth-loading logic those files already own.
+
+// GET /v1/photos/persons/calibration
+//
+// Must be registered before GET /persons/:id in route/router.go, same
+// route-order trap as /persons/hidden and /persons/suggestions above --
+// otherwise "calibration" would be swallowed as an :id lookup.
+func (h *PersonsHandler) GetCalibration(c echo.Context) error {
+	status, err := h.svc.Faces().CalibrationStatus()
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	}
+	return c.JSON(http.StatusOK, status)
+}
+
+// GET /v1/photos/persons/calibration/history?limit=
+//
+// Must precede GET /persons/:id for the same route-order reason as
+// /persons/calibration above.
+func (h *PersonsHandler) CalibrationHistory(c echo.Context) error {
+	limit, _ := strconv.Atoi(c.QueryParam("limit"))
+	runs, err := h.svc.Faces().CalibrationHistory(limit)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	}
+	return c.JSON(http.StatusOK, map[string]any{"runs": runs})
+}
+
+// PUT /v1/photos/persons/calibration/profile
+//
+// Factory-profile hot-update: the request body is the complete profile
+// document, validated and persisted by UpdateCalibrationProfile. Unlike the
+// two read-only endpoints above, this write can move every self-calibration
+// safety rail, so it must NEVER be added to route/router.go's JWT-exempt
+// mediaGetSkip suffix list -- it is deliberately absent from it (verified in
+// route/v1/persons_calibration_test.go and route/router.go's own route-order
+// comment at registration).
+func (h *PersonsHandler) PutCalibrationProfile(c echo.Context) error {
+	raw, err := io.ReadAll(c.Request().Body)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, "failed to read request body")
+	}
+	version, err := h.svc.Faces().UpdateCalibrationProfile(raw)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, err.Error())
+	}
+	return c.JSON(http.StatusOK, map[string]int{"version": version})
+}
+
+// POST /v1/photos/persons/suggestions/batch  { "accept": [ids], "reject": [ids] }
+//
+// Response: { "results": { "<id>": {"status": "accepted"|"rejected"|"error",
+// "decidedAt"?, "error"?} } }. Every id is processed independently (each
+// accept/reject call is its own transaction, per decideSuggestion — one id's
+// failure never rolls back another's decision) and the endpoint always
+// returns 200 with the per-id result map, so the caller can render a
+// partial-success summary instead of treating the whole batch as failed. An
+// id present in both arrays is processed accept-then-reject in that order,
+// so the reject outcome wins that id's slot in the result map.
+func (h *PersonsHandler) BatchPersonSuggestions(c echo.Context) error {
+	var req struct {
+		Accept []string `json:"accept"`
+		Reject []string `json:"reject"`
+	}
+	if err := c.Bind(&req); err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, "invalid request body")
+	}
+	results := map[string]suggestionBatchResult{}
+	decide := func(id string, accept bool) {
+		var dec *service.SuggestionDecision
+		var err error
+		if accept {
+			dec, err = h.svc.Persons().AcceptSuggestion(id)
+		} else {
+			dec, err = h.svc.Persons().RejectSuggestion(id)
+		}
+		switch {
+		case errors.Is(err, service.ErrNotFound):
+			results[id] = suggestionBatchResult{Status: "error", Error: "not found"}
+		case err != nil:
+			results[id] = suggestionBatchResult{Status: "error", Error: err.Error()}
+		default:
+			results[id] = suggestionBatchResult{Status: dec.Status, DecidedAt: dec.DecidedAt}
+		}
+	}
+	for _, id := range req.Accept {
+		decide(id, true)
+	}
+	for _, id := range req.Reject {
+		decide(id, false)
+	}
+	return c.JSON(http.StatusOK, map[string]any{"results": results})
 }

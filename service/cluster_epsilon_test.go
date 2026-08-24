@@ -24,7 +24,15 @@ func TestClusterEpsilonConfigDriven(t *testing.T) {
 		insertAssetFace(t, db, "fb", normalize(b))
 
 		old := config.Cfg
-		config.Cfg = &config.Config{ClusterEpsilon: eps, FacesEnabled: true}
+		// Pin ClusterEngine to "dbscan": this test is specifically about
+		// clusterEpsilon()'s config wiring, which only the dbscan path
+		// consumes. Since Task 5 (wire the two-pass engine behind
+		// photos.ClusterEngine) made "apple" the actual default engine
+		// (previously RunClustering always ran DBSCAN regardless of this
+		// config key), leaving ClusterEngine unset here would silently
+		// switch this fixture onto the apple engine's tightEps/mergeEps
+		// thresholds instead of exercising ClusterEpsilon at all.
+		config.Cfg = &config.Config{ClusterEngine: "dbscan", ClusterEpsilon: eps, FacesEnabled: true}
 		defer func() { config.Cfg = old }()
 
 		require.NoError(t, service.NewFaceService(db).RunClustering(context.Background()))

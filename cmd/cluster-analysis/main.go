@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"os"
 	"runtime"
 	"sort"
 	"sync"
@@ -44,12 +45,18 @@ const (
 )
 
 type Face struct {
-	ID       string
-	AssetID  string
-	Vec      []float32
-	MinSide  float64 // bbox min(width,height) in px
-	HasExif  bool
-	ImgMinD  float64 // min(width,height) of the image, px (only valid if HasExif)
+	ID      string
+	AssetID string
+	Vec     []float32
+	MinSide float64 // bbox min(width,height) in px
+	HasExif bool
+	ImgMinD float64 // min(width,height) of the image, px (only valid if HasExif)
+	// TakenAt/IndexedAt are the owning asset's capture/index timestamps, used
+	// by -mode twopass's service.SegmentMoments call. Zero value when the
+	// underlying column is NULL (same convention as service's faceRow /
+	// parseSQLiteTime: NULL -> zero time.Time, never an error).
+	TakenAt   time.Time
+	IndexedAt time.Time
 }
 
 type namedPerson struct {
@@ -88,6 +95,30 @@ func cosDist(a, b []float32) float64 {
 	return 1.0 - cos
 }
 
+// parseSQLiteTime reimplements service's unexported parseSQLiteTime (in
+// persons.go): parses a TEXT timestamp written by GORM (RFC3339 with offset,
+// or the legacy "2006-01-02 15:04:05.000000-07:00" form), returning nil for
+// a NULL/empty/unparseable column so callers can cleanly fall back to a zero
+// time.Time -- the same NULL-handling convention as service's faceRow.
+func parseSQLiteTime(s sql.NullString) *time.Time {
+	if !s.Valid || s.String == "" {
+		return nil
+	}
+	layouts := []string{
+		time.RFC3339Nano,
+		time.RFC3339,
+		"2006-01-02 15:04:05.999999999-07:00",
+		"2006-01-02 15:04:05-07:00",
+		"2006-01-02 15:04:05",
+	}
+	for _, l := range layouts {
+		if t, err := time.Parse(l, s.String); err == nil {
+			return &t
+		}
+	}
+	return nil
+}
+
 func mustOpenRO(dbPath string) *sql.DB {
 	db, err := sql.Open("sqlite3", "file:"+dbPath+"?mode=ro")
 	if err != nil {
@@ -101,7 +132,7 @@ func mustOpenRO(dbPath string) *sql.DB {
 
 func loadFaces(db *sql.DB) []Face {
 	rows, err := db.Query(`
-		SELECT fd.id, fd.asset_id, fd.embedding, fd.bbox
+		SELECT fd.id, fd.asset_id, fd.embedding, fd.bbox, a.taken_at, a.indexed_at
 		FROM face_detections fd
 		JOIN assets a ON a.id = fd.asset_id
 		WHERE fd.excluded = 0`)
@@ -115,8 +146,15 @@ func loadFaces(db *sql.DB) []Face {
 		var f Face
 		var blob []byte
 		var bboxStr string
-		if err := rows.Scan(&f.ID, &f.AssetID, &blob, &bboxStr); err != nil {
+		var takenAtStr, indexedAtStr sql.NullString
+		if err := rows.Scan(&f.ID, &f.AssetID, &blob, &bboxStr, &takenAtStr, &indexedAtStr); err != nil {
 			log.Fatalf("scan face: %v", err)
+		}
+		if t := parseSQLiteTime(takenAtStr); t != nil {
+			f.TakenAt = *t
+		}
+		if t := parseSQLiteTime(indexedAtStr); t != nil {
+			f.IndexedAt = *t
 		}
 		f.Vec = sqlite.DeserializeFloat32(blob)
 		var bb bboxJSON
@@ -314,35 +352,10 @@ func distStats(vals []float64) (min, p10, median, p90, max, mean float64) {
 	return
 }
 
-func main() {
-	dbPathFlag := flag.String("db", "", "path to a READ-ONLY copy of the Photos sqlite DB (required; opened with mode=ro, never written)")
-	epsFlag := flag.Float64("eps", 0.48, "DBSCAN cosine-distance epsilon to validate (production default since C1 is 0.48; see pkg/config ClusterEpsilon)")
-	minPtsFlag := flag.Int("minpts", 1, "DBSCAN minPoints to validate")
-	minConfFlag := flag.Float64("minconf", 0.5, "MinPersonConfidence gate to compare the residual cluster's confidence against (production default)")
-	flag.Parse()
-
-	if *dbPathFlag == "" {
-		fmt.Println("usage: cluster-analysis -db <path-to-readonly-photos.db-copy> [-eps 0.48] [-minpts 1] [-minconf 0.5]")
-		log.Fatal("-db is required")
-	}
-
-	db := mustOpenRO(*dbPathFlag)
-	defer db.Close()
-
-	fmt.Println("=== Loading faces (excluded=0, joined to live assets) ===")
-	faces := loadFaces(db)
-	N := len(faces)
-	fmt.Printf("Loaded %d faces\n", N)
-
-	idOf := make(map[string]int, N)
-	for i, f := range faces {
-		idOf[f.ID] = i
-	}
-
-	// --- Ground truth: garbage cluster + named persons ---
-	garbageFaceIDs := queryPersonFaceIDs(db, garbageClusterPersonID)
-	fmt.Printf("Garbage cluster (%s) member faces: %d\n", garbageClusterPersonID, len(garbageFaceIDs))
-
+// loadNamedPersons queries every named (non-anonymous) person and their
+// member face IDs, as the shared ground truth used by both the legacy
+// eps/minPoints study and -mode twopass's grid scan.
+func loadNamedPersons(db *sql.DB) []namedPerson {
 	var named []namedPerson
 	nrows, err := db.Query(`SELECT id, name FROM persons WHERE name != '' ORDER BY name`)
 	if err != nil {
@@ -359,10 +372,63 @@ func main() {
 	for i := range named {
 		named[i].faceIDs = queryPersonFaceIDs(db, named[i].id)
 	}
+	return named
+}
+
+func main() {
+	dbPathFlag := flag.String("db", "", "path to a READ-ONLY copy of the Photos sqlite DB (required; opened with mode=ro, never written)")
+	epsFlag := flag.Float64("eps", 0.48, "DBSCAN cosine-distance epsilon to validate (production default since C1 is 0.48; see pkg/config ClusterEpsilon)")
+	minPtsFlag := flag.Int("minpts", 1, "DBSCAN minPoints to validate")
+	minConfFlag := flag.Float64("minconf", 0.5, "MinPersonConfidence gate to compare the residual cluster's confidence against (production default)")
+	modeFlag := flag.String("mode", "", `analysis mode: "" (default, legacy eps x minPoints DBSCAN calibration study), "twopass" (Task 6: two-pass Apple-engine T_tight x T_merge grid scan across gap in {30,60,120}min), "knn" (KNN exemplar-assignment T_auto x T_suggest calibration from confirmed/negative ground truth), or "merge" (T-merge cluster-merge cut-point calibration from decided merge_suggestions rows)`)
+	knnKFlag := flag.Int("knnk", 5, "AssignKNNK: number of nearest exemplars used per KNN median-distance computation in -mode knn (production default per pkg/config AssignKNNK)")
+	flag.Parse()
+
+	if *dbPathFlag == "" {
+		fmt.Println("usage: cluster-analysis -db <path-to-readonly-photos.db-copy> [-eps 0.48] [-minpts 1] [-minconf 0.5] [-mode twopass|knn|merge] [-knnk 5]")
+		log.Fatal("-db is required")
+	}
+
+	db := mustOpenRO(*dbPathFlag)
+	defer db.Close()
+
+	fmt.Println("=== Loading faces (excluded=0, joined to live assets) ===")
+	faces := loadFaces(db)
+	N := len(faces)
+	fmt.Printf("Loaded %d faces\n", N)
+
+	idOf := make(map[string]int, N)
+	for i, f := range faces {
+		idOf[f.ID] = i
+	}
+
+	named := loadNamedPersons(db)
 	fmt.Println("Named persons (ground truth):")
 	for _, np := range named {
 		fmt.Printf("  %-10s %s  faces=%d\n", np.name, np.id, len(np.faceIDs))
 	}
+
+	if *modeFlag == "twopass" {
+		runTwoPass(faces, named)
+		fmt.Println("\n=== DONE ===")
+		return
+	}
+
+	if *modeFlag == "knn" {
+		runKNN(os.Stdout, db, *knnKFlag)
+		fmt.Println("\n=== DONE ===")
+		return
+	}
+
+	if *modeFlag == "merge" {
+		runMerge(os.Stdout, db)
+		fmt.Println("\n=== DONE ===")
+		return
+	}
+
+	// --- Ground truth: garbage cluster (twopass mode above doesn't need it) ---
+	garbageFaceIDs := queryPersonFaceIDs(db, garbageClusterPersonID)
+	fmt.Printf("Garbage cluster (%s) member faces: %d\n", garbageClusterPersonID, len(garbageFaceIDs))
 
 	fmt.Println("\n=== Building full pairwise cosine-distance matrix ===")
 	vecs := make([][]float32, N)
@@ -549,13 +615,7 @@ func validateFinalConfig(faces []Face, idOf map[string]int, vecs [][]float32, na
 		if total == 0 {
 			continue
 		}
-		bestLbl, bestCnt := -1, 0
-		for l, c := range labelCount {
-			if c > bestCnt {
-				bestCnt = c
-				bestLbl = l
-			}
-		}
+		bestLbl, bestCnt := service.PickMajorityLabel(labelCount, sizes)
 		purity := float64(bestCnt) / float64(sizes[bestLbl])
 		puritySum += purity
 		purityN++
