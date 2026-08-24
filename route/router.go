@@ -224,33 +224,10 @@ func InitRouter(ctx context.Context, svc service.Services, runtimePath string, t
 	g.GET("/persons", persons.List)
 	g.GET("/persons/merge-suggestions", persons.MergeSuggestions)
 	g.POST("/persons/merge-suggestions/reject", persons.RejectSuggestion)
-	// Cluster-merge questions (durable HAC gray-band queue) -- must precede
-	// GET /persons/:id for the same route-order reason as /persons/hidden
-	// above ("merge-suggestions" would otherwise be swallowed as an :id
-	// lookup on some routers; kept alongside the legacy merge-suggestions
-	// routes above for discoverability).
-	g.GET("/persons/merge-suggestions/v2", persons.MergeQuestions)
-	g.POST("/persons/merge-suggestions/v2/:id/accept", persons.AcceptMergeQuestion)
-	g.POST("/persons/merge-suggestions/v2/:id/reject", persons.RejectMergeQuestion)
 	g.POST("/persons/merge", persons.Merge)
 	g.POST("/persons/recluster", persons.Recluster)
 	// Must precede GET /persons/:id — otherwise "hidden" is swallowed as an :id lookup.
 	g.GET("/persons/hidden", persons.ListHidden)
-	// Must precede GET /persons/:id for the same reason as /persons/hidden
-	// above — otherwise "suggestions" would be swallowed as an :id lookup.
-	g.GET("/persons/suggestions", persons.PersonSuggestions)
-	g.POST("/persons/suggestions/batch", persons.BatchPersonSuggestions)
-	g.POST("/persons/suggestions/:id/accept", persons.AcceptPersonSuggestion)
-	g.POST("/persons/suggestions/:id/reject", persons.RejectPersonSuggestion)
-	// Threshold self-calibration status/history/profile endpoints -- must
-	// precede GET /persons/:id for the same route-order reason as
-	// /persons/hidden and /persons/suggestions above, otherwise "calibration"
-	// would be swallowed as an :id lookup. None of these three paths match
-	// any mediaGetSkip suffix, and PUT profile is deliberately NOT added to
-	// any JWT-exempt list: it can move every self-calibration safety rail.
-	g.GET("/persons/calibration", persons.GetCalibration)
-	g.GET("/persons/calibration/history", persons.CalibrationHistory)
-	g.PUT("/persons/calibration/profile", persons.PutCalibrationProfile)
 	g.GET("/persons/:id", persons.Get)
 	g.PUT("/persons/:id", persons.Update)
 	g.DELETE("/persons/:id", persons.Delete)
@@ -260,12 +237,6 @@ func InitRouter(ctx context.Context, svc service.Services, runtimePath string, t
 	g.GET("/persons/:id/relations", persons.Relations)
 	g.GET("/persons/:id/places", persons.Places)
 	g.GET("/persons/:id/face-thumbnail", persons.FaceThumbnail)
-	// Arbitrary face thumbnail by face_detections id, independent of person
-	// membership (used by the suggestions inbox to render a candidate face
-	// that may not belong to any person yet). Already covered by the
-	// existing generic "*/thumbnail" suffix rule in mediaGetSkip above — no
-	// separate JWT-exemption entry needed.
-	g.GET("/faces/:id/thumbnail", persons.FaceThumbnailByID)
 	g.POST("/persons/:id/detach", persons.Detach)
 	g.PUT("/persons/:id/cover", persons.SetCover)
 	g.DELETE("/persons/:id/cover", persons.DeleteCover)

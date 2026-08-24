@@ -3,8 +3,6 @@ package main
 import (
 	"fmt"
 	"sort"
-
-	"github.com/NimoTech/NimoOS-Photos/service"
 )
 
 // ---------- Q1: chaining anatomy ----------
@@ -302,7 +300,13 @@ func evalCombo(indices []int, eps float64, minPts int, idOf map[string]int, name
 		if total == 0 {
 			continue
 		}
-		bestLbl, bestCnt := service.PickMajorityLabel(labelCount, sizes)
+		bestLbl, bestCnt := -1, 0
+		for l, c := range labelCount {
+			if c > bestCnt {
+				bestCnt = c
+				bestLbl = l
+			}
+		}
 		recall := float64(bestCnt) / float64(total)
 		purity := float64(bestCnt) / float64(sizes[bestLbl])
 		recallSum += recall

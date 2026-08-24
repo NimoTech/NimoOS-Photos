@@ -40,12 +40,6 @@ func TestServicesExposesGeo(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	svc := NewService(ctx, cfg, func(Task) {})
-	// NewService wires the package-level calibration resolver
-	// (SetCalibrationDB) to this test's own db; reset it so later tests in
-	// this binary that never call NewService keep seeing their expected
-	// "no calibration DB wired" default, rather than a leaked pointer into
-	// this test's (soon torn down) db.
-	t.Cleanup(func() { SetCalibrationDB(nil) })
 
 	require.NotNil(t, svc.Geo())
 }
@@ -72,7 +66,6 @@ func TestNewService_TaskPublisherWired(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	svc := NewService(ctx, cfg, pub)
-	t.Cleanup(func() { SetCalibrationDB(nil) }) // see TestServicesExposesGeo's comment
 
 	svc.Tasks().Upsert(Task{
 		ID: "t1", Type: "index", Label: "Indexing photos",
@@ -117,7 +110,6 @@ func TestNewService_BatchDoneTriggersFacePipeline(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	svc := NewService(ctx, cfg, pub)
-	t.Cleanup(func() { SetCalibrationDB(nil) }) // see TestServicesExposesGeo's comment
 
 	svc.Indexer().SetIngestIdleTimeout(200 * time.Millisecond)
 	go svc.Indexer().Start(ctx)
@@ -166,7 +158,6 @@ func TestNewService_BatchDoneTriggersEmbedBackfill(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	svc := NewService(ctx, cfg, pub)
-	t.Cleanup(func() { SetCalibrationDB(nil) }) // see TestServicesExposesGeo's comment
 
 	svc.Indexer().SetIngestIdleTimeout(200 * time.Millisecond)
 	go svc.Indexer().Start(ctx)

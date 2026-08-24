@@ -46,7 +46,6 @@ func TestMediaGetSkip(t *testing.T) {
 		{"GET assets/:id/preview allowed", http.MethodGet, base + "/assets/:id/preview", true},
 		{"GET assets/:id/sprite allowed", http.MethodGet, base + "/assets/:id/sprite", true},
 		{"GET assets/:id/thumbnail allowed", http.MethodGet, base + "/assets/:id/thumbnail", true},
-		{"GET faces/:id/thumbnail allowed", http.MethodGet, base + "/faces/:id/thumbnail", true},
 		{"GET favorites/export allowed", http.MethodGet, base + "/favorites/export", true},
 		{"GET albums/:id/export allowed", http.MethodGet, base + "/albums/:id/export", true},
 		{"POST albums/:id/export NOT allowed (method pre-check)", http.MethodPost, base + "/albums/:id/export", false},
@@ -115,7 +114,6 @@ func newTestJWTRouter() *echo.Echo {
 	g.POST("/smart-views/preview", ok)
 	g.GET("/assets/:id/preview", ok)
 	g.GET("/assets/:id/sprite", ok)
-	g.GET("/faces/:id/thumbnail", ok)
 	return e
 }
 
@@ -148,21 +146,6 @@ func TestJWTExemption_PreviewSuffixCollision(t *testing.T) {
 	e.ServeHTTP(getSpriteRec, getSprite)
 	require.Equal(t, http.StatusOK, getSpriteRec.Code,
 		"GET /assets/:id/sprite should remain JWT-exempt and reach the handler normally")
-}
-
-// TestJWTExemption_FaceThumbnailByID is a route-layer test proving GET
-// /faces/:id/thumbnail (the arbitrary-face-id thumbnail endpoint the
-// suggestions inbox uses) is JWT-exempt without a dedicated Skipper rule —
-// it rides the existing generic "*/thumbnail" suffix whitelist already
-// covering GET /assets/:id/thumbnail.
-func TestJWTExemption_FaceThumbnailByID(t *testing.T) {
-	e := newTestJWTRouter()
-
-	req := httptest.NewRequest(http.MethodGet, common.V1APIPath+"/faces/abc/thumbnail", nil)
-	rec := httptest.NewRecorder()
-	e.ServeHTTP(rec, req)
-	require.Equal(t, http.StatusOK, rec.Code,
-		"GET /faces/:id/thumbnail must be JWT-exempt via the generic */thumbnail suffix rule")
 }
 
 // TestJWTExemption_Healthz is a route-layer regression test for the /healthz

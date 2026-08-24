@@ -36,82 +36,6 @@ func minPersonConfidence() float64 {
 	return 0.0
 }
 
-// ── Exemplar templates + KNN assignment accessors (replaces the
-//    anchored-person centroid snap; see the exemplar-assignment SDD) ───────
-// All six follow the clusterEpsilon()-style nil-config-fallback pattern:
-// config.Cfg nil (service constructed directly in tests), or a config file
-// predating these keys (zero Go value), both fall back to the documented
-// default rather than the unusable zero.
-
-// exemplarCap returns the configured max exemplar faces kept per person.
-// Falls back to 24 when config isn't initialized or the value is non-positive.
-func exemplarCap() int {
-	if config.Cfg != nil && config.Cfg.ExemplarMaxPerPerson > 0 {
-		return config.Cfg.ExemplarMaxPerPerson
-	}
-	return 24
-}
-
-// exemplarQualityGate returns the (score, frontality, sharpness) floors a
-// face_detections row must clear to become (or remain) an exemplar. Falls
-// back to 0.75/0.5/0.3 when config isn't initialized or a given value is
-// non-positive.
-func exemplarQualityGate() (score, front, sharp float64) {
-	score, front, sharp = 0.75, 0.5, 0.3
-	if config.Cfg == nil {
-		return
-	}
-	if config.Cfg.ExemplarMinScore > 0 {
-		score = config.Cfg.ExemplarMinScore
-	}
-	if config.Cfg.ExemplarMinFrontality > 0 {
-		front = config.Cfg.ExemplarMinFrontality
-	}
-	if config.Cfg.ExemplarMinSharpness > 0 {
-		sharp = config.Cfg.ExemplarMinSharpness
-	}
-	return
-}
-
-// assignAutoDist returns the KNN median-distance upper bound for
-// auto-accepting a free-floating face onto a person. Falls back to 0.45 when
-// config isn't initialized or the value is non-positive. Now resolved
-// through the 4-layer calibration stack (conf-explicit > calibrated state >
-// profile default > code default; see resolveThreshold).
-func assignAutoDist() float64 {
-	v, _ := resolveThreshold("AssignAutoDist", 0.45)
-	return v
-}
-
-// assignSuggestDist returns the KNN median-distance upper bound for the
-// "join" suggestion gray zone. Falls back to 0.60 when config isn't
-// initialized or the value is non-positive. Now resolved through the
-// 4-layer calibration stack (conf-explicit > calibrated state > profile
-// default > code default; see resolveThreshold).
-func assignSuggestDist() float64 {
-	v, _ := resolveThreshold("AssignSuggestDist", 0.60)
-	return v
-}
-
-// assignK returns the configured KNN neighborhood size. Falls back to 5 when
-// config isn't initialized or the value is non-positive.
-func assignK() int {
-	if config.Cfg != nil && config.Cfg.AssignKNNK > 0 {
-		return config.Cfg.AssignKNNK
-	}
-	return 5
-}
-
-// assignMinVotes returns the minimum number of the K nearest exemplars that
-// must agree on the same person for that person to win the vote. Falls back
-// to 3 when config isn't initialized or the value is non-positive.
-func assignMinVotes() int {
-	if config.Cfg != nil && config.Cfg.AssignMinVotes > 0 {
-		return config.Cfg.AssignMinVotes
-	}
-	return 3
-}
-
 // ListPersons returns all non-hidden persons as rich objects (with count/confidence/first-last-seen/places count).
 // Ordering ranks named/favorited persons ahead of unnamed clusters, then by photo
 // count: several frontend surfaces read this list unfiltered (e.g. the person-detail
@@ -1311,52 +1235,7 @@ WHERE p.id=? AND p.hidden=0`, personID).Scan(&faceID, &bbox, &srcPath, &mimeType
 	} else if err != nil {
 		return "", fmt.Errorf("FaceThumbnail query: %w", err)
 	}
-	return cropAndCacheFaceThumbnail(faceID, bbox, srcPath, mimeType, assetID, origW, origH, orientation, cacheDir, thumbDir)
-}
 
-// FaceThumbnailByID crops and caches a square thumbnail for an arbitrary
-// face_detections id, entirely independent of person membership: a
-// suggestions-inbox candidate face may be a free-floating face that isn't
-// (or isn't yet, or is no longer) attached to any person, so this
-// deliberately does not join through face_person/persons at all. Returns
-// ErrNotFound for an unknown face id, or when the owning asset is
-// offline/soft-deleted -- unlike FaceThumbnail, there is no
-// fallbackCoverFace-style fallback here: a single specific face has nothing
-// else to fall back to, so an unusable source is just a 404.
-//
-// Shares the exact crop/cache core with FaceThumbnail (cropAndCacheFaceThumbnail)
-// and, not incidentally, its cache-key convention too: both key the cached
-// file by face_detections.id (<cacheDir>/<faceID>.jpg), so a face that
-// happens to also be some person's cover face lands in the identical cache
-// entry regardless of which endpoint requested it first.
-func (s *PersonService) FaceThumbnailByID(faceID, cacheDir, thumbDir string) (string, error) {
-	var bbox, srcPath, mimeType, assetID string
-	var origW, origH, orientation sql.NullInt64
-	err := s.db.QueryRow(`
-SELECT fd.bbox, a.file_path, COALESCE(a.mime_type,''), a.id, e.width, e.height, e.orientation
-FROM face_detections fd
-JOIN assets a ON a.id=fd.asset_id AND a.offline=0 AND a.deleted_at IS NULL
-LEFT JOIN asset_exif e ON e.asset_id=a.id
-WHERE fd.id=?`, faceID).Scan(&bbox, &srcPath, &mimeType, &assetID, &origW, &origH, &orientation)
-	if err == sql.ErrNoRows {
-		return "", ErrNotFound
-	}
-	if err != nil {
-		return "", fmt.Errorf("FaceThumbnailByID query: %w", err)
-	}
-	return cropAndCacheFaceThumbnail(faceID, bbox, srcPath, mimeType, assetID, origW, origH, orientation, cacheDir, thumbDir)
-}
-
-// cropAndCacheFaceThumbnail is the shared crop/cache core behind
-// FaceThumbnail and FaceThumbnailByID: given one already-resolved face row
-// (bbox plus its source asset's path/mime-type/EXIF dims/orientation),
-// returns the cached square thumbnail path, cropping and caching it under
-// cacheDir/<faceID>.jpg on first request. Callers are responsible for
-// resolving which face_detections row to use (cover-face-with-fallback vs.
-// direct-by-id) and for translating a missing/unusable source into
-// ErrNotFound the way each of their own contracts requires.
-func cropAndCacheFaceThumbnail(faceID, bbox, srcPath, mimeType, assetID string,
-	origW, origH, orientation sql.NullInt64, cacheDir, thumbDir string) (string, error) {
 	if strings.HasPrefix(mimeType, "video/") {
 		srcPath = filepath.Join(thumbDir, assetID, "large.jpg")
 	}
@@ -1366,7 +1245,7 @@ func cropAndCacheFaceThumbnail(faceID, bbox, srcPath, mimeType, assetID string,
 		return outPath, nil
 	}
 	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
-		return "", fmt.Errorf("cropAndCacheFaceThumbnail mkdir: %w", err)
+		return "", fmt.Errorf("FaceThumbnail mkdir: %w", err)
 	}
 
 	var bb struct {
@@ -1376,14 +1255,14 @@ func cropAndCacheFaceThumbnail(faceID, bbox, srcPath, mimeType, assetID string,
 		Y2 float64 `json:"y2"`
 	}
 	if err := json.Unmarshal([]byte(bbox), &bb); err != nil {
-		return "", fmt.Errorf("cropAndCacheFaceThumbnail bbox: %w", err)
+		return "", fmt.Errorf("FaceThumbnail bbox: %w", err)
 	}
 	img, err := imaging.Open(srcPath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return "", ErrNotFound // source file is gone (drive unplugged/deleted): externally this is a 404, not a 500
 		}
-		return "", fmt.Errorf("cropAndCacheFaceThumbnail open: %w", err)
+		return "", fmt.Errorf("FaceThumbnail open: %w", err)
 	}
 	w := img.Bounds().Dx()
 	h := img.Bounds().Dy()
@@ -1407,7 +1286,7 @@ func cropAndCacheFaceThumbnail(faceID, bbox, srcPath, mimeType, assetID string,
 		side = hSide
 	}
 	if side <= 0 {
-		return "", fmt.Errorf("cropAndCacheFaceThumbnail: degenerate bbox %+v", bb)
+		return "", fmt.Errorf("FaceThumbnail: degenerate bbox %+v", bb)
 	}
 	side *= 1.3
 	half := side / 2
@@ -1428,7 +1307,7 @@ func cropAndCacheFaceThumbnail(faceID, bbox, srcPath, mimeType, assetID string,
 		y1 = h
 	}
 	if x1 <= x0 || y1 <= y0 {
-		return "", fmt.Errorf("cropAndCacheFaceThumbnail: empty crop rect after clamp")
+		return "", fmt.Errorf("FaceThumbnail: empty crop rect after clamp")
 	}
 	cropped := imaging.Crop(img, image.Rect(x0, y0, x1, y1))
 	square := imaging.Fill(cropped, 256, 256, imaging.Center, imaging.Lanczos)
@@ -1436,7 +1315,7 @@ func cropAndCacheFaceThumbnail(faceID, bbox, srcPath, mimeType, assetID string,
 		square = applyOrientation(square, int(orientation.Int64))
 	}
 	if err := imaging.Save(square, outPath); err != nil {
-		return "", fmt.Errorf("cropAndCacheFaceThumbnail save: %w", err)
+		return "", fmt.Errorf("FaceThumbnail save: %w", err)
 	}
 	return outPath, nil
 }
@@ -1490,327 +1369,4 @@ WHERE fp.person_id=?`, personID)
 		err = ErrNotFound
 	}
 	return
-}
-
-// ── Person suggestions API (Task 6 of the exemplar-assignment plan) ───────
-// The join/review gray-zone queue (person_suggestions, populated by
-// RunClustering's step 1.5 revalidation and step 3 free-face assignment --
-// see faces.go) surfaces here for human accept/reject. This is a DIFFERENT
-// queue from MergeSuggestions/RejectMerge above (a wholly separate table and
-// workflow, for merge-candidate pairs). Method names below deliberately
-// avoid "RejectSuggestion" clashing in spirit with that older concept, but
-// since PersonService has no method by that name today, ListSuggestions/
-// AcceptSuggestion/RejectSuggestion is unambiguous at this receiver.
-
-// PersonSuggestion is a single open join/review suggestion. FaceID lets the
-// caller fetch a thumbnail for the candidate face; AssetID is included for
-// click-through navigation to the source photo.
-type PersonSuggestion struct {
-	ID        string    `json:"id"`
-	FaceID    string    `json:"faceId"`
-	AssetID   string    `json:"assetId"`
-	Kind      string    `json:"kind"` // "join" | "review"
-	Score     float64   `json:"score"`
-	CreatedAt time.Time `json:"createdAt"`
-}
-
-// SuggestionGroup is one visible person's open suggestions, the shape GET
-// /persons/suggestions returns a list of (one per person with >=1 open
-// suggestion).
-//
-// ExemplarFaceIDs carries up to 5 of the person's quality-gated exemplar
-// faces (face_person.exemplar=1) for the review wizard's header reference
-// strip -- see exemplarFaceIDsQuery/scanExemplarFaceIDs below for the
-// ordering and cover-exclusion rules. Always a non-nil (possibly empty)
-// slice so it marshals as JSON [] rather than null; older frontends that
-// don't know this field simply ignore it, and a new frontend falls back to
-// showing only the cover face when the array comes back empty.
-type SuggestionGroup struct {
-	Person          Person             `json:"person"`
-	Suggestions     []PersonSuggestion `json:"suggestions"`
-	ExemplarFaceIDs []string           `json:"exemplarFaceIds"`
-}
-
-// exemplarFaceIDsQuery returns one person's exemplar face ids, quality-
-// ordered and excluding a given face id (the person's cover, so the
-// frontend's reference strip never shows a tile duplicating the cover shown
-// elsewhere in the same header).
-//
-// Order: fd.score DESC NULLS LAST, then fp.face_id ASC as a final
-// tie-breaker so the result is fully deterministic across repeated calls
-// (matters for stable snapshot/UI tests, not just correctness). SQLite's
-// default NULL ordering already treats NULL as the lowest possible value --
-// which means a plain "ORDER BY fd.score DESC" already sorts NULLs last on
-// its own -- but "NULLS LAST" is spelled out explicitly anyway (supported by
-// the bundled SQLite via mattn/go-sqlite3, 3.30.0+) so the intent reads
-// correctly regardless of sort direction or a future switch to a SQL engine
-// whose default NULL-ordering convention differs from SQLite's.
-const exemplarFaceIDsQuery = `
-	SELECT fp.face_id
-	FROM face_person fp
-	JOIN face_detections fd ON fd.id = fp.face_id
-	WHERE fp.person_id = ? AND fp.exemplar = 1 AND fp.face_id != ?
-	ORDER BY fd.score DESC NULLS LAST, fp.face_id ASC
-	LIMIT 5`
-
-// scanExemplarFaceIDs runs the (once-prepared) exemplar query for one
-// person, excluding coverFaceID. Returns a non-nil, possibly-empty slice --
-// see SuggestionGroup.ExemplarFaceIDs for why that matters to the wire
-// format.
-func scanExemplarFaceIDs(stmt *sql.Stmt, personID, coverFaceID string) ([]string, error) {
-	rows, err := stmt.Query(personID, coverFaceID)
-	if err != nil {
-		return nil, fmt.Errorf("scanExemplarFaceIDs: %w", err)
-	}
-	defer rows.Close()
-	ids := make([]string, 0, 5)
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			return nil, err
-		}
-		ids = append(ids, id)
-	}
-	return ids, rows.Err()
-}
-
-// SuggestionDecision is the outcome of one accept/reject call: the
-// suggestion's final status and when it was decided (nil status change on
-// the idempotent no-op repeat-decision path — see decideSuggestion).
-// Returned by AcceptSuggestion/RejectSuggestion and echoed per-id by the
-// batch endpoint's route-layer wrapper (route/v1/persons.go
-// BatchPersonSuggestions).
-type SuggestionDecision struct {
-	ID        string     `json:"id"`
-	Status    string     `json:"status"` // "accepted" | "rejected"
-	DecidedAt *time.Time `json:"decidedAt,omitempty"`
-}
-
-// ListSuggestions returns every open suggestion for visible (non-hidden)
-// persons, grouped by person. Group order follows ListPersons' convention:
-// named/favorited persons first, then by photo count descending, ties broken
-// by p.rowid (each person's stable insertion order) -- the underlying query
-// below explicitly ORDERs BY p.rowid so this tie-break is deterministic
-// rather than left to SQLite's unspecified DISTINCT row order (which, absent
-// an ORDER BY, is not guaranteed to be "arrival order" at all). Suggestions
-// within a group are sorted by score ascending (closest/most-confident match
-// first).
-func (s *PersonService) ListSuggestions() ([]SuggestionGroup, error) {
-	rows, err := s.db.Query(`
-		SELECT DISTINCT s.person_id, p.rowid
-		FROM person_suggestions s
-		JOIN persons p ON p.id = s.person_id
-		WHERE s.status = 'open' AND p.hidden = 0
-		ORDER BY p.rowid`)
-	if err != nil {
-		return nil, fmt.Errorf("ListSuggestions persons: %w", err)
-	}
-	var pids []string
-	for rows.Next() {
-		var pid string
-		var rowid int64
-		if err := rows.Scan(&pid, &rowid); err != nil {
-			rows.Close()
-			return nil, err
-		}
-		pids = append(pids, pid)
-	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return nil, err
-	}
-	rows.Close()
-
-	// Prepared once and executed per group below -- the group count here is
-	// small (visible persons with >=1 open suggestion), so a per-group Query
-	// against one prepared statement is plenty cheap.
-	exemplarStmt, err := s.db.Prepare(exemplarFaceIDsQuery)
-	if err != nil {
-		return nil, fmt.Errorf("ListSuggestions prepare exemplar query: %w", err)
-	}
-	defer exemplarStmt.Close()
-
-	groups := make([]SuggestionGroup, 0, len(pids))
-	for _, pid := range pids {
-		p, perr := s.GetPerson(pid)
-		if errors.Is(perr, ErrNotFound) {
-			// Hidden or deleted between the two queries above -- skip rather
-			// than fail the whole listing over one stale id.
-			continue
-		}
-		if perr != nil {
-			return nil, fmt.Errorf("ListSuggestions person %s: %w", pid, perr)
-		}
-		sugs, serr := s.suggestionsForPerson(pid)
-		if serr != nil {
-			return nil, serr
-		}
-		exemplars, eerr := scanExemplarFaceIDs(exemplarStmt, pid, p.CoverFaceID)
-		if eerr != nil {
-			return nil, eerr
-		}
-		groups = append(groups, SuggestionGroup{Person: *p, Suggestions: sugs, ExemplarFaceIDs: exemplars})
-	}
-
-	sort.SliceStable(groups, func(i, j int) bool {
-		iRanked := groups[i].Person.Name != "" || groups[i].Person.Favorite
-		jRanked := groups[j].Person.Name != "" || groups[j].Person.Favorite
-		if iRanked != jRanked {
-			return iRanked
-		}
-		return groups[i].Person.Count > groups[j].Person.Count
-	})
-	return groups, nil
-}
-
-// suggestionsForPerson loads one person's open suggestions, score ascending.
-func (s *PersonService) suggestionsForPerson(personID string) ([]PersonSuggestion, error) {
-	rows, err := s.db.Query(`
-		SELECT s.id, s.face_id, fd.asset_id, s.kind, s.score, s.created_at
-		FROM person_suggestions s
-		JOIN face_detections fd ON fd.id = s.face_id
-		WHERE s.person_id = ? AND s.status = 'open'
-		ORDER BY s.score ASC`, personID)
-	if err != nil {
-		return nil, fmt.Errorf("suggestionsForPerson: %w", err)
-	}
-	defer rows.Close()
-	var out []PersonSuggestion
-	for rows.Next() {
-		var sug PersonSuggestion
-		if err := rows.Scan(&sug.ID, &sug.FaceID, &sug.AssetID, &sug.Kind, &sug.Score, &sug.CreatedAt); err != nil {
-			return nil, err
-		}
-		out = append(out, sug)
-	}
-	return out, rows.Err()
-}
-
-// AcceptSuggestion accepts an open suggestion: kind='join' inserts (or
-// upgrades) the face_person membership with confirmed=1; kind='review'
-// confirms the existing membership. Both recompute the person's centroid/
-// cover/confidence and mark the suggestion 'accepted'. Idempotent: calling
-// this again on an already-decided suggestion is a no-op that returns its
-// current (already-decided) state rather than erroring. Returns ErrNotFound
-// if the suggestion doesn't exist or belongs to a hidden person (hidden-
-// person suggestions are neither listed nor operable).
-func (s *PersonService) AcceptSuggestion(id string) (*SuggestionDecision, error) {
-	return s.decideSuggestion(id, true)
-}
-
-// RejectSuggestion rejects an open suggestion: kind='join' just records a
-// person_negatives row (the face was never a member); kind='review' also
-// detaches the existing membership (DELETE face_person) before recording the
-// negative. Both mark the suggestion 'rejected'. Idempotent like
-// AcceptSuggestion. Returns ErrNotFound for an unknown id or a hidden
-// person's suggestion.
-func (s *PersonService) RejectSuggestion(id string) (*SuggestionDecision, error) {
-	return s.decideSuggestion(id, false)
-}
-
-// decideSuggestion implements the shared accept/reject transaction. See
-// AcceptSuggestion/RejectSuggestion for the accept==true/false semantics.
-// All writes for one decision happen in a single transaction; SQLite busy
-// handling is left to the driver's _busy_timeout DSN option (pkg/sqlite.Open),
-// the same as every other person-mutation method in this file -- no bespoke
-// retry loop needed here.
-func (s *PersonService) decideSuggestion(id string, accept bool) (result *SuggestionDecision, err error) {
-	tx, err := s.db.Begin()
-	if err != nil {
-		return nil, err
-	}
-	defer func() {
-		if err != nil {
-			tx.Rollback()
-		}
-	}()
-
-	var personID, faceID, kind, status string
-	var decidedAt sql.NullTime
-	qerr := tx.QueryRow(`
-		SELECT s.person_id, s.face_id, s.kind, s.status, s.decided_at
-		FROM person_suggestions s
-		JOIN persons p ON p.id = s.person_id AND p.hidden = 0
-		WHERE s.id = ?`, id).Scan(&personID, &faceID, &kind, &status, &decidedAt)
-	if qerr == sql.ErrNoRows {
-		err = ErrNotFound
-		return nil, err
-	}
-	if qerr != nil {
-		err = fmt.Errorf("decideSuggestion lookup: %w", qerr)
-		return nil, err
-	}
-
-	if status != "open" {
-		// Idempotent repeat decision: no writes, no 409 -- just hand back the
-		// suggestion's current (already-decided) state.
-		tx.Rollback()
-		d := &SuggestionDecision{ID: id, Status: status}
-		if decidedAt.Valid {
-			t := decidedAt.Time
-			d.DecidedAt = &t
-		}
-		return d, nil
-	}
-
-	now := time.Now()
-	newStatus := "rejected"
-	if accept {
-		newStatus = "accepted"
-		// Ensure face_person(face_id, person_id) exists with confirmed=1, for
-		// both kinds: 'join' has no existing row (the upsert's INSERT branch
-		// fires); 'review' already has one (the upsert's UPDATE branch fires,
-		// person_id already matching so that column is a no-op write). This
-		// also covers the "auto-assigned elsewhere meanwhile" case called out
-		// explicitly in the brief: an explicit user accept always wins and
-		// (re)assigns the face to the suggested person.
-		var oldPersonID sql.NullString
-		lookupErr := tx.QueryRow(`SELECT person_id FROM face_person WHERE face_id=?`, faceID).Scan(&oldPersonID)
-		if lookupErr != nil && lookupErr != sql.ErrNoRows {
-			err = lookupErr
-			return nil, err
-		}
-		if _, err = tx.Exec(`
-			INSERT INTO face_person(face_id, person_id, confirmed) VALUES(?, ?, 1)
-			ON CONFLICT(face_id) DO UPDATE SET person_id=excluded.person_id, confirmed=1`,
-			faceID, personID); err != nil {
-			return nil, err
-		}
-		if err = recomputeOneCentroidTx(tx, personID); err != nil {
-			return nil, err
-		}
-		// Defensive: if the face had drifted onto a different person in the
-		// meantime, that person's stats are now stale too.
-		if oldPersonID.Valid && oldPersonID.String != "" && oldPersonID.String != personID {
-			if err = recomputeOneCentroidTx(tx, oldPersonID.String); err != nil {
-				return nil, err
-			}
-		}
-	} else {
-		if kind == "review" {
-			// The face was an existing member drifting into review; reject
-			// means "no, detach it".
-			if _, err = tx.Exec(`DELETE FROM face_person WHERE face_id=? AND person_id=?`, faceID, personID); err != nil {
-				return nil, err
-			}
-			if err = recomputeOneCentroidTx(tx, personID); err != nil {
-				return nil, err
-			}
-		}
-		// kind == "join": the face was never a member -- nothing to detach,
-		// just remember the negative below so KNN voting never re-proposes it.
-		if _, err = tx.Exec(`
-			INSERT OR IGNORE INTO person_negatives(person_id, face_id, created_at) VALUES(?, ?, ?)`,
-			personID, faceID, now); err != nil {
-			return nil, err
-		}
-	}
-
-	if _, err = tx.Exec(`UPDATE person_suggestions SET status=?, decided_at=? WHERE id=?`, newStatus, now, id); err != nil {
-		return nil, err
-	}
-	if err = tx.Commit(); err != nil {
-		return nil, err
-	}
-	return &SuggestionDecision{ID: id, Status: newStatus, DecidedAt: &now}, nil
 }
