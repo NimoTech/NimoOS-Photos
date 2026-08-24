@@ -148,30 +148,6 @@ func migrate(db *sql.DB) error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_face_person_person ON face_person(person_id)`,
 
-		// ── Exemplar-assignment suggestion queue + negative feedback ────────
-		// kind='join': a free-floating face lands in the KNN gray zone for a
-		// person (queued for human accept/reject before it joins as a member).
-		// kind='review': a per-pass revalidation demotes an existing member's
-		// confidence, queuing it for re-confirmation rather than silently
-		// detaching it. Note: 'merge' is intentionally NOT a valid kind here —
-		// merge suggestions still go through the existing merge-suggestions
-		// endpoint; this is an explicit revision of the SDD's literal CHECK set.
-		`CREATE TABLE IF NOT EXISTS person_suggestions (
-			id TEXT PRIMARY KEY, person_id TEXT NOT NULL, face_id TEXT NOT NULL,
-			kind TEXT NOT NULL CHECK(kind IN ('join','review')),
-			score REAL NOT NULL,                -- median KNN distance at suggest time
-			status TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open','accepted','rejected')),
-			created_at DATETIME NOT NULL, decided_at DATETIME,
-			UNIQUE(person_id, face_id)
-		)`,
-		// A rejected join/review suggestion is recorded here so KNN voting
-		// never re-proposes the same (person, face) pair.
-		`CREATE TABLE IF NOT EXISTS person_negatives (
-			person_id TEXT NOT NULL, face_id TEXT NOT NULL, created_at DATETIME NOT NULL,
-			PRIMARY KEY(person_id, face_id)
-		)`,
-		`CREATE INDEX IF NOT EXISTS idx_suggestions_open ON person_suggestions(status, person_id)`,
-
 		// ── Albums ────────────────────────────────────────────────────────
 		`CREATE TABLE IF NOT EXISTS albums (
 			id             TEXT PRIMARY KEY,
@@ -226,63 +202,6 @@ func migrate(db *sql.DB) error {
 			rejected_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
 			PRIMARY KEY (person_a, person_b),
 			CHECK (person_a < person_b)
-		)`,
-
-		// ── Cluster-merge questions (gray-band merge suggestions, apple engine) ──
-		// Distinct from the legacy merge_rejections/on-the-fly MergeSuggestions
-		// above: this table is populated durably during RunClustering (see
-		// service/merge_questions.go) from pairs of the pass's final persons
-		// (auto + anchored) whose complete-linkage distance falls just above
-		// the HAC stop line (ClusterMergeEps, ClusterMergeEps+MergeSuggestBand].
-		//
-		// The pair is stored canonically -- person_a/person_b with
-		// person_a < person_b enforced in code (orderPair, same convention as
-		// merge_rejections/face_negative_pairs) and mirrored by the CHECK
-		// below -- rather than as directional from/into columns. A directional
-		// UNIQUE(from,into) would let the SAME physical pair collide with
-		// itself under a flipped direction (e.g. the larger-cluster-wins-into
-		// rule can flip which side is "into" as member counts change across
-		// passes), producing a duplicate open row alongside an old decided one
-		// for the reverse direction instead of ever hitting the UNIQUE
-		// constraint. Canonicalizing the key eliminates that edge outright:
-		// there is exactly one row per unordered pair, ever. into_is_a (1 =
-		// person_a is the merge target, 0 = person_b is) carries the
-		// direction, resolved at generation time (generateMergeSuggestionsTx)
-		// and re-derived at read time (PersonService.ListMergeQuestions) --
-		// see service/merge_questions.go's mergeSuggestionDirection.
-		//
-		// UNIQUE(person_a, person_b) backs the generation stage's upsert
-		// (refresh dist/into_is_a while status='open'; a decided row is
-		// immutable -- same invariant as person_suggestions). NOTE: auto
-		// person ids are rebuilt every clustering pass, so open rows
-		// referencing a since-deleted person id accumulate; the generation
-		// stage cleans those up each pass (see generateMergeSuggestionsTx).
-		//
-		// EDITED IN PLACE (not a second migration): this table has not yet
-		// shipped to any deployed database (still on an unmerged branch as of
-		// this edit), so there is no upgrade path to preserve -- the original
-		// from_person_id/into_person_id/UNIQUE(from,into) shape from the first
-		// draft of this feature never existed outside this branch.
-		`CREATE TABLE IF NOT EXISTS merge_suggestions (
-			id TEXT PRIMARY KEY, person_a TEXT NOT NULL, person_b TEXT NOT NULL, into_is_a INTEGER NOT NULL,
-			dist REAL NOT NULL, status TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open','accepted','rejected')),
-			created_at DATETIME NOT NULL, decided_at DATETIME,
-			UNIQUE(person_a, person_b),
-			CHECK (person_a < person_b)
-		)`,
-		`CREATE INDEX IF NOT EXISTS idx_merge_suggestions_open ON merge_suggestions(status, dist)`,
-
-		// ── Face-level cannot-link pairs (durable rejection of a merge question) ──
-		// Rejecting a merge_suggestions row pins the two clusters' top-quality
-		// representative faces here (face_a < face_b lexicographically --
-		// enforced in code, see orderPair/service/merge_questions.go) so the
-		// cannot-link survives the auto-person id churn across passes: even
-		// though the two clusters get rebuilt with new ids next pass, if the
-		// same two representative faces end up members of two candidate
-		// clusters again, the generation stage suppresses that pair.
-		`CREATE TABLE IF NOT EXISTS face_negative_pairs (
-			face_a TEXT NOT NULL, face_b TEXT NOT NULL, created_at DATETIME NOT NULL,
-			PRIMARY KEY(face_a, face_b)
 		)`,
 
 		// ── Geo location per asset ────────────────────────────────────────────
@@ -406,31 +325,6 @@ func migrate(db *sql.DB) error {
 			vec BLOB NOT NULL,
 			PRIMARY KEY (key, gen)
 		)`,
-
-		// ── Threshold self-calibration: effective-value overrides + audit log ──
-		// calibration_state holds the device's self-calibrated effective values.
-		// Rows whose model_gen differs from the running common.MLModelGen are
-		// treated as absent by the resolver (embeddings changed; old calibration
-		// is untrusted until re-earned) and overwritten by the next applied run.
-		`CREATE TABLE IF NOT EXISTS calibration_state (
-			key        TEXT PRIMARY KEY,
-			value      REAL NOT NULL,
-			model_gen  TEXT NOT NULL,
-			updated_at DATETIME NOT NULL
-		)`,
-		// calibration_history is append-only: one row per tier per calibration
-		// attempt (applied or held), tiny volume, never pruned.
-		`CREATE TABLE IF NOT EXISTS calibration_history (
-			id           INTEGER PRIMARY KEY AUTOINCREMENT,
-			run_at       DATETIME NOT NULL,
-			model_gen    TEXT NOT NULL,
-			tier         TEXT NOT NULL CHECK(tier IN ('knn','merge','twopass')),
-			truth_counts TEXT NOT NULL,   -- JSON snapshot, e.g. {"positives":123,"negatives":30,"persons":9}
-			old_values   TEXT NOT NULL,   -- JSON key->value of the tier's thresholds before the run
-			new_values   TEXT NOT NULL,   -- JSON key->value after (equal to old when held)
-			outcome      TEXT NOT NULL CHECK(outcome IN ('applied','held_insufficient','held_hysteresis','held_skewed','clamped','invariant_violation'))
-		)`,
-		`CREATE INDEX IF NOT EXISTS idx_calibration_history_tier ON calibration_history(tier, run_at)`,
 
 		// ── Smart Moments: moment type definitions (data-driven, the vehicle for hot-updated pushes) ──────────
 		`CREATE TABLE IF NOT EXISTS moment_recipes (
@@ -788,14 +682,6 @@ func migrate(db *sql.DB) error {
 		// when the ML backend doesn't emit them (treated as neutral).
 		`ALTER TABLE face_detections ADD COLUMN frontality REAL`,
 		`ALTER TABLE face_detections ADD COLUMN sharpness REAL`,
-		// exemplar=1 marks a face_detections row as one of its person's
-		// quality-gated exemplar templates, consulted by KNN-vote assignment
-		// instead of a single anchored centroid (see the exemplar-assignment
-		// SDD). confirmed=1 marks a face the user has explicitly confirmed as
-		// belonging to that person (never revalidated away by a later pass).
-		// Both default to 0 for existing rows.
-		`ALTER TABLE face_person ADD COLUMN exemplar INTEGER NOT NULL DEFAULT 0`,
-		`ALTER TABLE face_person ADD COLUMN confirmed INTEGER NOT NULL DEFAULT 0`,
 	}
 	for _, stmt := range alters {
 		if _, err := db.Exec(stmt); err != nil &&

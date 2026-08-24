@@ -102,11 +102,6 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 	if err != nil {
 		panic("nimoos-photos: failed to open database: " + err.Error())
 	}
-	// Wire the threshold self-calibration resolver to the live DB so the
-	// five accessors below (assignAutoDist/assignSuggestDist/momentGap/
-	// tightEps/mergeEps) can read calibration_state and the stored
-	// calibration profile, not just conf/code defaults.
-	SetCalibrationDB(db)
 
 	// 2. Build the ML client.
 	ml := mlclient.New(cfg.MLEndpoint)
@@ -180,7 +175,6 @@ func NewService(parentCtx context.Context, cfg *config.Config, pub TaskPublisher
 	faces.SetIndexIdleSource(idx.IdleFor)       // safety-net clustering debounce: only triggers once index activity has been quiet long enough
 	faces.SetML(ml)                             // used by RunPipeline's detection stage
 	faces.SetThumbDir(thumbDir)                 // used by RunPipeline for video keyframe thumbnails
-	faces.SetMarkerDir(cfg.DataPath)            // one-shot migration markers (e.g. exemplar-assignment, see exemplar_migrate.go)
 	faces.SetDuePurger(persons.PurgeDuePersons) // sweeps hidden persons past their undo grace period
 	rebuilder := NewRebuilder(parentCtx, db, idx, faces, taskReg, cfg.Workers)
 	embedder := NewEmbedder(db, ml, idx, taskReg)
@@ -512,11 +506,8 @@ func (s *services) RestartScanTicker(minutes int) {
 }
 
 // NewTestServices builds a minimal Services backed by db, for handler tests.
-// Only SmartViews, Albums, Search, Persons, and Faces are wired; other
-// accessors return nil. Faces is a bare NewFaceService(db) (no TaskRegistry/
-// ML/marker dir injected) -- enough for the calibration status/history/
-// profile endpoints (route/v1/persons_calibration_test.go), which only touch
-// s.db, never RunClustering's fuller dependency set.
+// Only SmartViews, Albums, Search, and Persons are wired; other accessors
+// return nil.
 func NewTestServices(db *sql.DB) Services {
 	search := NewSearchService(db, zeroML{})
 	albums := NewAlbumService(db)
@@ -524,7 +515,6 @@ func NewTestServices(db *sql.DB) Services {
 		db:         db,
 		search:     search,
 		albums:     albums,
-		faces:      NewFaceService(db),
 		persons:    NewPersonService(db),
 		smartViews: NewSmartViewService(db, search),
 		storage:    NewStorageService(db, "", os.TempDir(), os.TempDir(), os.TempDir()),

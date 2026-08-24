@@ -38,46 +38,6 @@ func clusterEpsilon() float64 {
 	return dbscanEpsilon
 }
 
-// clusterEngine returns the configured face-clustering engine selector.
-// Falls back to "apple" when config isn't initialized or the value is empty
-// (tests constructing services directly, or a config file predating this key).
-func clusterEngine() string {
-	if config.Cfg != nil && config.Cfg.ClusterEngine != "" {
-		return config.Cfg.ClusterEngine
-	}
-	return "apple"
-}
-
-// momentGap returns the configured moment-segmentation time gap used by the
-// apple engine's pass-1 greedy clustering. Falls back to 60 minutes when
-// config isn't initialized or the value is non-positive. Now resolved
-// through the 4-layer calibration stack (conf-explicit > calibrated state >
-// profile default > code default; see resolveThreshold).
-func momentGap() time.Duration {
-	v, _ := resolveThreshold("MomentGapMinutes", 60)
-	return time.Duration(v) * time.Minute
-}
-
-// tightEps returns the configured pass-1 greedy epsilon for the apple engine.
-// Falls back to 0.35 when config isn't initialized or the value is
-// non-positive. Now resolved through the 4-layer calibration stack
-// (conf-explicit > calibrated state > profile default > code default; see
-// resolveThreshold).
-func tightEps() float64 {
-	v, _ := resolveThreshold("ClusterTightEps", 0.35)
-	return v
-}
-
-// mergeEps returns the configured pass-2 HAC stop distance for the apple
-// engine. Falls back to 0.55 when config isn't initialized or the value is
-// non-positive. Now resolved through the 4-layer calibration stack
-// (conf-explicit > calibrated state > profile default > code default; see
-// resolveThreshold).
-func mergeEps() float64 {
-	v, _ := resolveThreshold("ClusterMergeEps", 0.55)
-	return v
-}
-
 // personAnchoredCond is the SQL predicate for persons that must survive
 // re-clustering with identity intact: user-named / favorited / related /
 // hidden, plus a user-pinned cover (cover_locked=1) or a user-chosen hero
@@ -393,12 +353,6 @@ type faceRow struct {
 	id      string
 	assetID string
 	vec     []float32
-	// takenAt/indexedAt are the owning asset's capture/index timestamps, used
-	// by the apple engine's SegmentMoments to bucket faces into moments. Zero
-	// value when the underlying column is NULL (mirrors SegmentMoments'
-	// "zero takenAt falls back to indexedAt" contract).
-	takenAt   time.Time
-	indexedAt time.Time
 }
 
 // FaceService handles face clustering and person management.
@@ -406,13 +360,6 @@ type FaceService struct {
 	db      *sql.DB
 	reg     *TaskRegistry
 	running atomic.Bool
-
-	// calibrating single-flights maybeCalibrate: a clustering pass that
-	// finishes while a previous calibration run is still in flight (e.g. a
-	// slow twopass grid scan on a large library) fires a second goroutine
-	// that just observes the CAS fail and returns immediately, rather than
-	// running two calibration passes concurrently against the same DB.
-	calibrating atomic.Bool
 
 	// ml is used by RunPipeline's detection stage to call
 	// DetectAndRecognizeFaces; when not injected (nil), every detection fails
@@ -422,16 +369,6 @@ type FaceService struct {
 	// detection input is <thumbDir>/<id>/large.jpg (a keyframe), falling back
 	// to small.jpg when missing (mirrors the Indexer's thumbDir field).
 	thumbDir string
-
-	// markerDir is the directory one-shot migration marker files live in
-	// (currently just the exemplar-assignment migration's
-	// .exemplar_init_v1.done — see exemplar_migrate.go). Empty ("", the zero
-	// value, e.g. every FaceService built without calling SetMarkerDir)
-	// deliberately disables migration-awareness entirely: rebuildPersonsWithProgress's
-	// step 1.5 always runs its normal (post-migration) detach behavior in
-	// that case — exactly the pre-Task-7 behavior every existing revalidation
-	// test already exercises, so those tests needed no changes.
-	markerDir string
 
 	// Failure backoff: after RunClustering errors, don't retrigger for a
 	// while, to avoid a retry storm every minute.
@@ -485,11 +422,6 @@ func (s *FaceService) SetDuePurger(fn func(context.Context) error) { s.duePurger
 // existing field), used by RunPipeline to locate video keyframe thumbnails
 // for detection.
 func (s *FaceService) SetThumbDir(dir string) { s.thumbDir = dir }
-
-// SetMarkerDir injects the directory used for one-shot migration marker
-// files (see the markerDir field doc comment and exemplar_migrate.go).
-// Mirrors SetThumbDir. Left unset in most tests.
-func (s *FaceService) SetMarkerDir(dir string) { s.markerDir = dir }
 
 // countUnassignedFaces returns the count of active (non-excluded) faces not
 // yet associated with any person — i.e. faces newly uploaded/detected that
@@ -555,55 +487,15 @@ func (s *FaceService) clusterStage(ctx context.Context, onStart func(total int64
 	for i, f := range faces {
 		vecs[i] = f.vec
 	}
+	labels := DBSCANWithProgress(vecs, clusterEpsilon(), dbscanMinPoints,
+		func(done, n int) {
+			if n == 0 {
+				return
+			}
+			pub(0.10 + 0.75*float64(done)/float64(n))
+		})
 
-	// Engine selection lives here (the sole call site), not inside
-	// clusterEngine(): the accessor's job is to mirror config.Cfg, and its
-	// siblings (momentGap/tightEps/mergeEps) are pure fallback-on-empty
-	// readers with no logging side effect. Falling back an *invalid* (not
-	// just empty) value to "apple" is a piece of orchestration policy that
-	// only clusterStage's dispatch needs to know about, so it stays here,
-	// next to the zap logger it needs to warn through.
-	engine := clusterEngine()
-	if engine != "dbscan" && engine != "apple" {
-		zap.L().Warn("unknown photos.ClusterEngine value, falling back to apple",
-			zap.String("configured", engine))
-		engine = "apple"
-	}
-
-	// labels is only populated for "dbscan": it is computed here, over every
-	// loaded face (anchored and free alike), exactly as before this engine
-	// switch existed -- preserving byte-identical DBSCAN behavior. For
-	// "apple", labels stays nil: the two-pass engine must never see an
-	// already-anchored face mixed in with free ones (that reintroduces the
-	// transitive-chaining risk HACComplete's docstring warns about), and the
-	// anchored/free split isn't known until rebuildPersonsWithProgress's step
-	// 3 runs inside the transaction -- so the real computation happens there,
-	// against the free subset only.
-	var labels []int
-	switch engine {
-	case "dbscan":
-		labels = DBSCANWithProgress(vecs, clusterEpsilon(), dbscanMinPoints,
-			func(done, n int) {
-				if n == 0 {
-					return
-				}
-				pub(0.10 + 0.75*float64(done)/float64(n))
-			})
-	default: // "apple"
-		// Neither GreedyMomentClusters nor HACComplete expose incremental
-		// progress (they're cheap enough over the pass-1 cluster counts this
-		// runs against that a per-item callback isn't worth the API surface),
-		// so this reports a few coarse ticks across the same [0.10, 0.85]
-		// window DBSCANWithProgress uses above, keeping the
-		// loading/clustering/persisting three-stage progress contract
-		// callers rely on (e.g. TestRunClustering_StagesPublishProgress)
-		// intact regardless of engine.
-		pub(0.10 + 0.75/3)
-		pub(0.10 + 0.75*2/3)
-		pub(0.85)
-	}
-
-	if err := s.rebuildPersonsWithProgress(ctx, faces, labels, engine,
+	if err := s.rebuildPersonsWithProgress(ctx, faces, labels,
 		func(done, n int) {
 			if n == 0 {
 				return
@@ -1014,7 +906,7 @@ func (s *FaceService) loadFacesWithProgress(ctx context.Context, total int64,
 	// itself keeps the stable semantics of "if the data is there, it
 	// participates in clustering".
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT fd.id, fd.asset_id, fd.embedding, a.taken_at, a.indexed_at
+		SELECT fd.id, fd.asset_id, fd.embedding
 		FROM face_detections fd
 		JOIN assets a ON a.id = fd.asset_id
 		WHERE fd.excluded = 0`)
@@ -1028,23 +920,10 @@ func (s *FaceService) loadFacesWithProgress(ctx context.Context, total int64,
 	for rows.Next() {
 		var f faceRow
 		var blob []byte
-		// taken_at/indexed_at are DATETIME columns that can be NULL (an asset
-		// row inserted before indexing finishes, or a test fixture that never
-		// sets them) -- scanned as sql.NullString and parsed explicitly
-		// (same convention as parseSQLiteTime's other callers), rather than
-		// relying on the driver's native TIMESTAMP scan, so a NULL cleanly
-		// becomes faceRow's documented zero time.Time rather than an error.
-		var takenAtStr, indexedAtStr sql.NullString
-		if err := rows.Scan(&f.id, &f.assetID, &blob, &takenAtStr, &indexedAtStr); err != nil {
+		if err := rows.Scan(&f.id, &f.assetID, &blob); err != nil {
 			return nil, err
 		}
 		f.vec = sqlite.DeserializeFloat32(blob)
-		if t := parseSQLiteTime(takenAtStr); t != nil {
-			f.takenAt = *t
-		}
-		if t := parseSQLiteTime(indexedAtStr); t != nil {
-			f.indexedAt = *t
-		}
 		out = append(out, f)
 		loaded++
 		if total > 0 {
@@ -1058,45 +937,7 @@ func (s *FaceService) loadFacesWithProgress(ctx context.Context, total int64,
 	return out, rows.Err()
 }
 
-// resolveOpenSuggestion deletes any OPEN person_suggestions row for
-// (personID, faceID) -- called from every "auto" decision inside
-// rebuildPersonsWithProgress: step 1.5's revalidation (a member that had
-// drifted into the gray zone, and got an open 'review' row, has since
-// recovered into the auto band) and step 3's free-face assignment (a face
-// that had an open 'join' row from an earlier pass now auto-joins directly).
-// Both are the same root cause: the SYSTEM itself just settled, in the
-// affirmative, the exact question that open suggestion row was asking a
-// human -- "does this face belong here" -- and leaving the row open lets a
-// human act on it long after it's moot:
-//   - a stale 'review' row rejected later detaches an otherwise still-good
-//     member AND permanently negates it (no un-negate surface exists), so
-//     the face can never rejoin that person via KNN voting again;
-//   - a stale 'join' row rejected later writes a person_negatives row for a
-//     face that is simultaneously a confirmed-good member, which then gets
-//     silently evicted by a LATER revalidation pass once Match's negation
-//     filter strips the person's own exemplars out of that face's pool.
-//
-// DELETE, not a status flip to some third state: 'resolved' isn't a value
-// the person_suggestions.status CHECK constraint accepts (only 'open'/
-// 'accepted'/'rejected'), and more fundamentally an open row is an
-// ephemeral machine-generated question, not a record worth preserving once
-// the question no longer applies -- unlike a DECIDED (accepted/rejected)
-// row, which is a real user decision and stays as an audit trail. The
-// `status='open'` clause is the exact WHERE-guard mirror of every other
-// write site in this function (see the 'review' UPSERT and 'join' INSERT's
-// INVARIANT comments): a decided row is machinery-read-only, never touched.
-func resolveOpenSuggestion(ctx context.Context, stmt *sql.Stmt, personID, faceID string) error {
-	_, err := stmt.ExecContext(ctx, personID, faceID)
-	return err
-}
-
-// engine selects how step 4 turns the free-face subset into labels:
-// "dbscan" consumes the precomputed global `labels` (aligned to `faces`,
-// indexed via freeFace.idx, exactly as before this parameter existed);
-// anything else ("apple", already validated/warned-on by clusterStage's
-// caller) runs the two-pass engine against the free subset itself, since
-// `labels` is nil in that case (see clusterStage).
-func (s *FaceService) rebuildPersonsWithProgress(ctx context.Context, faces []faceRow, labels []int, engine string,
+func (s *FaceService) rebuildPersonsWithProgress(ctx context.Context, faces []faceRow, labels []int,
 	onProgress func(done, n int),
 ) error {
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -1111,18 +952,7 @@ func (s *FaceService) rebuildPersonsWithProgress(ctx context.Context, faces []fa
 
 	// 1. Load anchored persons (matching personAnchoredCond: named/favorited/
 	//    related/hidden, or with a pinned cover / hero) and their current
-	//    member faces.
-	//
-	//    ENGINE SPLIT: "dbscan" keeps the legacy centroid computation
-	//    (unchanged below) feeding step 3's assignEpsilon snap -- a rollback
-	//    to dbscan must get the whole old stack, not a partial mix with the
-	//    exemplar matcher. "apple" instead loads each member face WITH its
-	//    quality signals (score/frontality/sharpness) and confirmed flag,
-	//    runs SelectExemplars per person, persists the exemplar flags, and
-	//    collects the selected vectors for BuildExemplarIndex below; the
-	//    centroid is no longer part of anchored-person matching for apple
-	//    (recomputePersonStatsTx still maintains it, for display/merge-
-	//    suggestion use).
+	//    member faces, and compute centroids.
 	type anchor struct {
 		id       string
 		centroid []float32
@@ -1147,490 +977,53 @@ func (s *FaceService) rebuildPersonsWithProgress(ctx context.Context, faces []fa
 	}
 	anchorRows.Close()
 
-	anchored := map[string]bool{}                // set of face_id belonging to anchored persons
-	anchors := make([]anchor, 0, len(anchorIDs)) // dbscan-only: centroid snap targets
-	exemplarVecs := map[string][][]float32{}     // apple-only: person -> selected exemplar vectors
-
-	// clearExemplarStmt/setExemplarStmt persist SelectExemplars' output
-	// (clear-then-set within this tx, per person) -- apple-only, prepared
-	// once and reused across the anchored-persons loop below AND by step
-	// 1.5's post-revalidation exemplar recompute further down.
-	var clearExemplarStmt, setExemplarStmt *sql.Stmt
-	// resolveSuggestionStmt backs resolveOpenSuggestion (see its doc comment)
-	// -- prepared once here so it's ready for BOTH step 1.5's "auto" case
-	// (a reviving member) and step 3's "auto" case (a free face that
-	// auto-joins directly), the same way clearExemplarStmt/setExemplarStmt
-	// above are shared across both stages.
-	var resolveSuggestionStmt *sql.Stmt
-	// negatives/k/minVotes/autoDist/suggestDist are apple-only, loaded/computed
-	// once here so both step 1.5 (revalidation, matches a member against its
-	// OWN person's exemplars) and step 3 (free-face assignment, matches
-	// against the full index) share identical thresholds and the same
-	// negation set -- hoisted out of step 3's switch (where only the latter
-	// used to live) because step 1.5 now needs them first.
-	var negatives map[[2]string]bool
-	var k, minVotes int
-	var autoDist, suggestDist float64
-	// lossless gates step 1.5's revalidation below into the one-shot
-	// exemplar-assignment migration's "first pass" mode (see
-	// exemplar_migrate.go): computed fresh from the marker file's
-	// absence/presence on THIS call, never cached as service state (the
-	// marker file on disk is the single source of truth for "has the
-	// migration's first pass already happened" -- a cached bool would go
-	// stale across process restarts). Stays false for the dbscan engine
-	// (revalidation is an exemplar-era concept, see the ENGINE SPLIT
-	// comments throughout this function) and whenever markerDir was never
-	// configured (SetMarkerDir), which is every test that doesn't opt in.
-	var lossless bool
-	if engine != "dbscan" {
-		clearExemplarStmt, err = tx.PrepareContext(ctx, `UPDATE face_person SET exemplar=0 WHERE person_id=?`)
-		if err != nil {
-			return err
-		}
-		defer clearExemplarStmt.Close()
-		setExemplarStmt, err = tx.PrepareContext(ctx, `UPDATE face_person SET exemplar=1 WHERE face_id=?`)
-		if err != nil {
-			return err
-		}
-		defer setExemplarStmt.Close()
-		resolveSuggestionStmt, err = tx.PrepareContext(ctx,
-			`DELETE FROM person_suggestions WHERE person_id=? AND face_id=? AND status='open'`)
-		if err != nil {
-			return err
-		}
-		defer resolveSuggestionStmt.Close()
-
-		// negatives: (person_id, face_id) pairs Match must exclude a person's
-		// exemplars for -- loaded once per pass, not per face.
-		negatives = map[[2]string]bool{}
-		nr, nerr := tx.QueryContext(ctx, `SELECT person_id, face_id FROM person_negatives`)
-		if nerr != nil {
-			err = nerr
-			return err
-		}
-		for nr.Next() {
-			var negPerson, negFace string
-			if err = nr.Scan(&negPerson, &negFace); err != nil {
-				nr.Close()
-				return err
-			}
-			negatives[[2]string{negPerson, negFace}] = true
-		}
-		if cerr := nr.Err(); cerr != nil {
-			nr.Close()
-			return cerr
-		}
-		nr.Close()
-
-		k, minVotes = assignK(), assignMinVotes()
-		autoDist, suggestDist = assignAutoDist(), assignSuggestDist()
-		lossless = exemplarMigrationLosslessPass(s.markerDir)
-	}
-
+	anchored := map[string]bool{} // set of face_id belonging to anchored persons
+	anchors := make([]anchor, 0, len(anchorIDs))
 	for _, pid := range anchorIDs {
-		if engine == "dbscan" {
-			// Legacy path: only the embedding is needed to compute a centroid.
-			fr, ferr := tx.QueryContext(ctx, `
-				SELECT fd.embedding
-				FROM face_person fp
-				JOIN face_detections fd ON fd.id = fp.face_id
-				JOIN assets a ON a.id = fd.asset_id
-				WHERE fp.person_id = ? AND fd.excluded = 0`, pid)
-			if ferr != nil {
-				err = ferr
-				return err
-			}
-			var vecs [][]float32
-			for fr.Next() {
-				var blob []byte
-				if err = fr.Scan(&blob); err != nil {
-					fr.Close()
-					return err
-				}
-				vecs = append(vecs, sqlite.DeserializeFloat32(blob))
-			}
-			if cerr := fr.Err(); cerr != nil {
-				fr.Close()
-				return cerr
-			}
-			fr.Close()
-			// Record anchored members.
-			mr, merr := tx.QueryContext(ctx, `SELECT face_id FROM face_person WHERE person_id=?`, pid)
-			if merr != nil {
-				err = merr
-				return err
-			}
-			for mr.Next() {
-				var fid string
-				if err = mr.Scan(&fid); err != nil {
-					mr.Close()
-					return err
-				}
-				anchored[fid] = true
-			}
-			if cerr := mr.Err(); cerr != nil {
-				mr.Close()
-				return cerr
-			}
-			mr.Close()
-			anchors = append(anchors, anchor{id: pid, centroid: ComputeCentroid(vecs)})
-			continue
-		}
-
-		// apple: load member faces along with the quality signals
-		// SelectExemplars' hard gate needs. Column order here MUST match the
-		// Scan order below exactly (face_id, embedding, score, frontality,
-		// sharpness, confirmed) -- this single query also gives us the
-		// anchored member set, unlike the dbscan branch above which needs a
-		// second face_id-only query.
-		cr, cerr := tx.QueryContext(ctx, `
-			SELECT fd.id, fd.embedding, fd.score, fd.frontality, fd.sharpness, fp.confirmed
+		fr, ferr := tx.QueryContext(ctx, `
+			SELECT fd.embedding
 			FROM face_person fp
 			JOIN face_detections fd ON fd.id = fp.face_id
 			JOIN assets a ON a.id = fd.asset_id
 			WHERE fp.person_id = ? AND fd.excluded = 0`, pid)
-		if cerr != nil {
-			err = cerr
+		if ferr != nil {
+			err = ferr
 			return err
 		}
-		var cands []exemplarCandidate
-		vecByFace := map[string][]float32{}
-		for cr.Next() {
-			var faceID string
+		var vecs [][]float32
+		for fr.Next() {
 			var blob []byte
-			var score, frontality, sharpness sql.NullFloat64
-			var confirmedFlag int
-			if err = cr.Scan(&faceID, &blob, &score, &frontality, &sharpness, &confirmedFlag); err != nil {
-				cr.Close()
+			if err = fr.Scan(&blob); err != nil {
+				fr.Close()
 				return err
 			}
-			vec := sqlite.DeserializeFloat32(blob)
-			cands = append(cands, exemplarCandidate{
-				FaceID: faceID, Vec: vec, Score: score,
-				Frontality: frontality, Sharpness: sharpness,
-				Confirmed: confirmedFlag != 0,
-			})
-			vecByFace[faceID] = vec
-			anchored[faceID] = true
+			vecs = append(vecs, sqlite.DeserializeFloat32(blob))
 		}
-		if cerr := cr.Err(); cerr != nil {
-			cr.Close()
+		if cerr := fr.Err(); cerr != nil {
+			fr.Close()
 			return cerr
 		}
-		cr.Close()
-
-		minScore, minFront, minSharp := exemplarQualityGate()
-		selected := SelectExemplars(cands, exemplarCap(), minScore, minFront, minSharp)
-
-		// Persist exemplar flags: clear then set within this tx, even for a
-		// hidden person -- hidden persons still participate in Match (same
-		// reason step 5's centroid write-back below covers hidden persons
-		// too: their up-to-date state must not go stale between passes).
-		if _, err = clearExemplarStmt.ExecContext(ctx, pid); err != nil {
+		fr.Close()
+		// Record anchored members
+		mr, merr := tx.QueryContext(ctx, `SELECT face_id FROM face_person WHERE person_id=?`, pid)
+		if merr != nil {
+			err = merr
 			return err
 		}
-		if len(selected) > 0 {
-			vecs := make([][]float32, len(selected))
-			for i, fid := range selected {
-				if _, err = setExemplarStmt.ExecContext(ctx, fid); err != nil {
-					return err
-				}
-				vecs[i] = vecByFace[fid]
-			}
-			exemplarVecs[pid] = vecs
-		}
-	}
-
-	// 1.5. Per-pass revalidation of already-anchored, non-exempt members
-	//      (apple-only -- revalidation is an exemplar-era concept; the
-	//      dbscan path is a complete, untouched legacy stack per the ENGINE
-	//      SPLIT comments above). This is the drift-killer for "members can
-	//      enter but never leave": once a face auto-joined an anchored
-	//      person in some earlier pass, nothing until now ever re-checked
-	//      whether it still belongs. Every pass, for every anchored person,
-	//      each CURRENT member face that is NOT confirmed=1, NOT the
-	//      person's cover_locked cover face, and NOT on the person's hero
-	//      asset is re-matched against THAT PERSON's OWN exemplar set alone
-	//      -- never the global index -- because the question here is "do you
-	//      still look like this person", not "does anyone else want you
-	//      more" (that competition already happened once, when the face
-	//      first joined; re-running it here would let an unrelated stronger
-	//      match steal a legitimately-still-valid member out from under its
-	//      own person).
-	//
-	//      ORDERING (load-bearing, do not reshuffle):
-	//        a) must run AFTER step 1 above, so exemplarVecs holds this
-	//           pass's freshly-selected templates -- revalidating against a
-	//           stale template would be pointless;
-	//        b) must run BEFORE step 3's BuildExemplarIndex call below, and
-	//           must itself recompute+re-persist the exemplar set of any
-	//           person it changed, so a just-detached face can never linger
-	//           as a stale exemplar feeding that index;
-	//        c) placement before step 2 (auto-person deletion) vs. after is
-	//           otherwise arbitrary -- neither reads nor writes here overlap
-	//           with step 2's non-anchored persons.
-	if engine != "dbscan" {
-		changedPersons := map[string]bool{} // persons that lost >=1 member -> exemplar recompute needed
-
-		for _, pid := range anchorIDs {
-			vecs := exemplarVecs[pid]
-			if len(vecs) == 0 {
-				// No gated exemplars at all -- nothing to revalidate
-				// against. BuildExemplarIndex would produce an empty pool
-				// and Match would always return "none", which must NOT be
-				// read as "every member drifted" -- it would evict an
-				// entire person whose whole membership merely failed the
-				// quality gate (e.g. pre-gen4 rows with no signals yet).
-				continue
-			}
-
-			var coverLocked int
-			var coverFaceID, heroAssetID string
-			if err = tx.QueryRowContext(ctx,
-				`SELECT cover_locked, COALESCE(cover_face_id,''), COALESCE(hero_asset_id,'') FROM persons WHERE id=?`,
-				pid).Scan(&coverLocked, &coverFaceID, &heroAssetID); err != nil {
-				return err
-			}
-
-			mr, merr := tx.QueryContext(ctx, `
-				SELECT fd.id, fd.embedding, fd.asset_id, fp.confirmed
-				FROM face_person fp
-				JOIN face_detections fd ON fd.id = fp.face_id
-				JOIN assets a ON a.id = fd.asset_id
-				WHERE fp.person_id = ? AND fd.excluded = 0`, pid)
-			if merr != nil {
-				err = merr
-				return err
-			}
-			type revalMember struct {
-				faceID, assetID string
-				vec             []float32
-				confirmed       int
-			}
-			var members []revalMember
-			for mr.Next() {
-				var m revalMember
-				var blob []byte
-				if err = mr.Scan(&m.faceID, &blob, &m.assetID, &m.confirmed); err != nil {
-					mr.Close()
-					return err
-				}
-				m.vec = sqlite.DeserializeFloat32(blob)
-				members = append(members, m)
-			}
-			if cerr := mr.Err(); cerr != nil {
+		for mr.Next() {
+			var fid string
+			if err = mr.Scan(&fid); err != nil {
 				mr.Close()
-				return cerr
+				return err
 			}
+			anchored[fid] = true
+		}
+		if cerr := mr.Err(); cerr != nil {
 			mr.Close()
-
-			// Single-person index: reusing Match (rather than a bespoke
-			// median-of-k helper) keeps identical dual-threshold/median/
-			// per-person-floor semantics to free-face assignment for free.
-			// With only one person in the pool, Match's plurality-vote and
-			// negation-exclusion logic degenerate harmlessly (a lone
-			// candidate always "wins" its own vote, with no competitor to
-			// tie against), leaving exactly the median-of-k-nearest distance
-			// check that "still looks like this person" needs.
-			//
-			// 1-exemplar-person edge: when this person has exactly one
-			// exemplar and the member under test IS that exemplar, the pool
-			// contains only its own vector, so the nearest (and only)
-			// neighbor is itself at dist 0 -- always "auto", never removed.
-			// This is intentional, not a bug to guard against: an exemplar
-			// face trivially still looks like itself, and a single-template
-			// person has nothing else to compare against anyway (see
-			// TestRunClustering_AppleRevalidate_SoloExemplarSelfMatchSurvives).
-			soloIndex := BuildExemplarIndex(map[string][][]float32{pid: vecs})
-
-			// demoteToReview is the shared write path for "keep the
-			// membership, queue an open 'review' suggestion" -- used both by
-			// the ordinary gray-zone "suggest" decision below AND, during the
-			// migration's lossless first pass, by what would otherwise be a
-			// "none" detach (see the switch below and exemplar_migrate.go).
-			demoteToReview := func(faceID string, dist float64) error {
-				_, err := tx.ExecContext(ctx, `
-					INSERT INTO person_suggestions(id, person_id, face_id, kind, score, status, created_at)
-					VALUES(?, ?, ?, 'review', ?, 'open', ?)
-					ON CONFLICT(person_id, face_id) DO UPDATE SET
-						kind=excluded.kind, score=excluded.score, created_at=excluded.created_at
-					WHERE person_suggestions.status='open'`,
-					uuid.NewString(), pid, faceID, dist, time.Now())
-				return err
-			}
-
-			// nearestExemplarDist is only needed by the migration's lossless
-			// "none" branch below: Match() always zeroes its returned dist
-			// when decision=="none" (nothing further needs it in the normal
-			// detach path), but a lossless-demoted review suggestion still
-			// needs a real, sortable score for the review queue -- so this
-			// recomputes the plain nearest-exemplar cosine distance directly
-			// against this person's own template vectors.
-			nearestExemplarDist := func(vec []float32) float64 {
-				best := math.Inf(1)
-				for _, ev := range vecs {
-					if d := cosDist(vec, ev); d < best {
-						best = d
-					}
-				}
-				return best
-			}
-
-			for _, m := range members {
-				if m.confirmed != 0 {
-					continue // user-confirmed members are never revalidated
-				}
-				if coverLocked != 0 && coverFaceID == m.faceID {
-					continue // the user-pinned cover face is exempt
-				}
-				if heroAssetID != "" && m.assetID == heroAssetID {
-					continue // any face on the user-chosen hero asset is exempt
-				}
-
-				_, dist, decision := soloIndex.Match(m.vec, m.faceID, negatives, k, minVotes, autoDist, suggestDist)
-				switch decision {
-				case "auto":
-					// Back within this person's own auto band. Membership
-					// itself needs no action, but a member that had drifted
-					// into the gray zone on an earlier pass (and got an open
-					// 'review' row) may have since recovered -- e.g. the
-					// person's exemplar set improved, or this face's own
-					// signal got re-detected. That open row is now moot: the
-					// system just re-confirmed this member itself, so leaving
-					// the row open would let a human reject it later and
-					// silently punish a currently-good member (see
-					// resolveOpenSuggestion's doc comment for the full
-					// failure mode). CRITICAL fix, final whole-span review.
-					if err = resolveOpenSuggestion(ctx, resolveSuggestionStmt, pid, m.faceID); err != nil {
-						return err
-					}
-				case "suggest":
-					// Gray zone: keep the membership but flag it for human
-					// re-confirmation (kind='review', distinct from a
-					// free-face 'join' suggestion). UPSERT, not DO NOTHING
-					// -- unlike a 'join' proposal (offered once per pair), a
-					// review suggestion's score should track this member's
-					// latest drift measurement across passes; also
-					// overwrites kind in case a stale row of a different
-					// kind exists for this same (person_id, face_id) pair
-					// (the UNIQUE index has no kind column).
-					//
-					// INVARIANT (also guarded at the 'join' INSERT below):
-					// a decided row (status accepted/rejected) is never
-					// silently reopened by machinery -- only a user
-					// action reopens a decided suggestion. The DO UPDATE's
-					// WHERE clause enforces this at the write site: it only
-					// fires when the existing row is still 'open' (so
-					// status itself never needs setting -- an open row
-					// simply stays open), leaving a decided row's
-					// status/decided_at untouched even if this same member
-					// drifts back into the gray zone on a later pass. Most
-					// reopen paths become unreachable once T6's accept/
-					// reject endpoints land anyway (accept -> confirmed,
-					// exempt from revalidation entirely; reject -> detached
-					// + negated, no longer a member to revalidate), but the
-					// invariant is enforced defensively regardless.
-					if err = demoteToReview(m.faceID, dist); err != nil {
-						return err
-					}
-				default: // "none": beyond suggestDist -- drift confirmed,
-					// UNLESS this is the exemplar-assignment migration's
-					// lossless first pass (see exemplar_migrate.go): the
-					// migration's whole point is that an EXISTING member's
-					// continued presence came from the old centroid-snap
-					// behavior, never from real user confirmation, so an
-					// algorithmic detach on the very first exemplar-engine
-					// pass could silently drop a face before a human ever
-					// gets a chance to look at it. Demote instead of detach --
-					// same write path as the ordinary "suggest" case above --
-					// and leave the membership, and `anchored`/`changedPersons`,
-					// untouched.
-					if lossless {
-						if err = demoteToReview(m.faceID, nearestExemplarDist(m.vec)); err != nil {
-							return err
-						}
-						continue
-					}
-					// Detach, NOT reject: this is an algorithmic re-check,
-					// not a user decision, so no person_negatives row is
-					// written -- that would permanently block the face from
-					// ever re-joining this person via KNN voting, which a
-					// mere auto-eviction hasn't earned (auto-removal !=
-					// user denial). The face returns to the free pool for
-					// THIS SAME pass: clearing it from `anchored` here makes
-					// step 3 below treat it exactly like any other
-					// unassigned face -- it may re-match a different
-					// person, or fall through into step 4's two-pass
-					// clustering.
-					if _, err = tx.ExecContext(ctx, `DELETE FROM face_person WHERE face_id=?`, m.faceID); err != nil {
-						return err
-					}
-					delete(anchored, m.faceID)
-					changedPersons[pid] = true
-				}
-			}
+			return cerr
 		}
-
-		// Recompute+re-persist the exemplar set of every person that lost a
-		// member above, BEFORE step 3's BuildExemplarIndex call reads
-		// exemplarVecs -- otherwise a just-detached face would linger as a
-		// stale exemplar template for the rest of this pass. Mirrors step
-		// 1's candidate query/SelectExemplars call above exactly, just
-		// re-run against the post-removal membership.
-		for pid := range changedPersons {
-			cr, cerr := tx.QueryContext(ctx, `
-				SELECT fd.id, fd.embedding, fd.score, fd.frontality, fd.sharpness, fp.confirmed
-				FROM face_person fp
-				JOIN face_detections fd ON fd.id = fp.face_id
-				JOIN assets a ON a.id = fd.asset_id
-				WHERE fp.person_id = ? AND fd.excluded = 0`, pid)
-			if cerr != nil {
-				err = cerr
-				return err
-			}
-			var cands []exemplarCandidate
-			vecByFace := map[string][]float32{}
-			for cr.Next() {
-				var faceID string
-				var blob []byte
-				var score, frontality, sharpness sql.NullFloat64
-				var confirmedFlag int
-				if err = cr.Scan(&faceID, &blob, &score, &frontality, &sharpness, &confirmedFlag); err != nil {
-					cr.Close()
-					return err
-				}
-				vec := sqlite.DeserializeFloat32(blob)
-				cands = append(cands, exemplarCandidate{
-					FaceID: faceID, Vec: vec, Score: score,
-					Frontality: frontality, Sharpness: sharpness,
-					Confirmed: confirmedFlag != 0,
-				})
-				vecByFace[faceID] = vec
-			}
-			if cerr := cr.Err(); cerr != nil {
-				cr.Close()
-				return cerr
-			}
-			cr.Close()
-
-			minScore, minFront, minSharp := exemplarQualityGate()
-			selected := SelectExemplars(cands, exemplarCap(), minScore, minFront, minSharp)
-
-			if _, err = clearExemplarStmt.ExecContext(ctx, pid); err != nil {
-				return err
-			}
-			delete(exemplarVecs, pid) // drop the stale entry even if selected is now empty
-			if len(selected) > 0 {
-				vecs := make([][]float32, len(selected))
-				for i, fid := range selected {
-					if _, err = setExemplarStmt.ExecContext(ctx, fid); err != nil {
-						return err
-					}
-					vecs[i] = vecByFace[fid]
-				}
-				exemplarVecs[pid] = vecs
-			}
-		}
+		mr.Close()
+		anchors = append(anchors, anchor{id: pid, centroid: ComputeCentroid(vecs)})
 	}
 
 	// 2. Delete auto persons (non-anchored) and their face_person rows.
@@ -1645,23 +1038,8 @@ func (s *FaceService) rebuildPersonsWithProgress(ctx context.Context, faces []fa
 		return err
 	}
 
-	// 3. Free faces = faces not in the anchored member set.
-	//
-	//    ENGINE SPLIT: "dbscan" snaps each free face onto the nearest
-	//    anchored centroid within assignEpsilon -- the legacy path, kept
-	//    byte-identical (an engine=dbscan rollback must get the whole old
-	//    stack, not a partial mix with the exemplar matcher). "apple"
-	//    instead matches each free face against the exemplar index built in
-	//    step 1: "auto" joins the person immediately (confirmed=0); "suggest"
-	//    queues an open person_suggestions row (idempotent across passes via
-	//    ON CONFLICT DO NOTHING on the (person_id,face_id) unique index --
-	//    an already-open row for the same pair is left untouched, and a
-	//    previously-rejected pair never reaches "suggest" again once it's in
-	//    person_negatives, since Match excludes a negated person's exemplars
-	//    for that face entirely); "none" and "suggest" both leave the face in
-	//    the free set for step 4's two-pass clustering -- a suggestion is
-	//    advisory, not a membership, so the face still needs an auto-person
-	//    home until a human accepts it.
+	// 3. Free faces = faces not in the anchored member set; first try to snap
+	//    them onto the nearest anchored centroid.
 	// Pre-compile the face_person INSERT, shared by steps 3 and 4.
 	fpStmt, err := tx.PrepareContext(ctx, `INSERT INTO face_person(face_id, person_id) VALUES(?,?)`)
 	if err != nil {
@@ -1674,89 +1052,35 @@ func (s *FaceService) rebuildPersonsWithProgress(ctx context.Context, faces []fa
 		idx  int
 	}
 	var free []freeFace
-
-	switch engine {
-	case "dbscan":
-		for i, f := range faces {
-			if anchored[f.id] {
+	for i, f := range faces {
+		if anchored[f.id] {
+			continue
+		}
+		assigned := false
+		bestDist := assignEpsilon
+		bestAnchor := ""
+		for _, an := range anchors {
+			if an.centroid == nil {
 				continue
 			}
-			assigned := false
-			bestDist := assignEpsilon
-			bestAnchor := ""
-			for _, an := range anchors {
-				if an.centroid == nil {
-					continue
-				}
-				d := cosDist(f.vec, an.centroid)
-				if d <= bestDist {
-					bestDist = d
-					bestAnchor = an.id
-				}
-			}
-			if bestAnchor != "" {
-				if _, err = fpStmt.ExecContext(ctx, f.id, bestAnchor); err != nil {
-					return err
-				}
-				assigned = true
-			}
-			if !assigned {
-				free = append(free, freeFace{face: f, idx: i})
+			d := cosDist(f.vec, an.centroid)
+			if d <= bestDist {
+				bestDist = d
+				bestAnchor = an.id
 			}
 		}
-
-	default: // "apple"
-		// negatives/k/minVotes/autoDist/suggestDist were already loaded/
-		// computed once, above step 1's anchor loop, and are shared with
-		// step 1.5's revalidation.
-		ix := BuildExemplarIndex(exemplarVecs)
-
-		for i, f := range faces {
-			if anchored[f.id] {
-				continue
+		if bestAnchor != "" {
+			if _, err = fpStmt.ExecContext(ctx, f.id, bestAnchor); err != nil {
+				return err
 			}
-			personID, dist, decision := ix.Match(f.vec, f.id, negatives, k, minVotes, autoDist, suggestDist)
-			switch decision {
-			case "auto":
-				if _, err = fpStmt.ExecContext(ctx, f.id, personID); err != nil {
-					return err
-				}
-				// This face may already carry an open 'join' row from an
-				// earlier pass (it landed in the gray zone for `personID`
-				// before, but now clears the auto bar directly -- e.g. its
-				// own signal improved, or personID's exemplars did). That
-				// row is now moot: it just auto-joined, so a later reject on
-				// the stale card would write a person_negatives row for a
-				// face that is simultaneously a confirmed member of that
-				// same person, which a subsequent revalidation pass would
-				// then silently evict via Match's negation filter (see
-				// resolveOpenSuggestion's doc comment). IMPORTANT fix, final
-				// whole-span review.
-				if err = resolveOpenSuggestion(ctx, resolveSuggestionStmt, personID, f.id); err != nil {
-					return err
-				}
-				continue // joined immediately -- not part of the free set
-			case "suggest":
-				// INVARIANT (see step 1.5's 'review' UPSERT above for the
-				// full explanation): a decided suggestion row is never
-				// silently reopened by machinery. DO NOTHING already
-				// satisfies this by construction -- an existing row for
-				// this (person_id, face_id) pair, decided or not, is left
-				// completely untouched; only a brand-new pair gets
-				// inserted.
-				if _, err = tx.ExecContext(ctx, `
-					INSERT INTO person_suggestions(id, person_id, face_id, kind, score, status, created_at)
-					VALUES(?, ?, ?, 'join', ?, 'open', ?)
-					ON CONFLICT(person_id, face_id) DO NOTHING`,
-					uuid.NewString(), personID, f.id, dist, time.Now()); err != nil {
-					return err
-				}
-			}
+			assigned = true
+		}
+		if !assigned {
 			free = append(free, freeFace{face: f, idx: i})
 		}
 	}
 
-	// 4. Group the remaining free faces into new auto persons.
+	// 4. Group the remaining free faces into new auto persons by DBSCAN label.
 	// cover_asset_id / cover_face_id are set uniformly by
 	// recomputePersonStatsTx, so left unset in this INSERT.
 	personStmt, err := tx.PrepareContext(ctx, `INSERT INTO persons(id, name, created_at, updated_at) VALUES(?, '', ?, ?)`)
@@ -1765,50 +1089,10 @@ func (s *FaceService) rebuildPersonsWithProgress(ctx context.Context, faces []fa
 	}
 	defer personStmt.Close()
 
-	// freeLabels is aligned to `free` (not to `faces`). For "dbscan", labels
-	// was already computed over every face before the anchored/free split
-	// existed (clusterStage, byte-identical to the historical behavior), so
-	// it's still looked up by the face's original position (ff.idx). For
-	// "apple", the two-pass engine runs now, for the first time, restricted
-	// to vecs/times of the free faces only -- moment segmentation must never
-	// be told about an already-anchored face's capture time, and pass-1/2
-	// must never union or merge across an anchored face, or a free cluster
-	// could get transitively chained onto one purely via an anchored
-	// bystander whose own label is never even consulted.
-	var freeLabels []int
-	switch engine {
-	case "dbscan":
-		freeLabels = make([]int, len(free))
-		for i, ff := range free {
-			freeLabels[i] = labels[ff.idx]
-		}
-	default: // "apple"
-		freeVecs := make([][]float32, len(free))
-		freeTakenAt := make([]time.Time, len(free))
-		freeIndexedAt := make([]time.Time, len(free))
-		for i, ff := range free {
-			freeVecs[i] = ff.face.vec
-			freeTakenAt[i] = ff.face.takenAt
-			freeIndexedAt[i] = ff.face.indexedAt
-		}
-		moments := SegmentMoments(freeTakenAt, freeIndexedAt, momentGap())
-		pass1 := GreedyMomentClusters(freeVecs, moments, tightEps())
-		freeLabels = HACComplete(freeVecs, pass1, mergeEps())
-	}
-
-	// autoMemberSets accumulates each newly created auto person's member
-	// face ids/vectors as they're assigned below -- apple-only, feeds step
-	// 6's merge-question generation without a second query, since step 4
-	// already has every free face's vector in memory right here.
-	var autoMemberSets map[string]*mcPerson
-	if engine != "dbscan" {
-		autoMemberSets = map[string]*mcPerson{}
-	}
-
 	labelToPersonID := map[int]string{}
 	now := time.Now()
-	for i, ff := range free {
-		l := freeLabels[i]
+	for _, ff := range free {
+		l := labels[ff.idx]
 		pid, ok := labelToPersonID[l]
 		if !ok {
 			pid = uuid.NewString()
@@ -1820,15 +1104,6 @@ func (s *FaceService) rebuildPersonsWithProgress(ctx context.Context, faces []fa
 		if _, err = fpStmt.ExecContext(ctx, ff.face.id, pid); err != nil {
 			return err
 		}
-		if autoMemberSets != nil {
-			pm, ok := autoMemberSets[pid]
-			if !ok {
-				pm = &mcPerson{id: pid}
-				autoMemberSets[pid] = pm
-			}
-			pm.faceIDs = append(pm.faceIDs, ff.face.id)
-			pm.vecs = append(pm.vecs, ff.face.vec)
-		}
 	}
 
 	// 5. Write back centroid/confidence/cover_face_id for every person
@@ -1839,69 +1114,10 @@ func (s *FaceService) rebuildPersonsWithProgress(ctx context.Context, faces []fa
 		return err
 	}
 
-	// 6. Generate this pass's cluster-merge question candidates (apple
-	//    engine only -- see service/merge_questions.go and OVERVIEW.md's
-	//    "Cluster-merge questions" section). Deliberately placed after step
-	//    5 (not step 4): by this point every person this pass touches --
-	//    anchored and freshly-created auto alike -- has its final
-	//    membership/centroid/confidence already written back, so this
-	//    stage's own fresh member-vector query (loadAnchoredMemberSets)
-	//    sees this pass's fully-settled state rather than an
-	//    in-progress one.
-	if autoMemberSets != nil {
-		autoPersons := make([]mcPerson, 0, len(autoMemberSets))
-		for _, pm := range autoMemberSets {
-			pm.centroid = ComputeCentroid(pm.vecs)
-			autoPersons = append(autoPersons, *pm)
-		}
-		if err = generateMergeSuggestionsTx(ctx, tx, autoPersons, anchorIDs); err != nil {
-			return err
-		}
-	}
-
 	n := len(faces)
 	onProgress(n, n)
-	if err = tx.Commit(); err != nil {
-		return err
-	}
-	// Only write the migration marker AFTER a successful commit -- writing
-	// it any earlier (e.g. right after step 1.5's loop, before steps 2-5 run)
-	// would risk marking the migration done while this pass's own lossless
-	// demotions never actually persisted (a later error rolling back the
-	// tx), which is exactly the silent-data-loss scenario the migration
-	// exists to prevent. See exemplar_migrate.go.
-	if lossless {
-		writeExemplarMigrationMarker(s.markerDir)
-	}
-
-	// Fire self-calibration asynchronously now that this pass's persons/
-	// face_person/calibration-relevant tables have all landed. This does
-	// NOT hard-exclude a concurrent clustering pass (WAL gives it a
-	// consistent read snapshot, calibration_state is written in one small
-	// tx, and any values it applies are only picked up by resolveThreshold's
-	// cache on the NEXT pass anyway), and it never triggers reclustering
-	// itself -- no feedback loop. See calibrate_run.go's maybeCalibrate doc
-	// comment for the full reasoning.
-	//
-	// The wiring guard is checked HERE, synchronously, rather than relying
-	// solely on maybeCalibrate's own first-line guard: every test in this
-	// package builds a FaceService directly and never calls
-	// SetCalibrationDB, so calibrationDBWired() is false for the entire
-	// lifetime of nearly every test -- checking it before spawning means
-	// those tests never spawn a goroutine here at all, which matters
-	// because a spawned-but-immediately-returning goroutine can still
-	// outlive its own test (Go gives no ordering guarantee between an
-	// orphaned goroutine and the next test's cleanup) and, if some later,
-	// unrelated test happens to wire calibration in the meantime, race that
-	// later test's globals against this test's already-closed db. Checking
-	// synchronously, in the same goroutine as the clustering pass itself,
-	// observes only contemporaneous state and never spawns anything when
-	// there is nothing to do.
-	if calibrationDBWired() && config.Cfg != nil {
-		go s.maybeCalibrate(ctx)
-	}
-
-	return nil
+	err = tx.Commit()
+	return err
 }
 
 // recomputePersonStatsTx recomputes centroid and confidence for every person in

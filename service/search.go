@@ -725,54 +725,40 @@ func (s *SearchService) UpdatePersonName(id, name string) error {
 // deletes the source person and recomputes the centroid/confidence/cover of
 // intoID — all within a single transaction.
 func (s *SearchService) MergePersons(fromID, intoID string) error {
+	if fromID == intoID {
+		return fmt.Errorf("MergePersons: from and into must be different persons")
+	}
+
 	tx, err := s.db.Begin()
 	if err != nil {
 		return fmt.Errorf("MergePersons begin tx: %w", err)
 	}
 	defer tx.Rollback() //nolint:errcheck
 
-	if err = mergePersonsTx(tx, fromID, intoID); err != nil {
-		return err
+	var one int
+	if err = tx.QueryRow(`SELECT 1 FROM persons WHERE id=?`, fromID).Scan(&one); err != nil {
+		if err == sql.ErrNoRows {
+			return ErrNotFound
+		}
+		return fmt.Errorf("MergePersons check from: %w", err)
+	}
+	if err = tx.QueryRow(`SELECT 1 FROM persons WHERE id=?`, intoID).Scan(&one); err != nil {
+		if err == sql.ErrNoRows {
+			return ErrNotFound
+		}
+		return fmt.Errorf("MergePersons check into: %w", err)
+	}
+
+	if _, err = tx.Exec(`UPDATE face_person SET person_id=? WHERE person_id=?`, intoID, fromID); err != nil {
+		return fmt.Errorf("MergePersons update: %w", err)
+	}
+	if _, err = tx.Exec(`DELETE FROM persons WHERE id=?`, fromID); err != nil {
+		return fmt.Errorf("MergePersons delete: %w", err)
+	}
+	if err = recomputeOneCentroidTx(tx, intoID); err != nil {
+		return fmt.Errorf("MergePersons recompute: %w", err)
 	}
 	return tx.Commit()
-}
-
-// mergePersonsTx implements MergePersons' body against an already-open
-// transaction: reassigns face_person rows from fromID to intoID, deletes the
-// source person, and recomputes intoID's centroid/confidence/cover. Shared
-// with PersonService.AcceptMergeSuggestion (service/merge_questions.go),
-// which needs the merge and the merge_suggestions status update to commit
-// atomically together — a plain call to the tx-owning MergePersons above
-// would commit before that status write could join the same transaction.
-func mergePersonsTx(tx *sql.Tx, fromID, intoID string) error {
-	if fromID == intoID {
-		return fmt.Errorf("mergePersonsTx: from and into must be different persons")
-	}
-
-	var one int
-	if err := tx.QueryRow(`SELECT 1 FROM persons WHERE id=?`, fromID).Scan(&one); err != nil {
-		if err == sql.ErrNoRows {
-			return ErrNotFound
-		}
-		return fmt.Errorf("mergePersonsTx check from: %w", err)
-	}
-	if err := tx.QueryRow(`SELECT 1 FROM persons WHERE id=?`, intoID).Scan(&one); err != nil {
-		if err == sql.ErrNoRows {
-			return ErrNotFound
-		}
-		return fmt.Errorf("mergePersonsTx check into: %w", err)
-	}
-
-	if _, err := tx.Exec(`UPDATE face_person SET person_id=? WHERE person_id=?`, intoID, fromID); err != nil {
-		return fmt.Errorf("mergePersonsTx update: %w", err)
-	}
-	if _, err := tx.Exec(`DELETE FROM persons WHERE id=?`, fromID); err != nil {
-		return fmt.Errorf("mergePersonsTx delete: %w", err)
-	}
-	if err := recomputeOneCentroidTx(tx, intoID); err != nil {
-		return fmt.Errorf("mergePersonsTx recompute: %w", err)
-	}
-	return nil
 }
 
 // ─── Asset CRUD ──────────────────────────────────────────────────────────────
