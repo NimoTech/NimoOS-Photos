@@ -19,6 +19,10 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    # A healthy run finishes in ~3 minutes. Without a cap, a hung step runs to
+    # GitHub's 360-minute default — one stuck apt-get on 2026-08-19 billed 12
+    # hours across this workflow's two jobs, a third of the monthly quota.
+    timeout-minutes: 15
     steps:
       # A single checkout is enough. go.mod used to redirect
       # github.com/NimoTech/NimoOS-Common to ../NimoOS-Common, so CI had to
@@ -75,6 +79,8 @@ jobs:
   # the workflow boring.
   mlserver-tests:
     runs-on: ubuntu-latest
+    # Same rationale as build above; a healthy run finishes in ~2 minutes.
+    timeout-minutes: 15
     steps:
       - name: Check out NimoOS-Photos
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
