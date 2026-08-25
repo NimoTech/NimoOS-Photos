@@ -59,7 +59,8 @@ func mediaGetSkip(method, path string) bool {
 }
 
 // mcpReadSkip reports whether a localhost caller may skip JWT on the read-only
-// photos endpoints the NimoOS-AI MCP server uses. Fail-closed + exact-match:
+// photos endpoints other NimoOS services use (the NimoOS-AI MCP server,
+// NimoOS-Search path expansion). Fail-closed + exact-match:
 //   - realIP must be 127.* (use c.RealIP(); the Gateway strips spoofed XFF, so
 //     external traffic never appears as 127, and RemoteAddr would be wrong here);
 //   - userID (X-NimoOS-User-ID) must be non-empty, else NOT skipped → JWT → 401
@@ -73,6 +74,11 @@ func mcpReadSkip(method, path, realIP, userID string) bool {
 		return true
 	}
 	if method == http.MethodGet && path == common.V1APIPath+"/albums" {
+		return true
+	}
+	// Asset metadata (name/path/mime/takenAt): NimoOS-Search uses it to give
+	// photos:<asset_id> search hits a real file name. Read-only, exact route.
+	if method == http.MethodGet && path == common.V1APIPath+"/assets/:id" {
 		return true
 	}
 	return false

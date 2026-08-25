@@ -25,6 +25,13 @@ func TestMcpReadSkip(t *testing.T) {
 		{"albums GET external ip", http.MethodGet, base + "/albums", "192.168.1.5", "42", false},
 		{"search/smart POST localhost with uid", http.MethodPost, base + "/search/smart", "127.0.0.1", "42", true},
 		{"suffix-lookalike not exact-matched", http.MethodGet, base + "/public/albums", "127.0.0.1", "42", false},
+		// NimoOS-Search resolves photos:<asset_id> search hits to a file path via
+		// the asset metadata endpoint; same trust model as search/smart.
+		{"assets/:id GET localhost with uid", http.MethodGet, base + "/assets/:id", "127.0.0.1", "42", true},
+		{"assets/:id GET localhost without uid", http.MethodGet, base + "/assets/:id", "127.0.0.1", "", false},
+		{"assets/:id GET external ip", http.MethodGet, base + "/assets/:id", "192.168.1.5", "42", false},
+		{"assets/:id DELETE localhost NOT allowed (read-only list)", http.MethodDelete, base + "/assets/:id", "127.0.0.1", "42", false},
+		{"assets/:id/original GET not via this skipper", http.MethodGet, base + "/assets/:id/original", "127.0.0.1", "42", false},
 	}
 	for _, c := range cases {
 		if got := mcpReadSkip(c.method, c.path, c.ip, c.userID); got != c.want {
