@@ -326,3 +326,77 @@ func TestMountGuard_AlignOnStartupNeverFlagsDevmonAssetsOffline(t *testing.T) {
 	require.NoError(t, db.QueryRow(`SELECT offline FROM assets WHERE id=?`, asset).Scan(&offline))
 	require.Equal(t, 0, offline, "devmon assets should not be marked offline by startup alignment")
 }
+
+// TestMountGuard_AlignOnStartupFlagsMntAssetsUnderAbsentMount is the /mnt
+// blind-spot regression (real machine: a system disk temporarily mounted at
+// /mnt/root-B was indexed — EnumerateScanRoots treats /mnt/* mounts as user
+// partitions — then unmounted; its assets stayed offline=0 forever, so the
+// OCR backfill re-read the vanished files on every cooldown window). The
+// governed namespace must match the scan namespace: an asset under an absent
+// /mnt mount is flagged offline by startup alignment exactly like /media,
+// while /DATA stays untouched.
+func TestMountGuard_AlignOnStartupFlagsMntAssetsUnderAbsentMount(t *testing.T) {
+	db := makeTestDB(t)
+	mntAsset := insertAsset(t, db, "/mnt/root-B/usr/share/icons/app.png", "indexed")
+	dataAsset := insertAsset(t, db, "/DATA/Gallery/photo.jpg", "indexed")
+
+	mg := NewMountGuard(db)
+	mg.currentMounts = func() []string { return nil }
+
+	mg.AlignOnStartup()
+
+	var offline int
+	require.NoError(t, db.QueryRow(`SELECT offline FROM assets WHERE id=?`, mntAsset).Scan(&offline))
+	require.Equal(t, 1, offline, "an asset under an absent /mnt mount must be marked offline by startup alignment")
+	require.NoError(t, db.QueryRow(`SELECT offline FROM assets WHERE id=?`, dataAsset).Scan(&offline))
+	require.Equal(t, 0, offline, "/DATA assets must never be touched by mount alignment")
+}
+
+// TestMountGuard_MntMountLifecycleMatchesMedia covers the runtime transitions
+// for a /mnt mount (e.g. a MergerFS volume or NAS share): vanishing from the
+// poll snapshot flags its assets offline, reappearing restores them and fires
+// the recovery hooks — the same lifecycle /media mounts already get. A
+// present /mnt mount must also keep its assets online through startup
+// alignment (the markOfflineOutside blanket must exempt every present mount,
+// not just /media ones).
+func TestMountGuard_MntMountLifecycleMatchesMedia(t *testing.T) {
+	db := makeTestDB(t)
+	mntAsset := insertAsset(t, db, "/mnt/nas-share/photo.jpg", "indexed")
+
+	mg := NewMountGuard(db)
+	mounts := []string{"/mnt/nas-share"}
+	mg.currentMounts = func() []string { return mounts }
+
+	var watcherCalls, scanCalls, backfillCalls, ocrCalls atomic.Int32
+	var scannedMount atomic.Value
+	mg.SetWatcherRestart(func() { watcherCalls.Add(1) })
+	mg.SetScanDir(func(m string) error { scanCalls.Add(1); scannedMount.Store(m); return nil })
+	mg.SetBackfill(func(ctx context.Context) error { backfillCalls.Add(1); return nil })
+	mg.SetBackfillOCR(func(ctx context.Context) error { ocrCalls.Add(1); return nil })
+
+	// Startup with the mount present: stays online.
+	mg.AlignOnStartup()
+	mg.lastMounts = toMountSet(mg.currentMounts())
+
+	offlineFlag := func() bool {
+		var v int
+		require.NoError(t, db.QueryRow(`SELECT offline FROM assets WHERE id=?`, mntAsset).Scan(&v))
+		return v == 1
+	}
+	require.False(t, offlineFlag(), "asset under a present /mnt mount must stay online through startup alignment")
+
+	// Unmount: /mnt/nas-share disappears from the snapshot.
+	mounts = []string{}
+	mg.checkOnce(context.Background())
+	require.True(t, offlineFlag(), "/mnt asset should be marked offline when its mount vanishes")
+
+	// Remount: it reappears — assets online again, recovery fires once.
+	mounts = []string{"/mnt/nas-share"}
+	mg.checkOnce(context.Background())
+	require.False(t, offlineFlag(), "remounting should restore offline=0")
+	require.Eventually(t, func() bool {
+		return watcherCalls.Load() == 1 && scanCalls.Load() == 1 &&
+			backfillCalls.Load() == 1 && ocrCalls.Load() == 1
+	}, 5*time.Second, 10*time.Millisecond, "remount should trigger one watcher restart/rescan/CLIP/OCR backfill each")
+	require.Equal(t, "/mnt/nas-share", scannedMount.Load())
+}

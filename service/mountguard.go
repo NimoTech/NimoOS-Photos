@@ -10,17 +10,26 @@ import (
 	"go.uber.org/zap"
 )
 
-// removableRoots is the mount-point namespace MountGuard governs. Only
-// /media/ is the automount namespace used for hot-plugged removable drives;
-// /DATA and any manually-mounted volumes under /mnt (MergerFS, NAS shares)
-// are permanent storage and are never touched, even if they transiently
-// vanish from /proc/mounts.
+// removableRoots is the mount-point namespace MountGuard governs. It must
+// match the namespace EnumerateScanRoots indexes from (isUserPartition:
+// /media/* and /mnt/*): anything Photos will scan while mounted needs the
+// same offline/online lifecycle when its mount goes away, or its assets ghost
+// permanently — offline=0 rows whose files can never be read again, which the
+// CLIP/OCR backfills then re-fetch on every cooldown window forever (seen in
+// production with a system disk temporarily mounted at /mnt/root-B). /DATA is
+// the one permanent root deliberately outside this namespace: it is never
+// flagged, even if it transiently vanishes from /proc/mounts.
+//
+// The offline flag is reversible and self-heals on remount (markOnline +
+// onMountBack), so governing manually-mounted /mnt volumes (MergerFS, NAS
+// shares) is safe: a flapping share briefly hides its assets, nothing is
+// deleted — the destructive paths have their own interlocks (pruneMissingUnder).
 //
 // /media/devmon/* sits under this namespace by path shape but is excluded via
 // IsExcludedMount (see toMountSet): devmon USB mounts are not indexed at all
 // (scanroots.go), so MountGuard must not track them either — see toMountSet
 // and markOfflineOutside for where that exclusion is enforced.
-var removableRoots = []string{"/media/"}
+var removableRoots = []string{"/media/", "/mnt/"}
 
 // mountGuardPollInterval is how often MountGuard re-reads the mount table to
 // detect a removable drive being unplugged or reinserted.
@@ -39,9 +48,9 @@ type MountGuard struct {
 	db       *sql.DB
 	interval time.Duration
 
-	// currentMounts returns the removable (/media/*) mount points that are
-	// mounted right now. Defaults to currentRemovableMounts; overridden in
-	// tests to avoid depending on the real /proc/mounts.
+	// currentMounts returns the governed-namespace (/media/*, /mnt/*) mount
+	// points that are mounted right now. Defaults to currentRemovableMounts;
+	// overridden in tests to avoid depending on the real /proc/mounts.
 	currentMounts func() []string
 
 	// Recovery hooks, run in this order after a removable mount reappears.
@@ -92,9 +101,9 @@ func (g *MountGuard) SetBackfill(f func(ctx context.Context) error) { g.backfill
 func (g *MountGuard) SetBackfillOCR(f func(ctx context.Context) error) { g.backfillOCR = f }
 
 // currentRemovableMounts is the production currentMounts implementation. It
-// reuses EnumerateScanRoots' /proc/mounts parsing and keeps only the /media/*
-// entries (removableRoots) — /DATA and /mnt mounts are out of scope for
-// offline tracking. EnumerateScanRoots already excludes devmon mounts (see
+// reuses EnumerateScanRoots' /proc/mounts parsing and keeps only the entries
+// under the governed namespace (removableRoots: /media/* and /mnt/*) — /DATA
+// is out of scope. EnumerateScanRoots already excludes devmon mounts (see
 // isUserPartition/IsExcludedMount), so they never reach this function's
 // output in production; toMountSet applies the same exclusion again so
 // test-injected currentMounts fixtures (and any future caller) can't
@@ -158,9 +167,9 @@ func (g *MountGuard) AlignOnStartup() {
 // 2 segments, devmon's /media/devmon/<label> is 3, so no fixed segment count
 // is correct):
 //   - restore: every asset under a currently-present mount goes online;
-//   - mark:    every /media/* asset NOT under ANY currently-present mount
-//     goes offline (with nested mounts, matching any one mount counts as
-//     online).
+//   - mark:    every governed-namespace (removableRoots) asset NOT under ANY
+//     currently-present mount goes offline (with nested mounts, matching any
+//     one mount counts as online).
 //
 // The restore direction here only fixes the flag; it deliberately does NOT
 // fire the onMountBack recovery hooks. Drives that came back while the
@@ -176,9 +185,10 @@ func (g *MountGuard) alignWith(cur map[string]bool) {
 	g.markOfflineOutside(cur)
 }
 
-// markOfflineOutside flags offline every online /media/* asset whose path is
-// not under any mount in cur. Prefix matching uses substr(), not LIKE — mount
-// names routinely contain LIKE metacharacters (e.g. a USB stick labelled
+// markOfflineOutside flags offline every online asset in the governed
+// namespace (removableRoots — /media/* and /mnt/*) whose path is not under
+// any mount in cur. Prefix matching uses substr(), not LIKE — mount names
+// routinely contain LIKE metacharacters (e.g. a USB stick labelled
 // Kingston_DataTra: `_` matches any character in a LIKE pattern and would
 // bleed onto sibling mounts).
 //
@@ -189,8 +199,20 @@ func (g *MountGuard) alignWith(cur map[string]bool) {
 // purge/alignment startup-ordering race — a stray devmon row must never be
 // flipped offline by this blanket query.
 func (g *MountGuard) markOfflineOutside(cur map[string]bool) {
-	q := `UPDATE assets SET offline=1 WHERE offline=0 AND substr(file_path,1,7)='/media/'`
+	// The namespace predicate is derived from removableRoots so this blanket
+	// query can never fall out of lockstep with the mount-set filter again
+	// (the /mnt blind spot existed precisely because '/media/' was hardcoded
+	// here while EnumerateScanRoots indexed /mnt/* too).
+	q := `UPDATE assets SET offline=1 WHERE offline=0 AND (`
 	var args []any
+	for i, ns := range removableRoots {
+		if i > 0 {
+			q += ` OR `
+		}
+		q += `substr(file_path,1,length(?))=?`
+		args = append(args, ns, ns)
+	}
+	q += `)`
 	for m := range cur {
 		q += ` AND NOT substr(file_path,1,length(?))=?`
 		p := strings.TrimRight(m, "/") + "/"
