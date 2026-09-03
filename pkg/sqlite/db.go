@@ -515,6 +515,15 @@ func migrate(db *sql.DB) error {
 		// (content genuinely changed) or on trash restore, letting the
 		// ingestion pipeline hand it off again.
 		{"caption_synced", "INTEGER NOT NULL DEFAULT 0"},
+		// caption_handed_at / caption_attempts: Parser only acknowledges the
+		// hand-off (HTTP 202 = queued); it never calls back on failure. The
+		// feeder therefore records when it handed the asset off and how many
+		// times, and re-feeds an asset whose caption still has not landed in
+		// asset_caption after captionStaleAfter, up to captionMaxAttempts
+		// (service/captionfeed.go). Rejected hand-offs (400) count too, so a
+		// permanently broken asset stops being retried on every sweep.
+		{"caption_handed_at", "INTEGER"},
+		{"caption_attempts", "INTEGER NOT NULL DEFAULT 0"},
 	}
 	assetsExisting := map[string]bool{}
 	aRows, err := db.Query(`PRAGMA table_info(assets)`)

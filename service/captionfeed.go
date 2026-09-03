@@ -28,6 +28,19 @@ var captionDeleteSem = make(chan struct{}, 4)
 // semaphore slot and stall subsequent deletes.
 const deleteTimeout = 3 * time.Second
 
+// captionStaleAfter is how long a hand-off may sit without its caption
+// landing in asset_caption before Backfill hands the asset off again. Parser
+// only ever acknowledges the hand-off (202 = queued) and never reports a
+// failed job back, so this is the only way a permanently failed caption
+// (model load error, OOM, corrupt frame) gets another chance. Generous on
+// purpose: a large library queues hours of VLM work behind one asset.
+const captionStaleAfter = 24 * time.Hour
+
+// captionMaxAttempts bounds hand-offs per asset (successful 202s and
+// rejections alike). Beyond it the asset is left alone until its content
+// changes or it is restored from trash, which reset the counter.
+const captionMaxAttempts = 3
+
 // captionSink is the duck-typed interface CaptionFeeder depends on, covering
 // only the two methods it needs from parserclient.Client, so tests can inject
 // fakes like recordingSink.
@@ -146,11 +159,49 @@ func (f *CaptionFeeder) FeedOne(ctx context.Context, assetID string) {
 			return
 		}
 		zap.L().Warn("caption feed failed", zap.String("asset_id", assetID), zap.Error(err))
+		f.markRejected(ctx, assetID)
 		return
 	}
-	if _, err := f.db.ExecContext(ctx, `UPDATE assets SET caption_synced=1 WHERE id=?`, assetID); err != nil {
+	if err := f.markHandedOff(ctx, assetID); err != nil {
 		zap.L().Warn("failed to set caption_synced", zap.String("asset_id", assetID), zap.Error(err))
 	}
+}
+
+// markHandedOff records a 202 from Parser: synced, stamped, one attempt used.
+func (f *CaptionFeeder) markHandedOff(ctx context.Context, assetID string) error {
+	_, err := f.db.ExecContext(ctx, `UPDATE assets
+		SET caption_synced=1, caption_handed_at=?, caption_attempts=caption_attempts+1
+		WHERE id=?`, time.Now().UnixMilli(), assetID)
+	return err
+}
+
+// markRejected records a hand-off Parser refused (e.g. 400: thumbnail
+// missing). The asset stays unsynced but burns an attempt, so sweeps stop
+// retrying it after captionMaxAttempts instead of looping forever.
+func (f *CaptionFeeder) markRejected(ctx context.Context, assetID string) {
+	if _, err := f.db.ExecContext(ctx, `UPDATE assets
+		SET caption_attempts=caption_attempts+1 WHERE id=?`, assetID); err != nil {
+		zap.L().Debug("caption feed: failed to count rejected attempt", zap.String("asset_id", assetID), zap.Error(err))
+	}
+}
+
+// requeueStale flips caption_synced back to 0 for assets handed off more
+// than captionStaleAfter ago whose caption never arrived in asset_caption
+// (the Puller writes that table when Parser finishes). Bounded by
+// captionMaxAttempts. Returns how many assets were requeued.
+func (f *CaptionFeeder) requeueStale(ctx context.Context) (int64, error) {
+	res, err := f.db.ExecContext(ctx, `UPDATE assets SET caption_synced=0
+		WHERE caption_synced = 1
+		  AND caption_handed_at IS NOT NULL AND caption_handed_at < ?
+		  AND caption_attempts < ?
+		  AND status = 'indexed' AND deleted_at IS NULL
+		  AND id NOT IN (SELECT asset_id FROM asset_caption)`,
+		time.Now().Add(-captionStaleAfter).UnixMilli(), captionMaxAttempts)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
 }
 
 // DeleteRemote asynchronously tells Parser to delete this asset's caption
@@ -182,17 +233,19 @@ func (f *CaptionFeeder) DeleteRemote(assetID string) {
 // restore flow (used by Task 4): a restored asset needs to be fed again, and
 // the next Backfill round will naturally pick it up.
 func (f *CaptionFeeder) OnRestore(assetID string) {
-	if _, err := f.db.Exec(`UPDATE assets SET caption_synced=0 WHERE id=?`, assetID); err != nil {
+	if _, err := f.db.Exec(`UPDATE assets SET caption_synced=0, caption_handed_at=NULL, caption_attempts=0 WHERE id=?`, assetID); err != nil {
 		zap.L().Warn("failed to reset caption_synced", zap.String("asset_id", assetID), zap.Error(err))
 	}
 }
 
 // queryPending lists asset ids pending feed: indexed, not soft-deleted,
-// source file readable (not on an offline drive), not yet synced.
+// source file readable (not on an offline drive), not yet synced, and still
+// within the hand-off attempt budget.
 func (f *CaptionFeeder) queryPending(ctx context.Context) ([]string, error) {
 	rows, err := f.db.QueryContext(ctx, `
 		SELECT id FROM assets
-		WHERE caption_synced = 0 AND status = 'indexed' AND deleted_at IS NULL AND offline = 0`)
+		WHERE caption_synced = 0 AND status = 'indexed' AND deleted_at IS NULL AND offline = 0
+		  AND caption_attempts < ?`, captionMaxAttempts)
 	if err != nil {
 		return nil, err
 	}
@@ -241,6 +294,11 @@ func (f *CaptionFeeder) Backfill(ctx context.Context) error {
 // backfillOnce is the body of a single Backfill round, without the
 // concurrency dedup and rerun loop.
 func (f *CaptionFeeder) backfillOnce(ctx context.Context) error {
+	if n, err := f.requeueStale(ctx); err != nil {
+		return err
+	} else if n > 0 {
+		zap.L().Info("caption backfill: re-feeding hand-offs whose caption never landed", zap.Int64("count", n))
+	}
 	ids, err := f.queryPending(ctx)
 	if err != nil {
 		return err
@@ -305,10 +363,11 @@ func (f *CaptionFeeder) feedBatch(ctx context.Context, ids []string) error {
 				// summary log (normal ops scenario, worth recording).
 				break
 			}
+			f.markRejected(ctx, id)
 			failed++
 			continue
 		}
-		if _, uerr := f.db.ExecContext(ctx, `UPDATE assets SET caption_synced=1 WHERE id=?`, id); uerr != nil {
+		if uerr := f.markHandedOff(ctx, id); uerr != nil {
 			failed++
 			continue
 		}
