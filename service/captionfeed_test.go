@@ -204,8 +204,12 @@ func TestBackfillSelectionAndCAS(t *testing.T) {
 
 		insertCaptionCandidate(t, db, "e1")
 		insertCaptionCandidate(t, db, "e2")
-		// Not selected: already synced.
+		// Not selected: already synced AND its caption landed. (A synced
+		// asset whose caption never arrived is deliberately re-fed — see
+		// requeueStale and captionfeed_retry_test.go.)
 		_, err := db.Exec(`INSERT INTO assets(id,file_path,status,caption_synced) VALUES('s1','/g/s1.jpg','indexed',1)`)
+		require.NoError(t, err)
+		_, err = db.Exec(`INSERT INTO asset_caption(asset_id, text, mtime_ms) VALUES('s1','a landed caption',1)`)
 		require.NoError(t, err)
 		// Not selected: not yet fully indexed.
 		_, err = db.Exec(`INSERT INTO assets(id,file_path,status,caption_synced) VALUES('p1','/g/p1.jpg','pending',0)`)
