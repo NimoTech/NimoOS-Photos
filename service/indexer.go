@@ -1038,7 +1038,9 @@ func (ix *Indexer) processFileInternal(path string, opts processOpts) (success b
 		  status        = 'pending',
 		  mtime         = excluded.mtime,
 		  face_scanned  = CASE WHEN excluded.checksum <> checksum THEN 0 ELSE face_scanned END,
-		  caption_synced = CASE WHEN excluded.checksum <> checksum THEN 0 ELSE caption_synced END`,
+		  caption_synced = CASE WHEN excluded.checksum <> checksum THEN 0 ELSE caption_synced END,
+		  caption_attempts = CASE WHEN excluded.checksum <> checksum THEN 0 ELSE caption_attempts END,
+		  caption_handed_at = CASE WHEN excluded.checksum <> checksum THEN NULL ELSE caption_handed_at END`,
 		// face_scanned is only reset to 0 when the content actually changed
 		// (checksum differs), handing it back to RunPipeline for
 		// re-detection; a pure force rerun (e.g. Embedder/Rebuilder's CLIP
