@@ -187,12 +187,13 @@ func (f *CaptionFeeder) markRejected(ctx context.Context, assetID string) {
 
 // requeueStale flips caption_synced back to 0 for assets handed off more
 // than captionStaleAfter ago whose caption never arrived in asset_caption
-// (the Puller writes that table when Parser finishes). Bounded by
+// (the Puller writes that table when Parser finishes). Rows from before
+// caption_handed_at existed (NULL) are stale by definition. Bounded by
 // captionMaxAttempts. Returns how many assets were requeued.
 func (f *CaptionFeeder) requeueStale(ctx context.Context) (int64, error) {
 	res, err := f.db.ExecContext(ctx, `UPDATE assets SET caption_synced=0
 		WHERE caption_synced = 1
-		  AND caption_handed_at IS NOT NULL AND caption_handed_at < ?
+		  AND (caption_handed_at IS NULL OR caption_handed_at < ?)
 		  AND caption_attempts < ?
 		  AND status = 'indexed' AND deleted_at IS NULL
 		  AND id NOT IN (SELECT asset_id FROM asset_caption)`,

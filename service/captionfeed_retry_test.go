@@ -86,3 +86,21 @@ func TestOnRestore_ResetsAttemptsSoARestoredPhotoGetsAFreshBudget(t *testing.T) 
 	require.Equal(t, 0, attempts)
 	require.Equal(t, 0, synced)
 }
+
+// Rows written before caption_handed_at existed have synced=1 and no
+// timestamp. If their caption never landed they are stale by definition
+// (on 143: 730 such rows, 0 captions, and Parser had never seen a visual
+// job) — the upgrade must pick them up, not grandfather them in forever.
+func TestBackfill_LegacyHandoffWithoutTimestampIsStale(t *testing.T) {
+	db := makeTestDB(t)
+	_, err := db.Exec(`INSERT INTO assets(id, file_path, mime_type, status, caption_synced)
+		VALUES('a1','/g/a1.jpg','image/jpeg','indexed',1)`)
+	require.NoError(t, err)
+	sink := &recordingSink{}
+	f := NewCaptionFeeder(db, sink, t.TempDir())
+	require.NoError(t, f.Backfill(context.Background()))
+	require.Equal(t, 1, ingestCount(sink))
+	var handed int64
+	require.NoError(t, db.QueryRow(`SELECT caption_handed_at FROM assets WHERE id='a1'`).Scan(&handed))
+	require.Greater(t, handed, int64(0), "the re-feed stamps a real hand-off time")
+}
